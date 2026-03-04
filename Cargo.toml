@@ -1,0 +1,29 @@
+[workspace]
+members = [
+  "augur-core",
+  "augur-prophesee",
+  "augur-cli",
+  "augur-gui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
+
+[workspace.dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+eframe = "0.27"
+egui = "0.27"
+evt3-core = "=0.1.0"
+rusb = { version = "0.9", features = ["vendored"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+toml = "0.8"
+ctrlc = "3"
+rfd = "0.15"

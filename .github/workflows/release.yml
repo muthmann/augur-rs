@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-release:
+    name: Build macOS release artifacts
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bin augur --bin augur-gui
+
+      - name: Assemble macOS app bundle
+        run: bash resources/macos-bundle.sh target/release/augur-gui dist
+
+      - name: Package release archive
+        run: |
+          mkdir -p dist/augur-macos/bin
+          cp target/release/augur dist/augur-macos/bin/
+          cp target/release/augur-gui dist/augur-macos/bin/
+          cp README.md LICENSE CONTRIBUTING.md dist/augur-macos/
+          mkdir -p dist/augur-macos/examples
+          cp examples/augur.toml dist/augur-macos/examples/
+          ditto -c -k --sequesterRsrc --keepParent dist/augur-macos augur-macos.zip
+          ditto -c -k --sequesterRsrc --keepParent dist/AugurGUI.app AugurGUI.app.zip
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: augur-release-assets
+          path: |
+            augur-macos.zip
+            AugurGUI.app.zip
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            augur-macos.zip
+            AugurGUI.app.zip

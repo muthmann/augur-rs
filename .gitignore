@@ -1,0 +1,19 @@
+.DS_Store
+
+# Rust build output
+/target/
+
+# Local capture/config artifacts
+/output.raw
+/output.toml
+/augur.toml
+
+# Local-only agent workflow files
+/AGENTS.md
+/CLAUDE.md
+/PLANS.md
+/tasks/
+/docs/ai/
+
+# Local tool state
+/.claude/

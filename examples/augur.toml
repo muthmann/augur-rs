@@ -1,0 +1,20 @@
+[biases]
+diff_on = 0
+diff_off = 0
+fo = 0
+hpf = 0
+refr = 0
+
+[roi]
+x = 0
+y = 0
+width = 1280
+height = 720
+
+[pixel_mask]
+masked_pixels = []
+
+[digital_filter]
+stc_enabled = false
+stc_threshold_us = 1000
+trail_enabled = false

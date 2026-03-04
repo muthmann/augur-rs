@@ -1,0 +1,18 @@
+[package]
+name = "augur-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "augur"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+augur-core = { path = "../augur-core" }
+augur-prophesee = { path = "../augur-prophesee" }
+clap.workspace = true
+ctrlc.workspace = true
+toml.workspace = true
