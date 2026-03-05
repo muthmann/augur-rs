@@ -308,19 +308,17 @@ impl CameraApp {
     fn latest_detected_hotpixels(&self) -> Vec<(u16, u16)> {
         let mut pixels = Vec::new();
         for overlay in &self.analysis_output.overlays {
-            match overlay {
-                Overlay::HighlightPixels {
-                    pixels: highlighted,
-                    ..
-                } => {
-                    for pixel in highlighted {
-                        let coords = (pixel.x, pixel.y);
-                        if !pixels.contains(&coords) {
-                            pixels.push(coords);
-                        }
+            if let Overlay::HighlightPixels {
+                pixels: highlighted,
+                ..
+            } = overlay
+            {
+                for pixel in highlighted {
+                    let coords = (pixel.x, pixel.y);
+                    if !pixels.contains(&coords) {
+                        pixels.push(coords);
                     }
                 }
-                Overlay::RoiGrid { .. } => {}
             }
         }
         pixels
@@ -689,13 +687,15 @@ impl eframe::App for CameraApp {
                 ));
             }
 
-            if mode != AppMode::Idle && (!self.config_dirty && !self.acq_dirty) {
-                ui.label("Runtime settings on the camera are up to date.");
-            } else if mode != AppMode::Idle && (self.config_dirty || self.acq_dirty) {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "There are unapplied runtime changes.",
-                );
+            if mode != AppMode::Idle {
+                if self.config_dirty || self.acq_dirty {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "There are unapplied runtime changes.",
+                    );
+                } else {
+                    ui.label("Runtime settings on the camera are up to date.");
+                }
             }
 
             if !self.analysis_output.warnings.is_empty() {

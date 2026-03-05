@@ -1,57 +1,46 @@
-# AugurRS Technical Notes
+# AugurRS Technical Overview
 
-## Goal
-macOS-compatible Rust toolkit for Prophesee EVK4 / IMX636 with:
-- trait-based camera abstraction
-- headless CLI recording
-- egui GUI preview and runtime controls
+## What It Is
 
-## Current Technical Scope
+A Rust workspace for controlling Prophesee EVK4 / IMX636 event cameras on macOS. It provides direct USB communication, sensor register programming, a bounded streaming pipeline, and both CLI and GUI frontends.
 
-The current implementation includes:
-- Treuzell USB transport over `rusb` with control/stream endpoints split
-- Treuzell command framing and property handling (devices, enable, stream, reg32, format)
-- IMX636 sensor integration with sourced register addresses and ISSD init/start/stop/destroy sequences
-- runtime controls for biases, ROI, pixel mask and digital filters
-- three-thread recording pipeline with bounded backpressure + lossy preview
-- runtime acquisition window (`acq_time_us`) via `Arc<AtomicU64>`
-- GUI-thread live analysis framework with extensible analyzers
-- hotpixel detection with EMA smoothing, preview overlays, severity warnings, and mask-copy handoff
-- CLI + GUI both consume the same pipeline and camera backend
+## Workspace Structure
 
-## Architecture
-- `augur-core`: traits, config types, pipeline, and `evt3-core`-backed incremental EVT3 preview decoding
-- `augur-prophesee`: EVK4 transport, Treuzell protocol, IMX636 sensor implementation
-- `augur-cli`: status/config/record commands
-- `augur-gui`: live preview + controls
+| Crate | Role |
+|-------|------|
+| `augur-core` | Camera traits, TOML config types, streaming pipeline, EVT3 preview decoding (via [`evt3-core`](https://crates.io/crates/evt3-core/0.1.0)), analysis framework |
+| `augur-prophesee` | EVK4 Treuzell USB transport, IMX636 register sequences (ISSD init/start/stop/destroy), sensor trait implementation |
+| `augur-cli` | `status`, `record`, `config` commands |
+| `augur-gui` | Live preview, runtime controls, hotpixel analysis, ROI-grid computation |
 
-## Data Path Guarantees
-- Disk path is bounded and backpressured (`disk_tx`): avoids unbounded memory growth.
-- Preview path is lossy (`try_send`): never blocks USB hot path.
-- GUI throughput stats use a 1-second sliding window for current `Mev/s` and `MB/s`; elapsed time remains since pipeline start.
-- Worker errors are surfaced through a pipeline error channel to CLI/GUI.
-- USB stream timeouts are treated as non-fatal (low-event scenes are valid).
-- Preview analysis runs on the GUI thread against the latest `PreviewFrame`; no extra analysis thread or channel is required for current workloads.
+## Hardware Interface
 
-## Sensor-Specific Behavior (IMX636)
-- ROI is configured in hardware (`roi_win_*`, `roi_ctrl`) and reduces event generation bandwidth.
-- Digital event mask uses hardware mask slots (`digital_mask_pixel_00..63`, max 64 masked pixels).
-- STC and Trail filters are configured from IMX636 `stc/*` registers and treated as mutually exclusive.
-- Biases are applied as offsets from factory defaults with range checks.
+- **Transport**: Treuzell protocol over `rusb` — control and stream endpoints, command framing, property queries (device info, enable, stream, reg32, format)
+- **Sensor**: IMX636 register programming with sourced addresses. Init/start/stop/destroy sequences derived from ISSD specifications
+- **Runtime controls**: Biases (5 offset keys), hardware ROI, 64-slot digital event mask (DEM), mutually exclusive STC/Trail filters, acquisition window via `Arc<AtomicU64>`
 
-## Recording Format
-`.raw` files start with EVT3 header lines and always use sensor geometry:
-- `% format EVT3;width=1280;height=720`
-- `% geometry 1280x720`
-- `% evt 3.0`
-- `% end`
+## Streaming Pipeline
 
-Each recording writes a sibling TOML (`<name>.toml`) with full configuration.
+Three threads with explicit flow control:
+
+| Thread | Channel | Behavior |
+|--------|---------|----------|
+| USB reader | — | Pulls raw EVT3 packets from the device |
+| Disk writer | Bounded (`disk_tx`) | Backpressure prevents unbounded memory growth |
+| Preview decoder | Lossy (`try_send`) | Drops frames rather than blocking capture |
+
+Additional guarantees:
+- Throughput stats use a 1-second sliding window (Mev/s, MB/s)
+- Worker errors surface through a dedicated error channel
+- USB timeouts are non-fatal (low-event scenes are valid)
+- Preview analysis runs on the GUI thread against the latest decoded frame
+
+## Recording Output
+
+Each capture produces:
+- `<name>.raw` — EVT3 stream with standard header (`format EVT3;width=1280;height=720`)
+- `<name>.toml` — effective configuration sidecar for reproducibility
 
 ## Configuration
-- Supports `masked_pixels` and backward-compatible alias `hot_pixels` in TOML.
-- GUI analysis settings are local to the desktop app and do not change hardware state until the user copies detections into the DEM mask and applies runtime settings.
-- Runtime validation checks:
-  - ROI bounds
-  - mask coordinates
-  - digital filter conflicts (`stc_enabled` and `trail_enabled` cannot both be true)
+
+TOML-based with four sections: `biases`, `roi`, `pixel_mask`, `digital_filter`. The GUI and CLI share the same config types. Runtime validation covers ROI bounds, mask coordinates, and filter conflicts.

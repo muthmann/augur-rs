@@ -28,14 +28,28 @@ pub struct RoiGrid {
     pub x_bounds: Vec<u16>,
     /// Sorted y-boundary positions (including 0 and sensor_height).
     pub y_bounds: Vec<u16>,
-    /// Row-major grid: `blocked[row][col]` is true if the cell contains a hotpixel.
-    pub blocked: Vec<Vec<bool>>,
+    /// Row-major flat grid: `blocked[row * cols() + col]` is true if the cell contains a hotpixel.
+    pub blocked: Vec<bool>,
     /// All free (unblocked) cells as sensor rectangles.
     pub free_cells: Vec<SensorRect>,
     /// Top-K largest merged rectangles (sorted by area, largest first).
     pub largest_rects: Vec<SensorRect>,
     pub sensor_width: u16,
     pub sensor_height: u16,
+}
+
+impl RoiGrid {
+    pub fn cols(&self) -> usize {
+        self.x_bounds.len() - 1
+    }
+
+    pub fn rows(&self) -> usize {
+        self.y_bounds.len() - 1
+    }
+
+    pub fn is_blocked(&self, row: usize, col: usize) -> bool {
+        self.blocked[row * self.cols() + col]
+    }
 }
 
 /// Compute the ROI grid from a list of hotpixel coordinates.
@@ -55,7 +69,7 @@ pub fn compute_roi_grid(
     let cols = x_bounds.len() - 1;
     let rows = y_bounds.len() - 1;
 
-    let mut blocked = vec![vec![false; cols]; rows];
+    let mut blocked = vec![false; rows * cols];
 
     // Mark blocked cells.  Each hotpixel at (hx, hy) falls into the cell
     // whose x-interval contains hx and y-interval contains hy.
@@ -66,22 +80,22 @@ pub fn compute_roi_grid(
         let col = find_cell(&x_bounds, hx);
         let row = find_cell(&y_bounds, hy);
         if col < cols && row < rows {
-            blocked[row][col] = true;
+            blocked[row * cols + col] = true;
         }
     }
 
     // Enumerate free cells.
     let mut free_cells = Vec::new();
-    for (r, row) in blocked.iter().enumerate().take(rows) {
-        for (c, &is_blocked) in row.iter().enumerate().take(cols) {
-            if !is_blocked {
+    for r in 0..rows {
+        for c in 0..cols {
+            if !blocked[r * cols + c] {
                 free_cells.push(cell_rect(&x_bounds, &y_bounds, r, c));
             }
         }
     }
 
     // Find largest merged rectangles using maximal-rectangle-in-histogram.
-    let largest_rects = find_largest_rects(&blocked, &x_bounds, &y_bounds, top_k);
+    let largest_rects = find_largest_rects(&blocked, cols, &x_bounds, &y_bounds, top_k);
 
     RoiGrid {
         x_bounds,
@@ -141,16 +155,16 @@ fn cell_rect(x_bounds: &[u16], y_bounds: &[u16], row: usize, col: usize) -> Sens
 /// rectangle algorithm, but weight each candidate rectangle by the actual
 /// pixel dimensions of the cells it spans.
 fn find_largest_rects(
-    blocked: &[Vec<bool>],
+    blocked: &[bool],
+    cols: usize,
     x_bounds: &[u16],
     y_bounds: &[u16],
     top_k: usize,
 ) -> Vec<SensorRect> {
-    let rows = blocked.len();
+    let rows = if cols == 0 { 0 } else { blocked.len() / cols };
     if rows == 0 {
         return Vec::new();
     }
-    let cols = blocked[0].len();
 
     // height[c] = number of consecutive free rows ending at current row for column c
     let mut height = vec![0_usize; cols];
@@ -158,10 +172,10 @@ fn find_largest_rects(
     // Collect all candidate rectangles across all rows, then take top-K.
     let mut candidates: Vec<SensorRect> = Vec::new();
 
-    for (r, row) in blocked.iter().enumerate().take(rows) {
+    for r in 0..rows {
         // Update histogram.
         for (c, column_height) in height.iter_mut().enumerate().take(cols) {
-            if row[c] {
+            if blocked[r * cols + c] {
                 *column_height = 0;
             } else {
                 *column_height += 1;
@@ -239,12 +253,11 @@ mod tests {
         assert_eq!(grid.y_bounds, vec![0, 360, 361, 720]);
 
         // 9 cells total, 1 blocked, 8 free
-        let total_cells: usize = grid.blocked.iter().map(|row| row.len()).sum();
-        assert_eq!(total_cells, 9);
+        assert_eq!(grid.blocked.len(), 9);
         assert_eq!(grid.free_cells.len(), 8);
 
         // The blocked cell is at (640, 360) with size 1x1
-        assert!(grid.blocked[1][1]);
+        assert!(grid.is_blocked(1, 1));
     }
 
     #[test]
@@ -253,7 +266,7 @@ mod tests {
         // x_bounds: [0, 1, 1280], y_bounds: [0, 1, 720]
         assert_eq!(grid.x_bounds, vec![0, 1, 1280]);
         assert_eq!(grid.y_bounds, vec![0, 1, 720]);
-        assert!(grid.blocked[0][0]);
+        assert!(grid.is_blocked(0, 0));
         assert_eq!(grid.free_cells.len(), 3);
     }
 
@@ -263,9 +276,9 @@ mod tests {
         assert_eq!(*grid.x_bounds.last().unwrap(), 1280);
         assert_eq!(*grid.y_bounds.last().unwrap(), 720);
         // The bottom-right cell is blocked
-        let last_row = grid.blocked.len() - 1;
-        let last_col = grid.blocked[0].len() - 1;
-        assert!(grid.blocked[last_row][last_col]);
+        let last_row = grid.rows() - 1;
+        let last_col = grid.cols() - 1;
+        assert!(grid.is_blocked(last_row, last_col));
         assert_eq!(grid.free_cells.len(), 3);
     }
 
@@ -280,8 +293,8 @@ mod tests {
         let col_100 = find_cell(&grid.x_bounds, 100);
         let col_101 = find_cell(&grid.x_bounds, 101);
         let row = find_cell(&grid.y_bounds, 200);
-        assert!(grid.blocked[row][col_100]);
-        assert!(grid.blocked[row][col_101]);
+        assert!(grid.is_blocked(row, col_100));
+        assert!(grid.is_blocked(row, col_101));
     }
 
     #[test]

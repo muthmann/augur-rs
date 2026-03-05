@@ -100,15 +100,16 @@ impl Analyzer for HotpixelDetector {
             AnalysisSeverity::Info
         };
 
+        let count = hot_pixels.len();
         AnalysisOutput {
             overlays: vec![Overlay::HighlightPixels {
-                pixels: hot_pixels.clone(),
+                pixels: hot_pixels,
                 color: HOTPIXEL_OVERLAY_COLOR,
             }],
             warnings: vec![AnalysisWarning {
                 source: self.name().to_owned(),
                 severity,
-                message: format!("{} suspected hot pixels detected", hot_pixels.len()),
+                message: format!("{count} suspected hot pixels detected"),
             }],
         }
     }

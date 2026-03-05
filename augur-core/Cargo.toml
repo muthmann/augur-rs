@@ -6,7 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-bytemuck.workspace = true
 crossbeam-channel.workspace = true
 evt3-core.workspace = true
 serde.workspace = true

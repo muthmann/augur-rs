@@ -10,10 +10,8 @@ name = "augur-gui"
 path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace = true
 augur-core = { path = "../augur-core" }
 augur-prophesee = { path = "../augur-prophesee" }
 eframe.workspace = true
 egui.workspace = true
-toml.workspace = true
 rfd.workspace = true

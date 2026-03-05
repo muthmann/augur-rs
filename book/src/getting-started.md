@@ -38,11 +38,9 @@ Expected result:
 If the command fails to open the EVK4:
 
 - confirm the camera is powered and connected directly over USB 3.0
-- prefer a direct cable over hubs or adapters when possible
+- use a direct cable — hubs and adapters can limit throughput
 - close other applications that may already own the device
-- rebuild once after dependency changes so `rusb` and the binaries are up to date
-
-If you observe better throughput or stability with a direct USB-C cable than with a USB-A adapter path, treat that as a real hardware-path variable.
+- rebuild after dependency changes so `rusb` and the binaries are up to date
 
 ## First Recording
 
@@ -80,4 +78,4 @@ Suggested first run:
 - Continue with [Configuration Reference](configuration.md)
 - Use [CLI Usage](cli.md) for headless workflows
 - Use [GUI Usage](gui.md) for preview and analysis flows
-- Read [Performance Notes](performance.md) before making benchmark claims
+- Read [Performance](performance.md) for architecture and design rationale

@@ -193,10 +193,6 @@ struct DiskChunk {
     len: usize,
 }
 
-struct PreviewChunk {
-    bytes: Vec<u8>,
-}
-
 pub struct PipelineController {
     pub frame_rx: Receiver<PreviewFrame>,
     pub settings_tx: Sender<CameraConfig>,
@@ -273,7 +269,7 @@ where
     } else {
         (None, None)
     };
-    let (preview_tx, preview_rx) = bounded::<PreviewChunk>(N_BUFFERS);
+    let (preview_tx, preview_rx) = bounded::<Vec<u8>>(N_BUFFERS);
     let (frame_tx, frame_rx) = bounded::<PreviewFrame>(2);
     let (settings_tx, settings_rx) = bounded::<CameraConfig>(8);
     let (error_tx, error_rx) = bounded::<String>(32);
@@ -400,9 +396,7 @@ where
                 let _ = usb_pool_tx.send(buf);
             }
 
-            let _ = preview_tx.try_send(PreviewChunk {
-                bytes: preview_copy,
-            });
+            let _ = preview_tx.try_send(preview_copy);
         }
 
         if let Err(e) = camera.stop_streaming() {
@@ -504,8 +498,8 @@ where
             }
 
             match preview_rx.recv_timeout(Duration::from_millis(2)) {
-                Ok(chunk) => {
-                    if let Err(e) = decoder.decode_bytes(&chunk.bytes, &mut events) {
+                Ok(bytes) => {
+                    if let Err(e) = decoder.decode_bytes(&bytes, &mut events) {
                         report_pipeline_error(
                             &error_preview,
                             &stop_preview,

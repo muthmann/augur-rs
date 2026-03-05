@@ -183,25 +183,16 @@ impl Imx636 {
 
     fn iph_mirror_control(&self, transport: &mut Transport, enable: bool) -> Result<()> {
         let mut tz = Treuzell::new(transport);
-        let mut reg = tz.read_reg32(self.device_id, REG_IPH_MIRR_CTRL)?;
-        if enable {
-            reg |= 1 << 0;
-        } else {
-            reg &= !(1 << 0);
+        for bit in 0..2_u32 {
+            let mut reg = tz.read_reg32(self.device_id, REG_IPH_MIRR_CTRL)?;
+            if enable {
+                reg |= 1 << bit;
+            } else {
+                reg &= !(1 << bit);
+            }
+            tz.write_reg32(self.device_id, REG_IPH_MIRR_CTRL, reg)?;
+            thread::sleep(Duration::from_micros(20));
         }
-        tz.write_reg32(self.device_id, REG_IPH_MIRR_CTRL, reg)?;
-
-        thread::sleep(Duration::from_micros(20));
-
-        let mut reg = tz.read_reg32(self.device_id, REG_IPH_MIRR_CTRL)?;
-        if enable {
-            reg |= 1 << 1;
-        } else {
-            reg &= !(1 << 1);
-        }
-        tz.write_reg32(self.device_id, REG_IPH_MIRR_CTRL, reg)?;
-
-        thread::sleep(Duration::from_micros(20));
         Ok(())
     }
 

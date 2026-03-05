@@ -1,15 +1,14 @@
 # AugurRS Documentation
 
-AugurRS is a Rust-first toolkit for Prophesee EVK4 / IMX636 event cameras. The workspace combines a small hardware layer, a bounded recording pipeline, a CLI for automation, and a native desktop GUI for preview and runtime tuning.
+AugurRS is a Rust toolkit for Prophesee EVK4 / IMX636 event cameras. Direct hardware control, a bounded streaming pipeline, a CLI for capture automation, and a native desktop GUI for live preview and runtime tuning.
 
-This mdBook mirrors the repository documentation so it can be published on GitHub Pages without losing the structure of the source docs in `docs/`.
+Start with [Getting Started](getting-started.md) to build, connect, and run your first capture.
 
-## What You Will Find Here
+## What's Covered
 
-- setup and first-run guidance for macOS
-- TOML configuration details
+- Setup and first-run guidance for macOS
+- TOML configuration reference
 - CLI and GUI workflows
-- recording and performance notes
-- deeper technical notes for maintainers
-
-If you are starting fresh, begin with [Getting Started](getting-started.md).
+- Recording format and pipeline behavior
+- Architecture and performance design
+- Technical notes for contributors

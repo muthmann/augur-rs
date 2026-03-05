@@ -1,44 +1,28 @@
-# Release And Distribution Notes
+# Releases
 
-## Current State
+## Distribution
 
-Today the repository ships in three layers:
+AugurRS ships in three forms:
 
-- developers can build from source with Cargo
-- GitHub Actions can verify repository health automatically
-- tagged releases can publish prebuilt macOS artifacts
+| Channel | Audience | Contents |
+|---------|----------|----------|
+| **Source** | Developers | `cargo build --workspace` from the repository |
+| **CLI archive** | Terminal users | `augur-macos.zip` — prebuilt binaries, docs, example config |
+| **macOS app** | Desktop users | `AugurGUI.app.zip` — unsigned `.app` bundle for the GUI |
 
-## Non-Technical Users
+Both archives are built by GitHub Actions and attached to every tagged release.
 
-For non-technical users, the long-term goal should be:
+## Release Workflow
 
-- downloadable GUI releases from GitHub Releases
-- minimal manual setup
-- a proper desktop app package for macOS
+On a version tag push, the CI pipeline:
 
-This repository now packages an unsigned `.app` bundle, but it is not fully turnkey yet.
+1. Builds `augur` and `augur-gui` for macOS
+2. Packages the CLI archive with binaries, documentation, and example config
+3. Assembles `AugurGUI.app` from `resources/Info.plist` and the GUI binary
+4. Uploads both `.zip` archives to the GitHub Release
 
-## What The Release Workflow Provides
+## Known Limitations
 
-The GitHub Actions release workflow is intended to:
-
-- build `augur` and `augur-gui` on tagged versions
-- package a source-first `augur-macos.zip` archive with binaries, docs, and example config
-- assemble `AugurGUI.app` and publish it as `AugurGUI.app.zip`
-- attach both archives to GitHub Releases
-
-## What It Does Not Solve Yet
-
-- macOS code signing
-- macOS notarization
-- installer-based distribution
-
-Those are the next steps if the project should feel truly turnkey for GUI-only users.
-
-## Practical Recommendation
-
-For now:
-
-- technical users can build from source immediately
-- less technical users can start from release artifacts once tags are published
-- if macOS GUI distribution becomes a priority, add signed `.app` packaging next
+- The `.app` bundle is **unsigned** — macOS Gatekeeper will prompt on first launch. Right-click → Open to bypass.
+- No notarization or installer-based distribution yet.
+- Code signing is the next step if broader GUI distribution becomes a priority.

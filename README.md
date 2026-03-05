@@ -1,58 +1,41 @@
 # AugurRS
 
-> Rust-first tooling for Prophesee EVK4 / IMX636 event cameras. Fast CLI capture, native desktop GUI, and a small codebase you can actually audit.
+**A Rust toolkit for Prophesee EVK4 / IMX636 event cameras.**
+Direct hardware control, zero vendor runtime, fast CLI capture, and a native desktop GUI — in under 10k lines of Rust.
 
 [![CI](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/muthmann/augur-rs/actions/workflows/release.yml/badge.svg)](https://github.com/muthmann/augur-rs/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-<!-- screenshot: desktop GUI preview placeholder -->
-<!-- screenshot: ROI-grid and hotpixel workflow placeholder -->
+<!-- screenshot: GUI preview -->
 
-## Highlights
+## Why AugurRS
 
-- **Built around the real hardware**: direct Treuzell USB transport and IMX636 register programming, no vendor runtime required
-- **Small, explicit architecture**: four crates, one bounded streaming pipeline, no giant framework stack
-- **Two interfaces, one backend**: `augur` for scripting and capture automation, `augur-gui` for live preview and runtime tuning
-- **Preview that stays out of the way**: EVT3 decoding via [`evt3-core`](https://crates.io/crates/evt3-core/0.1.0) on a lossy path so capture stays prioritized
-- **Runtime tuning and analysis**: biases, ROI, DEM mask, STC/Trail filters, hotpixel detection, and ROI-grid assistance
-- **Reproducible sessions**: every `.raw` recording writes the effective TOML sidecar next to the capture
+Prophesee's official stack (Metavision / OpenEB) is a large C++/Python ecosystem built for broad sensor support. AugurRS takes a different approach: a focused Rust workspace that talks directly to the EVK4 hardware over USB, with no SDK layers in between.
 
-## Built for macOS
-
-AugurRS is designed and hardware-validated on macOS first. The workspace remains portable Rust (`rusb` + `eframe`), CI checks Linux and Windows compilation, and tagged releases now package both a CLI archive and an unsigned macOS `.app` bundle for the GUI.
+- **Direct hardware path** — Treuzell USB transport and IMX636 register programming without vendor libraries
+- **Bounded streaming pipeline** — three-thread architecture: USB reader, backpressured disk writer, lossy preview decoder. Capture never stalls for the UI
+- **Two interfaces, one backend** — `augur` CLI for scripting and automation, `augur-gui` for live preview and runtime tuning
+- **Runtime sensor control** — biases, hardware ROI, 64-slot pixel mask (DEM), STC/Trail filters, acquisition window — all adjustable mid-session
+- **Hotpixel workflow** — detect, mask, and compute optimal ROI regions around defective pixels
+- **Reproducible captures** — every `.raw` recording writes the effective TOML config as a sidecar
 
 ## Architecture
 
-```text
-                 +---------------------------+
-                 |         augur-cli         |
-                 |      `augur` binary       |
-                 +-------------+-------------+
-                               |
-+-------------------+          |          +-------------------+
-| augur-prophesee   +----------+----------+   augur-gui       |
-| EVK4 / IMX636 I/O |                     | `augur-gui` app   |
-+---------+---------+                     +---------+---------+
-          \                                         /
-           \                                       /
-            +----------------+--------------------+
-                             |
-                     +-------v-------+
-                     |  augur-core   |
-                     | config, pipe, |
-                     | preview, anal |
-                     +---------------+
+```
+augur-cli ─────────┐
+                    ├──→ augur-core (config, pipeline, preview, analysis)
+augur-gui ─────────┤
+                    └──→ augur-prophesee (EVK4 transport, IMX636 registers)
 ```
 
-The libraries stay small and reusable. The binaries stay thin. That keeps hardware behavior visible and makes it practical to debug throughput, recording, and runtime-control issues without reverse-engineering a large vendor stack.
+Four crates, clear boundaries. The libraries are reusable, the binaries are thin wrappers, and the full hardware control path is auditable.
 
-## Quickstart
+## Quick Start
 
-**Requirements:** macOS, Rust toolchain, and a direct USB 3 connection to a Prophesee EVK4 with IMX636.
+**Requirements:** macOS (primary), Rust toolchain, Prophesee EVK4 over USB 3.
 
 ```bash
-# Build the workspace
 cargo build --workspace
 
 # Probe the camera
@@ -61,43 +44,31 @@ cargo run --bin augur -- status
 # Record a 10-second capture
 cargo run --bin augur -- record captures/session.raw --duration-s 10
 
-# Launch the desktop app
+# Launch the GUI
 cargo run --bin augur-gui
 ```
 
-AugurRS uses `augur.toml` by default for mutable CLI configuration. Start from the example config if you want a local profile:
+Copy the example config for a local profile:
 
 ```bash
 cp examples/augur.toml augur.toml
-cargo run --bin augur -- config show --config augur.toml
 ```
 
-## AugurRS vs. Prophesee Stack
+## Platform Support
 
-| | **AugurRS** | **Prophesee Metavision / OpenEB** |
-|---|---|---|
-| Language | Rust | C++ / Python |
-| Scope | EVK4 + IMX636 focused | Broad multi-sensor ecosystem |
-| Dependencies | Minimal (`rusb`, `eframe`) | Large SDK with plugin system |
-| Interface | CLI + native GUI | APIs, samples, Studio |
-| Release form | Source builds, release zips, macOS `.app` | Vendor installers and SDK packages |
-| Platform posture | macOS first, CI checks Linux/Windows builds | Linux and Windows officially supported |
-| Codebase shape | Small workspace, direct control path | Large multi-module stack |
-
-Choose AugurRS when you want a compact, Rust-native path to EVK4 capture and control. Choose the official stack when you need the broader vendor ecosystem, algorithms, or officially packaged multi-platform tooling.
+AugurRS is developed and hardware-tested on macOS. The codebase is portable Rust (`rusb` + `eframe`) — CI verifies Linux and Windows builds on every push. Tagged releases ship a CLI archive and an unsigned macOS `.app` bundle.
 
 ## Documentation
 
-- [Getting started](./docs/getting-started.md)
-- [Configuration reference](./docs/configuration.md)
-- [CLI usage](./docs/cli.md)
-- [GUI usage](./docs/gui.md)
-- [Recording format](./docs/recording.md)
-- [Performance notes](./docs/performance.md)
-- [Release notes](./docs/releases.md)
-- [Technical notes](./docs/features/README.md)
-- [Architecture decisions](./docs/adr/README.md)
-- [mdBook site](https://uthmann.github.io/augur-rs/)
+- [Getting Started](./docs/getting-started.md) — build, connect, first capture
+- [Configuration](./docs/configuration.md) — TOML reference for biases, ROI, mask, filters
+- [CLI Usage](./docs/cli.md) — commands and scripting
+- [GUI Usage](./docs/gui.md) — live preview, controls, analysis tools
+- [Recording Format](./docs/recording.md) — EVT3 output and pipeline behavior
+- [Performance](./docs/performance.md) — architecture and design rationale
+- [Releases](./docs/releases.md) — distribution and packaging
+- [Technical Notes](./docs/features/README.md) — SDK internals and ROI-grid algorithm
+- [Architecture Decisions](./docs/adr/README.md) — ADRs
 
 ## Contributing
 

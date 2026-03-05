@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use augur_core::{CameraError, Result};
-use rusb::{Context, Device, DeviceDescriptor, DeviceHandle, Direction, TransferType, UsbContext};
+use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 
 const TREUZELL_USB_CLASS: u8 = 0xff;
 const TREUZELL_SUBCLASS: u8 = 0x19;
@@ -53,7 +53,7 @@ impl Transport {
             }
 
             let Some((iface, ep_ctrl_in, ep_ctrl_out, ep_stream_in)) =
-                find_treuzell_interface(&device, &descriptor)
+                find_treuzell_interface(&device)
             else {
                 continue;
             };
@@ -131,10 +131,7 @@ impl Transport {
     }
 }
 
-fn find_treuzell_interface(
-    device: &Device<Context>,
-    _descriptor: &DeviceDescriptor,
-) -> Option<(u8, u8, u8, u8)> {
+fn find_treuzell_interface(device: &Device<Context>) -> Option<(u8, u8, u8, u8)> {
     let config = device.active_config_descriptor().ok()?;
 
     for interface in config.interfaces() {

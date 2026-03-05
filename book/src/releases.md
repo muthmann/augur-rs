@@ -1,28 +1,28 @@
-# Release Notes
+# Releases
 
-## Current State
+## Distribution
 
-AugurRS currently ships in three layers:
+AugurRS ships in three forms:
 
-- source builds through Cargo
-- `augur-macos.zip` for CLI-first macOS distribution
-- `AugurGUI.app.zip` for an unsigned macOS GUI app bundle
+| Channel | Audience | Contents |
+|---------|----------|----------|
+| **Source** | Developers | `cargo build --workspace` from the repository |
+| **CLI archive** | Terminal users | `augur-macos.zip` — prebuilt binaries, docs, example config |
+| **macOS app** | Desktop users | `AugurGUI.app.zip` — unsigned `.app` bundle for the GUI |
 
-## What The Release Workflow Publishes
+Both archives are built by GitHub Actions and attached to every tagged release.
 
-Tagged releases build:
+## Release Workflow
 
-- `augur`
-- `augur-gui`
-- `augur-macos.zip`
-- `AugurGUI.app.zip`
+On a version tag push, the CI pipeline:
 
-The archive release includes the binaries, top-level docs, and `examples/augur.toml`.
+1. Builds `augur` and `augur-gui` for macOS
+2. Packages the CLI archive with binaries, documentation, and example config
+3. Assembles `AugurGUI.app` from `resources/Info.plist` and the GUI binary
+4. Uploads both `.zip` archives to the GitHub Release
 
-## What Is Still Missing
+## Known Limitations
 
-- code signing
-- notarization
-- installer-based distribution
-
-That means the `.app` bundle is useful for testing and sharing, but it is not yet polished like a fully notarized macOS desktop release.
+- The `.app` bundle is **unsigned** — macOS Gatekeeper will prompt on first launch. Right-click → Open to bypass.
+- No notarization or installer-based distribution yet.
+- Code signing is the next step if broader GUI distribution becomes a priority.

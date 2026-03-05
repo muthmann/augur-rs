@@ -1,59 +1,34 @@
-# Performance Notes
+# Performance
 
-This project is performance-conscious, but it does not yet publish a formal benchmark against Prophesee's official software stack.
+AugurRS is designed around a small set of architectural choices that keep capture reliable and latency predictable.
 
-## What The Current Implementation Optimizes For
+## Pipeline Architecture
 
-- bounded recording pipeline to avoid unbounded memory growth
-- lossy preview path so UI rendering does not block capture
-- typed configuration with direct runtime updates
-- direct EVK4/Treuzell and IMX636 control path in Rust
+The recording pipeline uses three dedicated threads:
 
-These choices are aimed at keeping capture reliable and the code path understandable.
+1. **USB reader** — pulls raw EVT3 packets from the EVK4 as fast as the device delivers them
+2. **Disk writer** — receives packets through a bounded channel with backpressure. If the disk can't keep up, the channel blocks the reader rather than growing memory indefinitely
+3. **Preview decoder** — receives packets through a lossy channel (`try_send`). Frames are dropped rather than blocking the USB hot path
 
-## What We Can Honestly Say Today
+This means capture throughput is never throttled by UI rendering, and memory usage stays bounded regardless of event rate or recording duration.
 
-- The codebase is smaller and more focused than the full Metavision/OpenEB ecosystem.
-- The recording and preview architecture is designed to behave predictably under load.
-- The Rust implementation avoids additional language bindings and large framework layers in the core capture path.
+## Direct Control Path
 
-Those are architectural advantages. They are not the same thing as a published end-to-end performance win.
+AugurRS talks to the EVK4 through its own Treuzell USB transport and IMX636 register interface — no C++ bindings, no vendor runtime, no plugin system in the capture path. The result is a short, auditable code path from sensor to disk.
 
-## What We Cannot Claim Yet
+## Runtime Updates Without Restart
 
-Until the same workload is measured side by side, this repository should not claim:
+Biases, ROI, pixel mask, digital filters, and acquisition window can all be changed mid-session. Updates are applied through the same register interface without stopping the pipeline or restarting the USB stream.
 
-- lower latency than Metavision/OpenEB
-- higher sustained event throughput than Metavision/OpenEB
-- lower CPU or memory usage than the official stack
+## What This Means in Practice
 
-## Recommended Benchmark Plan
+- Recording sessions don't accumulate memory over time
+- Preview lag doesn't affect capture integrity
+- The full capture path fits in a single workspace you can read end-to-end
+- Startup is fast — no SDK initialization, no plugin discovery
 
-Benchmark on the same:
+## Benchmarking
 
-- EVK4 + IMX636 hardware
-- host machine
-- cable path
-- scene
-- recording target
+Formal side-by-side benchmarks against Metavision/OpenEB have not been published yet. The architectural properties above (bounded memory, non-blocking capture, direct USB path) are structural — they hold by construction, not by tuning.
 
-Measure at least:
-
-- sustained event rate during recording
-- dropped preview frames or preview freshness
-- CPU usage
-- memory usage
-- startup time
-- total bytes written for fixed-duration captures
-
-## USB Matters
-
-Connection quality can materially affect observed throughput and stability.
-
-In particular:
-
-- prefer direct USB 3 connections
-- avoid questionable hubs and adapters when possible
-- keep cable changes in your benchmark notes
-
-If a direct USB-C cable performs better than a USB-A path with an adapter, treat that as a real experimental variable, not just a curiosity.
+If you run your own comparisons, control for: hardware model, host machine, USB path (direct USB 3 — avoid hubs), scene, and recording target.

@@ -1,48 +1,46 @@
-# AugurRS Technical Notes
+# AugurRS Technical Overview
 
-## Goal
+## What It Is
 
-macOS-compatible Rust toolkit for Prophesee EVK4 / IMX636 with:
+A Rust workspace for controlling Prophesee EVK4 / IMX636 event cameras on macOS. It provides direct USB communication, sensor register programming, a bounded streaming pipeline, and both CLI and GUI frontends.
 
-- trait-based camera abstraction
-- headless CLI recording
-- egui GUI preview and runtime controls
+## Workspace Structure
 
-## Current Technical Scope
+| Crate | Role |
+|-------|------|
+| `augur-core` | Camera traits, TOML config types, streaming pipeline, EVT3 preview decoding (via `evt3-core`), analysis framework |
+| `augur-prophesee` | EVK4 Treuzell USB transport, IMX636 register sequences (ISSD init/start/stop/destroy), sensor trait implementation |
+| `augur-cli` | `status`, `record`, `config` commands |
+| `augur-gui` | Live preview, runtime controls, hotpixel analysis, ROI-grid computation |
 
-The current implementation includes:
+## Hardware Interface
 
-- Treuzell USB transport over `rusb` with control and stream endpoints split
-- Treuzell command framing and property handling
-- IMX636 sensor integration with sourced register addresses and ISSD init/start/stop/destroy sequences
-- runtime controls for biases, ROI, pixel mask, and digital filters
-- three-thread recording pipeline with bounded backpressure and lossy preview
-- runtime acquisition window (`acq_time_us`) via `Arc<AtomicU64>`
-- GUI-thread live analysis framework with extensible analyzers
-- hotpixel detection with EMA smoothing, preview overlays, severity warnings, and mask-copy handoff
+- **Transport**: Treuzell protocol over `rusb` — control and stream endpoints, command framing, property queries (device info, enable, stream, reg32, format)
+- **Sensor**: IMX636 register programming with sourced addresses. Init/start/stop/destroy sequences derived from ISSD specifications
+- **Runtime controls**: Biases (5 offset keys), hardware ROI, 64-slot digital event mask (DEM), mutually exclusive STC/Trail filters, acquisition window via `Arc<AtomicU64>`
 
-## Architecture
+## Streaming Pipeline
 
-- `augur-core`: traits, config types, pipeline, and `evt3-core`-backed incremental EVT3 preview decoding
-- `augur-prophesee`: EVK4 transport, Treuzell protocol, IMX636 sensor implementation
-- `augur-cli`: status, config, and record commands
-- `augur-gui`: live preview and runtime controls
+Three threads with explicit flow control:
 
-## Data Path Guarantees
+| Thread | Channel | Behavior |
+|--------|---------|----------|
+| USB reader | — | Pulls raw EVT3 packets from the device |
+| Disk writer | Bounded (`disk_tx`) | Backpressure prevents unbounded memory growth |
+| Preview decoder | Lossy (`try_send`) | Drops frames rather than blocking capture |
 
-- Disk path is bounded and backpressured.
-- Preview path is lossy and never blocks the USB hot path.
-- GUI throughput stats use a 1-second sliding window for current `Mev/s` and `MB/s`.
-- Worker errors are surfaced through a pipeline error channel to CLI and GUI clients.
-- USB stream timeouts are treated as non-fatal in low-event scenes.
+Additional guarantees:
+- Throughput stats use a 1-second sliding window (Mev/s, MB/s)
+- Worker errors surface through a dedicated error channel
+- USB timeouts are non-fatal (low-event scenes are valid)
+- Preview analysis runs on the GUI thread against the latest decoded frame
 
-## Sensor-Specific Behavior
+## Recording Output
 
-- ROI is configured in hardware and reduces event generation bandwidth.
-- The digital event mask uses IMX636 hardware mask slots with a 64-pixel budget.
-- STC and Trail filters are configured from IMX636 registers and treated as mutually exclusive.
-- Biases are applied as offsets from factory defaults with range checks.
+Each capture produces:
+- `<name>.raw` — EVT3 stream with standard header (`format EVT3;width=1280;height=720`)
+- `<name>.toml` — effective configuration sidecar for reproducibility
 
-## Recording Format
+## Configuration
 
-Every recording writes a sibling TOML file with the full effective configuration so captures remain reproducible.
+TOML-based with four sections: `biases`, `roi`, `pixel_mask`, `digital_filter`. The GUI and CLI share the same config types. Runtime validation covers ROI bounds, mask coordinates, and filter conflicts.

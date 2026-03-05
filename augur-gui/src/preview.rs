@@ -1,4 +1,7 @@
-use augur_core::{analysis::Overlay, pipeline::PreviewFrame};
+use augur_core::{
+    analysis::{roi_grid::RoiGrid, Overlay},
+    pipeline::PreviewFrame,
+};
 use egui::ColorImage;
 
 #[derive(Clone, Copy)]
@@ -10,123 +13,176 @@ struct PixelRect {
 }
 
 pub fn frame_to_color_image(frame: &PreviewFrame, overlays: &[Overlay]) -> ColorImage {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
     let max = frame.pixels.iter().copied().max().unwrap_or(1) as f32;
-    let mut rgba = Vec::with_capacity(frame.pixels.len() * 4);
+    let mut rgba = vec![0u8; w * h * 4];
 
-    for &v in &frame.pixels {
-        let norm = (v as f32 / max).sqrt();
-        let g = (norm * 255.0) as u8;
-        rgba.extend_from_slice(&[8, g, 8, 255]);
+    // Look for a ROI grid overlay to merge into the base rendering pass.
+    let roi = overlays.iter().find_map(|o| match o {
+        Overlay::RoiGrid {
+            grid,
+            highlight_top_n,
+        } => Some((grid.as_ref(), *highlight_top_n)),
+        _ => None,
+    });
+
+    if let Some((grid, top_n)) = roi {
+        render_base_with_grid(frame, grid, top_n, max, w, h, &mut rgba);
+    } else {
+        for (i, &v) in frame.pixels.iter().enumerate() {
+            let g = ((v as f32 / max).sqrt() * 255.0) as u8;
+            let off = i * 4;
+            rgba[off] = 8;
+            rgba[off + 1] = g;
+            rgba[off + 2] = 8;
+            rgba[off + 3] = 255;
+        }
     }
 
-    if !overlays.is_empty() {
-        for overlay in overlays {
-            match overlay {
-                Overlay::HighlightPixels { pixels, color } => {
-                    for pixel in pixels {
-                        if pixel.x >= frame.width || pixel.y >= frame.height {
-                            continue;
-                        }
-                        let idx = (pixel.y as usize * frame.width as usize + pixel.x as usize) * 4;
-                        blend_rgba(&mut rgba[idx..idx + 4], *color);
-                    }
+    // Sparse overlays (HighlightPixels) as a separate pass — only touches marked pixels.
+    for overlay in overlays {
+        if let Overlay::HighlightPixels { pixels, color } = overlay {
+            for pixel in pixels {
+                if pixel.x >= frame.width || pixel.y >= frame.height {
+                    continue;
                 }
-                Overlay::RoiGrid {
-                    grid,
-                    highlight_top_n,
-                } => {
-                    let size = [frame.width as usize, frame.height as usize];
-
-                    // Tint free cells with a subtle green wash so the partitioned
-                    // regions remain visible across the preview.
-                    let free_tint = [40, 220, 80, 36];
-                    for (r, row) in grid.blocked.iter().enumerate() {
-                        for (c, &is_blocked) in row.iter().enumerate() {
-                            if !is_blocked {
-                                fill_rect(
-                                    &mut rgba,
-                                    size,
-                                    PixelRect {
-                                        x: grid.x_bounds[c] as usize,
-                                        y: grid.y_bounds[r] as usize,
-                                        width: (grid.x_bounds[c + 1] - grid.x_bounds[c]) as usize,
-                                        height: (grid.y_bounds[r + 1] - grid.y_bounds[r]) as usize,
-                                    },
-                                    free_tint,
-                                );
-                            }
-                        }
-                    }
-
-                    // Tint blocked cells red (at most 64 hotpixels, each 1x1).
-                    let red_tint = [255, 40, 40, 80];
-                    for (r, row) in grid.blocked.iter().enumerate() {
-                        for (c, &is_blocked) in row.iter().enumerate() {
-                            if is_blocked {
-                                fill_rect(
-                                    &mut rgba,
-                                    size,
-                                    PixelRect {
-                                        x: grid.x_bounds[c] as usize,
-                                        y: grid.y_bounds[r] as usize,
-                                        width: (grid.x_bounds[c + 1] - grid.x_bounds[c]) as usize,
-                                        height: (grid.y_bounds[r + 1] - grid.y_bounds[r]) as usize,
-                                    },
-                                    red_tint,
-                                );
-                            }
-                        }
-                    }
-
-                    // Draw grid lines (cyan, semi-transparent).
-                    let cyan = [0, 220, 220, 100];
-                    for &x in &grid.x_bounds {
-                        if x > 0 && (x as usize) < size[0] {
-                            draw_vline(&mut rgba, size[0], size[1], x as usize, cyan);
-                        }
-                    }
-                    for &y in &grid.y_bounds {
-                        if y > 0 && (y as usize) < size[1] {
-                            draw_hline(&mut rgba, size[0], size[1], y as usize, cyan);
-                        }
-                    }
-
-                    // Highlight top-N largest rectangles with a stronger fill and
-                    // border so the best ROI candidates stand out.
-                    let highlight_fill = [80, 255, 120, 72];
-                    let yellow_border = [255, 220, 0, 200];
-                    let n = (*highlight_top_n).min(grid.largest_rects.len());
-                    for rect in &grid.largest_rects[..n] {
-                        fill_rect(
-                            &mut rgba,
-                            size,
-                            PixelRect {
-                                x: rect.x as usize,
-                                y: rect.y as usize,
-                                width: rect.width as usize,
-                                height: rect.height as usize,
-                            },
-                            highlight_fill,
-                        );
-                        draw_rect_border(
-                            &mut rgba,
-                            size,
-                            PixelRect {
-                                x: rect.x as usize,
-                                y: rect.y as usize,
-                                width: rect.width as usize,
-                                height: rect.height as usize,
-                            },
-                            2,
-                            yellow_border,
-                        );
-                    }
-                }
+                let idx = (pixel.y as usize * w + pixel.x as usize) * 4;
+                blend_rgba(&mut rgba[idx..idx + 4], *color);
             }
         }
     }
 
-    ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &rgba)
+    ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
+/// Single-pass base frame + ROI grid overlay rendering.
+///
+/// Merges cell tinting, grid lines, and highlight fills into one sequential
+/// scan over the pixel buffer, replacing the previous multi-pass approach that
+/// called `fill_rect` per grid cell, `draw_vline`/`draw_hline` per boundary,
+/// and `fill_rect` again per highlight rect.
+fn render_base_with_grid(
+    frame: &PreviewFrame,
+    grid: &RoiGrid,
+    top_n: usize,
+    max: f32,
+    w: usize,
+    h: usize,
+    rgba: &mut [u8],
+) {
+    let grid_cols = grid.cols();
+    let grid_rows = grid.rows();
+
+    // O(W + H): map each pixel coordinate to its grid cell index.
+    let col_map = build_pixel_to_grid_map(&grid.x_bounds, w);
+    let row_map = build_pixel_to_grid_map(&grid.y_bounds, h);
+
+    // O(W + H): boolean flags for grid line positions.
+    let mut x_on_line = vec![false; w];
+    for &xb in &grid.x_bounds {
+        let xb = xb as usize;
+        if xb > 0 && xb < w {
+            x_on_line[xb] = true;
+        }
+    }
+    let mut y_on_line = vec![false; h];
+    for &yb in &grid.y_bounds {
+        let yb = yb as usize;
+        if yb > 0 && yb < h {
+            y_on_line[yb] = true;
+        }
+    }
+
+    // Mark grid cells inside top-N highlight rectangles.
+    let n = top_n.min(grid.largest_rects.len());
+    let mut cell_highlighted = vec![false; grid_rows * grid_cols];
+    for rect in &grid.largest_rects[..n] {
+        let c0 = grid_bound_index(&grid.x_bounds, rect.x);
+        let c1 = grid_bound_index(&grid.x_bounds, rect.x + rect.width).min(grid_cols);
+        let r0 = grid_bound_index(&grid.y_bounds, rect.y);
+        let r1 = grid_bound_index(&grid.y_bounds, rect.y + rect.height).min(grid_rows);
+        for r in r0..r1 {
+            for c in c0..c1 {
+                cell_highlighted[r * grid_cols + c] = true;
+            }
+        }
+    }
+
+    // Tint colors as u32 arrays for arithmetic.
+    const LINE: [u32; 4] = [0, 220, 220, 100];
+    const HIGHLIGHT: [u32; 4] = [80, 255, 120, 72];
+    const FREE: [u32; 4] = [40, 220, 80, 36];
+    const BLOCKED: [u32; 4] = [255, 40, 40, 80];
+
+    // Single sequential pass — perfect cache locality, no per-cell function calls.
+    for py in 0..h {
+        let gr = row_map[py];
+        let on_hline = y_on_line[py];
+        let row_off = py * w;
+
+        for px in 0..w {
+            let v = frame.pixels[row_off + px];
+            let g = ((v as f32 / max).sqrt() * 255.0) as u32;
+
+            let gc = col_map[px];
+            let cell = gr * grid_cols + gc;
+
+            let tint = if on_hline || x_on_line[px] {
+                LINE
+            } else if cell_highlighted[cell] {
+                HIGHLIGHT
+            } else if grid.blocked[cell] {
+                BLOCKED
+            } else {
+                FREE
+            };
+
+            let a = tint[3];
+            let inv = 255 - a;
+            let off = (row_off + px) * 4;
+            rgba[off] = ((8 * inv + tint[0] * a) / 255) as u8;
+            rgba[off + 1] = ((g * inv + tint[1] * a) / 255) as u8;
+            rgba[off + 2] = ((8 * inv + tint[2] * a) / 255) as u8;
+            rgba[off + 3] = 255;
+        }
+    }
+
+    // Yellow borders for highlight rects — thin lines, negligible cost.
+    let border_color = [255u8, 220, 0, 200];
+    for rect in &grid.largest_rects[..n] {
+        draw_rect_border(
+            rgba,
+            [w, h],
+            PixelRect {
+                x: rect.x as usize,
+                y: rect.y as usize,
+                width: rect.width as usize,
+                height: rect.height as usize,
+            },
+            2,
+            border_color,
+        );
+    }
+}
+
+/// Linear sweep mapping each pixel coordinate to its grid cell index.
+fn build_pixel_to_grid_map(bounds: &[u16], size: usize) -> Vec<usize> {
+    let max_idx = bounds.len().saturating_sub(2);
+    let mut map = vec![0usize; size];
+    let mut gi = 0;
+    for (px, slot) in map.iter_mut().enumerate() {
+        while gi < max_idx && (px as u16) >= bounds[gi + 1] {
+            gi += 1;
+        }
+        *slot = gi;
+    }
+    map
+}
+
+/// Find the boundary index for a grid-aligned value.
+fn grid_bound_index(bounds: &[u16], val: u16) -> usize {
+    bounds.partition_point(|&b| b < val)
 }
 
 fn blend_rgba(dst: &mut [u8], src: [u8; 4]) {
@@ -134,42 +190,11 @@ fn blend_rgba(dst: &mut [u8], src: [u8; 4]) {
     let inv_alpha = 255 - alpha;
 
     for channel in 0..3 {
-        let blended = (u32::from(dst[channel]) * inv_alpha + u32::from(src[channel]) * alpha) / 255;
+        let blended =
+            (u32::from(dst[channel]) * inv_alpha + u32::from(src[channel]) * alpha) / 255;
         dst[channel] = blended as u8;
     }
     dst[3] = 255;
-}
-
-fn fill_rect(rgba: &mut [u8], size: [usize; 2], rect: PixelRect, color: [u8; 4]) {
-    let [width, height] = size;
-    let x_end = (rect.x + rect.width).min(width);
-    let y_end = (rect.y + rect.height).min(height);
-    for py in rect.y..y_end {
-        for px in rect.x..x_end {
-            let idx = (py * width + px) * 4;
-            blend_rgba(&mut rgba[idx..idx + 4], color);
-        }
-    }
-}
-
-fn draw_hline(rgba: &mut [u8], w: usize, h: usize, y: usize, color: [u8; 4]) {
-    if y >= h {
-        return;
-    }
-    for px in 0..w {
-        let idx = (y * w + px) * 4;
-        blend_rgba(&mut rgba[idx..idx + 4], color);
-    }
-}
-
-fn draw_vline(rgba: &mut [u8], w: usize, h: usize, x: usize, color: [u8; 4]) {
-    if x >= w {
-        return;
-    }
-    for py in 0..h {
-        let idx = (py * w + x) * 4;
-        blend_rgba(&mut rgba[idx..idx + 4], color);
-    }
 }
 
 fn draw_rect_border(

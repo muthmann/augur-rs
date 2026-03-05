@@ -578,7 +578,6 @@ dependencies = [
 name = "augur-core"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "crossbeam-channel",
  "evt3-core",
  "serde",
@@ -590,13 +589,11 @@ dependencies = [
 name = "augur-gui"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "augur-core",
  "augur-prophesee",
  "eframe",
  "egui",
  "rfd",
- "toml",
 ]
 
 [[package]]
@@ -605,9 +602,6 @@ version = "0.1.0"
 dependencies = [
  "augur-core",
  "rusb",
- "serde",
- "thiserror 1.0.69",
- "toml",
 ]
 
 [[package]]

@@ -124,13 +124,8 @@ fn record(output: PathBuf, config_path: Option<PathBuf>, duration_s: Option<u64>
     println!("Recording -> {}", output.display());
 
     let options = PipelineOptions::new(&output);
-    let controller = spawn_pipeline(
-        camera,
-        Evt3CorePreviewDecoder::default(),
-        cfg.clone(),
-        options,
-    )
-    .context("failed starting streaming pipeline")?;
+    let controller = spawn_pipeline(camera, Evt3CorePreviewDecoder::default(), cfg, options)
+        .context("failed starting streaming pipeline")?;
 
     let running = Arc::new(AtomicBool::new(true));
     {

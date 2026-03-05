@@ -168,15 +168,11 @@ impl<S: PseeSensor> PacketStreamCamera for Evk4Camera<S> {
 }
 
 fn format_serial_hex(raw: &[u8]) -> Option<String> {
-    if raw.len() >= 8 {
-        let v = u64::from_le_bytes([
-            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-        ]);
-        return Some(format!("{v:016x}"));
+    if let Ok(bytes) = <[u8; 8]>::try_from(&raw[..raw.len().min(8)]) {
+        return Some(format!("{:016x}", u64::from_le_bytes(bytes)));
     }
-    if raw.len() >= 4 {
-        let v = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        return Some(format!("{v:08x}"));
+    if let Ok(bytes) = <[u8; 4]>::try_from(&raw[..raw.len().min(4)]) {
+        return Some(format!("{:08x}", u32::from_le_bytes(bytes)));
     }
     None
 }

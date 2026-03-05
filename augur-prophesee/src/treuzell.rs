@@ -34,21 +34,14 @@ impl<'a> Treuzell<'a> {
 
     pub fn build_date(&mut self) -> Result<u64> {
         let resp = self.transact(TZ_PROP_BUILD_DATE, &[], false)?;
-        if resp.payload.len() < 8 {
-            return Err(CameraError::Transport(
-                "Treuzell build-date response too short".into(),
-            ));
-        }
-        Ok(u64::from_le_bytes([
-            resp.payload[0],
-            resp.payload[1],
-            resp.payload[2],
-            resp.payload[3],
-            resp.payload[4],
-            resp.payload[5],
-            resp.payload[6],
-            resp.payload[7],
-        ]))
+        let bytes: [u8; 8] = resp
+            .payload
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| {
+                CameraError::Transport("Treuzell build-date response too short".into())
+            })?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub fn serial_raw(&mut self) -> Result<Vec<u8>> {
@@ -62,9 +55,7 @@ impl<'a> Treuzell<'a> {
     }
 
     pub fn get_device_name(&mut self, device_id: u32) -> Result<String> {
-        let mut payload = Vec::with_capacity(4);
-        payload.extend_from_slice(&device_id.to_le_bytes());
-        let resp = self.transact(TZ_PROP_DEVICE_NAME, &payload, false)?;
+        let resp = self.transact(TZ_PROP_DEVICE_NAME, &device_id.to_le_bytes(), false)?;
         let strings = parse_device_string_list(&resp.payload, device_id)?;
         strings
             .into_iter()
@@ -73,24 +64,18 @@ impl<'a> Treuzell<'a> {
     }
 
     pub fn get_device_compatible(&mut self, device_id: u32) -> Result<Vec<String>> {
-        let mut payload = Vec::with_capacity(4);
-        payload.extend_from_slice(&device_id.to_le_bytes());
-        let resp = self.transact(TZ_PROP_DEVICE_COMPATIBLE, &payload, false)?;
+        let resp = self.transact(TZ_PROP_DEVICE_COMPATIBLE, &device_id.to_le_bytes(), false)?;
         parse_device_string_list(&resp.payload, device_id)
     }
 
     pub fn device_enable(&mut self, device_id: u32, on: bool) -> Result<()> {
-        let mut payload = Vec::with_capacity(8);
-        payload.extend_from_slice(&device_id.to_le_bytes());
-        payload.extend_from_slice(&(on as u32).to_le_bytes());
+        let payload = u32_pair_payload(device_id, on as u32);
         self.transact(TZ_PROP_DEVICE_ENABLE, &payload, true)
             .map(|_| ())
     }
 
     pub fn device_stream(&mut self, device_id: u32, on: bool) -> Result<()> {
-        let mut payload = Vec::with_capacity(8);
-        payload.extend_from_slice(&device_id.to_le_bytes());
-        payload.extend_from_slice(&(on as u32).to_le_bytes());
+        let payload = u32_pair_payload(device_id, on as u32);
         self.transact(TZ_PROP_DEVICE_STREAM, &payload, true)
             .map(|_| ())
     }
@@ -114,10 +99,10 @@ impl<'a> Treuzell<'a> {
         addr: u32,
         n_values: u32,
     ) -> Result<Vec<u32>> {
-        let mut payload = Vec::with_capacity(12);
-        payload.extend_from_slice(&device_id.to_le_bytes());
-        payload.extend_from_slice(&addr.to_le_bytes());
-        payload.extend_from_slice(&n_values.to_le_bytes());
+        let mut payload = [0u8; 12];
+        payload[..4].copy_from_slice(&device_id.to_le_bytes());
+        payload[4..8].copy_from_slice(&addr.to_le_bytes());
+        payload[8..].copy_from_slice(&n_values.to_le_bytes());
 
         let resp = self.transact(TZ_PROP_DEVICE_REG32, &payload, false)?;
 
@@ -136,11 +121,9 @@ impl<'a> Treuzell<'a> {
             ));
         }
 
-        let mut out = Vec::with_capacity(n_values as usize);
-        for i in 0..n_values as usize {
-            out.push(read_u32(&resp.payload, i + 2)?);
-        }
-        Ok(out)
+        (0..n_values as usize)
+            .map(|i| read_u32(&resp.payload, i + 2))
+            .collect()
     }
 
     pub fn write_device_register(
@@ -199,18 +182,8 @@ impl<'a> Treuzell<'a> {
             ));
         }
 
-        let property = u32::from_le_bytes([
-            response_buf[0],
-            response_buf[1],
-            response_buf[2],
-            response_buf[3],
-        ]);
-        let size = u32::from_le_bytes([
-            response_buf[4],
-            response_buf[5],
-            response_buf[6],
-            response_buf[7],
-        ]) as usize;
+        let property = u32::from_le_bytes(response_buf[0..4].try_into().unwrap());
+        let size = u32::from_le_bytes(response_buf[4..8].try_into().unwrap()) as usize;
 
         if size != n - 8 {
             return Err(CameraError::Transport(format!(
@@ -246,19 +219,22 @@ struct Response {
     payload: Vec<u8>,
 }
 
+fn u32_pair_payload(a: u32, b: u32) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&a.to_le_bytes());
+    buf[4..].copy_from_slice(&b.to_le_bytes());
+    buf
+}
+
 fn read_u32(payload: &[u8], index: usize) -> Result<u32> {
     let start = index * 4;
-    if start + 4 > payload.len() {
-        return Err(CameraError::Transport(format!(
-            "Treuzell payload too short for u32 index {index}"
-        )));
-    }
-    Ok(u32::from_le_bytes([
-        payload[start],
-        payload[start + 1],
-        payload[start + 2],
-        payload[start + 3],
-    ]))
+    let bytes: [u8; 4] = payload
+        .get(start..start + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| {
+            CameraError::Transport(format!("Treuzell payload too short for u32 index {index}"))
+        })?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn parse_device_string_list(payload: &[u8], expected_device: u32) -> Result<Vec<String>> {

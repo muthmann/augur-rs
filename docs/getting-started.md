@@ -38,11 +38,9 @@ Expected result:
 If the command fails to open the EVK4:
 
 - confirm the camera is powered and connected directly over USB 3.0
-- prefer a direct cable over hubs or adapters when possible
+- use a direct cable — hubs and adapters can limit throughput
 - close other applications that may already own the device
-- rebuild once after dependency changes so `rusb` and the binaries are up to date
-
-If you observe better throughput or stability with a direct USB-C cable than with a USB-A adapter path, that is plausible. The adapter path can be the bottleneck even when the camera itself is unchanged.
+- rebuild after dependency changes so `rusb` and the binaries are up to date
 
 ## First Recording
 
@@ -80,4 +78,4 @@ Suggested first run:
 - Use [Configuration reference](./configuration.md) to create a reusable TOML file
 - Use [CLI usage](./cli.md) for headless operation and scripting
 - Use [GUI usage](./gui.md) for hotpixel workflows and ROI-grid assistance
-- Use [Performance notes](./performance.md) if you want to benchmark or validate throughput behavior
+- Read [Performance](./performance.md) for architecture and design rationale
