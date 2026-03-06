@@ -59,16 +59,26 @@ Available plugin types include hotpixel detection, ROI grid analysis, molecule l
 
 Opening a `.raw` file starts a preview-only pipeline backed by the file replay camera in `augur-core`.
 
-Replay adds a transport bar below the preview with:
+Replay adds a transport area below the preview with:
 
 - `Play` / `Pause`
-- `Step Forward` when paused
+- `Restart`
 - speed selection (`0.25x` to `Max`)
-- a replay progress bar based on bytes consumed from the file
+- a timeline slider for seeking
+- current / total replay time
+- MB progress
 
 Enabled analysis plugins continue to process replayed frames through the same `PreviewFrame` path used for live preview.
 
-When replay reaches EOF, the pipeline shuts down cleanly and the app returns to idle automatically.
+When replay reaches EOF, the pipeline threads stop but the app stays in replay mode so the final frame and controls remain available for restart or seeking.
+
+## Preview Contrast
+
+A `Contrast` slider below the preview is available in both live and replay modes.
+
+- it uses percentile-based normalization instead of raw max-value normalization
+- this keeps single hotpixels from washing out the rest of the frame
+- lower percentiles reveal dimmer activity sooner
 
 ## Runtime Notes
 

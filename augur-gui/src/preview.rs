@@ -12,10 +12,14 @@ struct PixelRect {
     height: usize,
 }
 
-pub fn frame_to_color_image(frame: &PreviewFrame, overlays: &[Overlay]) -> ColorImage {
+pub fn frame_to_color_image(
+    frame: &PreviewFrame,
+    overlays: &[Overlay],
+    contrast_percentile: f32,
+) -> ColorImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    let max = frame.pixels.iter().copied().max().unwrap_or(1) as f32;
+    let max = percentile_value(&frame.pixels, contrast_percentile) as f32;
     let mut rgba = vec![0u8; w * h * 4];
 
     // Look for a ROI grid overlay to merge into the base rendering pass.
@@ -31,7 +35,7 @@ pub fn frame_to_color_image(frame: &PreviewFrame, overlays: &[Overlay]) -> Color
         render_base_with_grid(frame, grid, top_n, max, w, h, &mut rgba);
     } else {
         for (i, &v) in frame.pixels.iter().enumerate() {
-            let g = ((v as f32 / max).sqrt() * 255.0) as u8;
+            let g = normalized_green(v, max);
             let off = i * 4;
             rgba[off] = 8;
             rgba[off + 1] = g;
@@ -73,6 +77,36 @@ pub fn frame_to_color_image(frame: &PreviewFrame, overlays: &[Overlay]) -> Color
     }
 
     ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+}
+
+fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
+    let max_val = pixels.iter().copied().max().unwrap_or(0) as usize;
+    if max_val == 0 {
+        return 1;
+    }
+
+    let mut hist = vec![0u32; max_val + 1];
+    for &value in pixels {
+        hist[value as usize] += 1;
+    }
+
+    let percentile = percentile.clamp(0.0, 100.0);
+    let target = ((pixels.len() as f64 * percentile as f64 / 100.0).ceil() as u64)
+        .clamp(1, pixels.len() as u64);
+    let mut cumulative = 0u64;
+    for (value, &count) in hist.iter().enumerate() {
+        cumulative += u64::from(count);
+        if cumulative >= target {
+            return value.max(1) as u16;
+        }
+    }
+
+    max_val.max(1) as u16
+}
+
+fn normalized_green(value: u16, max: f32) -> u8 {
+    let clamped = (value as f32).min(max);
+    ((clamped / max).sqrt() * 255.0) as u8
 }
 
 /// Single-pass base frame + ROI grid overlay rendering.
@@ -142,7 +176,7 @@ fn render_base_with_grid(
 
         for px in 0..w {
             let v = frame.pixels[row_off + px];
-            let g = ((v as f32 / max).sqrt() * 255.0) as u32;
+            let g = u32::from(normalized_green(v, max));
 
             let gc = col_map[px];
             let cell = gr * grid_cols + gc;
@@ -291,5 +325,22 @@ fn draw_rect_border(
                 blend_rgba(&mut rgba[idx..idx + 4], color);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile_value;
+
+    #[test]
+    fn percentile_ignores_single_hotpixel_outlier() {
+        let pixels = [1, 2, 2, 3, 10_000];
+        assert_eq!(percentile_value(&pixels, 80.0), 3);
+    }
+
+    #[test]
+    fn percentile_returns_one_for_empty_or_all_zero() {
+        assert_eq!(percentile_value(&[], 99.5), 1);
+        assert_eq!(percentile_value(&[0, 0, 0], 99.5), 1);
     }
 }

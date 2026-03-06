@@ -2,7 +2,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
-    time::{Duration, Instant},
 };
 
 use augur_core::{
@@ -12,7 +11,7 @@ use augur_core::{
     pipeline::{
         spawn_pipeline, Evt3CorePreviewDecoder, PipelineController, PipelineOptions, PreviewFrame,
     },
-    replay::{RawFileCamera, ReplayControls},
+    replay::{RawFileCamera, ReplayControls, ReplayFileInfo},
 };
 use augur_prophesee::evk4::Evk4Camera;
 
@@ -56,10 +55,13 @@ pub struct CameraApp {
     texture: Option<egui::TextureHandle>,
     latest_frame: Option<PreviewFrame>,
     replay_controls: Option<ReplayControls>,
+    replay_file_info: Option<ReplayFileInfo>,
     replay_paused: bool,
+    replay_finished: bool,
+    replay_pause_after_seek_frame: bool,
     replay_speed: f32,
-    replay_step_pending: bool,
     replay_notice: Option<String>,
+    replay_seek_drag_value: Option<f32>,
     saved_live_state: Option<SavedLiveState>,
     plugins: Vec<Box<dyn AnalysisPlugin>>,
     plugin_context: PluginContext,
@@ -68,6 +70,7 @@ pub struct CameraApp {
     acq_time_ms: u64,
     acq_dirty: bool,
     config_dirty: bool,
+    contrast_percentile: f32,
     lock_settings_while_recording: bool,
     settings_panel_open: bool,
     analysis_panel_open: bool,
@@ -75,7 +78,6 @@ pub struct CameraApp {
     mask_y: u16,
     mask_file: String,
     last_error: Option<String>,
-    last_stats_tick: Instant,
     camera_info: Option<DeviceInfo>,
     camera_status: String,
 }
@@ -91,10 +93,13 @@ impl CameraApp {
             texture: None,
             latest_frame: None,
             replay_controls: None,
+            replay_file_info: None,
             replay_paused: false,
+            replay_finished: false,
+            replay_pause_after_seek_frame: false,
             replay_speed: 1.0,
-            replay_step_pending: false,
             replay_notice: None,
+            replay_seek_drag_value: None,
             saved_live_state: None,
             plugins: create_all_plugins(),
             plugin_context: PluginContext::default(),
@@ -103,6 +108,7 @@ impl CameraApp {
             acq_time_ms: 50,
             acq_dirty: false,
             config_dirty: false,
+            contrast_percentile: 99.5,
             lock_settings_while_recording: true,
             settings_panel_open: true,
             analysis_panel_open: true,
@@ -110,7 +116,6 @@ impl CameraApp {
             mask_y: 0,
             mask_file: String::new(),
             last_error: None,
-            last_stats_tick: Instant::now(),
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
         }
@@ -235,7 +240,7 @@ impl CameraApp {
             camera_info: self.camera_info.clone(),
         };
 
-        let (camera, controls) = match RawFileCamera::open(&path) {
+        let (camera, controls, info) = match RawFileCamera::open(&path) {
             Ok(result) => result,
             Err(err) => {
                 self.last_error = Some(format!("open replay file failed: {err}"));
@@ -243,23 +248,17 @@ impl CameraApp {
             }
         };
         let (display_config, display_mask_file, replay_notice) =
-            self.load_replay_display_settings(&path, controls.width, controls.height);
-
+            self.load_replay_display_settings(&path, info.width, info.height);
         let replay_info = camera.device_info();
-        let mut replay_config = CameraConfig::default();
-        replay_config.roi.width = controls.width;
-        replay_config.roi.height = controls.height;
-        let controller = spawn_pipeline(
+        let controller = match spawn_pipeline(
             camera,
             Evt3CorePreviewDecoder::default(),
-            replay_config,
-            PipelineOptions::preview_only(controls.width, controls.height),
-        )
-        .map_err(|e| format!("pipeline start failed: {e}"));
-        let controller = match controller {
+            replay_pipeline_config(&info),
+            PipelineOptions::preview_only(info.width, info.height),
+        ) {
             Ok(controller) => controller,
             Err(err) => {
-                self.last_error = Some(err);
+                self.last_error = Some(format!("pipeline start failed: {err}"));
                 return;
             }
         };
@@ -275,15 +274,17 @@ impl CameraApp {
         self.replay_notice = replay_notice;
         self.replay_path = Some(path.display().to_string());
         self.replay_controls = Some(controls);
+        self.replay_file_info = Some(info);
         self.replay_paused = false;
+        self.replay_finished = false;
+        self.replay_pause_after_seek_frame = false;
         self.replay_speed = 1.0;
-        self.replay_step_pending = false;
+        self.replay_seek_drag_value = None;
         self.saved_live_state = Some(saved_live_state);
         self.reset_analysis();
         self.config_dirty = false;
         self.acq_dirty = false;
         self.last_error = None;
-        self.last_stats_tick = Instant::now();
         self.camera_status = format!(
             "Replaying {}.",
             path.file_name()
@@ -388,7 +389,7 @@ impl CameraApp {
         self.set_replay_paused_internal(controls, paused);
         self.replay_paused = paused;
         if !paused {
-            self.replay_step_pending = false;
+            self.replay_pause_after_seek_frame = false;
         }
     }
 
@@ -400,12 +401,86 @@ impl CameraApp {
         self.replay_speed = speed;
     }
 
-    fn request_replay_step(&mut self) {
-        if self.mode != AppMode::Replaying || !self.replay_paused {
+    fn seek_replay(&mut self, fraction: f32) {
+        if self.mode != AppMode::Replaying {
             return;
         }
-        self.replay_step_pending = true;
-        self.set_replay_paused(false);
+
+        let Some(path) = self.replay_path.as_ref().map(PathBuf::from) else {
+            self.last_error = Some("replay path is missing".into());
+            return;
+        };
+        let Some(info) = self.replay_file_info.clone() else {
+            self.last_error = Some("replay file metadata is missing".into());
+            return;
+        };
+        let desired_paused = self.replay_paused || self.replay_finished;
+
+        if let Some(controller) = self.controller.take() {
+            if let Err(err) = controller.shutdown() {
+                self.last_error = Some(format!("pipeline shutdown failed: {err}"));
+            }
+        }
+
+        let data_len = info.data_len();
+        let fraction = fraction.clamp(0.0, 1.0);
+        let target_rel = ((data_len as f64 * fraction as f64) as u64).min(data_len);
+        let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
+
+        let (camera, controls) = match RawFileCamera::open_at(&path, &info, target_byte) {
+            Ok(result) => result,
+            Err(err) => {
+                self.replay_finished = true;
+                self.replay_paused = true;
+                self.replay_seek_drag_value = None;
+                self.last_error = Some(format!("seek failed: {err}"));
+                if let Some(existing_controls) = &self.replay_controls {
+                    existing_controls.paused.store(true, Ordering::Relaxed);
+                }
+                return;
+            }
+        };
+
+        let controller = match spawn_pipeline(
+            camera,
+            Evt3CorePreviewDecoder::default(),
+            replay_pipeline_config(&info),
+            PipelineOptions::preview_only(info.width, info.height),
+        ) {
+            Ok(controller) => controller,
+            Err(err) => {
+                self.replay_finished = true;
+                self.replay_paused = true;
+                self.replay_seek_drag_value = None;
+                self.last_error = Some(format!("seek pipeline start failed: {err}"));
+                return;
+            }
+        };
+
+        let pause_after_first_frame = desired_paused;
+        self.set_replay_paused_internal(&controls, false);
+        self.set_replay_speed_internal(&controls, self.replay_speed);
+        self.sync_pipeline_requirements(&controller);
+        self.controller = Some(controller);
+        self.replay_controls = Some(controls);
+        self.replay_file_info = Some(info);
+        self.replay_paused = desired_paused;
+        self.replay_finished = false;
+        self.replay_pause_after_seek_frame = pause_after_first_frame;
+        self.replay_seek_drag_value = None;
+        self.last_error = None;
+        self.camera_status = format!(
+            "Replaying {}.",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        );
+        self.latest_frame = None;
+        self.reset_analysis();
+    }
+
+    fn restart_replay(&mut self) {
+        self.seek_replay(0.0);
     }
 
     fn restore_saved_live_state(&mut self) {
@@ -418,11 +493,14 @@ impl CameraApp {
 
     fn clear_replay_state(&mut self) {
         self.replay_controls = None;
+        self.replay_file_info = None;
         self.replay_paused = false;
+        self.replay_finished = false;
+        self.replay_pause_after_seek_frame = false;
         self.replay_speed = 1.0;
-        self.replay_step_pending = false;
         self.replay_notice = None;
         self.replay_path = None;
+        self.replay_seek_drag_value = None;
         self.restore_saved_live_state();
     }
 
@@ -445,7 +523,23 @@ impl CameraApp {
     }
 
     fn finish_replay(&mut self) {
-        self.stop_pipeline();
+        if let Some(controller) = self.controller.take() {
+            if let Err(err) = controller.shutdown() {
+                self.last_error = Some(format!("pipeline shutdown failed: {err}"));
+            }
+        }
+
+        if let (Some(controls), Some(info)) = (&self.replay_controls, &self.replay_file_info) {
+            controls.paused.store(true, Ordering::Relaxed);
+            controls
+                .bytes_read
+                .store(info.data_len(), Ordering::Relaxed);
+        }
+
+        self.replay_finished = true;
+        self.replay_paused = true;
+        self.replay_pause_after_seek_frame = false;
+        self.replay_seek_drag_value = None;
         if self.last_error.is_none() {
             self.camera_status = "Replay finished.".into();
         }
@@ -537,14 +631,21 @@ impl CameraApp {
             return;
         };
 
-        if self.mode == AppMode::Replaying && self.replay_step_pending {
-            self.set_replay_paused(true);
-            self.replay_step_pending = false;
+        if self.mode == AppMode::Replaying && self.replay_pause_after_seek_frame {
+            if let Some(controls) = &self.replay_controls {
+                self.set_replay_paused_internal(controls, true);
+            }
+            self.replay_pause_after_seek_frame = false;
+            self.replay_paused = true;
         }
 
         self.run_analysis_plugins(&frame);
 
-        let image = frame_to_color_image(&frame, &self.analysis_output.overlays);
+        let image = frame_to_color_image(
+            &frame,
+            &self.analysis_output.overlays,
+            self.contrast_percentile,
+        );
         self.latest_frame = Some(frame);
         if let Some(texture) = &mut self.texture {
             texture.set(image, egui::TextureOptions::LINEAR);
@@ -556,6 +657,47 @@ impl CameraApp {
     fn settings_are_locked(&self) -> bool {
         self.mode == AppMode::Replaying
             || (self.mode == AppMode::Recording && self.lock_settings_while_recording)
+    }
+
+    fn current_replay_fraction(&self) -> f32 {
+        if let Some(drag_value) = self.replay_seek_drag_value {
+            return drag_value.clamp(0.0, 1.0);
+        }
+
+        let Some(controls) = &self.replay_controls else {
+            return 0.0;
+        };
+        let total_bytes = controls.file_size.saturating_sub(controls.data_offset);
+        if total_bytes == 0 {
+            return 1.0;
+        }
+
+        (controls.bytes_read.load(Ordering::Relaxed) as f32 / total_bytes as f32).clamp(0.0, 1.0)
+    }
+
+    fn current_replay_bytes_read(&self) -> u64 {
+        self.replay_controls
+            .as_ref()
+            .map(|controls| controls.bytes_read.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn current_replay_time_us(&self) -> u64 {
+        let Some(info) = &self.replay_file_info else {
+            return 0;
+        };
+        if self.replay_finished {
+            return info.total_duration_us;
+        }
+        if let Some(frame) = &self.latest_frame {
+            return frame
+                .window_end_us
+                .saturating_sub(info.first_timestamp_us)
+                .min(info.total_duration_us);
+        }
+
+        ((self.current_replay_fraction() as f64 * info.total_duration_us as f64).round() as u64)
+            .min(info.total_duration_us)
     }
 
     fn latest_detected_hotpixels(&self) -> Vec<(u16, u16)> {
@@ -912,9 +1054,7 @@ impl eframe::App for CameraApp {
             } else {
                 match mode {
                     AppMode::Replaying => {
-                        ui.label(
-                            "No replay frame yet. Replay starts immediately after opening a file.",
-                        );
+                        ui.label("No replay frame yet. Use the timeline or wait for playback to decode the next frame.");
                     }
                     _ => {
                         ui.label("No preview yet. Probe the camera, then click Preview or Record.");
@@ -926,15 +1066,15 @@ impl eframe::App for CameraApp {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     let play_pause = if self.replay_paused { "Play" } else { "Pause" };
-                    if ui.button(play_pause).clicked() {
+                    if ui
+                        .add_enabled(!self.replay_finished, egui::Button::new(play_pause))
+                        .clicked()
+                    {
                         self.set_replay_paused(!self.replay_paused);
                     }
 
-                    if ui
-                        .add_enabled(self.replay_paused, egui::Button::new("Step Forward"))
-                        .clicked()
-                    {
-                        self.request_replay_step();
+                    if ui.button("Restart").clicked() {
+                        self.restart_replay();
                     }
 
                     ui.label("Speed");
@@ -954,26 +1094,41 @@ impl eframe::App for CameraApp {
                             }
                         });
 
-                    if let Some(controls) = &self.replay_controls {
-                        let total_bytes = controls.file_size.saturating_sub(controls.data_offset);
-                        let bytes_read = controls.bytes_read.load(Ordering::Relaxed);
-                        let progress = if total_bytes == 0 {
-                            1.0
-                        } else {
-                            (bytes_read as f32 / total_bytes as f32).clamp(0.0, 1.0)
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_width(220.0)
-                                .show_percentage()
-                                .text(format!(
-                                    "{:.1} / {:.1} MB",
-                                    bytes_read as f64 / (1024.0 * 1024.0),
-                                    total_bytes as f64 / (1024.0 * 1024.0)
-                                )),
-                        );
+                    if self.replay_finished {
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, "Finished");
                     }
                 });
+
+                if let Some(info) = self.replay_file_info.clone() {
+                    let mut timeline_fraction =
+                        self.replay_seek_drag_value.unwrap_or_else(|| self.current_replay_fraction());
+                    let slider = egui::Slider::new(&mut timeline_fraction, 0.0..=1.0)
+                        .show_value(false)
+                        .text("Timeline");
+                    let slider_width = ui.available_width().max(420.0);
+                    let response = ui.add_sized([slider_width, 0.0], slider);
+                    if response.dragged() {
+                        self.replay_seek_drag_value = Some(timeline_fraction);
+                    }
+                    if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                        self.replay_seek_drag_value = None;
+                        self.seek_replay(timeline_fraction);
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!(
+                            "{} / {}",
+                            format_replay_time(self.current_replay_time_us()),
+                            format_replay_time(info.total_duration_us)
+                        ));
+                        ui.separator();
+                        ui.label(format!(
+                            "{:.1} / {:.1} MB",
+                            self.current_replay_bytes_read() as f64 / (1024.0 * 1024.0),
+                            info.data_len() as f64 / (1024.0 * 1024.0)
+                        ));
+                    });
+                }
             } else {
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -997,10 +1152,14 @@ impl eframe::App for CameraApp {
                 });
             }
 
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Contrast");
+                ui.add(egui::Slider::new(&mut self.contrast_percentile, 90.0..=100.0));
+                ui.label(format!("{:.1}th percentile", self.contrast_percentile));
+            });
+
             if let Some(ctrl) = &self.controller {
-                if self.last_stats_tick.elapsed() >= Duration::from_millis(250) {
-                    self.last_stats_tick = Instant::now();
-                }
                 let s = ctrl.stats_snapshot();
                 ui.label(format!(
                     "{:.2} Mev/s current | {:.2} MB/s current | {:02}:{:02}:{:02} elapsed",
@@ -1057,7 +1216,7 @@ impl eframe::App for CameraApp {
             }
         });
 
-        if self.mode != AppMode::Idle {
+        if self.mode != AppMode::Idle && self.controller.is_some() {
             ctx.request_repaint();
         }
     }
@@ -1069,6 +1228,13 @@ fn analysis_warning_color(severity: AnalysisSeverity) -> egui::Color32 {
         AnalysisSeverity::Warning => egui::Color32::YELLOW,
         AnalysisSeverity::Error => egui::Color32::RED,
     }
+}
+
+fn replay_pipeline_config(info: &ReplayFileInfo) -> CameraConfig {
+    let mut config = CameraConfig::default();
+    config.roi.width = info.width;
+    config.roi.height = info.height;
+    config
 }
 
 fn replay_config_path(raw_path: &Path) -> Option<PathBuf> {
@@ -1090,6 +1256,18 @@ fn replay_speed_matches(current: f32, candidate: f32) -> bool {
     } else {
         (current - candidate).abs() < f32::EPSILON
     }
+}
+
+fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
+    relative_offset & !1
+}
+
+fn format_replay_time(duration_us: u64) -> String {
+    let total_tenths = ((duration_us as f64) / 100_000.0).round() as u64;
+    let minutes = total_tenths / 600;
+    let seconds = (total_tenths % 600) / 10;
+    let tenths = total_tenths % 10;
+    format!("{minutes:02}:{seconds:02}.{tenths}")
 }
 
 impl Drop for CameraApp {

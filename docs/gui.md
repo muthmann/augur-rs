@@ -80,13 +80,27 @@ Opening a `.raw` file starts a preview-only pipeline backed by `RawFileCamera`.
 The center panel switches to a `Replay` heading and adds transport controls below the preview:
 
 - `Play` / `Pause`
-- `Step Forward` when paused
+- `Restart`
 - replay speed selector (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
-- replay progress bar based on bytes consumed from the file
+- a timeline slider for seeking within the recording
+- current / total replay time
+- replay MB progress as secondary info
 
 Enabled plugins continue to process replayed frames through the normal `PreviewFrame` path.
 
-At EOF, replay stops cleanly and the app returns to idle automatically.
+At EOF, replay shuts down its controller threads but stays in replay mode so the last frame, timeline, and transport controls remain available. Use `Restart`, drag the timeline, or click `Stop` to leave replay mode.
+
+---
+
+## Preview Contrast
+
+A `Contrast` slider below the preview is available in both live and replay modes.
+
+- the slider controls percentile-based normalization (`90.0` to `100.0`)
+- this prevents a single hotpixel from dominating the entire frame
+- lower percentiles reveal dimmer activity at the cost of earlier saturation
+
+The same contrast setting is used for the base preview image and ROI-grid rendering.
 
 ---
 

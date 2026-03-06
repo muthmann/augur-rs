@@ -21,7 +21,24 @@ use crate::{
 const HEADER_END: &str = "% end";
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THROTTLE_SLEEP_SLICE: Duration = Duration::from_millis(10);
-const TIMESTAMP_SCAN_BUF_SIZE: usize = 65_536;
+const FAST_SCAN_WINDOW_BYTES: u64 = 128 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct ReplayFileInfo {
+    pub file_size: u64,
+    pub data_offset: u64,
+    pub width: u16,
+    pub height: u16,
+    pub total_duration_us: u64,
+    pub first_timestamp_us: u64,
+    pub nominal_bytes_per_sec: Option<f64>,
+}
+
+impl ReplayFileInfo {
+    pub fn data_len(&self) -> u64 {
+        self.file_size.saturating_sub(self.data_offset)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ReplayControls {
@@ -32,18 +49,22 @@ pub struct ReplayControls {
     pub data_offset: u64,
     pub width: u16,
     pub height: u16,
+    pub total_duration_us: u64,
+    pub first_timestamp_us: u64,
 }
 
 impl ReplayControls {
-    fn new(file_size: u64, data_offset: u64, width: u16, height: u16) -> Self {
+    fn new(info: &ReplayFileInfo, bytes_read: u64) -> Self {
         Self {
             paused: Arc::new(AtomicBool::new(false)),
             speed_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
-            bytes_read: Arc::new(AtomicU64::new(0)),
-            file_size,
-            data_offset,
-            width,
-            height,
+            bytes_read: Arc::new(AtomicU64::new(bytes_read)),
+            file_size: info.file_size,
+            data_offset: info.data_offset,
+            width: info.width,
+            height: info.height,
+            total_duration_us: info.total_duration_us,
+            first_timestamp_us: info.first_timestamp_us,
         }
     }
 }
@@ -55,15 +76,16 @@ pub struct RawFileCamera {
     controls: ReplayControls,
     nominal_bytes_per_sec: Option<f64>,
     bytes_read: u64,
+    session_start_bytes: u64,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
     total_paused: Duration,
 }
 
 impl RawFileCamera {
-    pub fn open(path: impl AsRef<Path>) -> Result<(Self, ReplayControls)> {
+    pub fn open(path: impl AsRef<Path>) -> Result<(Self, ReplayControls, ReplayFileInfo)> {
         let path = path.as_ref();
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
         let file_size = file.metadata()?.len();
         let (data_offset, width, height) = parse_evt3_header(&file)?;
         if data_offset > file_size {
@@ -71,30 +93,51 @@ impl RawFileCamera {
                 "raw file header offset {data_offset} exceeds file size {file_size}"
             )));
         }
-        let data_len = file_size.saturating_sub(data_offset);
-        let nominal_bytes_per_sec = estimate_nominal_bytes_per_sec(&file, data_offset, data_len)?;
-        file.seek(SeekFrom::Start(data_offset))?;
 
-        let controls = ReplayControls::new(file_size, data_offset, width, height);
-        let info = DeviceInfo {
-            vendor: "AugurRS".into(),
-            model: "RAW File Replay".into(),
-            serial: None,
-            firmware: None,
-            compatible: Some(
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string()),
-            ),
+        let data_len = file_size.saturating_sub(data_offset);
+        let (first_timestamp_us, last_timestamp_us, nominal_bytes_per_sec) =
+            scan_duration_fast(&file, data_offset, data_len)?;
+        let total_duration_us = last_timestamp_us
+            .zip(first_timestamp_us)
+            .and_then(|(last, first)| last.checked_sub(first))
+            .unwrap_or(0);
+
+        let info = ReplayFileInfo {
+            file_size,
+            data_offset,
+            width,
+            height,
+            total_duration_us,
+            first_timestamp_us: first_timestamp_us.unwrap_or(0),
+            nominal_bytes_per_sec,
         };
+        let (camera, controls) = Self::open_at(path, &info, info.data_offset)?;
+        Ok((camera, controls, info))
+    }
+
+    pub fn open_at(
+        path: impl AsRef<Path>,
+        info: &ReplayFileInfo,
+        start_byte: u64,
+    ) -> Result<(Self, ReplayControls)> {
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
+        let aligned_start = align_evt3_word_offset(info.data_offset, start_byte)
+            .clamp(info.data_offset, info.file_size);
+        let start_data_bytes = aligned_start.saturating_sub(info.data_offset);
+        file.seek(SeekFrom::Start(aligned_start))?;
+
+        let controls = ReplayControls::new(info, start_data_bytes);
+        let device_info = build_device_info(path);
 
         Ok((
             Self {
                 file,
-                info,
+                info: device_info,
                 controls: controls.clone(),
-                nominal_bytes_per_sec,
-                bytes_read: 0,
+                nominal_bytes_per_sec: info.nominal_bytes_per_sec,
+                bytes_read: start_data_bytes,
+                session_start_bytes: start_data_bytes,
                 playback_started_at: None,
                 paused_at: None,
                 total_paused: Duration::ZERO,
@@ -125,7 +168,8 @@ impl RawFileCamera {
             return Ok(());
         };
         let speed = self.speed_multiplier();
-        if !speed.is_finite() || speed <= 0.0 || self.bytes_read == 0 {
+        let session_bytes = self.bytes_read.saturating_sub(self.session_start_bytes);
+        if !speed.is_finite() || speed <= 0.0 || session_bytes == 0 {
             return Ok(());
         }
 
@@ -142,7 +186,7 @@ impl RawFileCamera {
             let active_elapsed = now
                 .saturating_duration_since(started_at)
                 .saturating_sub(self.total_paused);
-            let desired_elapsed_s = self.bytes_read as f64 / (base_rate * speed as f64);
+            let desired_elapsed_s = session_bytes as f64 / (base_rate * speed as f64);
             let remaining_s = desired_elapsed_s - active_elapsed.as_secs_f64();
             if remaining_s <= 0.0 {
                 break;
@@ -198,6 +242,20 @@ impl PacketStreamCamera for RawFileCamera {
             .bytes_read
             .store(self.bytes_read, Ordering::Relaxed);
         Ok(n)
+    }
+}
+
+fn build_device_info(path: &Path) -> DeviceInfo {
+    DeviceInfo {
+        vendor: "AugurRS".into(),
+        model: "RAW File Replay".into(),
+        serial: None,
+        firmware: None,
+        compatible: Some(
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        ),
     }
 }
 
@@ -282,62 +340,65 @@ fn parse_u16(raw: &str, label: &str) -> Result<u16> {
     })
 }
 
-fn estimate_nominal_bytes_per_sec(
+fn scan_duration_fast(
     file: &File,
     data_offset: u64,
     data_len: u64,
-) -> Result<Option<f64>> {
-    if data_len == 0 {
-        return Ok(None);
+) -> Result<(Option<u64>, Option<u64>, Option<f64>)> {
+    if data_len < 2 {
+        return Ok((None, None, None));
+    }
+
+    let window_len = data_len.min(FAST_SCAN_WINDOW_BYTES);
+    let first_start = data_offset;
+    let last_start =
+        data_offset + align_relative_evt3_word_offset(data_len.saturating_sub(window_len));
+    let (first_ts, _) = scan_timestamp_window(file, first_start, window_len)?;
+    let (_, last_ts) = scan_timestamp_window(file, last_start, window_len)?;
+
+    let nominal_bytes_per_sec = first_ts
+        .zip(last_ts)
+        .and_then(|(first, last)| last.checked_sub(first))
+        .filter(|duration_us| *duration_us > 0)
+        .map(|duration_us| data_len as f64 / (duration_us as f64 / 1_000_000.0));
+
+    Ok((first_ts, last_ts, nominal_bytes_per_sec))
+}
+
+fn scan_timestamp_window(file: &File, start: u64, len: u64) -> Result<(Option<u64>, Option<u64>)> {
+    let aligned_len = align_relative_evt3_word_offset(len);
+    if aligned_len < 2 {
+        return Ok((None, None));
     }
 
     let mut clone = file.try_clone()?;
-    clone.seek(SeekFrom::Start(data_offset))?;
+    clone.seek(SeekFrom::Start(start))?;
+
+    let mut bytes = vec![0_u8; aligned_len as usize];
+    clone.read_exact(&mut bytes)?;
 
     let mut decoder = Evt3Decoder::default();
     let mut cd_events = Vec::<Evt3CdEvent>::with_capacity(4_096);
     let mut trigger_events = Vec::<Evt3TriggerEvent>::with_capacity(256);
-    let mut buf = [0_u8; TIMESTAMP_SCAN_BUF_SIZE];
-    let mut first_ts = None;
-    let mut last_ts = None;
-
-    loop {
-        let n = clone.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-
-        cd_events.clear();
-        trigger_events.clear();
-        decoder
-            .decode_bytes(&buf[..n], &mut cd_events, &mut trigger_events)
-            .map_err(|e| CameraError::Other(format!("failed to scan replay timestamps: {e}")))?;
-
-        if let Some(event) = cd_events.first() {
-            first_ts.get_or_insert(event.timestamp);
-        }
-        if let Some(event) = cd_events.last() {
-            last_ts = Some(event.timestamp);
-        }
-    }
-
+    decoder
+        .decode_bytes(&bytes, &mut cd_events, &mut trigger_events)
+        .map_err(|e| CameraError::Other(format!("failed to scan replay timestamps: {e}")))?;
     decoder.finish_stream().map_err(|e| {
         CameraError::Other(format!("failed to finalize replay timestamp scan: {e}"))
     })?;
 
-    let Some((first_ts, last_ts)) = first_ts.zip(last_ts) else {
-        return Ok(None);
-    };
-    if last_ts <= first_ts {
-        return Ok(None);
-    }
+    Ok((
+        cd_events.first().map(|event| event.timestamp),
+        cd_events.last().map(|event| event.timestamp),
+    ))
+}
 
-    let duration_s = (last_ts - first_ts) as f64 / 1_000_000.0;
-    if duration_s <= 0.0 {
-        return Ok(None);
-    }
+fn align_evt3_word_offset(data_offset: u64, absolute_offset: u64) -> u64 {
+    data_offset + align_relative_evt3_word_offset(absolute_offset.saturating_sub(data_offset))
+}
 
-    Ok(Some(data_len as f64 / duration_s))
+fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
+    relative_offset & !1
 }
 
 #[cfg(test)]
@@ -375,45 +436,71 @@ mod tests {
         bytes
     }
 
-    fn write_sample_raw(path: &Path) -> u64 {
+    fn write_sample_raw(path: &Path) -> (u64, Vec<u8>) {
         let body = sample_raw_bytes();
         let header = "% format EVT3;width=1280;height=720\n% geometry 1280x720\n% evt 3.0\n% end\n";
         let mut bytes = header.as_bytes().to_vec();
         bytes.extend_from_slice(&body);
         fs::write(path, bytes).expect("sample raw file must be written");
-        header.len() as u64
+        (header.len() as u64, body)
     }
 
     #[test]
-    fn open_parses_evt3_header_and_geometry() {
+    fn open_parses_evt3_header_and_fast_scan_metadata() {
         let path = temp_path("header");
-        let data_offset = write_sample_raw(&path);
+        let (data_offset, _body) = write_sample_raw(&path);
 
-        let (_camera, controls) = RawFileCamera::open(&path).expect("raw file must open");
+        let (_camera, controls, info) = RawFileCamera::open(&path).expect("raw file must open");
 
         assert_eq!(controls.width, 1280);
         assert_eq!(controls.height, 720);
         assert_eq!(controls.data_offset, data_offset);
+        assert_eq!(controls.first_timestamp_us, 0x1010);
+        assert_eq!(controls.total_duration_us, 0x10);
         assert!(controls.file_size > data_offset);
+        assert_eq!(info.data_offset, data_offset);
+        assert_eq!(info.first_timestamp_us, 0x1010);
+        assert_eq!(info.total_duration_us, 0x10);
+        assert!(info.nominal_bytes_per_sec.is_some());
 
         fs::remove_file(path).expect("temp file must be removed");
     }
 
     #[test]
-    fn read_packet_updates_progress_and_reports_eof() {
-        let path = temp_path("eof");
-        write_sample_raw(&path);
+    fn open_at_starts_from_requested_offset_and_updates_absolute_progress() {
+        let path = temp_path("seek");
+        let (data_offset, body) = write_sample_raw(&path);
+        let (_camera, _controls, info) = RawFileCamera::open(&path).expect("raw file must open");
+        let start_byte = data_offset + 4;
 
-        let (mut camera, controls) = RawFileCamera::open(&path).expect("raw file must open");
+        let (mut camera, controls) =
+            RawFileCamera::open_at(&path, &info, start_byte).expect("seeked open must work");
         camera.start_streaming().expect("start must succeed");
 
+        assert_eq!(controls.bytes_read.load(Ordering::Relaxed), 4);
         let mut buf = [0_u8; 256];
         let n = camera
             .read_packet(&mut buf)
-            .expect("first read must succeed");
-        assert!(n > 0);
-        assert_eq!(controls.bytes_read.load(Ordering::Relaxed), n as u64);
+            .expect("read after seek must succeed");
+        assert_eq!(controls.bytes_read.load(Ordering::Relaxed), 4 + n as u64);
+        assert_eq!(&buf[..n], &body[4..]);
 
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn read_packet_reports_eof() {
+        let path = temp_path("eof");
+        write_sample_raw(&path);
+
+        let (mut camera, _controls, _info) =
+            RawFileCamera::open(&path).expect("raw file must open");
+        camera.start_streaming().expect("start must succeed");
+
+        let mut buf = [0_u8; 256];
+        camera
+            .read_packet(&mut buf)
+            .expect("first read must succeed");
         let err = camera
             .read_packet(&mut buf)
             .expect_err("second read must reach EOF");
@@ -427,7 +514,7 @@ mod tests {
         let path = temp_path("pause");
         write_sample_raw(&path);
 
-        let (mut camera, controls) = RawFileCamera::open(&path).expect("raw file must open");
+        let (mut camera, controls, _info) = RawFileCamera::open(&path).expect("raw file must open");
         controls.paused.store(true, Ordering::Relaxed);
 
         let err = camera
