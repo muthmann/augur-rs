@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -12,6 +12,7 @@ use augur_core::{
     pipeline::{
         spawn_pipeline, Evt3CorePreviewDecoder, PipelineController, PipelineOptions, PreviewFrame,
     },
+    replay::{RawFileCamera, ReplayControls},
 };
 use augur_prophesee::evk4::Evk4Camera;
 
@@ -22,20 +23,44 @@ use crate::{
     settings::draw_settings,
 };
 
+const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
+    (0.25, "0.25x"),
+    (0.5, "0.5x"),
+    (1.0, "1x"),
+    (2.0, "2x"),
+    (4.0, "4x"),
+    (f32::INFINITY, "Max"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppMode {
     Idle,
     Previewing,
     Recording,
+    Replaying,
+}
+
+#[derive(Debug, Clone)]
+struct SavedLiveState {
+    config: CameraConfig,
+    mask_file: String,
+    camera_info: Option<DeviceInfo>,
 }
 
 pub struct CameraApp {
     config: CameraConfig,
     output_path: String,
+    replay_path: Option<String>,
     mode: AppMode,
     controller: Option<PipelineController>,
     texture: Option<egui::TextureHandle>,
     latest_frame: Option<PreviewFrame>,
+    replay_controls: Option<ReplayControls>,
+    replay_paused: bool,
+    replay_speed: f32,
+    replay_step_pending: bool,
+    replay_notice: Option<String>,
+    saved_live_state: Option<SavedLiveState>,
     plugins: Vec<Box<dyn AnalysisPlugin>>,
     plugin_context: PluginContext,
     analysis_output: AnalysisOutput,
@@ -44,6 +69,8 @@ pub struct CameraApp {
     acq_dirty: bool,
     config_dirty: bool,
     lock_settings_while_recording: bool,
+    settings_panel_open: bool,
+    analysis_panel_open: bool,
     mask_x: u16,
     mask_y: u16,
     mask_file: String,
@@ -58,10 +85,17 @@ impl CameraApp {
         Self {
             config: CameraConfig::default(),
             output_path: "./output.raw".into(),
+            replay_path: None,
             mode: AppMode::Idle,
             controller: None,
             texture: None,
             latest_frame: None,
+            replay_controls: None,
+            replay_paused: false,
+            replay_speed: 1.0,
+            replay_step_pending: false,
+            replay_notice: None,
+            saved_live_state: None,
             plugins: create_all_plugins(),
             plugin_context: PluginContext::default(),
             analysis_output: AnalysisOutput::default(),
@@ -70,6 +104,8 @@ impl CameraApp {
             acq_dirty: false,
             config_dirty: false,
             lock_settings_while_recording: true,
+            settings_panel_open: true,
+            analysis_panel_open: true,
             mask_x: 0,
             mask_y: 0,
             mask_file: String::new(),
@@ -181,6 +217,128 @@ impl CameraApp {
         }
     }
 
+    fn open_replay_file(&mut self) {
+        if self.mode != AppMode::Idle {
+            return;
+        }
+
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("RAW", &["raw"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let saved_live_state = SavedLiveState {
+            config: self.config.clone(),
+            mask_file: self.mask_file.clone(),
+            camera_info: self.camera_info.clone(),
+        };
+
+        let (camera, controls) = match RawFileCamera::open(&path) {
+            Ok(result) => result,
+            Err(err) => {
+                self.last_error = Some(format!("open replay file failed: {err}"));
+                return;
+            }
+        };
+        let (display_config, display_mask_file, replay_notice) =
+            self.load_replay_display_settings(&path, controls.width, controls.height);
+
+        let replay_info = camera.device_info();
+        let mut replay_config = CameraConfig::default();
+        replay_config.roi.width = controls.width;
+        replay_config.roi.height = controls.height;
+        let controller = spawn_pipeline(
+            camera,
+            Evt3CorePreviewDecoder::default(),
+            replay_config,
+            PipelineOptions::preview_only(controls.width, controls.height),
+        )
+        .map_err(|e| format!("pipeline start failed: {e}"));
+        let controller = match controller {
+            Ok(controller) => controller,
+            Err(err) => {
+                self.last_error = Some(err);
+                return;
+            }
+        };
+
+        self.set_replay_paused_internal(&controls, false);
+        self.set_replay_speed_internal(&controls, 1.0);
+        self.sync_pipeline_requirements(&controller);
+        self.controller = Some(controller);
+        self.mode = AppMode::Replaying;
+        self.camera_info = Some(replay_info);
+        self.config = display_config;
+        self.mask_file = display_mask_file;
+        self.replay_notice = replay_notice;
+        self.replay_path = Some(path.display().to_string());
+        self.replay_controls = Some(controls);
+        self.replay_paused = false;
+        self.replay_speed = 1.0;
+        self.replay_step_pending = false;
+        self.saved_live_state = Some(saved_live_state);
+        self.reset_analysis();
+        self.config_dirty = false;
+        self.acq_dirty = false;
+        self.last_error = None;
+        self.last_stats_tick = Instant::now();
+        self.camera_status = format!(
+            "Replaying {}.",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        );
+    }
+
+    fn load_replay_display_settings(
+        &self,
+        raw_path: &Path,
+        width: u16,
+        height: u16,
+    ) -> (CameraConfig, String, Option<String>) {
+        let mut default_config = CameraConfig::default();
+        default_config.roi.width = width;
+        default_config.roi.height = height;
+
+        let Some(config_path) = replay_config_path(raw_path) else {
+            return (
+                default_config,
+                String::new(),
+                Some("Replay sidecar path could not be derived; showing default settings.".into()),
+            );
+        };
+
+        if !config_path.is_file() {
+            return (
+                default_config,
+                String::new(),
+                Some("No companion .toml sidecar found; showing default settings.".into()),
+            );
+        }
+
+        match CameraConfig::load_from_path(&config_path) {
+            Ok(config) => {
+                let mask_file = config
+                    .pixel_mask
+                    .mask_file
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                (config, mask_file, None)
+            }
+            Err(err) => (
+                default_config,
+                String::new(),
+                Some(format!(
+                    "Replay sidecar {} could not be loaded: {err}",
+                    config_path.display()
+                )),
+            ),
+        }
+    }
+
     fn start_pipeline_inner(&mut self, preview_only: bool) -> Result<PipelineController, String> {
         let options = if preview_only {
             PipelineOptions::preview_only(1280, 720)
@@ -213,11 +371,70 @@ impl CameraApp {
         Ok(controller)
     }
 
+    fn set_replay_paused_internal(&self, controls: &ReplayControls, paused: bool) {
+        controls.paused.store(paused, Ordering::Relaxed);
+    }
+
+    fn set_replay_speed_internal(&self, controls: &ReplayControls, speed: f32) {
+        controls
+            .speed_bits
+            .store(speed.to_bits(), Ordering::Relaxed);
+    }
+
+    fn set_replay_paused(&mut self, paused: bool) {
+        let Some(controls) = &self.replay_controls else {
+            return;
+        };
+        self.set_replay_paused_internal(controls, paused);
+        self.replay_paused = paused;
+        if !paused {
+            self.replay_step_pending = false;
+        }
+    }
+
+    fn set_replay_speed(&mut self, speed: f32) {
+        let Some(controls) = &self.replay_controls else {
+            return;
+        };
+        self.set_replay_speed_internal(controls, speed);
+        self.replay_speed = speed;
+    }
+
+    fn request_replay_step(&mut self) {
+        if self.mode != AppMode::Replaying || !self.replay_paused {
+            return;
+        }
+        self.replay_step_pending = true;
+        self.set_replay_paused(false);
+    }
+
+    fn restore_saved_live_state(&mut self) {
+        if let Some(saved) = self.saved_live_state.take() {
+            self.config = saved.config;
+            self.mask_file = saved.mask_file;
+            self.camera_info = saved.camera_info;
+        }
+    }
+
+    fn clear_replay_state(&mut self) {
+        self.replay_controls = None;
+        self.replay_paused = false;
+        self.replay_speed = 1.0;
+        self.replay_step_pending = false;
+        self.replay_notice = None;
+        self.replay_path = None;
+        self.restore_saved_live_state();
+    }
+
     fn stop_pipeline(&mut self) {
+        let was_replaying = self.mode == AppMode::Replaying;
         if let Some(controller) = self.controller.take() {
             if let Err(e) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {e}"));
             }
+        }
+        if was_replaying {
+            self.clear_replay_state();
         }
         self.texture = None;
         self.latest_frame = None;
@@ -227,7 +444,14 @@ impl CameraApp {
             "Camera idle. Current local settings will be used for the next recording.".into();
     }
 
-    fn poll_pipeline_error(&mut self) {
+    fn finish_replay(&mut self) {
+        self.stop_pipeline();
+        if self.last_error.is_none() {
+            self.camera_status = "Replay finished.".into();
+        }
+    }
+
+    fn poll_pipeline_state(&mut self) {
         let maybe_error = self
             .controller
             .as_ref()
@@ -235,6 +459,17 @@ impl CameraApp {
         if let Some(err) = maybe_error {
             self.last_error = Some(err);
             self.stop_pipeline();
+            return;
+        }
+
+        let replay_finished = self.mode == AppMode::Replaying
+            && self
+                .controller
+                .as_ref()
+                .is_some_and(|ctrl| ctrl.is_stopped() && ctrl.frame_rx.is_empty());
+        if replay_finished {
+            self.last_error = None;
+            self.finish_replay();
         }
     }
 
@@ -302,6 +537,11 @@ impl CameraApp {
             return;
         };
 
+        if self.mode == AppMode::Replaying && self.replay_step_pending {
+            self.set_replay_paused(true);
+            self.replay_step_pending = false;
+        }
+
         self.run_analysis_plugins(&frame);
 
         let image = frame_to_color_image(&frame, &self.analysis_output.overlays);
@@ -314,7 +554,8 @@ impl CameraApp {
     }
 
     fn settings_are_locked(&self) -> bool {
-        self.mode == AppMode::Recording && self.lock_settings_while_recording
+        self.mode == AppMode::Replaying
+            || (self.mode == AppMode::Recording && self.lock_settings_while_recording)
     }
 
     fn latest_detected_hotpixels(&self) -> Vec<(u16, u16)> {
@@ -362,7 +603,7 @@ impl CameraApp {
             added += 1;
         }
 
-        if added > 0 {
+        if added > 0 && self.mode != AppMode::Replaying {
             self.config_dirty = self.controller.is_some();
         }
 
@@ -374,8 +615,8 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_pipeline_error();
         self.update_preview_texture(ctx);
+        self.poll_pipeline_state();
 
         let mode = self.mode;
         let mut plugin_toggle_changed = false;
@@ -409,10 +650,14 @@ impl eframe::App for CameraApp {
                 }
 
                 if ui
-                    .add_enabled(
-                        mode == AppMode::Previewing || mode == AppMode::Recording,
-                        egui::Button::new("Stop"),
-                    )
+                    .add_enabled(mode == AppMode::Idle, egui::Button::new("Open .raw"))
+                    .clicked()
+                {
+                    self.open_replay_file();
+                }
+
+                if ui
+                    .add_enabled(mode != AppMode::Idle, egui::Button::new("Stop"))
                     .clicked()
                 {
                     self.stop_pipeline();
@@ -430,6 +675,18 @@ impl eframe::App for CameraApp {
                 }
 
                 ui.separator();
+                if ui
+                    .selectable_label(self.settings_panel_open, "Settings Panel")
+                    .clicked()
+                {
+                    self.settings_panel_open = !self.settings_panel_open;
+                }
+                if ui
+                    .selectable_label(self.analysis_panel_open, "Analysis Panel")
+                    .clicked()
+                {
+                    self.analysis_panel_open = !self.analysis_panel_open;
+                }
                 ui.menu_button("Analysis", |ui| {
                     for plugin in &mut self.plugins {
                         let mut enabled = plugin.enabled();
@@ -442,7 +699,7 @@ impl eframe::App for CameraApp {
 
                 ui.separator();
 
-                let output_enabled = mode != AppMode::Recording;
+                let output_enabled = mode != AppMode::Recording && mode != AppMode::Replaying;
                 ui.label("Output");
                 ui.add_enabled(
                     output_enabled,
@@ -463,7 +720,10 @@ impl eframe::App for CameraApp {
 
                 ui.separator();
 
-                if ui.button("Save Config").clicked() {
+                if ui
+                    .add_enabled(mode != AppMode::Replaying, egui::Button::new("Save Config"))
+                    .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new()
                         .set_file_name("augur.toml")
                         .add_filter("TOML", &["toml"])
@@ -476,7 +736,10 @@ impl eframe::App for CameraApp {
                 }
 
                 if ui
-                    .add_enabled(mode != AppMode::Recording, egui::Button::new("Load Config"))
+                    .add_enabled(
+                        mode != AppMode::Recording && mode != AppMode::Replaying,
+                        egui::Button::new("Load Config"),
+                    )
                     .clicked()
                 {
                     if let Some(path) = rfd::FileDialog::new()
@@ -506,7 +769,11 @@ impl eframe::App for CameraApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Camera: {}", self.camera_status));
                 ui.separator();
-                ui.label(format!("Output: {}", self.output_path.trim()));
+                if let Some(replay_path) = &self.replay_path {
+                    ui.label(format!("Replay: {replay_path}"));
+                } else {
+                    ui.label(format!("Output: {}", self.output_path.trim()));
+                }
                 if mode == AppMode::Recording {
                     ui.separator();
                     ui.label("Output path changes apply only to the next recording.");
@@ -520,47 +787,57 @@ impl eframe::App for CameraApp {
             self.sync_active_pipeline_requirements();
         }
 
-        egui::SidePanel::left("settings")
-            .min_width(340.0)
-            .show(ctx, |ui| {
-                let locked = self.settings_are_locked();
+        if self.settings_panel_open {
+            egui::SidePanel::left("settings")
+                .min_width(340.0)
+                .show(ctx, |ui| {
+                    let locked = self.settings_are_locked();
 
-                ui.heading("Settings");
-                ui.separator();
-                ui.checkbox(
-                    &mut self.lock_settings_while_recording,
-                    "Lock settings while recording",
-                );
+                    ui.heading("Settings");
+                    ui.separator();
+                    if mode != AppMode::Replaying {
+                        ui.checkbox(
+                            &mut self.lock_settings_while_recording,
+                            "Lock settings while recording",
+                        );
+                    }
 
-                match mode {
-                    AppMode::Recording if locked => {
-                        ui.label("Recording: settings are locked.");
+                    match mode {
+                        AppMode::Recording if locked => {
+                            ui.label("Recording: settings are locked.");
+                        }
+                        AppMode::Recording => {
+                            ui.label("Recording: edits stay local until you click Apply Settings.");
+                        }
+                        AppMode::Previewing => {
+                            ui.label("Previewing: edits stay local until you click Apply Settings.");
+                        }
+                        AppMode::Replaying => {
+                            ui.label("Replay mode: camera settings are shown as read-only reference data.");
+                            if let Some(notice) = &self.replay_notice {
+                                ui.colored_label(egui::Color32::YELLOW, notice);
+                            }
+                        }
+                        AppMode::Idle => {
+                            ui.label("Idle: edits change the local config for the next recording.");
+                        }
                     }
-                    AppMode::Recording => {
-                        ui.label("Recording: edits stay local until you click Apply Settings.");
-                    }
-                    AppMode::Previewing => {
-                        ui.label("Previewing: edits stay local until you click Apply Settings.");
-                    }
-                    AppMode::Idle => {
-                        ui.label("Idle: edits change the local config for the next recording.");
-                    }
-                }
 
-                ui.separator();
-                ui.add_enabled_ui(!locked, |ui| {
-                    let changed = draw_settings(
-                        ui,
-                        &mut self.config,
-                        &mut self.mask_x,
-                        &mut self.mask_y,
-                        &mut self.mask_file,
-                    );
-                    if changed {
-                        self.config_dirty = true;
-                    }
+                    ui.separator();
+                    ui.add_enabled_ui(!locked, |ui| {
+                        let changed = draw_settings(
+                            ui,
+                            &mut self.config,
+                            &mut self.mask_x,
+                            &mut self.mask_y,
+                            &mut self.mask_file,
+                        );
+                        if changed {
+                            self.config_dirty = true;
+                        }
+                    });
                 });
-            });
+        }
 
         let enabled_plugin_names: Vec<String> = self
             .plugins
@@ -569,7 +846,7 @@ impl eframe::App for CameraApp {
             .map(|plugin| plugin.name().to_owned())
             .collect();
         let mut plugin_config_changed = false;
-        if !enabled_plugin_names.is_empty() {
+        if self.analysis_panel_open && !enabled_plugin_names.is_empty() {
             egui::SidePanel::right("analysis")
                 .min_width(360.0)
                 .show(ctx, |ui| {
@@ -606,12 +883,16 @@ impl eframe::App for CameraApp {
                 });
         }
 
-        if plugin_config_changed {
+        if plugin_config_changed && mode != AppMode::Replaying {
             self.config_dirty = true;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Live Preview");
+            ui.heading(if mode == AppMode::Replaying {
+                "Replay"
+            } else {
+                "Live Preview"
+            });
             ui.separator();
 
             if let Some(info) = &self.camera_info {
@@ -629,29 +910,92 @@ impl eframe::App for CameraApp {
                 let scale = (available.x / size.x).min(available.y / size.y).max(0.1);
                 ui.add(egui::Image::new(texture).fit_to_exact_size(size * scale));
             } else {
-                ui.label("No preview yet. Probe the camera, then click Preview or Record.");
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Acq time [ms]");
-                let changed = ui
-                    .add_enabled(
-                        !self.settings_are_locked(),
-                        egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
-                    )
-                    .changed();
-                if changed {
-                    self.acq_dirty = true;
-                }
-                if mode != AppMode::Idle {
-                    if self.settings_are_locked() {
-                        ui.label("Preview changes are locked during recording.");
-                    } else {
-                        ui.label("Click Apply Settings to push preview timing.");
+                match mode {
+                    AppMode::Replaying => {
+                        ui.label(
+                            "No replay frame yet. Replay starts immediately after opening a file.",
+                        );
+                    }
+                    _ => {
+                        ui.label("No preview yet. Probe the camera, then click Preview or Record.");
                     }
                 }
-            });
+            }
+
+            if mode == AppMode::Replaying {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    let play_pause = if self.replay_paused { "Play" } else { "Pause" };
+                    if ui.button(play_pause).clicked() {
+                        self.set_replay_paused(!self.replay_paused);
+                    }
+
+                    if ui
+                        .add_enabled(self.replay_paused, egui::Button::new("Step Forward"))
+                        .clicked()
+                    {
+                        self.request_replay_step();
+                    }
+
+                    ui.label("Speed");
+                    egui::ComboBox::from_id_source("replay-speed")
+                        .selected_text(replay_speed_label(self.replay_speed))
+                        .show_ui(ui, |ui| {
+                            for (speed, label) in REPLAY_SPEED_OPTIONS {
+                                if ui
+                                    .selectable_label(
+                                        replay_speed_matches(self.replay_speed, speed),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.set_replay_speed(speed);
+                                }
+                            }
+                        });
+
+                    if let Some(controls) = &self.replay_controls {
+                        let total_bytes = controls.file_size.saturating_sub(controls.data_offset);
+                        let bytes_read = controls.bytes_read.load(Ordering::Relaxed);
+                        let progress = if total_bytes == 0 {
+                            1.0
+                        } else {
+                            (bytes_read as f32 / total_bytes as f32).clamp(0.0, 1.0)
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(220.0)
+                                .show_percentage()
+                                .text(format!(
+                                    "{:.1} / {:.1} MB",
+                                    bytes_read as f64 / (1024.0 * 1024.0),
+                                    total_bytes as f64 / (1024.0 * 1024.0)
+                                )),
+                        );
+                    }
+                });
+            } else {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Acq time [ms]");
+                    let changed = ui
+                        .add_enabled(
+                            !self.settings_are_locked(),
+                            egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
+                        )
+                        .changed();
+                    if changed {
+                        self.acq_dirty = true;
+                    }
+                    if mode != AppMode::Idle {
+                        if self.settings_are_locked() {
+                            ui.label("Preview changes are locked during recording.");
+                        } else {
+                            ui.label("Click Apply Settings to push preview timing.");
+                        }
+                    }
+                });
+            }
 
             if let Some(ctrl) = &self.controller {
                 if self.last_stats_tick.elapsed() >= Duration::from_millis(250) {
@@ -668,7 +1012,7 @@ impl eframe::App for CameraApp {
                 ));
             }
 
-            if mode != AppMode::Idle {
+            if mode != AppMode::Idle && mode != AppMode::Replaying {
                 if self.config_dirty || self.acq_dirty {
                     ui.colored_label(
                         egui::Color32::YELLOW,
@@ -724,6 +1068,27 @@ fn analysis_warning_color(severity: AnalysisSeverity) -> egui::Color32 {
         AnalysisSeverity::Info => egui::Color32::from_rgb(96, 160, 255),
         AnalysisSeverity::Warning => egui::Color32::YELLOW,
         AnalysisSeverity::Error => egui::Color32::RED,
+    }
+}
+
+fn replay_config_path(raw_path: &Path) -> Option<PathBuf> {
+    let stem = raw_path.file_stem()?.to_string_lossy();
+    let parent = raw_path.parent().unwrap_or_else(|| Path::new("."));
+    Some(parent.join(format!("{stem}.toml")))
+}
+
+fn replay_speed_label(speed: f32) -> &'static str {
+    REPLAY_SPEED_OPTIONS
+        .iter()
+        .find_map(|(candidate, label)| replay_speed_matches(speed, *candidate).then_some(*label))
+        .unwrap_or("Custom")
+}
+
+fn replay_speed_matches(current: f32, candidate: f32) -> bool {
+    if current.is_infinite() || candidate.is_infinite() {
+        current.is_infinite() && candidate.is_infinite()
+    } else {
+        (current - candidate).abs() < f32::EPSILON
     }
 }
 

@@ -1,8 +1,8 @@
 # GUI Usage
 
-The `augur-gui` desktop app wraps the same backend as the CLI with a live preview and runtime controls.
+The `augur-gui` desktop app wraps the same backend as the CLI with live preview, file replay, runtime controls, and plugin-driven analysis.
 
-## Start The App
+## Start the App
 
 ```bash
 cargo run --bin augur-gui
@@ -12,93 +12,66 @@ cargo run --bin augur-gui
 
 The top toolbar provides the main session controls:
 
-- `Probe`: query the EVK4 and display model, serial, and firmware information
+- `Probe Camera`: query the EVK4 and display model, serial, and firmware information
 - `Preview`: start live preview without writing to disk
 - `Record`: start recording to the configured output path
-- `Stop`: stop preview or recording
+- `Open .raw`: open a recorded EVT3 file in replay mode
+- `Stop`: stop preview, recording, or replay
 - `Apply Settings`: push pending runtime changes while previewing or recording
+- `Settings Panel` / `Analysis Panel`: show or hide the left and right side panels
 - `Analysis`: enable or disable analysis plugins from a dropdown menu
 - `Save Config` / `Load Config`: store or restore TOML settings
 
-The GUI also shows the current output path and the current camera state.
+The toolbar also shows the current session status and either the active replay file or the configured output path.
 
 ## Settings Panel
 
-The left panel is camera-only and groups runtime settings into focused sections.
+The left panel groups camera-only controls into focused sections:
 
-### Biases
+- Biases
+- ROI
+- Pixel Mask (DEM)
+- Digital Filters
 
-Sliders for:
+### Live sessions
 
-- `diff_on`
-- `diff_off`
-- `fo`
-- `hpf`
-- `refr`
+- `Idle`: edits affect the next preview or recording session
+- `Previewing` / `Recording`: edits stay local until `Apply Settings`
+- `Lock settings while recording` prevents runtime changes during capture
 
-### ROI
+### Replay sessions
 
-Set:
-
-- `x`
-- `y`
-- `width`
-- `height`
-
-Use ROI to reduce the active sensor area and event bandwidth.
-
-### Pixel Mask (DEM)
-
-Manage individual masked pixels in hardware:
-
-- add coordinates manually
-- remove coordinates from the list
-- clear the list
-- select a mask bitfield file
-
-### Digital Filters
-
-Enable one of the two on-sensor filters:
-
-- STC
-- Trail
-
-They are mutually exclusive in the UI because they share the same hardware block.
+- the panel becomes read-only
+- a companion `<capture>.toml` sidecar is shown when available
+- otherwise the GUI falls back to a geometry-matched default reference config
 
 ## Analysis Panel
 
 When at least one analysis plugin is enabled, a right-side **Analysis Tools** panel appears.
 
-- each enabled plugin gets a collapsible section
-- plugins can exchange per-frame derived data through a typed context
-- disabling all plugins hides the panel
+- plugins keep running even if the panel is hidden
+- disabling all plugins hides the panel automatically
+- plugins can exchange per-frame derived data through the shared context bus
 
-### Hotpixel Detection Plugin
+Available plugin types include hotpixel detection, ROI grid analysis, molecule localization, and focus metrics.
 
-- highlights likely hotpixels in the preview pipeline
-- shows warnings in the main panel
-- can copy detected hotpixels into the DEM mask list
+## Replay Mode
 
-### ROI Grid Plugin
+Opening a `.raw` file starts a preview-only pipeline backed by the file replay camera in `augur-core`.
 
-Computes hotpixel-free rectangular regions from the current mask list.
+Replay adds a transport bar below the preview with:
 
-### Molecule Localization Plugin
+- `Play` / `Pause`
+- `Step Forward` when paused
+- speed selection (`0.25x` to `Max`)
+- a replay progress bar based on bytes consumed from the file
 
-- wavelet-filters the preview stream for emitter candidates
-- fits sub-pixel Gaussian spots
-- renders crosshair overlays
-- publishes localization results for downstream plugins
+Enabled analysis plugins continue to process replayed frames through the same `PreviewFrame` path used for live preview.
 
-### Focus Metrics Plugin
+When replay reaches EOF, the pipeline shuts down cleanly and the app returns to idle automatically.
 
-- mean PSF sigma from localizations
-- FFT high-frequency sharpness metric
-- astigmatic ratio for directional focus analysis
+## Runtime Notes
 
-## Runtime Behavior
-
-- In `Idle`, edits affect the next preview or recording
-- In `Previewing` or `Recording`, edits stay local until `Apply Settings`
-- `Lock settings while recording` prevents runtime changes during capture
-- Acquisition time can be adjusted separately from the main config and applied at runtime
+- acquisition time is only adjustable for live preview and recording
+- output path editing is disabled during active recording and replay
+- collapsing either side panel gives more space back to the preview

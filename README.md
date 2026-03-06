@@ -16,7 +16,7 @@
 
 ---
 
-AugurRS gives you direct, auditable control over an EVK4 event camera. Whether you are capturing raw event streams for computer vision research, running robotics experiments, doing high-speed measurements, or building a custom imaging workflow — the core tool does exactly what you need: reliable capture, live preview, and full sensor control. Nothing more, nothing less.
+AugurRS gives you direct, auditable control over an EVK4 event camera. Whether you are capturing raw event streams for computer vision research, running robotics experiments, doing high-speed measurements, or building a custom imaging workflow — the core tool does exactly what you need: reliable capture, live preview, recorded-file replay, and full sensor control. Nothing more, nothing less.
 
 If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything — signal processing, detection, localization, metrics, custom overlays. Scientific plugins for SMLM microscopy and biophotonics workflows are maintained in the companion [**augur-plugins**](#plugin-ecosystem) repository.
 
@@ -31,6 +31,7 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 - **Direct hardware path** — Treuzell USB transport + IMX636 register programming, no Metavision or OpenEB required
 - **Backpressured 3-thread pipeline** — USB reader → bounded disk writer → lossy preview decoder. Recording never blocks on the UI, never grows unbounded in memory
 - **Reproducible sessions** — every `.raw` file gets a `.toml` config sidecar written automatically
+- **Replay in the GUI** — open recorded `.raw` captures through the same preview and plugin path used for live sessions
 - **Throughput stats** — 1-second sliding window for Mev/s and MB/s, visible in the GUI and CLI
 
 ### Sensor Control
@@ -74,7 +75,7 @@ augur-gui ─────────────┤      camera traits · TOML 
          └──► plugin host  ← plugins live here, not in augur-core
 ```
 
-**`augur-core` is a pure camera SDK.** It knows nothing about localization, microscopy, or any specific analysis domain. The plugin host in `augur-gui` is the only place science-specific code runs. Removing all plugins returns the app to a plain recorder with no dead code.
+**`augur-core` is a pure camera SDK.** The plugin host in `augur-gui` is the only place your data analysation pipeline can live.
 
 ### Streaming Pipeline
 

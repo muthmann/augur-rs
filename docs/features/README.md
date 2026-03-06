@@ -14,6 +14,8 @@ This repository defines the plugin API and runtime. See [Plugin Architecture](./
 ## Index
 
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
+- [RAW Replay](./raw-replay.md) — file-backed `PacketStreamCamera`, replay transport controls, clean EOF handling
+- [Collapsible GUI Panels](./collapsible-panels.md) — toolbar toggles for the settings and analysis side panels
 - [Plugin Architecture](./analysis-plugins.md) — compile-time plugin model, typed plugin context, phased execution, raw-event transport
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection
 

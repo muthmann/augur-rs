@@ -221,6 +221,10 @@ impl PipelineController {
         self.error_rx.try_recv().ok()
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
     pub fn shutdown(mut self) -> Result<()> {
         self.request_stop();
         let mut had_panic = false;
@@ -339,6 +343,11 @@ where
                 Err(CameraError::Timeout(_)) => {
                     let _ = usb_pool_tx.send(buf);
                     continue;
+                }
+                Err(CameraError::Eof) => {
+                    let _ = usb_pool_tx.send(buf);
+                    stop_usb.store(true, Ordering::Relaxed);
+                    break;
                 }
                 Err(e) => {
                     report_pipeline_error(
@@ -498,10 +507,6 @@ where
         let mut frame_start_ts: Option<u64> = None;
 
         loop {
-            if stop_preview.load(Ordering::Relaxed) {
-                break;
-            }
-
             match preview_rx.recv_timeout(Duration::from_millis(2)) {
                 Ok(bytes) => {
                     if let Err(e) = decoder.decode_bytes(&bytes, &mut events) {
@@ -555,7 +560,11 @@ where
                         }
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    if stop_preview.load(Ordering::Relaxed) && preview_rx.is_empty() {
+                        break;
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }

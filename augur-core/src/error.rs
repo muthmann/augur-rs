@@ -21,6 +21,9 @@ pub enum CameraError {
     #[error("timeout: {0}")]
     Timeout(String),
 
+    #[error("end of stream")]
+    Eof,
+
     #[error("operation failed: {0}")]
     Other(String),
 }
