@@ -1,16 +1,12 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{atomic::Ordering, Arc},
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
 use augur_core::{
-    analysis::{
-        hotpixel::{HotpixelConfig, HotpixelDetector},
-        roi_grid::{self, RoiGrid},
-        AnalysisOutput, AnalysisPipeline, AnalysisSeverity, Overlay,
-    },
+    analysis::{AnalysisOutput, AnalysisSeverity, Overlay},
     camera::{DeviceInfo, EventCamera},
     config::CameraConfig,
     pipeline::{
@@ -20,7 +16,9 @@ use augur_core::{
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
-    analysis_settings::draw_analysis_settings, preview::frame_to_color_image,
+    plugin::{AnalysisPlugin, PluginContext, PluginInput},
+    plugins::create_all_plugins,
+    preview::frame_to_color_image,
     settings::draw_settings,
 };
 
@@ -33,13 +31,13 @@ enum AppMode {
 
 pub struct CameraApp {
     config: CameraConfig,
-    hotpixel_config: HotpixelConfig,
     output_path: String,
     mode: AppMode,
     controller: Option<PipelineController>,
     texture: Option<egui::TextureHandle>,
     latest_frame: Option<PreviewFrame>,
-    analysis_pipeline: AnalysisPipeline,
+    plugins: Vec<Box<dyn AnalysisPlugin>>,
+    plugin_context: PluginContext,
     analysis_output: AnalysisOutput,
     analysis_notice: Option<String>,
     acq_time_ms: u64,
@@ -49,10 +47,6 @@ pub struct CameraApp {
     mask_x: u16,
     mask_y: u16,
     mask_file: String,
-    roi_grid: Option<Arc<RoiGrid>>,
-    show_roi_grid: bool,
-    roi_grid_top_n: usize,
-    last_mask_snapshot: Vec<(u16, u16)>,
     last_error: Option<String>,
     last_stats_tick: Instant,
     camera_info: Option<DeviceInfo>,
@@ -63,13 +57,13 @@ impl CameraApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             config: CameraConfig::default(),
-            hotpixel_config: HotpixelConfig::default(),
             output_path: "./output.raw".into(),
             mode: AppMode::Idle,
             controller: None,
             texture: None,
             latest_frame: None,
-            analysis_pipeline: Self::build_analysis_pipeline(&HotpixelConfig::default()),
+            plugins: create_all_plugins(),
+            plugin_context: PluginContext::default(),
             analysis_output: AnalysisOutput::default(),
             analysis_notice: None,
             acq_time_ms: 50,
@@ -79,10 +73,6 @@ impl CameraApp {
             mask_x: 0,
             mask_y: 0,
             mask_file: String::new(),
-            roi_grid: None,
-            show_roi_grid: false,
-            roi_grid_top_n: 3,
-            last_mask_snapshot: Vec::new(),
             last_error: None,
             last_stats_tick: Instant::now(),
             camera_info: None,
@@ -90,22 +80,31 @@ impl CameraApp {
         }
     }
 
-    fn build_analysis_pipeline(hotpixel_config: &HotpixelConfig) -> AnalysisPipeline {
-        AnalysisPipeline::new(vec![Box::new(HotpixelDetector::new(
-            hotpixel_config.clone(),
-        ))])
-    }
-
     fn reset_analysis(&mut self) {
-        self.analysis_pipeline.reset();
+        for plugin in &mut self.plugins {
+            plugin.reset();
+        }
+        self.plugin_context.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
     }
 
-    fn rebuild_analysis_pipeline(&mut self) {
-        self.analysis_pipeline = Self::build_analysis_pipeline(&self.hotpixel_config);
-        self.analysis_output = AnalysisOutput::default();
-        self.analysis_notice = None;
+    fn plugins_need_raw_events(&self) -> bool {
+        self.plugins
+            .iter()
+            .any(|plugin| plugin.enabled() && plugin.input_kind() == PluginInput::RawEvents)
+    }
+
+    fn sync_pipeline_requirements(&self, controller: &PipelineController) {
+        controller
+            .raw_events_needed
+            .store(self.plugins_need_raw_events(), Ordering::Relaxed);
+    }
+
+    fn sync_active_pipeline_requirements(&self) {
+        if let Some(controller) = &self.controller {
+            self.sync_pipeline_requirements(controller);
+        }
     }
 
     fn validated_output_path(&self) -> Result<PathBuf, String> {
@@ -147,6 +146,7 @@ impl CameraApp {
         }
         match self.start_pipeline_inner(true) {
             Ok(controller) => {
+                self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
                 self.mode = AppMode::Previewing;
                 self.reset_analysis();
@@ -163,12 +163,12 @@ impl CameraApp {
         if self.mode == AppMode::Recording {
             return;
         }
-        // Stop preview pipeline if running
         if self.mode == AppMode::Previewing {
             self.stop_pipeline();
         }
         match self.start_pipeline_inner(false) {
             Ok(controller) => {
+                self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
                 self.mode = AppMode::Recording;
                 self.reset_analysis();
@@ -221,9 +221,7 @@ impl CameraApp {
         }
         self.texture = None;
         self.latest_frame = None;
-        self.analysis_output = AnalysisOutput::default();
-        self.analysis_notice = None;
-        self.analysis_pipeline.reset();
+        self.reset_analysis();
         self.mode = AppMode::Idle;
         self.camera_status =
             "Camera idle. Current local settings will be used for the next recording.".into();
@@ -266,6 +264,30 @@ impl CameraApp {
         self.last_error = None;
     }
 
+    fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
+        self.analysis_output = AnalysisOutput::default();
+        self.plugin_context.clear();
+        if self.plugins_need_raw_events() {
+            self.plugin_context.raw_events = frame.events.clone();
+        }
+
+        for phase in [
+            PluginInput::FrameOnly,
+            PluginInput::RawEvents,
+            PluginInput::DerivedData,
+        ] {
+            for plugin in &mut self.plugins {
+                if plugin.enabled() && plugin.input_kind() == phase {
+                    plugin.process_frame_with_context(
+                        frame,
+                        &mut self.analysis_output,
+                        &mut self.plugin_context,
+                    );
+                }
+            }
+        }
+    }
+
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
         let Some(ctrl) = &self.controller else {
             return;
@@ -280,17 +302,7 @@ impl CameraApp {
             return;
         };
 
-        self.analysis_output = self.analysis_pipeline.process_frame(&frame);
-
-        // Inject ROI grid overlay if enabled.
-        if self.show_roi_grid {
-            if let Some(grid) = &self.roi_grid {
-                self.analysis_output.overlays.push(Overlay::RoiGrid {
-                    grid: grid.clone(),
-                    highlight_top_n: self.roi_grid_top_n,
-                });
-            }
-        }
+        self.run_analysis_plugins(&frame);
 
         let image = frame_to_color_image(&frame, &self.analysis_output.overlays);
         self.latest_frame = Some(frame);
@@ -358,38 +370,15 @@ impl CameraApp {
             "Mask copy: added {added}, duplicates {duplicates}, skipped by DEM limit {capacity_skipped}."
         ));
     }
-
-    fn recompute_roi_grid(&mut self) {
-        let grid = roi_grid::compute_roi_grid(
-            &self.config.pixel_mask.masked_pixels,
-            1280,
-            720,
-            self.roi_grid_top_n.max(1),
-        );
-        self.last_mask_snapshot = self.config.pixel_mask.masked_pixels.clone();
-        self.roi_grid = Some(Arc::new(grid));
-    }
-
-    fn maybe_auto_recompute_roi_grid(&mut self) {
-        if self.config.pixel_mask.masked_pixels == self.last_mask_snapshot {
-            return;
-        }
-
-        if self.roi_grid.is_some() || self.show_roi_grid {
-            self.recompute_roi_grid();
-        } else {
-            self.last_mask_snapshot = self.config.pixel_mask.masked_pixels.clone();
-        }
-    }
 }
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_pipeline_error();
-        self.maybe_auto_recompute_roi_grid();
         self.update_preview_texture(ctx);
 
         let mode = self.mode;
+        let mut plugin_toggle_changed = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -439,6 +428,17 @@ impl eframe::App for CameraApp {
                 {
                     self.apply_runtime_changes();
                 }
+
+                ui.separator();
+                ui.menu_button("Analysis", |ui| {
+                    for plugin in &mut self.plugins {
+                        let mut enabled = plugin.enabled();
+                        if ui.checkbox(&mut enabled, plugin.name()).changed() {
+                            plugin.set_enabled(enabled);
+                            plugin_toggle_changed = true;
+                        }
+                    }
+                });
 
                 ui.separator();
 
@@ -514,6 +514,12 @@ impl eframe::App for CameraApp {
             });
         });
 
+        if plugin_toggle_changed {
+            self.analysis_output = AnalysisOutput::default();
+            self.analysis_notice = None;
+            self.sync_active_pipeline_requirements();
+        }
+
         egui::SidePanel::left("settings")
             .min_width(340.0)
             .show(ctx, |ui| {
@@ -554,80 +560,55 @@ impl eframe::App for CameraApp {
                         self.config_dirty = true;
                     }
                 });
+            });
 
-                ui.separator();
-                if draw_analysis_settings(ui, &mut self.hotpixel_config) {
-                    self.rebuild_analysis_pipeline();
-                }
+        let enabled_plugin_names: Vec<String> = self
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.enabled())
+            .map(|plugin| plugin.name().to_owned())
+            .collect();
+        let mut plugin_config_changed = false;
+        if !enabled_plugin_names.is_empty() {
+            egui::SidePanel::right("analysis")
+                .min_width(360.0)
+                .show(ctx, |ui| {
+                    ui.heading("Analysis Tools");
+                    ui.separator();
 
-                ui.separator();
-                ui.collapsing("ROI Grid", |ui| {
-                    ui.weak("Finds the largest hotpixel-free rectangular regions on the sensor. Partitions the pixel area into a grid around masked pixels, then searches for the biggest contiguous free rectangle \u{2014} useful for placing the ROI to maximize usable area while avoiding all defective pixels.");
-                    if ui.button("Compute ROI Grid").clicked() {
-                        self.recompute_roi_grid();
-                        self.show_roi_grid = true;
-                    }
-
-                    ui.checkbox(&mut self.show_roi_grid, "Show ROI Grid overlay");
-
-                    ui.horizontal(|ui| {
-                        ui.label("Top N").on_hover_text("Number of largest free rectangles to show. The biggest ones are the best candidates for ROI placement.");
-                        if ui
-                            .add(egui::DragValue::new(&mut self.roi_grid_top_n).clamp_range(1..=10))
-                            .changed()
-                            && self.roi_grid.is_some()
-                        {
-                            self.recompute_roi_grid();
+                    let (plugins, config) = (&mut self.plugins, &mut self.config);
+                    for plugin in plugins.iter_mut() {
+                        if !plugin.enabled() {
+                            continue;
                         }
-                    });
 
-                    if let Some(grid) = &self.roi_grid {
-                        ui.label(format!(
-                            "Grid: {}x{} cells, {} free",
-                            grid.x_bounds.len() - 1,
-                            grid.y_bounds.len() - 1,
-                            grid.free_cells.len(),
-                        ));
-
-                        if grid.largest_rects.is_empty() {
-                            ui.label("No free rectangles found.");
-                        } else {
-                            ui.label("Largest rectangles:");
-                            let mut use_idx = None;
-                            egui::ScrollArea::vertical()
-                                .max_height(120.0)
-                                .show(ui, |ui| {
-                                    for (i, rect) in grid.largest_rects.iter().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            ui.monospace(format!(
-                                                "#{} ({},{}) {}x{} = {} px",
-                                                i + 1,
-                                                rect.x,
-                                                rect.y,
-                                                rect.width,
-                                                rect.height,
-                                                rect.area(),
-                                            ));
-                                            if ui.small_button("Use as ROI").clicked() {
-                                                use_idx = Some(i);
-                                            }
-                                        });
-                                    }
-                                });
-                            if let Some(i) = use_idx {
-                                let r = &grid.largest_rects[i];
-                                self.config.roi.x = r.x;
-                                self.config.roi.y = r.y;
-                                self.config.roi.width = r.width;
-                                self.config.roi.height = r.height;
-                                self.config_dirty = self.controller.is_some();
-                            }
+                        let missing_dependencies: Vec<&str> = plugin
+                            .dependencies()
+                            .iter()
+                            .copied()
+                            .filter(|dependency| {
+                                !enabled_plugin_names.iter().any(|name| name == dependency)
+                            })
+                            .collect();
+                        if !missing_dependencies.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("Missing dependency: {}", missing_dependencies.join(", ")),
+                            );
                         }
-                    } else {
-                        ui.label("Click 'Compute ROI Grid' to analyze masked pixels.");
+
+                        if plugin.ui_settings(ui, config) {
+                            plugin_config_changed = true;
+                        }
+
+                        ui.separator();
                     }
                 });
-            });
+        }
+
+        if plugin_config_changed {
+            self.config_dirty = true;
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Live Preview");
@@ -638,7 +619,7 @@ impl eframe::App for CameraApp {
                     "{} | serial: {} | firmware: {}",
                     info.compatible.as_deref().unwrap_or(&info.model),
                     info.serial.as_deref().unwrap_or("-"),
-                    info.firmware.as_deref().unwrap_or("-")
+                    info.firmware.as_deref().unwrap_or("-"),
                 ));
             }
 

@@ -1,5 +1,6 @@
-mod analysis_settings;
 mod app;
+mod plugin;
+mod plugins;
 mod preview;
 mod settings;
 

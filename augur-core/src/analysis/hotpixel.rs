@@ -129,6 +129,7 @@ mod tests {
             width,
             height,
             pixels,
+            events: None,
             window_start_us: 0,
             window_end_us: 1,
         }

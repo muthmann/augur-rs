@@ -27,13 +27,14 @@ At most 64 hotpixels (IMX636 DEM limit) produce a grid of at most ~129x129 = 16,
 |------|------|
 | `augur-core/src/analysis/roi_grid.rs` | Core algorithm + unit tests |
 | `augur-core/src/analysis/mod.rs` | Module registration, `Overlay::RoiGrid` variant |
+| `augur-gui/src/plugins/roi_grid.rs` | GUI plugin state, ROI-grid settings UI, recompute logic, "Use as ROI" wiring |
 | `augur-gui/src/preview.rs` | Grid overlay rendering (grid lines, cell tints, highlighted rects) |
-| `augur-gui/src/app.rs` | GUI state, compute button, toggle, largest-rect list, "Use as ROI" |
+| `augur-gui/src/plugin.rs` | Shared GUI plugin trait used by all analysis tools |
 
 ## GUI Workflow
 
-1. Add masked pixels via the Pixel Mask (DEM) panel or hotpixel detection.
-2. Open the **ROI Grid** collapsible section in the settings panel.
+1. Enable **ROI Grid** from the toolbar **Analysis** dropdown.
+2. Open the ROI Grid section in the right-side **Analysis Tools** panel.
 3. Click **Compute ROI Grid** — grid is computed and overlay shown.
 4. Toggle **Show ROI Grid overlay** to visualize grid lines and regions on the preview.
 5. Adjust **Top N** to control how many largest rectangles are highlighted.

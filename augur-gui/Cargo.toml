@@ -15,3 +15,4 @@ augur-prophesee = { path = "../augur-prophesee" }
 eframe.workspace = true
 egui.workspace = true
 rfd.workspace = true
+rustfft.workspace = true

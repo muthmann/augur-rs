@@ -17,6 +17,12 @@ impl Pixel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubpixelMarker {
+    pub x: f32,
+    pub y: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisSeverity {
     Info,
@@ -36,6 +42,11 @@ pub enum Overlay {
     HighlightPixels {
         pixels: Vec<Pixel>,
         color: [u8; 4],
+    },
+    CrosshairMarkers {
+        markers: Vec<SubpixelMarker>,
+        color: [u8; 4],
+        arm_len: u16,
     },
     RoiGrid {
         grid: Arc<roi_grid::RoiGrid>,

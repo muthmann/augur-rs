@@ -8,89 +8,93 @@ The `augur-gui` desktop app wraps the same backend as the CLI with a live previe
 cargo run --bin augur-gui
 ```
 
-## Toolbar Workflow
+---
+
+## Toolbar
 
 The top toolbar provides the main session controls:
 
-- `Probe`: query the EVK4 and display model, serial, and firmware information
-- `Preview`: start live preview without writing to disk
-- `Record`: start recording to the configured output path
-- `Stop`: stop preview or recording
-- `Apply Settings`: push pending runtime changes while previewing or recording
-- `Save Config` / `Load Config`: store or restore TOML settings
+| Button | Action |
+|---|---|
+| `Probe` | Query the EVK4 and display model, serial, and firmware information |
+| `Preview` | Start live preview without writing to disk |
+| `Record` | Start recording to the configured output path |
+| `Stop` | Stop preview or recording |
+| `Apply Settings` | Push pending runtime changes while previewing or recording |
+| `Analysis` | Enable or disable plugins from a dropdown menu |
+| `Save Config` / `Load Config` | Store or restore TOML settings |
 
-The GUI also shows the current output path and the current camera state.
+---
 
-## Settings Panel
+## Settings Panel (Left)
 
-The left panel groups runtime settings into focused sections.
+Camera-only controls, always available regardless of plugins.
 
 ### Biases
 
-Sliders for:
-
-- `diff_on`
-- `diff_off`
-- `fo`
-- `hpf`
-- `refr`
-
-Each control includes a short explanation of the tradeoff between sensitivity, latency, and noise.
+Sliders for `diff_on`, `diff_off`, `fo`, `hpf`, `refr`. Each includes a short explanation of the tradeoff between sensitivity, latency, and noise.
 
 ### ROI
 
-Set:
-
-- `x`
-- `y`
-- `width`
-- `height`
-
-Use ROI to reduce the active sensor area and event bandwidth.
+Set `x`, `y`, `width`, `height` to reduce the active sensor area and event bandwidth.
 
 ### Pixel Mask (DEM)
 
-Manage individual masked pixels in hardware:
+Manage the 64-slot hardware pixel mask:
 
 - add coordinates manually
 - remove coordinates from the list
 - clear the list
 - select a mask bitfield file
 
-The GUI keeps the mask list visible and enforces the 64-slot hardware budget when adding pixels interactively.
+The GUI enforces the 64-slot hardware budget when adding pixels interactively.
 
 ### Digital Filters
 
-Enable one of the two on-sensor filters:
+Enable one of the two on-sensor filters: **STC** or **Trail**. They are mutually exclusive because they share the same hardware block.
 
-- STC
-- Trail
+---
 
-They are mutually exclusive in the UI because they share the same hardware block.
+## Analysis Panel (Right) — Plugin Extension Point
+
+> **The analysis panel is powered by the plugin system.** The plugins shown here are loaded from the [augur-plugins](https://github.com/muthmann/augur-plugins) repository and compiled in. The panel only appears when at least one plugin is enabled.
+
+Plugins run live alongside the preview stream. Each plugin gets a collapsible section in the panel with its own settings. Plugins can depend on each other — one plugin's output can feed the next within the same frame.
+
+See the [Plugin Architecture](./features/analysis-plugins.md) doc for how to add your own.
+
+### Plugins available in augur-plugins
+
+**Hotpixel Detection**
+- Highlights likely hotpixels in the preview
+- Shows warnings in the main panel
+- Can copy detected hotpixels directly into the DEM mask list
+
+**ROI Grid**
+- Computes hotpixel-free rectangular regions from the current mask
+- Visualizes blocked and free regions on the preview
+- Lists the largest valid rectangles; click `Use as ROI` to apply one
+
+**Molecule Localization**
+- Reconstructs a localization image from the event stream
+- Denoises candidate spots with wavelet filtering
+- Fits sub-pixel elliptical Gaussian emitters
+- Renders crosshair markers at accepted positions
+- Publishes localization results for downstream plugins
+
+**Focus Metrics**
+- Three selectable focus estimators:
+  - Mean PSF sigma (from localization fits) — lower = sharper
+  - FFT high-frequency power (standalone, no localization needed) — higher = sharper
+  - Astigmatic `sigma_x / sigma_y` ratio
+- Rolling history plot with coarse focus-quality indicator
+- Dependency warnings surface when a localization-driven mode is active without the localization plugin
+
+---
 
 ## Runtime Behavior
 
-- In `Idle`, edits affect the next preview or recording
-- In `Previewing` or `Recording`, edits stay local until `Apply Settings`
+- In `Idle`: edits affect the next preview or recording session
+- In `Previewing` or `Recording`: edits stay local until `Apply Settings`
 - `Lock settings while recording` prevents runtime changes during capture
 - Acquisition time can be adjusted separately from the main config and applied at runtime
-
-## Analysis Tools
-
-The GUI includes preview-side analysis utilities that do not change hardware state until you explicitly copy or apply settings.
-
-### Hotpixel Analysis
-
-- highlights likely hotpixels in the preview pipeline
-- shows warnings in the main panel
-- can copy detected hotpixels into the DEM mask list
-
-### ROI Grid
-
-The ROI-grid panel computes hotpixel-free rectangular regions from the current mask list.
-
-Use it to:
-
-- visualize blocked and free regions on the preview
-- inspect the largest valid rectangles
-- copy one candidate directly into the ROI fields with `Use as ROI`

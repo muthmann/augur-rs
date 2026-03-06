@@ -77,6 +77,7 @@ pub struct PreviewFrame {
     pub width: u16,
     pub height: u16,
     pub pixels: Vec<u16>,
+    pub events: Option<Vec<CdEvent>>,
     pub window_start_us: u64,
     pub window_end_us: u64,
 }
@@ -197,6 +198,7 @@ pub struct PipelineController {
     pub frame_rx: Receiver<PreviewFrame>,
     pub settings_tx: Sender<CameraConfig>,
     pub acq_time_us: Arc<AtomicU64>,
+    pub raw_events_needed: Arc<AtomicBool>,
     error_rx: Receiver<String>,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStatsInner>>,
@@ -275,6 +277,7 @@ where
     let (error_tx, error_rx) = bounded::<String>(32);
 
     let acq_time_us = Arc::new(AtomicU64::new(50_000));
+    let raw_events_needed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(PipelineStatsInner::new()));
 
@@ -282,6 +285,7 @@ where
     let stop_preview = Arc::clone(&stop);
     let stats_usb = Arc::clone(&stats);
     let acq_preview = Arc::clone(&acq_time_us);
+    let raw_events_preview = Arc::clone(&raw_events_needed);
     let error_usb = error_tx.clone();
     let error_preview = error_tx.clone();
 
@@ -489,6 +493,7 @@ where
     let height = options.sensor_height;
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
+        let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
         let mut frame_buf = vec![0_u16; width as usize * height as usize];
         let mut frame_start_ts: Option<u64> = None;
 
@@ -516,15 +521,31 @@ where
                         frame_buf[idx] = frame_buf[idx].saturating_add(1);
                         frame_start_ts.get_or_insert(ev.timestamp);
                     }
+                    if raw_events_preview.load(Ordering::Relaxed) {
+                        frame_events.extend_from_slice(&events);
+                    } else if !frame_events.is_empty() {
+                        frame_events.clear();
+                    }
 
                     if let (Some(t0), Some(last_ts)) =
                         (frame_start_ts, events.last().map(|e| e.timestamp))
                     {
                         if last_ts.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed) {
+                            let raw_events = if raw_events_preview.load(Ordering::Relaxed) {
+                                let next_capacity = frame_events.capacity().max(8_192);
+                                Some(std::mem::replace(
+                                    &mut frame_events,
+                                    Vec::with_capacity(next_capacity),
+                                ))
+                            } else {
+                                frame_events.clear();
+                                None
+                            };
                             let frame = PreviewFrame {
                                 width,
                                 height,
                                 pixels: frame_buf.clone(),
+                                events: raw_events,
                                 window_start_us: t0,
                                 window_end_us: last_ts,
                             };
@@ -555,6 +576,7 @@ where
         frame_rx,
         settings_tx,
         acq_time_us,
+        raw_events_needed,
         error_rx,
         stop,
         stats,

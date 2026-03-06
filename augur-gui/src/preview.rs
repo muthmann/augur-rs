@@ -42,14 +42,33 @@ pub fn frame_to_color_image(frame: &PreviewFrame, overlays: &[Overlay]) -> Color
 
     // Sparse overlays (HighlightPixels) as a separate pass — only touches marked pixels.
     for overlay in overlays {
-        if let Overlay::HighlightPixels { pixels, color } = overlay {
-            for pixel in pixels {
-                if pixel.x >= frame.width || pixel.y >= frame.height {
-                    continue;
+        match overlay {
+            Overlay::HighlightPixels { pixels, color } => {
+                for pixel in pixels {
+                    if pixel.x >= frame.width || pixel.y >= frame.height {
+                        continue;
+                    }
+                    let idx = (pixel.y as usize * w + pixel.x as usize) * 4;
+                    blend_rgba(&mut rgba[idx..idx + 4], *color);
                 }
-                let idx = (pixel.y as usize * w + pixel.x as usize) * 4;
-                blend_rgba(&mut rgba[idx..idx + 4], *color);
             }
+            Overlay::CrosshairMarkers {
+                markers,
+                color,
+                arm_len,
+            } => {
+                for marker in markers {
+                    draw_crosshair(
+                        &mut rgba,
+                        [w, h],
+                        marker.x,
+                        marker.y,
+                        usize::from(*arm_len),
+                        *color,
+                    );
+                }
+            }
+            Overlay::RoiGrid { .. } => {}
         }
     }
 
@@ -190,11 +209,46 @@ fn blend_rgba(dst: &mut [u8], src: [u8; 4]) {
     let inv_alpha = 255 - alpha;
 
     for channel in 0..3 {
-        let blended =
-            (u32::from(dst[channel]) * inv_alpha + u32::from(src[channel]) * alpha) / 255;
+        let blended = (u32::from(dst[channel]) * inv_alpha + u32::from(src[channel]) * alpha) / 255;
         dst[channel] = blended as u8;
     }
     dst[3] = 255;
+}
+
+fn draw_crosshair(
+    rgba: &mut [u8],
+    size: [usize; 2],
+    x: f32,
+    y: f32,
+    arm_len: usize,
+    color: [u8; 4],
+) {
+    let [width, height] = size;
+    let cx = x.round() as isize;
+    let cy = y.round() as isize;
+    let arm_len = arm_len.max(2) as isize;
+
+    for dx in -arm_len..=arm_len {
+        if dx.abs() <= 1 {
+            continue;
+        }
+        blend_pixel(rgba, width, height, cx + dx, cy, color);
+    }
+    for dy in -arm_len..=arm_len {
+        if dy.abs() <= 1 {
+            continue;
+        }
+        blend_pixel(rgba, width, height, cx, cy + dy, color);
+    }
+    blend_pixel(rgba, width, height, cx, cy, color);
+}
+
+fn blend_pixel(rgba: &mut [u8], width: usize, height: usize, x: isize, y: isize, color: [u8; 4]) {
+    if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+        return;
+    }
+    let idx = (y as usize * width + x as usize) * 4;
+    blend_rgba(&mut rgba[idx..idx + 4], color);
 }
 
 fn draw_rect_border(

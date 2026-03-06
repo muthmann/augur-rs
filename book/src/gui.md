@@ -17,13 +17,14 @@ The top toolbar provides the main session controls:
 - `Record`: start recording to the configured output path
 - `Stop`: stop preview or recording
 - `Apply Settings`: push pending runtime changes while previewing or recording
+- `Analysis`: enable or disable analysis plugins from a dropdown menu
 - `Save Config` / `Load Config`: store or restore TOML settings
 
 The GUI also shows the current output path and the current camera state.
 
 ## Settings Panel
 
-The left panel groups runtime settings into focused sections.
+The left panel is camera-only and groups runtime settings into focused sections.
 
 ### Biases
 
@@ -64,29 +65,40 @@ Enable one of the two on-sensor filters:
 
 They are mutually exclusive in the UI because they share the same hardware block.
 
+## Analysis Panel
+
+When at least one analysis plugin is enabled, a right-side **Analysis Tools** panel appears.
+
+- each enabled plugin gets a collapsible section
+- plugins can exchange per-frame derived data through a typed context
+- disabling all plugins hides the panel
+
+### Hotpixel Detection Plugin
+
+- highlights likely hotpixels in the preview pipeline
+- shows warnings in the main panel
+- can copy detected hotpixels into the DEM mask list
+
+### ROI Grid Plugin
+
+Computes hotpixel-free rectangular regions from the current mask list.
+
+### Molecule Localization Plugin
+
+- wavelet-filters the preview stream for emitter candidates
+- fits sub-pixel Gaussian spots
+- renders crosshair overlays
+- publishes localization results for downstream plugins
+
+### Focus Metrics Plugin
+
+- mean PSF sigma from localizations
+- FFT high-frequency sharpness metric
+- astigmatic ratio for directional focus analysis
+
 ## Runtime Behavior
 
 - In `Idle`, edits affect the next preview or recording
 - In `Previewing` or `Recording`, edits stay local until `Apply Settings`
 - `Lock settings while recording` prevents runtime changes during capture
 - Acquisition time can be adjusted separately from the main config and applied at runtime
-
-## Analysis Tools
-
-The GUI includes preview-side analysis utilities that do not change hardware state until you explicitly copy or apply settings.
-
-### Hotpixel Analysis
-
-- highlights likely hotpixels in the preview pipeline
-- shows warnings in the main panel
-- can copy detected hotpixels into the DEM mask list
-
-### ROI Grid
-
-The ROI-grid panel computes hotpixel-free rectangular regions from the current mask list.
-
-Use it to:
-
-- visualize blocked and free regions on the preview
-- inspect the largest valid rectangles
-- copy one candidate directly into the ROI fields with `Use as ROI`
