@@ -12,7 +12,7 @@ use augur_core::{
     pipeline::{
         spawn_pipeline, Evt3CorePreviewDecoder, PipelineController, PipelineOptions, PreviewFrame,
     },
-    replay::{RawFileCamera, ReplayControls, ReplayFileInfo},
+    replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
 };
 use augur_plugin_api::PluginInput;
 use augur_prophesee::evk4::Evk4Camera;
@@ -1495,10 +1495,6 @@ fn replay_speed_matches(current: f32, candidate: f32) -> bool {
     } else {
         (current - candidate).abs() < f32::EPSILON
     }
-}
-
-fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
-    relative_offset & !1
 }
 
 fn format_replay_time(duration_us: u64) -> String {

@@ -73,12 +73,6 @@ impl FfiString {
         }
     }
 
-    #[allow(clippy::should_implement_trait)]
-    #[deprecated(note = "use FfiString::from(...) or FfiString::borrowed(...)")]
-    pub fn from_str(value: &str) -> Self {
-        Self::borrowed(value)
-    }
-
     /// Returns a borrowed UTF-8 view over the raw FFI buffer.
     ///
     /// # Safety

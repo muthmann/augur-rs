@@ -397,7 +397,7 @@ fn align_evt3_word_offset(data_offset: u64, absolute_offset: u64) -> u64 {
     data_offset + align_relative_evt3_word_offset(absolute_offset.saturating_sub(data_offset))
 }
 
-fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
+pub fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
     relative_offset & !1
 }
 

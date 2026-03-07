@@ -85,9 +85,14 @@ fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
         return 1;
     }
 
-    let mut hist = vec![0u32; max_val + 1];
+    // Cap histogram at 4096 entries (16 KB). Values above the cap are clamped
+    // into the last bin, so a single hot pixel at 65535 does not force a
+    // 256 KB allocation every frame.
+    const MAX_BINS: usize = 4096;
+    let hist_size = max_val.min(MAX_BINS - 1) + 1;
+    let mut hist = vec![0u32; hist_size];
     for &value in pixels {
-        hist[value as usize] += 1;
+        hist[(value as usize).min(hist_size - 1)] += 1;
     }
 
     let percentile = percentile.clamp(0.0, 100.0);
@@ -101,7 +106,7 @@ fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
         }
     }
 
-    max_val.max(1) as u16
+    hist_size.max(1) as u16
 }
 
 fn normalized_green(value: u16, max: f32) -> u8 {
@@ -312,8 +317,10 @@ fn draw_rect_border(
             }
         }
     }
-    // Left and right edges.
-    for py in rect.y..y_end {
+    // Left and right edges — skip rows already covered by the top/bottom passes.
+    let inner_y = (rect.y + thickness).min(y_end);
+    let inner_y_end = y_end.saturating_sub(thickness).max(inner_y);
+    for py in inner_y..inner_y_end {
         for t in 0..thickness {
             if rect.x + t < x_end {
                 let idx = (py * width + rect.x + t) * 4;
