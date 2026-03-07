@@ -8,7 +8,7 @@ AugurRS can replay recorded EVT3 `.raw` files through the same preview and plugi
 
 Replay lives in `augur-core` as `RawFileCamera`, so the rest of the stack can treat file playback like any other packet-stream camera.
 
-- parses the EVT3 header (`% format`, `% geometry`, `% end`) before streaming
+- parses the EVT3 header (`% format`, `% geometry`, `% end`) before streaming; tolerates older files that omit `% format` or contain non-UTF-8 header bytes
 - records the replay data offset and source geometry once in `ReplayFileInfo`
 - scans only the first and last replay windows to estimate total duration and nominal byte rate
 - reopens at an arbitrary byte offset through `RawFileCamera::open_at`
@@ -72,6 +72,14 @@ This is intentionally lightweight and fast rather than perfectly timestamp-aware
 | `augur-core/src/error.rs` | `CameraError::Eof` |
 | `augur-core/src/pipeline.rs` | Clean EOF handling and preview-queue drain on shutdown |
 | `augur-gui/src/app.rs` | Replay mode, persisted EOF state, transport controls, seeking, restart |
+
+## Older File Compatibility
+
+Older Prophesee `.raw` files (e.g. recorded with earlier MetaVision SDK versions) may differ from the current header convention in three ways:
+
+1. **Non-UTF-8 header bytes** — the header parser uses `read_until` + `from_utf8_lossy` so stray binary bytes are tolerated.
+2. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
+3. **Truncated EVT3 stream** — `finish_stream()` errors during the fast timestamp scan are silenced; whatever timestamps were decoded before the unexpected EOF are used as-is.
 
 ## Verification
 
