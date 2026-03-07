@@ -93,6 +93,10 @@ Dynamic plugins no longer render `egui` directly. Instead they expose:
 5. Copy the built library plus manifest into `~/.augur/plugins/<name>/`
 6. Use the GUI Plugin Manager to scan and load it
 
+The `Plugin` trait includes an optional `dependencies()` method that returns a slice of plugin name strings. The Plugin Manager uses these to show dependency relationships. If your plugin consumes an upstream context payload (such as `CTX_LOCALIZATION_RESULTS`) and cannot operate at all without that upstream producer, return its name from `dependencies()`. If your plugin degrades gracefully when the payload is absent, prefer a runtime warning over a hard dependency declaration.
+
+See [augur-plugins](https://github.com/muthmann/augur-plugins) for the template and full contributor guide.
+
 This workspace includes reference plugin crates under:
 
 - `plugins/hotpixel`

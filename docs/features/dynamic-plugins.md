@@ -29,15 +29,27 @@ Library extensions vary by platform:
 
 ## Manifest
 
-Each plugin directory must contain a `plugin.toml` with loader metadata such as:
+Each plugin directory must contain a `plugin.toml`:
 
-- `name`
-- `version`
-- `description`
-- `domain`
-- optional `library` base name
+```toml
+name = "Hotpixel Detection"
+version = "0.1.0"
+description = "Detects persistently noisy pixels."
+domain = "general"
+library = "augur_plugin_hotpixel"
+```
 
-If `library` is omitted, the loader falls back to auto-discovering a single matching dynamic library in the directory.
+Fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | yes | Display name shown in the Plugin Manager |
+| `version` | yes | Semantic version string |
+| `description` | yes | One-line summary |
+| `domain` | yes | Category tag (`general`, `smlm`, `biophotonics`, …) |
+| `library` | no | Base name of the dynamic library, **without** the `lib` prefix and without the platform extension (`.dylib`, `.so`, `.dll`). If omitted, the loader auto-discovers a single library file in the directory. |
+
+For example, `library = "augur_plugin_hotpixel"` resolves to `libaugur_plugin_hotpixel.dylib` on macOS, `libaugur_plugin_hotpixel.so` on Linux, and `augur_plugin_hotpixel.dll` on Windows.
 
 ## Plugin Manager Workflow
 
@@ -68,6 +80,27 @@ cp target/release/libaugur_plugin_hotpixel.dylib ~/.augur/plugins/hotpixel/
 ```
 
 After copying the files, launch `augur-gui` and use **Plugins → Scan for New Plugins**.
+
+## Troubleshooting
+
+### "missing field `name`"
+
+The `plugin.toml` still uses the old `[plugin]` section format:
+
+```toml
+[plugin]
+name = "..."
+```
+
+Update it to top-level fields as shown in the Manifest section above.
+
+### "no .dylib / .so / .dll found"
+
+A source folder was copied instead of the built library. Build in `--release` mode first, then copy the generated dynamic library.
+
+### "loading symbol augur_plugin_vtable failed"
+
+The library was built against the old compile-time plugin API. Port it to `augur-plugin-api::Plugin` and export it with `export_plugin!`.
 
 ## Why C FFI + `libloading`
 
