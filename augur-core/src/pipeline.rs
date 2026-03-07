@@ -569,14 +569,10 @@ where
             }
         }
 
-        if let Err(e) = decoder.finish_stream() {
-            report_pipeline_error(
-                &error_preview,
-                &stop_preview,
-                "preview",
-                format!("EVT3 stream finalize failed: {e}"),
-            );
-        }
+        // finish_stream may fail for older files whose EVT3 stream has no
+        // clean terminator; this is not a pipeline error — all events before
+        // EOF were already decoded and delivered.
+        let _ = decoder.finish_stream();
     });
 
     threads.push(preview_thread);

@@ -79,7 +79,7 @@ Older Prophesee `.raw` files (e.g. recorded with earlier MetaVision SDK versions
 
 1. **Non-UTF-8 header bytes** — the header parser uses `read_until` + `from_utf8_lossy` so stray binary bytes are tolerated.
 2. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
-3. **Truncated EVT3 stream** — `finish_stream()` errors during the fast timestamp scan are silenced; whatever timestamps were decoded before the unexpected EOF are used as-is.
+3. **Truncated EVT3 stream** — `finish_stream()` errors are silenced in both the fast timestamp scan (`replay.rs`) and the preview pipeline shutdown (`pipeline.rs`); all events decoded before the unexpected EOF are delivered normally.
 
 ## Verification
 
