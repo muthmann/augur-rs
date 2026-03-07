@@ -29,7 +29,7 @@ At most 64 hotpixels (IMX636 DEM limit) produce a grid of at most ~129x129 = 16,
 | `augur-core/src/analysis/mod.rs` | Module registration, `Overlay::RoiGrid` variant |
 | `augur-gui/src/plugins/roi_grid.rs` | GUI plugin state, ROI-grid settings UI, recompute logic, "Use as ROI" wiring |
 | `augur-gui/src/preview.rs` | Grid overlay rendering (grid lines, cell tints, highlighted rects) |
-| `augur-gui/src/plugin.rs` | Shared GUI plugin trait used by all analysis tools |
+| `augur-gui/src/plugin.rs` | Built-in plugin trait used by ROI Grid |
 
 ## GUI Workflow
 

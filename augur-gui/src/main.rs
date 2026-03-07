@@ -1,5 +1,7 @@
 mod app;
 mod plugin;
+mod plugin_loader;
+mod plugin_settings_ui;
 mod plugins;
 mod preview;
 mod settings;

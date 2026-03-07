@@ -4,10 +4,9 @@ These notes capture feature-level behavior and implementation constraints useful
 
 ## Plugin Ecosystem
 
-Plugin implementations are maintained in the companion repository:
-**[augur-plugins](https://github.com/muthmann/augur-plugins)** — plugin registry, implementations, and contribution guide.
+This repository defines the plugin API, runtime loader, and a small set of reference dynamic plugin crates. The long-term home for the broader plugin registry remains **[augur-plugins](https://github.com/muthmann/augur-plugins)**.
 
-This repository defines the plugin API and runtime. See [Plugin Architecture](./analysis-plugins.md) for the interface spec.
+See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dynamic Plugin Loading](./dynamic-plugins.md) for the install/reload workflow.
 
 ---
 
@@ -16,7 +15,8 @@ This repository defines the plugin API and runtime. See [Plugin Architecture](./
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
 - [RAW Replay](./raw-replay.md) — fast-open file replay, seekable transport controls, persisted EOF state
 - [Collapsible GUI Panels](./collapsible-panels.md) — toolbar toggles for the settings and analysis side panels
-- [Plugin Architecture](./analysis-plugins.md) — compile-time plugin model, typed plugin context, phased execution, raw-event transport
+- [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
+- [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection
 
 The following notes document plugins that ship in [augur-plugins](https://github.com/muthmann/augur-plugins):

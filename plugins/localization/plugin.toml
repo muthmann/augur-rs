@@ -1,0 +1,5 @@
+name = "Molecule Localization"
+version = "0.1.0"
+domain = "Reference"
+description = "Wavelet-filtered spot detection with center-of-mass seeding and Gaussian fitting."
+library = "augur_plugin_localization"

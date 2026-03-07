@@ -1,0 +1,5 @@
+name = "Hotpixel Detection"
+version = "0.1.0"
+domain = "Reference"
+description = "Detects persistently noisy pixels in the preview stream."
+library = "augur_plugin_hotpixel"

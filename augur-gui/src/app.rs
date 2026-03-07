@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
@@ -13,13 +14,13 @@ use augur_core::{
     },
     replay::{RawFileCamera, ReplayControls, ReplayFileInfo},
 };
+use augur_plugin_api::PluginInput;
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
-    plugin::{AnalysisPlugin, PluginContext, PluginInput},
-    plugins::create_all_plugins,
-    preview::frame_to_color_image,
-    settings::draw_settings,
+    plugin::AnalysisPlugin, plugin_loader::PluginManager,
+    plugin_settings_ui::render_plugin_settings, plugins::create_all_plugins,
+    preview::frame_to_color_image, settings::draw_settings,
 };
 
 const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
@@ -63,8 +64,9 @@ pub struct CameraApp {
     replay_notice: Option<String>,
     replay_seek_drag_value: Option<f32>,
     saved_live_state: Option<SavedLiveState>,
-    plugins: Vec<Box<dyn AnalysisPlugin>>,
-    plugin_context: PluginContext,
+    builtin_plugins: Vec<Box<dyn AnalysisPlugin>>,
+    plugin_manager: PluginManager,
+    plugin_context_data: HashMap<String, Vec<u8>>,
     analysis_output: AnalysisOutput,
     analysis_notice: Option<String>,
     acq_time_ms: u64,
@@ -74,6 +76,7 @@ pub struct CameraApp {
     lock_settings_while_recording: bool,
     settings_panel_open: bool,
     analysis_panel_open: bool,
+    plugins_window_open: bool,
     mask_x: u16,
     mask_y: u16,
     mask_file: String,
@@ -84,6 +87,9 @@ pub struct CameraApp {
 
 impl CameraApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let mut plugin_manager = PluginManager::new_default();
+        let plugin_scan_error = plugin_manager.scan_and_load().err();
+
         Self {
             config: CameraConfig::default(),
             output_path: "./output.raw".into(),
@@ -101,8 +107,9 @@ impl CameraApp {
             replay_notice: None,
             replay_seek_drag_value: None,
             saved_live_state: None,
-            plugins: create_all_plugins(),
-            plugin_context: PluginContext::default(),
+            builtin_plugins: create_all_plugins(),
+            plugin_manager,
+            plugin_context_data: HashMap::new(),
             analysis_output: AnalysisOutput::default(),
             analysis_notice: None,
             acq_time_ms: 50,
@@ -112,28 +119,39 @@ impl CameraApp {
             lock_settings_while_recording: true,
             settings_panel_open: true,
             analysis_panel_open: true,
+            plugins_window_open: false,
             mask_x: 0,
             mask_y: 0,
             mask_file: String::new(),
-            last_error: None,
+            last_error: plugin_scan_error,
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
         }
     }
 
     fn reset_analysis(&mut self) {
-        for plugin in &mut self.plugins {
+        for plugin in &mut self.builtin_plugins {
             plugin.reset();
         }
-        self.plugin_context.clear();
+        for record in self.plugin_manager.records_mut() {
+            if let Some(plugin) = record.plugin_mut() {
+                plugin.reset();
+            }
+        }
+        self.plugin_context_data.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
     }
 
     fn plugins_need_raw_events(&self) -> bool {
-        self.plugins
+        self.builtin_plugins
             .iter()
             .any(|plugin| plugin.enabled() && plugin.input_kind() == PluginInput::RawEvents)
+            || self.plugin_manager.records().iter().any(|record| {
+                record.plugin().is_some_and(|plugin| {
+                    plugin.enabled() && plugin.input_kind() == PluginInput::RawEvents
+                })
+            })
     }
 
     fn sync_pipeline_requirements(&self, controller: &PipelineController) {
@@ -146,6 +164,24 @@ impl CameraApp {
         if let Some(controller) = &self.controller {
             self.sync_pipeline_requirements(controller);
         }
+    }
+
+    fn enabled_plugin_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .builtin_plugins
+            .iter()
+            .filter(|plugin| plugin.enabled())
+            .map(|plugin| plugin.name().to_owned())
+            .collect();
+        names.extend(
+            self.plugin_manager
+                .records()
+                .iter()
+                .filter_map(|record| record.plugin())
+                .filter(|plugin| plugin.enabled())
+                .map(|plugin| plugin.name().to_owned()),
+        );
+        names
     }
 
     fn validated_output_path(&self) -> Result<PathBuf, String> {
@@ -595,22 +631,28 @@ impl CameraApp {
 
     fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
         self.analysis_output = AnalysisOutput::default();
-        self.plugin_context.clear();
-        if self.plugins_need_raw_events() {
-            self.plugin_context.raw_events = frame.events.clone();
-        }
+        self.plugin_context_data.clear();
 
         for phase in [
             PluginInput::FrameOnly,
             PluginInput::RawEvents,
             PluginInput::DerivedData,
         ] {
-            for plugin in &mut self.plugins {
+            for plugin in &mut self.builtin_plugins {
                 if plugin.enabled() && plugin.input_kind() == phase {
-                    plugin.process_frame_with_context(
+                    plugin.process_frame(frame, &mut self.analysis_output);
+                }
+            }
+
+            for record in self.plugin_manager.records_mut() {
+                let Some(plugin) = record.plugin_mut() else {
+                    continue;
+                };
+                if plugin.enabled() && plugin.input_kind() == phase {
+                    plugin.process_frame(
                         frame,
                         &mut self.analysis_output,
-                        &mut self.plugin_context,
+                        &mut self.plugin_context_data,
                     );
                 }
             }
@@ -762,6 +804,8 @@ impl eframe::App for CameraApp {
 
         let mode = self.mode;
         let mut plugin_toggle_changed = false;
+        let mut plugin_scan_requested = false;
+        let mut open_plugins_dir_requested = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -830,12 +874,43 @@ impl eframe::App for CameraApp {
                     self.analysis_panel_open = !self.analysis_panel_open;
                 }
                 ui.menu_button("Analysis", |ui| {
-                    for plugin in &mut self.plugins {
+                    for plugin in &mut self.builtin_plugins {
                         let mut enabled = plugin.enabled();
                         if ui.checkbox(&mut enabled, plugin.name()).changed() {
                             plugin.set_enabled(enabled);
                             plugin_toggle_changed = true;
                         }
+                    }
+                    for record in self.plugin_manager.records_mut() {
+                        let Some(plugin) = record.plugin_mut() else {
+                            continue;
+                        };
+                        let mut enabled = plugin.enabled();
+                        if ui.checkbox(&mut enabled, plugin.name()).changed() {
+                            plugin.set_enabled(enabled);
+                            plugin_toggle_changed = true;
+                        }
+                    }
+                });
+                ui.menu_button("Plugins", |ui| {
+                    if ui
+                        .button(if self.plugins_window_open {
+                            "Hide Plugin Manager"
+                        } else {
+                            "Show Plugin Manager"
+                        })
+                        .clicked()
+                    {
+                        self.plugins_window_open = !self.plugins_window_open;
+                        ui.close_menu();
+                    }
+                    if ui.button("Scan for New Plugins").clicked() {
+                        plugin_scan_requested = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Open Plugins Folder").clicked() {
+                        open_plugins_dir_requested = true;
+                        ui.close_menu();
                     }
                 });
 
@@ -923,6 +998,23 @@ impl eframe::App for CameraApp {
             });
         });
 
+        if plugin_scan_requested {
+            match self.plugin_manager.scan_and_load() {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.reset_analysis();
+                    plugin_toggle_changed = true;
+                }
+                Err(err) => self.last_error = Some(err),
+            }
+        }
+
+        if open_plugins_dir_requested {
+            if let Err(err) = self.plugin_manager.open_plugins_dir() {
+                self.last_error = Some(err);
+            }
+        }
+
         if plugin_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
@@ -981,13 +1073,8 @@ impl eframe::App for CameraApp {
                 });
         }
 
-        let enabled_plugin_names: Vec<String> = self
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.enabled())
-            .map(|plugin| plugin.name().to_owned())
-            .collect();
-        let mut plugin_config_changed = false;
+        let enabled_plugin_names = self.enabled_plugin_names();
+        let mut builtin_plugin_config_changed = false;
         if self.analysis_panel_open && !enabled_plugin_names.is_empty() {
             egui::SidePanel::right("analysis")
                 .min_width(360.0)
@@ -995,7 +1082,7 @@ impl eframe::App for CameraApp {
                     ui.heading("Analysis Tools");
                     ui.separator();
 
-                    let (plugins, config) = (&mut self.plugins, &mut self.config);
+                    let (plugins, config) = (&mut self.builtin_plugins, &mut self.config);
                     for plugin in plugins.iter_mut() {
                         if !plugin.enabled() {
                             continue;
@@ -1017,7 +1104,40 @@ impl eframe::App for CameraApp {
                         }
 
                         if plugin.ui_settings(ui, config) {
-                            plugin_config_changed = true;
+                            builtin_plugin_config_changed = true;
+                        }
+
+                        ui.separator();
+                    }
+
+                    for record in self.plugin_manager.records_mut() {
+                        let Some(plugin) = record.plugin_mut() else {
+                            continue;
+                        };
+                        if !plugin.enabled() {
+                            continue;
+                        }
+
+                        let missing_dependencies: Vec<String> = plugin
+                            .dependencies()
+                            .iter()
+                            .filter(|dependency| {
+                                !enabled_plugin_names.iter().any(|name| name == *dependency)
+                            })
+                            .cloned()
+                            .collect();
+                        if !missing_dependencies.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("Missing dependency: {}", missing_dependencies.join(", ")),
+                            );
+                        }
+
+                        if let Err(err) = render_plugin_settings(ui, plugin) {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("Dynamic plugin UI failed: {err}"),
+                            );
                         }
 
                         ui.separator();
@@ -1025,8 +1145,127 @@ impl eframe::App for CameraApp {
                 });
         }
 
-        if plugin_config_changed && mode != AppMode::Replaying {
+        if builtin_plugin_config_changed && mode != AppMode::Replaying {
             self.config_dirty = true;
+        }
+
+        let mut reload_requested = None;
+        let mut rescan_requested = false;
+        let mut open_dir_requested = false;
+        egui::Window::new("Plugin Manager")
+            .open(&mut self.plugins_window_open)
+            .resizable(true)
+            .default_width(760.0)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "Directory: {}",
+                        self.plugin_manager.plugins_dir().display()
+                    ));
+                    if ui.button("Scan for New Plugins").clicked() {
+                        rescan_requested = true;
+                    }
+                    if ui.button("Open Plugins Folder").clicked() {
+                        open_dir_requested = true;
+                    }
+                });
+                ui.separator();
+
+                if self.plugin_manager.records().is_empty() {
+                    ui.label("No plugins found. Build a plugin cdylib and copy it together with plugin.toml into the plugins directory.");
+                    return;
+                }
+
+                egui::Grid::new("plugin_manager_grid")
+                    .striped(true)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.strong("Name");
+                        ui.strong("Version");
+                        ui.strong("Domain");
+                        ui.strong("Phase");
+                        ui.strong("Status");
+                        ui.strong("Enabled");
+                        ui.strong("Action");
+                        ui.end_row();
+
+                        for (index, record) in self.plugin_manager.records_mut().iter_mut().enumerate()
+                        {
+                            let response = ui.label(record.name());
+                            if !record.description().is_empty() {
+                                response.on_hover_text(record.description());
+                            }
+                            ui.label(record.version());
+                            ui.label(record.domain());
+                            ui.label(record.phase_label());
+                            let status_color = if record.load_error().is_some() {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::from_rgb(88, 196, 92)
+                            };
+                            ui.colored_label(status_color, record.status_label());
+
+                            if let Some(plugin) = record.plugin_mut() {
+                                let mut enabled = plugin.enabled();
+                                if ui.checkbox(&mut enabled, "").changed() {
+                                    plugin.set_enabled(enabled);
+                                    plugin_toggle_changed = true;
+                                }
+                            } else {
+                                ui.label("-");
+                            }
+
+                            if ui.button("Reload").clicked() {
+                                reload_requested = Some(index);
+                            }
+                            ui.end_row();
+
+                            if let Some(error) = record.load_error() {
+                                ui.colored_label(egui::Color32::YELLOW, error);
+                                ui.label("");
+                                ui.label("");
+                                ui.label("");
+                                ui.label("");
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+
+        if let Some(index) = reload_requested {
+            match self.plugin_manager.reload_plugin(index) {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.reset_analysis();
+                    plugin_toggle_changed = true;
+                }
+                Err(err) => self.last_error = Some(err),
+            }
+        }
+
+        if rescan_requested {
+            match self.plugin_manager.scan_and_load() {
+                Ok(()) => {
+                    self.last_error = None;
+                    self.reset_analysis();
+                    plugin_toggle_changed = true;
+                }
+                Err(err) => self.last_error = Some(err),
+            }
+        }
+
+        if open_dir_requested {
+            if let Err(err) = self.plugin_manager.open_plugins_dir() {
+                self.last_error = Some(err);
+            }
+        }
+
+        if plugin_toggle_changed {
+            self.analysis_output = AnalysisOutput::default();
+            self.analysis_notice = None;
+            self.sync_active_pipeline_requirements();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {

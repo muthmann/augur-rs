@@ -1,0 +1,10 @@
+[package]
+name = "augur-plugin-api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

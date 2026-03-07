@@ -1,119 +1,120 @@
-# GUI Analysis Plugin Architecture
-
-## Repository Split
-
-The **plugin API and runtime** are defined here in `augur-rs`.
-**Plugin implementations** — including the scientific analysis suite — live in the companion repository:
-
-> **[augur-plugins](https://github.com/muthmann/augur-plugins)** — plugin registry and implementations
-
-This separation keeps `augur-rs` a general-purpose camera tool. Plugins are opt-in and domain-specific. Adding or removing a plugin is a one-line registration change in `augur-gui/src/plugins/mod.rs`.
-
----
+# Dynamic Analysis Plugin Architecture
 
 ## Summary
 
-`augur-gui` hosts preview-side analysis through a compile-time plugin layer. Plugins share typed derived data through a `PluginContext`, declare the kind of input they require, and run in ordered phases so downstream plugins can consume upstream results in the same preview frame.
+`augur-gui` now hosts analysis through a mixed plugin model:
 
-Design goals:
+- **ROI Grid** stays built in through `augur-gui/src/plugin.rs` because it mutates `CameraConfig` directly
+- **scientific analysis plugins** load at runtime from `~/.augur/plugins/` through `libloading`
 
-- `augur-core` remains a camera SDK and streaming pipeline with no domain-specific knowledge
-- all analysis logic lives in plugin files in `augur-gui` (or in external plugin repos)
-- removing plugin files and their registration lines returns the app to a plain recording tool
+This keeps `augur-core` free of domain logic while removing the need to recompile `augur-gui` whenever a plugin changes.
 
----
+## Runtime Model
 
-## Plugin API
+Each dynamic plugin ships as:
 
-### `AnalysisPlugin` Trait
+- a `plugin.toml` manifest
+- one platform library (`.dylib`, `.so`, or `.dll`)
+- a Rust crate that depends on `augur-plugin-api`
 
-Each plugin implements one trait covering:
+At startup or on rescan, `augur-gui`:
 
-- enable / disable state
-- settings UI (rendered in the Analysis panel)
-- per-frame processing
-- reset behavior
-- optional context-aware processing
-- declared dependencies and input kind
+1. walks `~/.augur/plugins/`
+2. parses each `plugin.toml`
+3. resolves the matching library file
+4. loads the exported `augur_plugin_vtable` entry with `libloading`
+5. instantiates the plugin and caches its declarative settings schema
 
-Extension points are backward-compatible defaults:
+Loader failures are non-fatal and stay visible in the Plugin Manager window.
 
-- `process_frame_with_context(frame, context, settings)`
-- `input_kind() -> PluginInput`
-- `dependencies() -> &[&str]`
+## FFI API
 
-### `PluginContext` — Typed Data Bus
+The standalone `augur-plugin-api` crate defines the cross-library boundary:
 
-`PluginContext` is a type-indexed data bus shared across all plugins for the current frame.
+- `Plugin`: safe Rust trait for plugin authors
+- `export_plugin!`: exports a panic-safe C vtable
+- `PluginFrame`: zero-copy access to preview pixels and optional raw events
+- `HostOutput`: safe overlay and warning callbacks back into the GUI host
+- `HostContext`: string-keyed context publishing and lookup using serialized JSON bytes
+- `SettingsSchema` / `StatusEntry`: declarative UI and read-only status reporting
 
-| Method | Description |
-|---|---|
-| `publish::<T>(value)` | Store a derived value under its type |
-| `get::<T>()` | Retrieve a value type-safely |
-| `raw_events` | Raw `CdEvent` stream for the current preview window |
-
-### Execution Phases
-
-Plugins run in three ordered passes per preview frame:
-
-| Phase | When it runs | Typical use |
-|---|---|---|
-| `FrameOnly` | First | Overlays, pixel statistics — cheap, no event reconstruction |
-| `RawEvents` | Second | Plugins that need the raw event stream |
-| `DerivedData` | Third | Plugins that consume results from earlier phases |
-
-Current phase assignments (in `augur-plugins`):
-
-- `Hotpixel Detection` — `FrameOnly`
-- `ROI Grid` — `FrameOnly`
-- `Molecule Localization` — `RawEvents`
-- `Focus Metrics` — `DerivedData`
-
-### Raw Event Transport
-
-`PreviewFrame` carries an optional `events: Option<Vec<CdEvent>>`. The pipeline only fills this field when a running plugin declares `PluginInput::RawEvents`, controlled by `PipelineController::raw_events_needed`. When no plugin needs raw events, the preview path stays on its low-overhead default.
-
----
-
-## Shared Plugin Types
-
-Science-facing shared types live in `augur-gui/src/plugins/types.rs`, not in `augur-core`.
-
-Currently:
+Shared science-facing context types live in `augur-plugin-api/src/context.rs`, including:
 
 - `Localization`
 - `LocalizationResults`
+- `CTX_LOCALIZATION_RESULTS`
 
-These are consumed by downstream plugins (e.g. Focus Metrics reads `LocalizationResults` published by Molecule Localization) while the SDK crate remains free of domain-specific data models.
+## Execution Phases
 
----
+Plugins still run in three ordered passes per preview frame:
 
-## Writing a Plugin
+| Phase | Use |
+|---|---|
+| `FrameOnly` | overlays, pixel statistics, inexpensive preview-only analysis |
+| `RawEvents` | event-domain reconstruction and analysis |
+| `DerivedData` | consumers of upstream plugin outputs |
 
-1. Implement the `AnalysisPlugin` trait in a new file under `augur-gui/src/plugins/`
-2. Register it in `augur-gui/src/plugins/mod.rs`
-3. Declare the input kind and any dependencies
-4. Publish results to `PluginContext` if downstream plugins should consume them
+Current assignments:
 
-To contribute a plugin to the shared ecosystem, open a PR at [augur-plugins](https://github.com/muthmann/augur-plugins).
+- `ROI Grid` — built-in `FrameOnly`
+- `Hotpixel Detection` — dynamic `FrameOnly`
+- `Molecule Localization` — dynamic `RawEvents`
+- `Focus Metrics` — dynamic `DerivedData`
 
----
+## Context Bus
 
-## Files (this repository)
+The old type-indexed `PluginContext` is gone for dynamic plugins. The host now stores:
+
+```rust
+HashMap<String, Vec<u8>>
+```
+
+Plugins publish and read JSON-serialized values under well-known keys. This keeps the boundary debuggable and works across independently compiled dynamic libraries.
+
+## Settings and Status
+
+Dynamic plugins no longer render `egui` directly. Instead they expose:
+
+- `SettingsSchema`: sections and items describing checkboxes, sliders, drag values, and enums
+- `StatusEntry`: text rows, labeled values with optional colors, and sparklines
+
+`augur-gui/src/plugin_settings_ui.rs` turns that schema into the right-side analysis panel.
+
+## Raw Event Transport
+
+`PreviewFrame` still carries optional raw events. The pipeline only fills them when at least one enabled plugin declares `PluginInput::RawEvents`, so the default preview path stays cheap when event-domain plugins are disabled.
+
+## Writing a Dynamic Plugin
+
+1. Create a crate with `crate-type = ["cdylib", "rlib"]`
+2. Implement `augur_plugin_api::Plugin`
+3. Export it with `export_plugin!(MyPlugin)`
+4. Add a `plugin.toml`
+5. Copy the built library plus manifest into `~/.augur/plugins/<name>/`
+6. Use the GUI Plugin Manager to scan and load it
+
+This workspace includes reference plugin crates under:
+
+- `plugins/hotpixel`
+- `plugins/localization`
+- `plugins/focus-metrics`
+
+## Files
 
 | File | Role |
 |---|---|
-| `augur-gui/src/plugin.rs` | `AnalysisPlugin` trait, `PluginInput`, `PluginContext` |
-| `augur-gui/src/plugins/mod.rs` | Plugin registry |
-| `augur-gui/src/plugins/types.rs` | Shared plugin-layer types (`Localization`, `LocalizationResults`) |
-| `augur-gui/src/app.rs` | Plugin host, phase execution, dependency display |
-| `augur-core/src/pipeline.rs` | Optional raw-event transport on preview frames |
-
----
+| `augur-plugin-api/src/ffi.rs` | C ABI types and vtable definition |
+| `augur-plugin-api/src/helpers.rs` | safe plugin-author trait and host wrappers |
+| `augur-plugin-api/src/macros.rs` | `export_plugin!` |
+| `augur-gui/src/plugin_loader.rs` | manifest parsing, library loading, callback bridges |
+| `augur-gui/src/plugin_settings_ui.rs` | declarative settings and status renderer |
+| `augur-gui/src/plugin.rs` | built-in ROI Grid trait surface |
+| `augur-gui/src/plugins/roi_grid.rs` | built-in ROI Grid implementation |
+| `plugins/*/src/lib.rs` | reference dynamic plugins |
 
 ## Verification
 
 ```bash
-cargo build
-cargo test -p augur-core
+cargo build --workspace
+cargo test -p augur-plugin-api -p augur-plugin-hotpixel -p augur-plugin-localization -p augur-plugin-focus-metrics -p augur-gui
 ```

@@ -24,6 +24,7 @@ The top toolbar provides the main session controls:
 | `Apply Settings` | Push pending runtime changes while previewing or recording |
 | `Settings Panel` / `Analysis Panel` | Show or hide the left and right side panels |
 | `Analysis` | Enable or disable plugins from a dropdown menu |
+| `Plugins` | Open the plugin manager, rescan `~/.augur/plugins/`, or open the plugin directory |
 | `Save Config` / `Load Config` | Store or restore TOML settings |
 
 ---
@@ -58,7 +59,9 @@ Camera-only controls are shown in the left panel.
 When at least one analysis plugin is enabled, a right-side **Analysis Tools** panel appears.
 
 - each enabled plugin gets a section in the panel
-- plugins can exchange per-frame derived data through a typed context
+- built-in ROI Grid settings still edit `CameraConfig` directly
+- runtime-loaded plugins expose declarative settings and status entries through the FFI host
+- plugins can exchange per-frame derived data through the shared context bus
 - hiding the panel does not disable plugin execution
 - disabling all plugins hides the panel automatically
 
@@ -70,6 +73,16 @@ When at least one analysis plugin is enabled, a right-side **Analysis Tools** pa
 - Focus metrics
 
 See [Plugin Architecture](./features/analysis-plugins.md) for the plugin host model.
+
+## Plugin Manager
+
+Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
+
+- the default plugin directory is `~/.augur/plugins/`
+- each plugin lives in its own subdirectory with a `plugin.toml` manifest plus one `.dylib`, `.so`, or `.dll`
+- `Scan for New Plugins` refreshes the loader without restarting the GUI
+- `Reload` unloads and reloads one plugin, which is useful while iterating on plugin code
+- load failures stay visible in the manager instead of crashing the app
 
 ---
 

@@ -1,43 +1,5 @@
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-};
-
-use augur_core::{
-    analysis::AnalysisOutput,
-    config::CameraConfig,
-    pipeline::{CdEvent, PreviewFrame},
-};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginInput {
-    FrameOnly,
-    RawEvents,
-    DerivedData,
-}
-
-#[derive(Default)]
-pub struct PluginContext {
-    data: HashMap<TypeId, Box<dyn Any>>,
-    pub raw_events: Option<Vec<CdEvent>>,
-}
-
-impl PluginContext {
-    pub fn publish<T: Any + 'static>(&mut self, value: T) {
-        self.data.insert(TypeId::of::<T>(), Box::new(value));
-    }
-
-    pub fn get<T: Any + 'static>(&self) -> Option<&T> {
-        self.data
-            .get(&TypeId::of::<T>())
-            .and_then(|value| value.downcast_ref::<T>())
-    }
-
-    pub fn clear(&mut self) {
-        self.data.clear();
-        self.raw_events = None;
-    }
-}
+use augur_core::{analysis::AnalysisOutput, config::CameraConfig, pipeline::PreviewFrame};
+use augur_plugin_api::PluginInput;
 
 pub trait AnalysisPlugin {
     fn name(&self) -> &str;
@@ -55,15 +17,6 @@ pub trait AnalysisPlugin {
 
     /// Process a new preview frame. Called only when plugin is enabled.
     fn process_frame(&mut self, frame: &PreviewFrame, output: &mut AnalysisOutput);
-
-    fn process_frame_with_context(
-        &mut self,
-        frame: &PreviewFrame,
-        output: &mut AnalysisOutput,
-        _ctx: &mut PluginContext,
-    ) {
-        self.process_frame(frame, output);
-    }
 
     fn input_kind(&self) -> PluginInput {
         PluginInput::FrameOnly

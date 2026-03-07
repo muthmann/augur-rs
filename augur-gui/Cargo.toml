@@ -11,8 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 augur-core = { path = "../augur-core" }
+augur-plugin-api = { path = "../augur-plugin-api" }
 augur-prophesee = { path = "../augur-prophesee" }
 eframe.workspace = true
 egui.workspace = true
+libloading.workspace = true
 rfd.workspace = true
-rustfft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

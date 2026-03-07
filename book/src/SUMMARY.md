@@ -10,5 +10,6 @@
 - [Release Notes](releases.md)
 - [Technical Notes](technical-notes/augur-sdk.md)
 - [GUI Analysis Plugin Architecture](technical-notes/analysis-plugins.md)
+- [Dynamic Plugin Loading](technical-notes/dynamic-plugins.md)
 - [ROI Grid Computation](technical-notes/roi-grid.md)
 - [Architecture Decisions](architecture-decisions.md)

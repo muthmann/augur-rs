@@ -1,29 +1,31 @@
-# GUI Analysis Plugin Architecture
+# Dynamic Analysis Plugin Architecture
 
 ## Summary
 
-`augur-gui` uses a compile-time plugin system for preview-side analysis tools. Plugins now share typed derived data through a `PluginContext`, declare their input needs, and run in ordered phases so downstream tools can consume upstream results in the same frame.
+`augur-gui` now uses a mixed plugin model:
 
-## Why
+- **ROI Grid** remains built in because it edits `CameraConfig`
+- scientific plugins load at runtime from `~/.augur/plugins/`
 
-The plugin model separates recording and camera control from scientific analysis tooling.
-
-It also preserves the repository's layering rule:
-
-- `augur-core` remains the SDK and pipeline layer
-- localization and focus logic live in GUI plugin files
-- removing plugin files and their registration lines returns the app to a plain recorder
+This keeps the host application stable while allowing plugin crates to be rebuilt and reloaded independently.
 
 ## Main Pieces
 
-- `AnalysisPlugin`: plugin trait with defaults for context-aware processing and dependency declaration
-- `PluginContext`: type-indexed per-frame data exchange
-- `PluginInput`: phase selection for `FrameOnly`, `RawEvents`, and `DerivedData`
-- optional raw-event transport on `PreviewFrame`
+- `augur-plugin-api`: FFI types, shared context models, declarative settings/status schema, and the `export_plugin!` macro
+- `augur-gui/src/plugin_loader.rs`: manifest parsing, library loading, and callback bridging
+- `augur-gui/src/plugin_settings_ui.rs`: renders plugin settings and status entries in `egui`
+- `plugins/*`: reference dynamic plugin crates in this workspace
 
-## Current Plugins
+## Execution Model
 
-- hotpixel detection
-- ROI grid
-- molecule localization
-- focus metrics
+Plugins still run in ordered phases:
+
+- `FrameOnly`
+- `RawEvents`
+- `DerivedData`
+
+The preview pipeline only transports raw events when an enabled plugin requests them.
+
+## Context Bus
+
+Dynamic plugins exchange derived data through a per-frame `HashMap<String, Vec<u8>>` filled with JSON payloads. Shared keys and types, such as localization results, live in `augur-plugin-api`.

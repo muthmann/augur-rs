@@ -1,0 +1,212 @@
+use std::{ffi::c_void, str::Utf8Error};
+
+use serde::{Deserialize, Serialize};
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfiSlice<T> {
+    pub ptr: *const T,
+    pub len: usize,
+}
+
+impl<T> Default for FfiSlice<T> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<T> FfiSlice<T> {
+    pub const fn empty() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
+        }
+    }
+
+    pub fn from_slice(slice: &[T]) -> Self {
+        Self {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    /// The caller must guarantee that `ptr` is valid for `len` elements.
+    pub unsafe fn as_slice<'a>(&self) -> &'a [T] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(self.ptr, self.len)
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfiString {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl Default for FfiString {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl FfiString {
+    pub const fn empty() -> Self {
+        Self {
+            ptr: std::ptr::null(),
+            len: 0,
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        Self {
+            ptr: value.as_ptr(),
+            len: value.len(),
+        }
+    }
+
+    /// The caller must guarantee that `ptr` is valid for `len` bytes.
+    pub unsafe fn as_str<'a>(&self) -> Result<&'a str, Utf8Error> {
+        if self.ptr.is_null() || self.len == 0 {
+            Ok("")
+        } else {
+            std::str::from_utf8(std::slice::from_raw_parts(self.ptr, self.len))
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInput {
+    FrameOnly = 0,
+    RawEvents = 1,
+    DerivedData = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisSeverity {
+    Info = 0,
+    Warning = 1,
+    Error = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfiCdEvent {
+    pub timestamp: u64,
+    pub x: u16,
+    pub y: u16,
+    pub polarity: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfiPixel {
+    pub x: u16,
+    pub y: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FfiSubpixelMarker {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfiColorRgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl FfiColorRgba {
+    pub const fn from_rgba(rgba: [u8; 4]) -> Self {
+        Self {
+            r: rgba[0],
+            g: rgba[1],
+            b: rgba[2],
+            a: rgba[3],
+        }
+    }
+
+    pub const fn to_rgba(self) -> [u8; 4] {
+        [self.r, self.g, self.b, self.a]
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiPreviewFrame {
+    pub width: u16,
+    pub height: u16,
+    pub pixels: FfiSlice<u16>,
+    pub events: FfiSlice<FfiCdEvent>,
+    pub window_start_us: u64,
+    pub window_end_us: u64,
+}
+
+pub type AddHighlightPixelsFn = unsafe extern "C" fn(*mut c_void, FfiSlice<FfiPixel>, FfiColorRgba);
+pub type AddCrosshairMarkersFn =
+    unsafe extern "C" fn(*mut c_void, FfiSlice<FfiSubpixelMarker>, FfiColorRgba, u16);
+pub type AddWarningFn = unsafe extern "C" fn(*mut c_void, FfiString, AnalysisSeverity, FfiString);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiOutputCallbacks {
+    pub ctx: *mut c_void,
+    pub add_highlight_pixels: AddHighlightPixelsFn,
+    pub add_crosshair_markers: AddCrosshairMarkersFn,
+    pub add_warning: AddWarningFn,
+}
+
+pub type ContextPublishFn = unsafe extern "C" fn(*mut c_void, FfiString, FfiSlice<u8>);
+pub type ContextGetFn =
+    unsafe extern "C" fn(*mut c_void, FfiString, *mut *const u8, *mut usize) -> bool;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiPluginContext {
+    pub ctx: *mut c_void,
+    pub raw_events: FfiSlice<FfiCdEvent>,
+    pub publish: ContextPublishFn,
+    pub get: ContextGetFn,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PluginVTable {
+    pub create: unsafe extern "C" fn() -> *mut c_void,
+    pub destroy: unsafe extern "C" fn(*mut c_void),
+    pub name: unsafe extern "C" fn(*const c_void) -> FfiString,
+    pub description: unsafe extern "C" fn(*const c_void) -> FfiString,
+    pub enabled: unsafe extern "C" fn(*const c_void) -> bool,
+    pub set_enabled: unsafe extern "C" fn(*mut c_void, bool),
+    pub reset: unsafe extern "C" fn(*mut c_void),
+    pub input_kind: unsafe extern "C" fn(*const c_void) -> PluginInput,
+    pub num_dependencies: unsafe extern "C" fn(*const c_void) -> usize,
+    pub dependency: unsafe extern "C" fn(*const c_void, usize) -> FfiString,
+    pub process_frame: unsafe extern "C" fn(
+        *mut c_void,
+        *const FfiPreviewFrame,
+        *mut FfiOutputCallbacks,
+        *mut FfiPluginContext,
+    ),
+    pub settings_schema: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
+    pub get_setting:
+        unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
+    pub set_setting: unsafe extern "C" fn(*mut c_void, FfiString, FfiSlice<u8>) -> bool,
+    pub status_entries: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
+}
+
+pub type PluginEntry = unsafe extern "C" fn() -> *const PluginVTable;
+
+pub const PLUGIN_ENTRY_SYMBOL: &str = "augur_plugin_vtable";

@@ -590,11 +590,49 @@ name = "augur-gui"
 version = "0.1.0"
 dependencies = [
  "augur-core",
+ "augur-plugin-api",
  "augur-prophesee",
  "eframe",
  "egui",
+ "libloading 0.8.9",
  "rfd",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "augur-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "augur-plugin-focus-metrics"
+version = "0.1.0"
+dependencies = [
+ "augur-plugin-api",
  "rustfft",
+ "serde_json",
+]
+
+[[package]]
+name = "augur-plugin-hotpixel"
+version = "0.1.0"
+dependencies = [
+ "augur-core",
+ "augur-plugin-api",
+ "serde_json",
+]
+
+[[package]]
+name = "augur-plugin-localization"
+version = "0.1.0"
+dependencies = [
+ "augur-plugin-api",
+ "serde_json",
 ]
 
 [[package]]

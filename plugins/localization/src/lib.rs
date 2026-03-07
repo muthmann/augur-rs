@@ -1,13 +1,9 @@
-use augur_core::{
-    analysis::{AnalysisOutput, AnalysisSeverity, AnalysisWarning, Overlay, SubpixelMarker},
-    config::CameraConfig,
-    pipeline::{CdEvent, PreviewFrame},
+use augur_plugin_api::{
+    export_plugin, AnalysisSeverity, FfiCdEvent, FfiSubpixelMarker, HostContext, HostOutput,
+    Localization, LocalizationResults, Plugin, PluginFrame, PluginInput, SettingItem, SettingKind,
+    SettingsSchema, SettingsSection, StatusEntry, CTX_LOCALIZATION_RESULTS,
 };
-
-use crate::{
-    plugin::{AnalysisPlugin, PluginContext, PluginInput},
-    plugins::types::{Localization, LocalizationResults},
-};
+use serde_json::{json, Value};
 
 const KERNEL_G1: [f64; 5] = [1.0 / 16.0, 0.25, 3.0 / 8.0, 0.25, 1.0 / 16.0];
 const KERNEL_G2: [f64; 9] = [
@@ -51,7 +47,7 @@ impl Default for LocalizationSettings {
     }
 }
 
-pub struct LocalizationPlugin {
+struct LocalizationPlugin {
     enabled: bool,
     settings: LocalizationSettings,
     last_candidate_count: usize,
@@ -91,13 +87,13 @@ impl LocalizationPlugin {
 
     fn analyze_frame(
         &mut self,
-        frame: &PreviewFrame,
-        raw_events: Option<&[CdEvent]>,
-        output: &mut AnalysisOutput,
+        frame: &PluginFrame<'_>,
+        raw_events: Option<&[FfiCdEvent]>,
+        output: &mut HostOutput<'_>,
     ) -> LocalizationResults {
         let image = build_analysis_image(frame, raw_events);
-        let width = frame.width as usize;
-        let height = frame.height as usize;
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
 
         if image.is_empty() {
             self.last_candidate_count = 0;
@@ -106,8 +102,8 @@ impl LocalizationPlugin {
             self.last_status = "The preview frame is empty.".into();
             return LocalizationResults {
                 localizations: Vec::new(),
-                frame_window_start_us: frame.window_start_us,
-                frame_window_end_us: frame.window_end_us,
+                frame_window_start_us: frame.window_start_us(),
+                frame_window_end_us: frame.window_end_us(),
             };
         }
 
@@ -146,8 +142,8 @@ impl LocalizationPlugin {
 
             localization.timestamp_us = estimate_timestamp_us(
                 raw_events,
-                frame.window_start_us,
-                frame.window_end_us,
+                frame.window_start_us(),
+                frame.window_end_us(),
                 localization.x,
                 localization.y,
                 self.settings.fit_radius_px as f64,
@@ -184,34 +180,38 @@ impl LocalizationPlugin {
         );
 
         if self.settings.show_overlay && !localizations.is_empty() {
-            let markers = localizations
+            let markers: Vec<FfiSubpixelMarker> = localizations
                 .iter()
-                .map(|localization| SubpixelMarker {
+                .map(|localization| FfiSubpixelMarker {
                     x: localization.x as f32,
                     y: localization.y as f32,
                 })
                 .collect();
-            output.overlays.push(Overlay::CrosshairMarkers {
-                markers,
-                color: OVERLAY_COLOR,
-                arm_len: 5,
-            });
+            output.add_crosshair_markers(&markers, OVERLAY_COLOR, 5);
         }
 
         LocalizationResults {
             localizations,
-            frame_window_start_us: frame.window_start_us,
-            frame_window_end_us: frame.window_end_us,
+            frame_window_start_us: frame.window_start_us(),
+            frame_window_end_us: frame.window_end_us(),
         }
+    }
+
+    fn parse_usize(value: Value) -> Option<usize> {
+        value.as_u64().and_then(|value| usize::try_from(value).ok())
+    }
+
+    fn warning(output: &mut HostOutput<'_>, message: &str) {
+        output.add_warning("Molecule Localization", AnalysisSeverity::Warning, message);
     }
 }
 
-impl AnalysisPlugin for LocalizationPlugin {
-    fn name(&self) -> &str {
+impl Plugin for LocalizationPlugin {
+    fn name(&self) -> &'static str {
         "Molecule Localization"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Wavelet-filtered spot detection with center-of-mass seeding and least-squares Gaussian fitting."
     }
 
@@ -226,132 +226,248 @@ impl AnalysisPlugin for LocalizationPlugin {
         }
     }
 
-    fn ui_settings(&mut self, ui: &mut egui::Ui, _config: &mut CameraConfig) -> bool {
-        let mut changed = false;
-
-        egui::CollapsingHeader::new(self.name())
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.weak(self.description());
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.threshold_factor, 0.5..=4.0)
-                            .text("Wavelet threshold n"),
-                    )
-                    .on_hover_text(
-                        "Threshold multiplier applied to sigma(F1) before keeping F2 wavelet coefficients.",
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.settings.fit_radius_px)
-                            .clamp_range(2..=8)
-                            .prefix("Fit radius "),
-                    )
-                    .on_hover_text("Radius of the Gaussian-fit ROI in pixels. 4 px corresponds to a 9x9 fit window.")
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.initial_sigma_px, 0.8..=3.5)
-                            .text("Initial sigma [px]"),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.nm_per_pixel, 20.0..=150.0)
-                            .text("Scale [nm/px]"),
-                    )
-                    .on_hover_text("Used to express sigma and uncertainty filters in nanometers.")
-                    .changed();
-                ui.horizontal(|ui| {
-                    ui.label("Sigma range [nm]");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.settings.sigma_min_nm)
-                                .speed(1.0)
-                                .clamp_range(10.0..=500.0),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.settings.sigma_max_nm)
-                                .speed(1.0)
-                                .clamp_range(20.0..=800.0),
-                        )
-                        .changed();
-                });
-                changed |= ui
-                    .add(
-                        egui::Slider::new(
-                            &mut self.settings.max_xy_uncertainty_nm,
-                            5.0..=120.0,
-                        )
-                        .text("Max xy uncertainty [nm]"),
-                    )
-                    .changed();
-                changed |= ui
-                    .checkbox(&mut self.settings.show_overlay, "Show localization overlay")
-                    .changed();
-
-                ui.separator();
-                ui.label(&self.last_status);
-                ui.label(format!(
-                    "Current frame: {} accepted / {} candidates",
-                    self.last_localization_count, self.last_candidate_count
-                ));
-                if let Some(background) = self.last_mean_background {
-                    ui.label(format!("Mean fitted background: {:.2}", background));
-                }
-            });
-
-        changed
-    }
-
-    fn process_frame(&mut self, frame: &PreviewFrame, output: &mut AnalysisOutput) {
-        let _ = self.analyze_frame(frame, frame.events.as_deref(), output);
-    }
-
-    fn process_frame_with_context(
-        &mut self,
-        frame: &PreviewFrame,
-        output: &mut AnalysisOutput,
-        ctx: &mut PluginContext,
-    ) {
-        let raw_events = ctx.raw_events.as_deref().or(frame.events.as_deref());
-        if raw_events.is_none() {
-            output.warnings.push(AnalysisWarning {
-                source: self.name().to_owned(),
-                severity: AnalysisSeverity::Warning,
-                message: "Raw-event transport is unavailable for this frame; falling back to preview counts."
-                    .into(),
-            });
-        }
-        let results = self.analyze_frame(frame, raw_events, output);
-        ctx.publish(results);
-    }
-
-    fn input_kind(&self) -> PluginInput {
-        PluginInput::RawEvents
-    }
-
     fn reset(&mut self) {
         self.last_candidate_count = 0;
         self.last_localization_count = 0;
         self.last_mean_background = None;
         self.last_status = "Waiting for the next preview frame.".into();
     }
+
+    fn input_kind(&self) -> PluginInput {
+        PluginInput::RawEvents
+    }
+
+    fn process_frame(
+        &mut self,
+        frame: &PluginFrame<'_>,
+        output: &mut HostOutput<'_>,
+        context: &mut HostContext<'_>,
+    ) {
+        let raw_events = if !context.raw_events().is_empty() {
+            Some(context.raw_events())
+        } else if !frame.events().is_empty() {
+            Some(frame.events())
+        } else {
+            None
+        };
+
+        if raw_events.is_none() {
+            Self::warning(
+                output,
+                "Raw-event transport is unavailable for this frame; falling back to preview counts.",
+            );
+        }
+
+        let results = self.analyze_frame(frame, raw_events, output);
+        if let Err(err) = context.publish(CTX_LOCALIZATION_RESULTS, &results) {
+            output.add_warning(
+                self.name(),
+                AnalysisSeverity::Error,
+                &format!("Failed to publish localization results: {err}"),
+            );
+        }
+    }
+
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema {
+            sections: vec![SettingsSection {
+                label: "Localization".into(),
+                description: Some(
+                    "Wavelet filtering finds candidate emitters before the Gaussian fit rejects unstable detections."
+                        .into(),
+                ),
+                default_open: true,
+                items: vec![
+                    SettingItem {
+                        key: "threshold_factor".into(),
+                        label: "Wavelet threshold n".into(),
+                        tooltip: Some("Threshold multiplier applied to sigma(F1) before keeping F2 coefficients.".into()),
+                        kind: SettingKind::F64Slider {
+                            min: 0.5,
+                            max: 4.0,
+                            default: self.settings.threshold_factor,
+                            suffix: None,
+                        },
+                    },
+                    SettingItem {
+                        key: "fit_radius_px".into(),
+                        label: "Fit radius".into(),
+                        tooltip: Some("Radius of the Gaussian-fit ROI in pixels.".into()),
+                        kind: SettingKind::I64Drag {
+                            min: 2,
+                            max: 8,
+                            default: i64::try_from(self.settings.fit_radius_px).unwrap_or(4),
+                        },
+                    },
+                    SettingItem {
+                        key: "initial_sigma_px".into(),
+                        label: "Initial sigma [px]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Slider {
+                            min: 0.8,
+                            max: 3.5,
+                            default: self.settings.initial_sigma_px,
+                            suffix: None,
+                        },
+                    },
+                    SettingItem {
+                        key: "nm_per_pixel".into(),
+                        label: "Scale [nm/px]".into(),
+                        tooltip: Some("Used to express sigma and uncertainty filters in nanometers.".into()),
+                        kind: SettingKind::F64Slider {
+                            min: 20.0,
+                            max: 150.0,
+                            default: self.settings.nm_per_pixel,
+                            suffix: None,
+                        },
+                    },
+                    SettingItem {
+                        key: "sigma_min_nm".into(),
+                        label: "Sigma min [nm]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Drag {
+                            min: 10.0,
+                            max: 500.0,
+                            speed: 1.0,
+                            default: self.settings.sigma_min_nm,
+                        },
+                    },
+                    SettingItem {
+                        key: "sigma_max_nm".into(),
+                        label: "Sigma max [nm]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Drag {
+                            min: 20.0,
+                            max: 800.0,
+                            speed: 1.0,
+                            default: self.settings.sigma_max_nm,
+                        },
+                    },
+                    SettingItem {
+                        key: "max_xy_uncertainty_nm".into(),
+                        label: "Max xy uncertainty [nm]".into(),
+                        tooltip: None,
+                        kind: SettingKind::F64Slider {
+                            min: 5.0,
+                            max: 120.0,
+                            default: self.settings.max_xy_uncertainty_nm,
+                            suffix: None,
+                        },
+                    },
+                    SettingItem {
+                        key: "show_overlay".into(),
+                        label: "Show localization overlay".into(),
+                        tooltip: None,
+                        kind: SettingKind::Bool {
+                            default: self.settings.show_overlay,
+                        },
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn get_setting(&self, key: &str) -> Option<Value> {
+        match key {
+            "threshold_factor" => Some(json!(self.settings.threshold_factor)),
+            "fit_radius_px" => Some(json!(self.settings.fit_radius_px)),
+            "initial_sigma_px" => Some(json!(self.settings.initial_sigma_px)),
+            "sigma_min_nm" => Some(json!(self.settings.sigma_min_nm)),
+            "sigma_max_nm" => Some(json!(self.settings.sigma_max_nm)),
+            "max_xy_uncertainty_nm" => Some(json!(self.settings.max_xy_uncertainty_nm)),
+            "nm_per_pixel" => Some(json!(self.settings.nm_per_pixel)),
+            "show_overlay" => Some(json!(self.settings.show_overlay)),
+            _ => None,
+        }
+    }
+
+    fn set_setting(&mut self, key: &str, value: Value) -> Result<(), String> {
+        match key {
+            "threshold_factor" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("threshold_factor must be numeric".into());
+                };
+                self.settings.threshold_factor = value.clamp(0.5, 4.0);
+            }
+            "fit_radius_px" => {
+                let Some(value) = Self::parse_usize(value) else {
+                    return Err("fit_radius_px must be an integer".into());
+                };
+                self.settings.fit_radius_px = value.clamp(2, 8);
+            }
+            "initial_sigma_px" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("initial_sigma_px must be numeric".into());
+                };
+                self.settings.initial_sigma_px = value.clamp(0.8, 3.5);
+            }
+            "sigma_min_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("sigma_min_nm must be numeric".into());
+                };
+                self.settings.sigma_min_nm = value.clamp(10.0, 500.0);
+            }
+            "sigma_max_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("sigma_max_nm must be numeric".into());
+                };
+                self.settings.sigma_max_nm = value.clamp(20.0, 800.0);
+            }
+            "max_xy_uncertainty_nm" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("max_xy_uncertainty_nm must be numeric".into());
+                };
+                self.settings.max_xy_uncertainty_nm = value.clamp(5.0, 120.0);
+            }
+            "nm_per_pixel" => {
+                let Some(value) = value.as_f64() else {
+                    return Err("nm_per_pixel must be numeric".into());
+                };
+                self.settings.nm_per_pixel = value.clamp(20.0, 150.0);
+            }
+            "show_overlay" => {
+                let Some(value) = value.as_bool() else {
+                    return Err("show_overlay must be a bool".into());
+                };
+                self.settings.show_overlay = value;
+            }
+            _ => return Err(format!("unknown setting: {key}")),
+        }
+
+        Ok(())
+    }
+
+    fn status_entries(&self) -> Vec<StatusEntry> {
+        let mut entries = vec![
+            StatusEntry::Text(self.last_status.clone()),
+            StatusEntry::Text(format!(
+                "Current frame: {} accepted / {} candidates",
+                self.last_localization_count, self.last_candidate_count
+            )),
+        ];
+        if let Some(background) = self.last_mean_background {
+            entries.push(StatusEntry::Text(format!(
+                "Mean fitted background: {:.2}",
+                background
+            )));
+        }
+        entries
+    }
 }
 
-fn build_analysis_image(frame: &PreviewFrame, raw_events: Option<&[CdEvent]>) -> Vec<f64> {
+fn build_analysis_image(frame: &PluginFrame<'_>, raw_events: Option<&[FfiCdEvent]>) -> Vec<f64> {
     if let Some(events) = raw_events.filter(|events| !events.is_empty()) {
-        let mut image = vec![0.0; frame.pixels.len()];
+        let mut image = vec![0.0; frame.pixels().len()];
         for event in events {
-            if event.x >= frame.width || event.y >= frame.height {
+            if event.x >= frame.width() || event.y >= frame.height() {
                 continue;
             }
-            let idx = event.y as usize * frame.width as usize + event.x as usize;
-            let weight = event.timestamp.saturating_sub(frame.window_start_us).max(1) as f64;
-            if event.polarity {
+            let idx = event.y as usize * frame.width() as usize + event.x as usize;
+            let weight = event
+                .timestamp
+                .saturating_sub(frame.window_start_us())
+                .max(1) as f64;
+            if event.polarity != 0 {
                 image[idx] += weight;
             } else {
                 image[idx] -= weight;
@@ -359,7 +475,11 @@ fn build_analysis_image(frame: &PreviewFrame, raw_events: Option<&[CdEvent]>) ->
         }
         image
     } else {
-        frame.pixels.iter().map(|&pixel| f64::from(pixel)).collect()
+        frame
+            .pixels()
+            .iter()
+            .map(|&pixel| f64::from(pixel))
+            .collect()
     }
 }
 
@@ -662,7 +782,7 @@ fn solve_linear_system(mut lhs: [[f64; 6]; 6], mut rhs: [f64; 6]) -> Option<[f64
 }
 
 fn estimate_timestamp_us(
-    raw_events: Option<&[CdEvent]>,
+    raw_events: Option<&[FfiCdEvent]>,
     frame_window_start_us: u64,
     frame_window_end_us: u64,
     x: f64,
@@ -694,6 +814,8 @@ fn estimate_timestamp_us(
         (weighted_timestamp / weight_sum).round() as u64
     }
 }
+
+export_plugin!(LocalizationPlugin);
 
 #[cfg(test)]
 mod tests {

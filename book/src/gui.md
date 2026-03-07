@@ -20,6 +20,7 @@ The top toolbar provides the main session controls:
 - `Apply Settings`: push pending runtime changes while previewing or recording
 - `Settings Panel` / `Analysis Panel`: show or hide the left and right side panels
 - `Analysis`: enable or disable analysis plugins from a dropdown menu
+- `Plugins`: open the plugin manager, rescan `~/.augur/plugins/`, or open the plugin directory
 - `Save Config` / `Load Config`: store or restore TOML settings
 
 The toolbar also shows the current session status and either the active replay file or the configured output path.
@@ -51,9 +52,21 @@ When at least one analysis plugin is enabled, a right-side **Analysis Tools** pa
 
 - plugins keep running even if the panel is hidden
 - disabling all plugins hides the panel automatically
+- built-in ROI Grid settings still edit `CameraConfig` directly
+- runtime-loaded plugins expose declarative settings and status entries through the FFI host
 - plugins can exchange per-frame derived data through the shared context bus
 
 Available plugin types include hotpixel detection, ROI grid analysis, molecule localization, and focus metrics.
+
+## Plugin Manager
+
+Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
+
+- the default plugin directory is `~/.augur/plugins/`
+- each plugin lives in its own subdirectory with a `plugin.toml` manifest plus one `.dylib`, `.so`, or `.dll`
+- `Scan for New Plugins` refreshes the loader without restarting the GUI
+- `Reload` unloads and reloads one plugin, which is useful while iterating on plugin code
+- load failures stay visible in the manager instead of crashing the app
 
 ## Replay Mode
 

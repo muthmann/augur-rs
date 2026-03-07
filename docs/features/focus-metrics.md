@@ -2,7 +2,7 @@
 
 ## Summary
 
-The `Focus Metrics` plugin estimates focus quality from either localization results or the preview frame itself. It keeps a rolling metric history, draws a lightweight trend plot in the analysis panel, and reports a coarse focus-quality indicator.
+The `Focus Metrics` plugin estimates focus quality from either localization results or the preview frame itself. It keeps a rolling metric history, reports declarative status entries back to the GUI host, and renders a sparkline in the analysis panel through the dynamic plugin status API.
 
 ## Methods
 

@@ -4,7 +4,7 @@
 
 The `Molecule Localization` plugin detects candidate emitters in the preview stream, fits sub-pixel Gaussian spots, renders crosshair markers, and publishes `LocalizationResults` into the plugin context for downstream consumers.
 
-The implementation stays entirely in the GUI plugin layer.
+The implementation lives in the runtime-loaded plugin layer (`plugins/localization/` in this workspace).
 
 ## Pipeline
 
@@ -44,4 +44,4 @@ Per frame the plugin:
 
 - The current implementation reconstructs a signed time-weighted image from raw events when raw-event transport is enabled.
 - Timestamp assignment uses the fitted neighborhood in the current frame window.
-- All localization types and fitting code remain outside `augur-core`.
+- All localization types and fitting code remain outside `augur-core` in `augur-plugin-api` and the plugin crate itself.

@@ -136,16 +136,16 @@ captures/
 
 ## Plugin Ecosystem
 
-> **Plugins live in a separate repository.**
-> The core AugurRS repo defines the plugin API and hosts the plugin runtime. Plugin implementations — including the scientific analysis suite — are maintained at **[augur-plugins](https://github.com/muthmann/augur-plugins)** *(coming soon)*.
+The core AugurRS repo defines the plugin API and hosts the runtime loader. Reference dynamic plugins currently live in this workspace under `plugins/`, and the long-term home for the broader plugin registry remains **[augur-plugins](https://github.com/muthmann/augur-plugins)**.
 
 The plugin system is a first-class extension point, not an afterthought. Plugins:
 
 - run live alongside the preview stream, frame by frame
-- share typed derived data with each other through a per-frame context bus
+- are loaded at runtime from `~/.augur/plugins/`
+- share derived data with each other through a per-frame string-keyed context bus
 - declare their input kind (decoded frame, raw events, or upstream plugin results)
 - run in ordered phases so one plugin can feed the next within the same frame
-- are compiled in — adding or removing a plugin is a one-line registration change
+- expose settings and status through a declarative JSON schema instead of direct `egui` access
 
 Anyone can write a plugin. The API is documented in [Plugin Architecture](./docs/features/analysis-plugins.md).
 
@@ -161,16 +161,16 @@ Plugins can operate on anything the preview pipeline produces:
 
 ### Available Plugins
 
-The **[augur-plugins](https://github.com/muthmann/augur-plugins)** repository is the central home for plugin implementations. It currently includes:
+This workspace currently includes reference dynamic plugins for:
 
 | Plugin | What it does |
 |---|---|
-| **Hotpixel Detection** | Detects persistently noisy pixels live and pushes them into the hardware DEM mask |
-| **ROI Grid** | Partitions the sensor around masked hotpixels; finds the largest clean capture regions with one-click "Use as ROI" |
+| **Hotpixel Detection** | Detects persistently noisy pixels live and highlights them in the preview |
+| **ROI Grid** | Built-in plugin that partitions the sensor around masked hotpixels and offers one-click "Use as ROI" |
 | **Molecule Localization** | Wavelet denoising, center-of-mass seeding, sub-pixel elliptical Gaussian fitting — SMLM-grade localization from the live event stream |
 | **Focus Metrics** | Mean PSF sigma, FFT high-frequency power, and astigmatic ratio — live focus feedback for event-camera imaging |
 
-These plugins are purpose-built for SMLM microscopy and biophotonics, but they also illustrate the full range of what the plugin API supports. The same system can host any domain-specific live analysis.
+Build a plugin crate, copy its `plugin.toml` plus the generated `.dylib/.so/.dll` into `~/.augur/plugins/<plugin-name>/`, then use the GUI's **Plugins** menu and **Plugin Manager** window to scan, enable, disable, and reload it without recompiling `augur-gui`.
 
 ---
 
@@ -207,10 +207,11 @@ Tagged releases ship a CLI archive and an unsigned macOS `.app` bundle.
 | [Getting Started](./docs/getting-started.md) | Build, connect, first capture |
 | [Configuration](./docs/configuration.md) | TOML reference: biases, ROI, mask, filters |
 | [CLI Reference](./docs/cli.md) | Commands and scripting |
-| [GUI Guide](./docs/gui.md) | Live preview, controls, and the plugin panel |
+| [GUI Guide](./docs/gui.md) | Live preview, controls, the plugin panel, and the Plugin Manager |
 | [Recording Format](./docs/recording.md) | EVT3 output and pipeline behavior |
 | [Performance](./docs/performance.md) | Architecture and design rationale |
-| [Plugin Architecture](./docs/features/analysis-plugins.md) | Plugin API: input kinds, phases, context bus |
+| [Plugin Architecture](./docs/features/analysis-plugins.md) | Plugin API: FFI host, phases, context bus |
+| [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
 | [Technical Notes](./docs/features/README.md) | SDK internals, ROI grid, and feature details |
 | [Architecture Decisions](./docs/adr/README.md) | ADRs |
 

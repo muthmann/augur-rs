@@ -4,6 +4,10 @@ members = [
   "augur-prophesee",
   "augur-cli",
   "augur-gui",
+  "augur-plugin-api",
+  "plugins/hotpixel",
+  "plugins/localization",
+  "plugins/focus-metrics",
 ]
 resolver = "2"
 
@@ -28,3 +32,5 @@ toml = "0.8"
 ctrlc = "3"
 rfd = "0.15"
 rustfft = "6"
+serde_json = "1"
+libloading = "0.8"
