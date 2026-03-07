@@ -63,7 +63,7 @@ macro_rules! export_plugin {
             unsafe extern "C" fn __name(instance: *const ::std::ffi::c_void) -> $crate::FfiString {
                 ::std::panic::catch_unwind(|| {
                     __instance_ref(instance)
-                        .map(|plugin| $crate::FfiString::from_str(plugin.plugin.name()))
+                        .map(|plugin| $crate::FfiString::from(plugin.plugin.name()))
                         .unwrap_or_default()
                 })
                 .unwrap_or_default()
@@ -74,7 +74,7 @@ macro_rules! export_plugin {
             ) -> $crate::FfiString {
                 ::std::panic::catch_unwind(|| {
                     __instance_ref(instance)
-                        .map(|plugin| $crate::FfiString::from_str(plugin.plugin.description()))
+                        .map(|plugin| $crate::FfiString::from(plugin.plugin.description()))
                         .unwrap_or_default()
                 })
                 .unwrap_or_default()
@@ -137,7 +137,7 @@ macro_rules! export_plugin {
                                 .dependencies()
                                 .get(index)
                                 .copied()
-                                .map($crate::FfiString::from_str)
+                                .map($crate::FfiString::from)
                         })
                         .unwrap_or_default()
                 })
@@ -180,16 +180,21 @@ macro_rules! export_plugin {
             ) {
                 let result = ::std::panic::catch_unwind(|| {
                     let Some(plugin) = __instance_ref(instance) else {
-                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
                         return;
                     };
                     let json =
                         ::serde_json::to_vec(&plugin.plugin.settings_schema()).unwrap_or_default();
-                    $crate::__private::write_bytes(&plugin.schema_json, json, out_ptr, out_len);
+                    unsafe {
+                        $crate::__private::write_bytes(&plugin.schema_json, json, out_ptr, out_len);
+                    }
                 });
-                if result.is_err() && !out_ptr.is_null() && !out_len.is_null() {
-                    *out_ptr = ::std::ptr::null();
-                    *out_len = 0;
+                if result.is_err() {
+                    unsafe {
+                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                    }
                 }
             }
 
@@ -210,7 +215,14 @@ macro_rules! export_plugin {
                         return false;
                     };
                     let json = ::serde_json::to_vec(&value).unwrap_or_default();
-                    $crate::__private::write_bytes(&plugin.setting_json, json, out_ptr, out_len);
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.setting_json,
+                            json,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
                     true
                 })
                 .unwrap_or(false)
@@ -245,16 +257,21 @@ macro_rules! export_plugin {
             ) {
                 let result = ::std::panic::catch_unwind(|| {
                     let Some(plugin) = __instance_ref(instance) else {
-                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
                         return;
                     };
                     let json =
                         ::serde_json::to_vec(&plugin.plugin.status_entries()).unwrap_or_default();
-                    $crate::__private::write_bytes(&plugin.status_json, json, out_ptr, out_len);
+                    unsafe {
+                        $crate::__private::write_bytes(&plugin.status_json, json, out_ptr, out_len);
+                    }
                 });
-                if result.is_err() && !out_ptr.is_null() && !out_len.is_null() {
-                    *out_ptr = ::std::ptr::null();
-                    *out_len = 0;
+                if result.is_err() {
+                    unsafe {
+                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                    }
                 }
             }
 

@@ -219,7 +219,7 @@ impl DynPlugin {
         let found = unsafe {
             (self.vtable.get_setting)(
                 self.instance,
-                FfiString::from_str(key),
+                FfiString::from(key),
                 &mut out_ptr,
                 &mut out_len,
             )
@@ -243,7 +243,7 @@ impl DynPlugin {
         Ok(unsafe {
             (self.vtable.set_setting)(
                 self.instance,
-                FfiString::from_str(key),
+                FfiString::from(key),
                 FfiSlice::from_slice(&json),
             )
         })

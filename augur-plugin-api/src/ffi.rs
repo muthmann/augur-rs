@@ -30,7 +30,12 @@ impl<T> FfiSlice<T> {
         }
     }
 
-    /// The caller must guarantee that `ptr` is valid for `len` elements.
+    /// Returns a borrowed view over the raw FFI buffer.
+    ///
+    /// # Safety
+    /// `self.ptr` must be null or point to `self.len` contiguous initialized values of `T`
+    /// that remain valid for the returned lifetime. The pointed-to memory must not be mutated
+    /// for the duration of the returned slice.
     pub unsafe fn as_slice<'a>(&self) -> &'a [T] {
         if self.ptr.is_null() || self.len == 0 {
             &[]
@@ -61,20 +66,36 @@ impl FfiString {
         }
     }
 
-    pub fn from_str(value: &str) -> Self {
+    pub fn borrowed(value: &str) -> Self {
         Self {
             ptr: value.as_ptr(),
             len: value.len(),
         }
     }
 
-    /// The caller must guarantee that `ptr` is valid for `len` bytes.
+    #[allow(clippy::should_implement_trait)]
+    #[deprecated(note = "use FfiString::from(...) or FfiString::borrowed(...)")]
+    pub fn from_str(value: &str) -> Self {
+        Self::borrowed(value)
+    }
+
+    /// Returns a borrowed UTF-8 view over the raw FFI buffer.
+    ///
+    /// # Safety
+    /// `self.ptr` must be null or point to `self.len` bytes that remain valid for the returned
+    /// lifetime, and the pointed-to bytes must contain valid UTF-8.
     pub unsafe fn as_str<'a>(&self) -> Result<&'a str, Utf8Error> {
         if self.ptr.is_null() || self.len == 0 {
             Ok("")
         } else {
             std::str::from_utf8(std::slice::from_raw_parts(self.ptr, self.len))
         }
+    }
+}
+
+impl From<&str> for FfiString {
+    fn from(value: &str) -> Self {
+        Self::borrowed(value)
     }
 }
 

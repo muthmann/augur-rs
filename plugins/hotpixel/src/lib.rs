@@ -132,7 +132,7 @@ impl Plugin for HotpixelPlugin {
                         kind: SettingKind::I64Slider {
                             min: 4,
                             max: 64,
-                            default: i64::try_from(self.config.history_depth).unwrap_or(8),
+                            default: i64::from(self.config.history_depth),
                             suffix: None,
                         },
                     },
@@ -154,7 +154,7 @@ impl Plugin for HotpixelPlugin {
                         kind: SettingKind::I64Slider {
                             min: 1,
                             max: 100,
-                            default: i64::try_from(self.config.min_absolute_count).unwrap_or(1),
+                            default: i64::from(self.config.min_absolute_count),
                             suffix: None,
                         },
                     },

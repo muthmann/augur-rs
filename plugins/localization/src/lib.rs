@@ -654,9 +654,7 @@ fn fit_localization(
         for (i, row) in lhs.iter_mut().enumerate() {
             row[i] += damping;
         }
-        let Some(delta) = solve_linear_system(lhs, jtr) else {
-            return None;
-        };
+        let delta = solve_linear_system(lhs, jtr)?;
 
         let candidate = [
             params[0] + delta[0],
@@ -742,8 +740,8 @@ fn solve_linear_system(mut lhs: [[f64; 6]; 6], mut rhs: [f64; 6]) -> Option<[f64
     for pivot in 0..6 {
         let mut best_row = pivot;
         let mut best_value = lhs[pivot][pivot].abs();
-        for row in pivot + 1..6 {
-            let candidate = lhs[row][pivot].abs();
+        for (row, lhs_row) in lhs.iter().enumerate().skip(pivot + 1) {
+            let candidate = lhs_row[pivot].abs();
             if candidate > best_value {
                 best_value = candidate;
                 best_row = row;

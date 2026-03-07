@@ -81,9 +81,9 @@ impl<'a> HostOutput<'a> {
         unsafe {
             (self.raw.add_warning)(
                 self.raw.ctx,
-                FfiString::from_str(source),
+                FfiString::from(source),
                 severity,
-                FfiString::from_str(message),
+                FfiString::from(message),
             );
         }
     }
@@ -107,7 +107,7 @@ impl<'a> HostContext<'a> {
         unsafe {
             (self.raw.publish)(
                 self.raw.ctx,
-                FfiString::from_str(key),
+                FfiString::from(key),
                 FfiSlice::from_slice(&json),
             );
         }
@@ -120,7 +120,7 @@ impl<'a> HostContext<'a> {
         let found = unsafe {
             (self.raw.get)(
                 self.raw.ctx,
-                FfiString::from_str(key),
+                FfiString::from(key),
                 &mut out_ptr,
                 &mut out_len,
             )

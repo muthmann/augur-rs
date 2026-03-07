@@ -17,7 +17,11 @@ pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, St
 pub mod __private {
     use std::cell::RefCell;
 
-    pub fn write_bytes(
+    /// Stores `bytes` in `scratch` and exposes the buffer through raw out-pointers.
+    ///
+    /// # Safety
+    /// When non-null, `out_ptr` and `out_len` must be valid writable pointers for one value each.
+    pub unsafe fn write_bytes(
         scratch: &RefCell<Vec<u8>>,
         bytes: Vec<u8>,
         out_ptr: *mut *const u8,
@@ -35,7 +39,11 @@ pub mod __private {
         }
     }
 
-    pub fn clear_out_bytes(out_ptr: *mut *const u8, out_len: *mut usize) {
+    /// Clears raw out-pointers used for returning borrowed byte buffers.
+    ///
+    /// # Safety
+    /// When non-null, `out_ptr` and `out_len` must be valid writable pointers for one value each.
+    pub unsafe fn clear_out_bytes(out_ptr: *mut *const u8, out_len: *mut usize) {
         if out_ptr.is_null() || out_len.is_null() {
             return;
         }
@@ -125,7 +133,7 @@ mod tests {
     #[test]
     fn ffi_string_and_slice_helpers_preserve_contents() {
         let text = "hello";
-        let ffi = FfiString::from_str(text);
+        let ffi = FfiString::from(text);
         let numbers = [1u8, 2, 3];
         let slice = FfiSlice::from_slice(&numbers);
 
