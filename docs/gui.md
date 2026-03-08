@@ -19,7 +19,7 @@ The top toolbar provides the main session controls:
 | `Probe Camera` | Query the EVK4 and display model, serial, and firmware information |
 | `Preview` | Start live preview without writing to disk |
 | `Record` | Start recording to the configured output path |
-| `Open Replay` | Open a recorded `.raw` file or decoded `.csv`, `.bin`, `.npy` event file in replay mode |
+| `Open Replay` | Open a recorded `.raw` file or decoded `.csv`, `.bin`, `.npy`, or optional `.h5` / `.hdf5` event file in replay mode |
 | `Stop` | Stop preview, recording, or replay |
 | `Apply Settings` | Push pending runtime changes while previewing or recording |
 | `Settings Panel` / `Analysis Panel` | Show or hide the left and right side panels |
@@ -91,7 +91,7 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 Opening a replay file starts a preview-only pipeline:
 
 - `.raw` files use `RawFileCamera`
-- decoded `.csv`, `.bin`, and `.npy` files use `DecodedEventFileCamera`
+- decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` files use `DecodedEventFileCamera`
 - all formats share the same transport controls, plugin path, and preview rendering
 
 Decoded replay files carry geometry differently:
@@ -99,6 +99,9 @@ Decoded replay files carry geometry differently:
 - `.csv` requires a `%geometry:W,H` header
 - `.bin` stores geometry in its binary header
 - `.npy` infers geometry from `max(x) + 1` / `max(y) + 1` with a minimum of `1280x720`
+- `.h5` / `.hdf5` read the file-level `geometry` attribute when present and otherwise infer geometry from event bounds with a minimum of `1280x720`
+
+HDF5 replay is optional at build time. Build or run `augur-gui` with `--features hdf5` on a machine with the HDF5 system library installed to enable `.h5` / `.hdf5` support.
 
 The center panel switches to a `Replay` heading and adds transport controls below the preview:
 

@@ -31,7 +31,7 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 - **Direct hardware path** — Treuzell USB transport + IMX636 register programming, no Metavision or OpenEB required
 - **Backpressured 3-thread pipeline** — USB reader → bounded disk writer → lossy preview decoder. Recording never blocks on the UI, never grows unbounded in memory
 - **Reproducible sessions** — every `.raw` file gets a `.toml` config sidecar written automatically
-- **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, and `.npy` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
+- **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
 - **Live preview stats** — 1-second sliding window for Mev/s and MB/s, plus per-frame ON/OFF polarity percentages in the GUI
 
 ### Sensor Control
@@ -104,6 +104,10 @@ The disk writer uses a **bounded channel** — recording pauses if the OS falls 
 # Build everything
 cargo build --workspace
 
+# Optional: enable `.h5` / `.hdf5` replay in the GUI
+# Requires a system HDF5 installation such as `brew install hdf5`.
+cargo build -p augur-gui --features hdf5
+
 # Check camera connection
 cargo run --bin augur -- status
 
@@ -112,6 +116,9 @@ cargo run --bin augur -- record captures/run.raw --duration-s 30
 
 # Launch the live GUI
 cargo run --bin augur-gui
+
+# Launch the GUI with optional HDF5 replay support
+cargo run --bin augur-gui --features hdf5
 ```
 
 Copy the example config for a local profile:

@@ -11,6 +11,10 @@
 
 ```bash
 cargo build --workspace
+
+# Optional: enable `.h5` / `.hdf5` replay in the GUI
+# Requires a system HDF5 installation such as `brew install hdf5`.
+cargo build -p augur-gui --features hdf5
 ```
 
 Optional local checks:

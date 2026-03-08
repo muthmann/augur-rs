@@ -25,6 +25,7 @@ crossbeam-channel = "0.5"
 eframe = "0.27"
 egui = "0.27"
 evt3-core = { path = "../evt3_core" }
+hdf5 = { package = "hdf5-metno", version = "0.12.3" }
 rusb = { version = "0.9", features = ["vendored"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"

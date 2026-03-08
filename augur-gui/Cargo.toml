@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+hdf5 = ["augur-core/hdf5"]
+
 [[bin]]
 name = "augur-gui"
 path = "src/main.rs"

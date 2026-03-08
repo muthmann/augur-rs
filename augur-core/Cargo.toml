@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+hdf5 = ["dep:hdf5"]
+
 [dependencies]
 crossbeam-channel.workspace = true
 evt3-core.workspace = true
+hdf5 = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
