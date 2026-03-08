@@ -1452,6 +1452,17 @@ impl eframe::App for CameraApp {
                     s.elapsed_s as u64 % 60
                 ));
             }
+            if let Some(frame) = &self.latest_frame {
+                let total = frame.on_count + frame.off_count;
+                if total > 0 {
+                    let on_pct = frame.on_count as f64 * 100.0 / total as f64;
+                    let off_pct = frame.off_count as f64 * 100.0 / total as f64;
+                    ui.label(format!(
+                        "ON {:.1}%  |  OFF {:.1}%  ({} ev this frame)",
+                        on_pct, off_pct, total
+                    ));
+                }
+            }
 
             if mode != AppMode::Idle && mode != AppMode::Replaying {
                 if self.config_dirty || self.acq_dirty {

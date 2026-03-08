@@ -88,6 +88,10 @@ pub struct PreviewFrame {
     pub width: u16,
     pub height: u16,
     pub pixels: Vec<u16>,
+    pub pixels_on: Vec<u16>,
+    pub pixels_off: Vec<u16>,
+    pub on_count: u64,
+    pub off_count: u64,
     pub events: Option<Vec<CdEvent>>,
     pub window_start_us: u64,
     pub window_end_us: u64,
@@ -515,6 +519,10 @@ where
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
         let mut frame_buf = vec![0_u16; width as usize * height as usize];
+        let mut frame_buf_on = vec![0_u16; width as usize * height as usize];
+        let mut frame_buf_off = vec![0_u16; width as usize * height as usize];
+        let mut on_count = 0_u64;
+        let mut off_count = 0_u64;
         let mut frame_start_ts: Option<u64> = None;
 
         loop {
@@ -535,6 +543,13 @@ where
                         }
                         let idx = ev.y as usize * width as usize + ev.x as usize;
                         frame_buf[idx] = frame_buf[idx].saturating_add(1);
+                        if ev.polarity {
+                            frame_buf_on[idx] = frame_buf_on[idx].saturating_add(1);
+                            on_count += 1;
+                        } else {
+                            frame_buf_off[idx] = frame_buf_off[idx].saturating_add(1);
+                            off_count += 1;
+                        }
                         frame_start_ts.get_or_insert(ev.timestamp);
                     }
                     if raw_events_preview.load(Ordering::Relaxed) {
@@ -561,12 +576,20 @@ where
                                 width,
                                 height,
                                 pixels: frame_buf.clone(),
+                                pixels_on: frame_buf_on.clone(),
+                                pixels_off: frame_buf_off.clone(),
+                                on_count,
+                                off_count,
                                 events: raw_events,
                                 window_start_us: t0,
                                 window_end_us: last_ts,
                             };
                             let _ = frame_tx.try_send(frame);
                             frame_buf.fill(0);
+                            frame_buf_on.fill(0);
+                            frame_buf_off.fill(0);
+                            on_count = 0;
+                            off_count = 0;
                             frame_start_ts = None;
                         }
                     }
