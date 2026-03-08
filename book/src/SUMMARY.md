@@ -9,6 +9,7 @@
 - [Performance Notes](performance.md)
 - [Release Notes](releases.md)
 - [Technical Notes](technical-notes/augur-sdk.md)
+- [HDF5 File Support](technical-notes/hdf5-file-support.md)
 - [GUI Analysis Plugin Architecture](technical-notes/analysis-plugins.md)
 - [Dynamic Plugin Loading](technical-notes/dynamic-plugins.md)
 - [ROI Grid Computation](technical-notes/roi-grid.md)

@@ -2,14 +2,14 @@
 
 ## Summary
 
-AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, and `.npy` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, and now finalizes older `.raw` files without suppressing genuine preview errors.
+AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, and now finalizes older `.raw` files without suppressing genuine preview errors.
 
 ## Core Design
 
 Replay lives in `augur-core` as two file-backed camera adapters, so the rest of the stack can treat file playback like any other packet-stream camera:
 
 - `RawFileCamera` parses the EVT3 header (`% format`, `% geometry`, `% end`), tolerates older files that omit `% format` or contain non-UTF-8 header bytes, scans only the first and last replay windows to estimate duration/byte rate, and reopens at arbitrary EVT3-aligned offsets through `RawFileCamera::open_at`
-- `DecodedEventFileCamera` parses decoded `.csv`, `.bin`, and `.npy` event files once, keeps the decoded `CdEvent` vector in shared memory for cheap seeks, and replays those events through an internal packed 14-byte transport consumed by `PackedEventPreviewDecoder`
+- `DecodedEventFileCamera` parses decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files once, keeps the decoded `CdEvent` vector in shared memory for cheap seeks, and replays those events through an internal packed 14-byte transport consumed by `PackedEventPreviewDecoder`
 - both cameras record geometry and replay timing in `ReplayFileInfo`
 - both return `CameraError::Timeout` while paused
 - both return `CameraError::Eof` at end-of-file so the pipeline can stop cleanly
@@ -35,6 +35,9 @@ The decoded replay path is intentionally narrow and matches the evt3-core decode
 - `.csv` — XYPT rows with a required `%geometry:W,H` header
 - `.bin` — `EVT3BIN\0` header + 14-byte packed XYPT records
 - `.npy` — structured NumPy array with fields `x`, `y`, `p`, padding, `t`; geometry is inferred from the event bounds with a minimum of `1280x720`
+- `.h5` / `.hdf5` — Prophesee HDF5 recordings using the `CD/events` dataset; geometry comes from the file-level `geometry` attribute when present, whether it is stored as variable-length ASCII or variable-length Unicode, otherwise it is inferred from event bounds with a minimum of `1280x720`
+
+HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `augur-gui` and requires a system HDF5 installation. ECF-compressed Prophesee files also require the HDF5 ECF plugin via `HDF5_PLUGIN_PATH`; see [HDF5 File Support](./hdf5-file-support.md).
 
 ## GUI Workflow
 
@@ -77,7 +80,7 @@ This is intentionally lightweight and fast rather than perfectly timestamp-aware
 | File | Role |
 |---|---|
 | `augur-core/src/replay.rs` | `RawFileCamera`, `ReplayFileInfo`, fast metadata scan, reopen-at-offset support for `.raw` |
-| `augur-core/src/decoded_replay.rs` | `DecodedEventFileCamera`, `PackedEventPreviewDecoder`, decoded `.csv` / `.bin` / `.npy` parsers |
+| `augur-core/src/decoded_replay.rs` | `DecodedEventFileCamera`, `PackedEventPreviewDecoder`, decoded `.csv` / `.bin` / `.npy` / optional `.h5` parsers |
 | `augur-core/src/error.rs` | `CameraError::Eof` |
 | `augur-core/src/pipeline.rs` | Decoder-specific event-rate estimation, EOF finalization, preview-queue drain on shutdown |
 | `augur-gui/src/app.rs` | Replay mode, persisted EOF state, transport controls, decoded-event seek cache, restart |
@@ -88,11 +91,12 @@ Older Prophesee `.raw` files (e.g. recorded with earlier MetaVision SDK versions
 
 1. **Non-UTF-8 header bytes** — the header parser uses `read_until` + `from_utf8_lossy` so stray binary bytes are tolerated.
 2. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
-3. **Single trailing padding byte** — the local `evt3_core` path dependency now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
+3. **Single trailing padding byte** — the published `evt3-core` crate now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
 
 ## Verification
 
 - `cargo fmt --all`
-- `cargo test --manifest-path ../evt3_core/Cargo.toml`
 - `cargo build --workspace`
+- `cargo build -p augur-gui --features hdf5`
 - `cargo test --workspace`
+- `cargo test -p augur-core --features hdf5`

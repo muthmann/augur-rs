@@ -268,7 +268,7 @@ impl CameraApp {
         }
 
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Replay Files", &["raw", "csv", "bin", "npy"])
+            .add_filter("Replay Files", &["raw", "csv", "bin", "npy", "h5", "hdf5"])
             .pick_file()
         else {
             return;
@@ -295,28 +295,30 @@ impl CameraApp {
                 }
                 Err(err) => Err(format!("open replay file failed: {err}")),
             },
-            Some("csv") | Some("bin") | Some("npy") => match DecodedEventFileCamera::open(&path) {
-                Ok((camera, controls, info, decoded_events)) => {
-                    let replay_info = camera.device_info();
-                    spawn_pipeline(
-                        camera,
-                        PackedEventPreviewDecoder::default(),
-                        replay_pipeline_config(&info),
-                        PipelineOptions::preview_only(info.width, info.height),
-                    )
-                    .map(|controller| {
-                        (
-                            controller,
-                            controls,
-                            info,
-                            replay_info,
-                            Some(decoded_events),
+            Some("csv") | Some("bin") | Some("npy") | Some("h5") | Some("hdf5") => {
+                match DecodedEventFileCamera::open(&path) {
+                    Ok((camera, controls, info, decoded_events)) => {
+                        let replay_info = camera.device_info();
+                        spawn_pipeline(
+                            camera,
+                            PackedEventPreviewDecoder::default(),
+                            replay_pipeline_config(&info),
+                            PipelineOptions::preview_only(info.width, info.height),
                         )
-                    })
-                    .map_err(|err| format!("pipeline start failed: {err}"))
+                        .map(|controller| {
+                            (
+                                controller,
+                                controls,
+                                info,
+                                replay_info,
+                                Some(decoded_events),
+                            )
+                        })
+                        .map_err(|err| format!("pipeline start failed: {err}"))
+                    }
+                    Err(err) => Err(format!("open replay file failed: {err}")),
                 }
-                Err(err) => Err(format!("open replay file failed: {err}")),
-            },
+            }
             Some(ext) => Err(format!("unsupported replay file extension: .{ext}")),
             None => Err("replay file is missing an extension".into()),
         };

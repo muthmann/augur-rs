@@ -144,7 +144,10 @@ impl DynPlugin {
 
     fn call_dependency(&self, index: usize) -> Result<Option<String>, String> {
         let ffi = unsafe { (self.vtable.dependency)(self.instance, index) };
-        ffi_string_to_option(ffi, &format!("plugin dependency {index} is not valid UTF-8"))
+        ffi_string_to_option(
+            ffi,
+            &format!("plugin dependency {index} is not valid UTF-8"),
+        )
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(
@@ -553,7 +556,11 @@ unsafe extern "C" fn get_context_value(
 
 fn ffi_string_to_option(ffi: FfiString, context: &str) -> Result<Option<String>, String> {
     let text = unsafe { ffi.as_str() }.map_err(|err| format!("{context}: {err}"))?;
-    Ok(if text.is_empty() { None } else { Some(text.to_owned()) })
+    Ok(if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    })
 }
 
 unsafe fn bytes_from_out_ptr<'a>(ptr: *const u8, len: usize) -> &'a [u8] {

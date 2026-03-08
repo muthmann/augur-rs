@@ -15,6 +15,9 @@ use crate::{
     CameraError, Result,
 };
 
+#[cfg(feature = "hdf5")]
+use hdf5::types::{VarLenAscii, VarLenUnicode};
+
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THROTTLE_SLEEP_SLICE: Duration = Duration::from_millis(10);
 const BIN_MAGIC: &[u8; 8] = b"EVT3BIN\0";
@@ -24,6 +27,16 @@ const NPY_RECORD_BYTES: usize = 16;
 const DEFAULT_NPY_WIDTH: u32 = 1280;
 const DEFAULT_NPY_HEIGHT: u32 = 720;
 pub const PACKED_EVENT_RECORD_BYTES: usize = 14;
+
+#[cfg(feature = "hdf5")]
+#[derive(hdf5::H5Type, Clone)]
+#[repr(C)]
+struct RawHdf5CdEvent {
+    x: u16,
+    y: u16,
+    p: i16,
+    t: i64,
+}
 
 #[derive(Debug)]
 pub struct DecodedEventFileCamera {
@@ -47,6 +60,14 @@ impl DecodedEventFileCamera {
             "csv" => parse_csv(path)?,
             "bin" => parse_bin(path)?,
             "npy" => parse_npy(path)?,
+            #[cfg(feature = "hdf5")]
+            "h5" | "hdf5" => parse_hdf5(path)?,
+            #[cfg(not(feature = "hdf5"))]
+            "h5" | "hdf5" => {
+                return Err(CameraError::Config(
+                    "HDF5 replay support is not compiled in; rebuild with `--features hdf5`".into(),
+                ))
+            }
             ext => {
                 return Err(CameraError::Config(format!(
                     "unsupported decoded replay extension: .{ext}"
@@ -543,6 +564,78 @@ fn parse_npy(path: &Path) -> Result<(Vec<CdEvent>, u16, u16)> {
     Ok((events, width, height))
 }
 
+#[cfg(feature = "hdf5")]
+fn parse_hdf5(path: &Path) -> Result<(Vec<CdEvent>, u16, u16)> {
+    let file = hdf5::File::open(path).map_err(|err| {
+        CameraError::Config(format!(
+            "hdf5 replay file {} could not be opened: {err}",
+            path.display()
+        ))
+    })?;
+
+    let geometry = parse_hdf5_geometry(&file, path)?;
+    let raw_events = file
+        .group("CD")
+        .map_err(|_| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} is missing the CD group",
+                path.display()
+            ))
+        })?
+        .dataset("events")
+        .map_err(|_| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} is missing the CD/events dataset",
+                path.display()
+            ))
+        })?
+        .read_1d::<RawHdf5CdEvent>()
+        .map_err(|err| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} failed to read CD/events: {err}",
+                path.display()
+            ))
+        })?;
+
+    let mut events = Vec::with_capacity(raw_events.len());
+    let mut max_x = 0_u32;
+    let mut max_y = 0_u32;
+    for raw in raw_events {
+        let timestamp = u64::try_from(raw.t).map_err(|_| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} contains a negative timestamp {}",
+                path.display(),
+                raw.t
+            ))
+        })?;
+        max_x = max_x.max(raw.x as u32);
+        max_y = max_y.max(raw.y as u32);
+        events.push(CdEvent {
+            x: raw.x,
+            y: raw.y,
+            polarity: raw.p > 0,
+            timestamp,
+        });
+    }
+
+    let width = parse_geometry_u16(
+        "width",
+        geometry
+            .map(|(width, _)| width)
+            .unwrap_or_else(|| (max_x.saturating_add(1)).max(DEFAULT_NPY_WIDTH)),
+        path,
+    )?;
+    let height = parse_geometry_u16(
+        "height",
+        geometry
+            .map(|(_, height)| height)
+            .unwrap_or_else(|| (max_y.saturating_add(1)).max(DEFAULT_NPY_HEIGHT)),
+        path,
+    )?;
+
+    Ok((events, width, height))
+}
+
 fn parse_csv_geometry(raw: &str, path: &Path) -> Result<(u16, u16)> {
     let (raw_width, raw_height) = raw.split_once(',').ok_or_else(|| {
         CameraError::Config(format!(
@@ -637,6 +730,53 @@ fn parse_geometry_u16(label: &str, raw: u32, path: &Path) -> Result<u16> {
     })
 }
 
+#[cfg(feature = "hdf5")]
+fn parse_hdf5_geometry(file: &hdf5::File, path: &Path) -> Result<Option<(u32, u32)>> {
+    let attr = match file.attr("geometry") {
+        Ok(attr) => attr,
+        Err(_) => return Ok(None),
+    };
+
+    let geometry = attr
+        .read_scalar::<VarLenAscii>()
+        .map(|geometry| geometry.as_str().to_string())
+        .or_else(|_| {
+            attr.read_scalar::<VarLenUnicode>()
+                .map(|geometry| geometry.to_string())
+        })
+        .map_err(|err| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} has an unreadable geometry attribute: {err}",
+                path.display()
+            ))
+        })?;
+    let geometry = geometry.as_str();
+    let Some((raw_width, raw_height)) = geometry.split_once('x') else {
+        return Err(CameraError::Config(format!(
+            "hdf5 replay file {} geometry attribute {:?} is not in WxH format",
+            path.display(),
+            geometry
+        )));
+    };
+
+    Ok(Some((
+        raw_width.trim().parse::<u32>().map_err(|err| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} has invalid geometry width {:?}: {err}",
+                path.display(),
+                raw_width.trim()
+            ))
+        })?,
+        raw_height.trim().parse::<u32>().map_err(|err| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} has invalid geometry height {:?}: {err}",
+                path.display(),
+                raw_height.trim()
+            ))
+        })?,
+    )))
+}
+
 fn validate_npy_header(path: &Path, header: &str) -> Result<()> {
     let normalized: String = header.chars().filter(|ch| !ch.is_whitespace()).collect();
     if !normalized.contains("'fortran_order':False") {
@@ -689,6 +829,11 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(feature = "hdf5")]
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
+    #[cfg(feature = "hdf5")]
+    use std::str::FromStr;
 
     fn temp_path(suffix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -757,7 +902,7 @@ mod tests {
         );
         let mut header = raw_header.into_bytes();
         let preamble_len = NPY_MAGIC.len() + 2 + 2;
-        while (preamble_len + header.len() + 1) % 16 != 0 {
+        while !(preamble_len + header.len() + 1).is_multiple_of(16) {
             header.push(b' ');
         }
         header.push(b'\n');
@@ -776,6 +921,52 @@ mod tests {
             bytes.extend_from_slice(&(event.timestamp as i64).to_le_bytes());
         }
         fs::write(path, bytes).expect("npy sample must be written");
+    }
+
+    #[cfg(feature = "hdf5")]
+    fn write_hdf5(path: &Path, geometry: Option<&str>, events: &[RawHdf5CdEvent]) {
+        let file = hdf5::File::create(path).expect("hdf5 sample must be created");
+
+        if let Some(geometry) = geometry {
+            let geometry =
+                VarLenUnicode::from_str(geometry).expect("geometry string must be valid");
+            file.new_attr::<VarLenUnicode>()
+                .shape(())
+                .create("geometry")
+                .expect("geometry attribute must be created")
+                .write_scalar(&geometry)
+                .expect("geometry attribute must be written");
+        }
+
+        let group = file.create_group("CD").expect("CD group must be created");
+        group
+            .new_dataset_builder()
+            .with_data(events)
+            .create("events")
+            .expect("CD events dataset must be created");
+    }
+
+    #[cfg(feature = "hdf5")]
+    fn write_hdf5_ascii(path: &Path, geometry: Option<&str>, events: &[RawHdf5CdEvent]) {
+        let file = hdf5::File::create(path).expect("hdf5 sample must be created");
+
+        if let Some(geometry) = geometry {
+            let geometry = VarLenAscii::from_ascii(geometry.as_bytes())
+                .expect("geometry string must be ASCII");
+            file.new_attr::<VarLenAscii>()
+                .shape(())
+                .create("geometry")
+                .expect("geometry attribute must be created")
+                .write_scalar(&geometry)
+                .expect("geometry attribute must be written");
+        }
+
+        let group = file.create_group("CD").expect("CD group must be created");
+        group
+            .new_dataset_builder()
+            .with_data(events)
+            .create("events")
+            .expect("CD events dataset must be created");
     }
 
     #[test]
@@ -865,6 +1056,102 @@ mod tests {
         assert_eq!(info.width, 1280);
         assert_eq!(info.height, 720);
         assert_eq!(&*shared_events, &events);
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn open_hdf5_replay_reads_geometry_and_events() {
+        let path = temp_path("h5");
+        write_hdf5(
+            &path,
+            Some("320x240"),
+            &[
+                RawHdf5CdEvent {
+                    x: 10,
+                    y: 20,
+                    p: 1,
+                    t: 100,
+                },
+                RawHdf5CdEvent {
+                    x: 11,
+                    y: 21,
+                    p: 0,
+                    t: 120,
+                },
+            ],
+        );
+
+        let (_camera, _controls, info, shared_events) =
+            DecodedEventFileCamera::open(&path).expect("hdf5 replay must open");
+        assert_eq!(info.width, 320);
+        assert_eq!(info.height, 240);
+        assert_eq!(
+            &*shared_events,
+            &[
+                CdEvent {
+                    x: 10,
+                    y: 20,
+                    polarity: true,
+                    timestamp: 100,
+                },
+                CdEvent {
+                    x: 11,
+                    y: 21,
+                    polarity: false,
+                    timestamp: 120,
+                },
+            ]
+        );
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn open_hdf5_replay_reads_ascii_geometry_and_events() {
+        let path = temp_path("h5");
+        write_hdf5_ascii(
+            &path,
+            Some("320x240"),
+            &[
+                RawHdf5CdEvent {
+                    x: 10,
+                    y: 20,
+                    p: 1,
+                    t: 100,
+                },
+                RawHdf5CdEvent {
+                    x: 11,
+                    y: 21,
+                    p: 0,
+                    t: 120,
+                },
+            ],
+        );
+
+        let (_camera, _controls, info, shared_events) =
+            DecodedEventFileCamera::open(&path).expect("hdf5 replay must open");
+        assert_eq!(info.width, 320);
+        assert_eq!(info.height, 240);
+        assert_eq!(
+            &*shared_events,
+            &[
+                CdEvent {
+                    x: 10,
+                    y: 20,
+                    polarity: true,
+                    timestamp: 100,
+                },
+                CdEvent {
+                    x: 11,
+                    y: 21,
+                    polarity: false,
+                    timestamp: 120,
+                },
+            ]
+        );
 
         fs::remove_file(path).expect("temp file must be removed");
     }
