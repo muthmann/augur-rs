@@ -91,12 +91,11 @@ Older Prophesee `.raw` files (e.g. recorded with earlier MetaVision SDK versions
 
 1. **Non-UTF-8 header bytes** — the header parser uses `read_until` + `from_utf8_lossy` so stray binary bytes are tolerated.
 2. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
-3. **Single trailing padding byte** — the local `evt3_core` path dependency now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
+3. **Single trailing padding byte** — the published `evt3-core` crate now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
 
 ## Verification
 
 - `cargo fmt --all`
-- `cargo test --manifest-path ../evt3_core/Cargo.toml`
 - `cargo build --workspace`
 - `cargo build -p augur-gui --features hdf5`
 - `cargo test --workspace`
