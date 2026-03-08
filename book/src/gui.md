@@ -93,6 +93,14 @@ A `Contrast` slider below the preview is available in both live and replay modes
 - this keeps single hotpixels from washing out the rest of the frame
 - lower percentiles reveal dimmer activity sooner
 
+## Status Colors
+
+Status, warning, and error labels adapt to the active GUI theme.
+
+- warning and error text follows egui's theme-aware foreground colors
+- replay and plugin success labels use a darker mid-green that stays readable in light mode
+- analysis info messages use a darker blue for better contrast on light backgrounds
+
 ## Runtime Notes
 
 - acquisition time is only adjustable for live preview and recording
