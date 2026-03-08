@@ -122,8 +122,9 @@ A `Contrast` slider below the preview is available in both live and replay modes
 - the slider controls percentile-based normalization (`90.0` to `100.0`)
 - this prevents a single hotpixel from dominating the entire frame
 - lower percentiles reveal dimmer activity at the cost of earlier saturation
+- ON events render in green, OFF events render in red, and mixed pixels appear yellow/orange
 
-The same contrast setting is used for the base preview image and ROI-grid rendering.
+The same contrast setting is used for the base preview image and ROI-grid rendering, with one shared normalization range across both polarity channels so relative ON/OFF strength remains visible.
 
 ---
 
@@ -132,3 +133,4 @@ The same contrast setting is used for the base preview image and ROI-grid render
 - Acquisition time is only adjustable for live preview and recording
 - output path editing is disabled during active recording and replay
 - the camera/replay status line below the toolbar shows the current session state
+- the stats area also shows per-frame `ON % | OFF %` plus the event count for the latest preview frame

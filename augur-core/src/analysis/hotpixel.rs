@@ -125,10 +125,15 @@ mod tests {
     use super::*;
 
     fn frame(width: u16, height: u16, pixels: Vec<u16>) -> PreviewFrame {
+        let n = pixels.len();
         PreviewFrame {
             width,
             height,
             pixels,
+            pixels_on: vec![0; n],
+            pixels_off: vec![0; n],
+            on_count: 0,
+            off_count: 0,
             events: None,
             window_start_us: 0,
             window_end_us: 1,
