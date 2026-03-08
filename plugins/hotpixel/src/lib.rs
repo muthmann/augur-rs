@@ -34,10 +34,15 @@ impl HotpixelPlugin {
     }
 
     fn build_preview_frame(frame: &PluginFrame<'_>) -> PreviewFrame {
+        let n = frame.width() as usize * frame.height() as usize;
         PreviewFrame {
             width: frame.width(),
             height: frame.height(),
             pixels: frame.pixels().to_vec(),
+            pixels_on: vec![0; n],
+            pixels_off: vec![0; n],
+            on_count: 0,
+            off_count: 0,
             events: None,
             window_start_us: frame.window_start_us(),
             window_end_us: frame.window_end_us(),

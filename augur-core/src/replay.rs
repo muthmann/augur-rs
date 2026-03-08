@@ -54,7 +54,7 @@ pub struct ReplayControls {
 }
 
 impl ReplayControls {
-    fn new(info: &ReplayFileInfo, bytes_read: u64) -> Self {
+    pub(crate) fn new(info: &ReplayFileInfo, bytes_read: u64) -> Self {
         Self {
             paused: Arc::new(AtomicBool::new(false)),
             speed_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
@@ -261,36 +261,41 @@ fn build_device_info(path: &Path) -> DeviceInfo {
 
 fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16)> {
     let mut reader = BufReader::new(file.try_clone()?);
-    let mut line = String::new();
+    let mut buf = Vec::new();
     let mut geometry = None;
     let mut format_geometry = None;
-    let mut saw_format = false;
+    // If a % format line is present it must declare EVT3; if absent we assume EVT3.
+    let mut format_rejected = false;
 
     loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        buf.clear();
+        let bytes = reader.read_until(b'\n', &mut buf)?;
         if bytes == 0 {
             return Err(CameraError::Config(
                 "raw file is missing the EVT3 header terminator".into(),
             ));
         }
 
+        // Older files may have non-UTF-8 bytes in the header; use lossy conversion.
+        let line = String::from_utf8_lossy(&buf);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if let Some(rest) = trimmed.strip_prefix("% format ") {
-            saw_format = true;
-            format_geometry = Some(parse_format_line(rest)?);
+            match parse_format_line(rest) {
+                Ok(geom) => format_geometry = Some(geom),
+                Err(_) => format_rejected = true,
+            }
         } else if let Some(rest) = trimmed.strip_prefix("% geometry ") {
             geometry = Some(parse_geometry_line(rest)?);
         } else if trimmed == HEADER_END {
             let data_offset = reader.stream_position()?;
+            if format_rejected {
+                return Err(CameraError::Config(
+                    "raw file declares a non-EVT3 format".into(),
+                ));
+            }
             let (width, height) = geometry
                 .or(format_geometry)
                 .ok_or_else(|| CameraError::Config("raw file header is missing geometry".into()))?;
-            if !saw_format {
-                return Err(CameraError::Config(
-                    "raw file header is missing the EVT3 format line".into(),
-                ));
-            }
             return Ok((data_offset, width, height));
         }
     }
@@ -383,9 +388,7 @@ fn scan_timestamp_window(file: &File, start: u64, len: u64) -> Result<(Option<u6
     decoder
         .decode_bytes(&bytes, &mut cd_events, &mut trigger_events)
         .map_err(|e| CameraError::Other(format!("failed to scan replay timestamps: {e}")))?;
-    decoder.finish_stream().map_err(|e| {
-        CameraError::Other(format!("failed to finalize replay timestamp scan: {e}"))
-    })?;
+    decoder.finish_stream_lenient();
 
     Ok((
         cd_events.first().map(|event| event.timestamp),
@@ -397,7 +400,7 @@ fn align_evt3_word_offset(data_offset: u64, absolute_offset: u64) -> u64 {
     data_offset + align_relative_evt3_word_offset(absolute_offset.saturating_sub(data_offset))
 }
 
-fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
+pub fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
     relative_offset & !1
 }
 

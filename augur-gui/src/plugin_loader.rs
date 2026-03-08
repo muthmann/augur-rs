@@ -139,24 +139,15 @@ impl DynPlugin {
         func: unsafe extern "C" fn(*const c_void) -> FfiString,
     ) -> Result<Option<String>, String> {
         let ffi = unsafe { func(self.instance) };
-        let text = unsafe { ffi.as_str() }
-            .map_err(|err| format!("plugin returned invalid UTF-8: {err}"))?;
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(text.to_owned()))
-        }
+        ffi_string_to_option(ffi, "plugin returned invalid UTF-8")
     }
 
     fn call_dependency(&self, index: usize) -> Result<Option<String>, String> {
         let ffi = unsafe { (self.vtable.dependency)(self.instance, index) };
-        let text = unsafe { ffi.as_str() }
-            .map_err(|err| format!("plugin dependency {index} is not valid UTF-8: {err}"))?;
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(text.to_owned()))
-        }
+        ffi_string_to_option(
+            ffi,
+            &format!("plugin dependency {index} is not valid UTF-8"),
+        )
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(
@@ -168,11 +159,7 @@ impl DynPlugin {
         unsafe {
             func(self.instance, &mut out_ptr, &mut out_len);
         }
-        let bytes = if out_ptr.is_null() || out_len == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(out_ptr, out_len) }
-        };
+        let bytes = unsafe { bytes_from_out_ptr(out_ptr, out_len) };
         serde_json::from_slice(bytes)
             .map_err(|err| format!("plugin returned invalid JSON payload: {err}"))
     }
@@ -227,11 +214,7 @@ impl DynPlugin {
         if !found {
             return Ok(None);
         }
-        let bytes = if out_ptr.is_null() || out_len == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(out_ptr, out_len) }
-        };
+        let bytes = unsafe { bytes_from_out_ptr(out_ptr, out_len) };
         serde_json::from_slice(bytes)
             .map(Some)
             .map_err(|err| format!("plugin setting {key} is not valid JSON: {err}"))
@@ -259,18 +242,23 @@ impl DynPlugin {
         analysis_output: &mut AnalysisOutput,
         context_data: &mut HashMap<String, Vec<u8>>,
     ) {
-        let raw_events: Vec<FfiCdEvent> = frame
-            .events
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|event| FfiCdEvent {
-                timestamp: event.timestamp,
-                x: event.x,
-                y: event.y,
-                polarity: u8::from(event.polarity),
-            })
-            .collect();
+        // Only pay the conversion cost when the plugin actually consumes events.
+        let raw_events: Vec<FfiCdEvent> = if self.input_kind == PluginInput::FrameOnly {
+            Vec::new()
+        } else {
+            frame
+                .events
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|event| FfiCdEvent {
+                    timestamp: event.timestamp,
+                    x: event.x,
+                    y: event.y,
+                    polarity: u8::from(event.polarity),
+                })
+                .collect()
+        };
         let ffi_frame = FfiPreviewFrame {
             width: frame.width,
             height: frame.height,
@@ -566,6 +554,23 @@ unsafe extern "C" fn get_context_value(
     true
 }
 
+fn ffi_string_to_option(ffi: FfiString, context: &str) -> Result<Option<String>, String> {
+    let text = unsafe { ffi.as_str() }.map_err(|err| format!("{context}: {err}"))?;
+    Ok(if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    })
+}
+
+unsafe fn bytes_from_out_ptr<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, len)
+    }
+}
+
 fn load_record(entry_dir: PathBuf) -> ManagedPlugin {
     let manifest = match read_manifest(&entry_dir) {
         Ok(manifest) => manifest,
@@ -627,8 +632,12 @@ fn find_library_file(entry_dir: &Path, manifest: &PluginManifest) -> Result<Path
     })?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("reading plugin file failed: {err}"))?;
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
+        if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
             candidates.push(path);
         }
     }
@@ -657,8 +666,6 @@ fn candidate_library_names(base: &str) -> Vec<String> {
     if !base.starts_with("lib") {
         names.push(format!("lib{base}.{extension}"));
     }
-    names.sort();
-    names.dedup();
     names
 }
 

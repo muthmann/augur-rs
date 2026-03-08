@@ -19,7 +19,7 @@ The top toolbar provides the main session controls:
 | `Probe Camera` | Query the EVK4 and display model, serial, and firmware information |
 | `Preview` | Start live preview without writing to disk |
 | `Record` | Start recording to the configured output path |
-| `Open .raw` | Open a recorded EVT3 file in replay mode |
+| `Open Replay` | Open a recorded `.raw` file or decoded `.csv`, `.bin`, `.npy`, or optional `.h5` / `.hdf5` event file in replay mode |
 | `Stop` | Stop preview, recording, or replay |
 | `Apply Settings` | Push pending runtime changes while previewing or recording |
 | `Settings Panel` / `Analysis Panel` | Show or hide the left and right side panels |
@@ -88,7 +88,20 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 ## Replay Mode
 
-Opening a `.raw` file starts a preview-only pipeline backed by `RawFileCamera`.
+Opening a replay file starts a preview-only pipeline:
+
+- `.raw` files use `RawFileCamera`
+- decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` files use `DecodedEventFileCamera`
+- all formats share the same transport controls, plugin path, and preview rendering
+
+Decoded replay files carry geometry differently:
+
+- `.csv` requires a `%geometry:W,H` header
+- `.bin` stores geometry in its binary header
+- `.npy` infers geometry from `max(x) + 1` / `max(y) + 1` with a minimum of `1280x720`
+- `.h5` / `.hdf5` read the file-level `geometry` attribute when present and otherwise infer geometry from event bounds with a minimum of `1280x720`
+
+HDF5 replay is optional at build time. Build or run `augur-gui` with `--features hdf5` on a machine with the HDF5 system library installed to enable `.h5` / `.hdf5` support.
 
 The center panel switches to a `Replay` heading and adds transport controls below the preview:
 
@@ -112,8 +125,9 @@ A `Contrast` slider below the preview is available in both live and replay modes
 - the slider controls percentile-based normalization (`90.0` to `100.0`)
 - this prevents a single hotpixel from dominating the entire frame
 - lower percentiles reveal dimmer activity at the cost of earlier saturation
+- ON events render in green, OFF events render in red, and mixed pixels appear yellow/orange
 
-The same contrast setting is used for the base preview image and ROI-grid rendering.
+The same contrast setting is used for the base preview image and ROI-grid rendering, with one shared normalization range across both polarity channels so relative ON/OFF strength remains visible.
 
 ---
 
@@ -122,3 +136,4 @@ The same contrast setting is used for the base preview image and ROI-grid render
 - Acquisition time is only adjustable for live preview and recording
 - output path editing is disabled during active recording and replay
 - the camera/replay status line below the toolbar shows the current session state
+- the stats area also shows per-frame `ON % | OFF %` plus the event count for the latest preview frame

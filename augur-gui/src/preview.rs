@@ -19,7 +19,7 @@ pub fn frame_to_color_image(
 ) -> ColorImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    let max = percentile_value(&frame.pixels, contrast_percentile) as f32;
+    let max = percentile_value_two(&frame.pixels_on, &frame.pixels_off, contrast_percentile) as f32;
     let mut rgba = vec![0u8; w * h * 4];
 
     // Look for a ROI grid overlay to merge into the base rendering pass.
@@ -34,11 +34,12 @@ pub fn frame_to_color_image(
     if let Some((grid, top_n)) = roi {
         render_base_with_grid(frame, grid, top_n, max, w, h, &mut rgba);
     } else {
-        for (i, &v) in frame.pixels.iter().enumerate() {
-            let g = normalized_green(v, max);
+        for i in 0..(w * h) {
+            let r = normalized_channel(frame.pixels_off[i], max);
+            let g = normalized_channel(frame.pixels_on[i], max);
             let off = i * 4;
-            rgba[off] = 8;
-            rgba[off + 1] = g;
+            rgba[off] = r.max(8);
+            rgba[off + 1] = g.max(8);
             rgba[off + 2] = 8;
             rgba[off + 3] = 255;
         }
@@ -79,20 +80,42 @@ pub fn frame_to_color_image(
     ColorImage::from_rgba_unmultiplied([w, h], &rgba)
 }
 
+#[cfg(test)]
 fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
-    let max_val = pixels.iter().copied().max().unwrap_or(0) as usize;
+    percentile_value_from_slices(&[pixels], percentile)
+}
+
+fn percentile_value_two(on: &[u16], off: &[u16], percentile: f32) -> u16 {
+    percentile_value_from_slices(&[on, off], percentile)
+}
+
+fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
+    let max_val = channels
+        .iter()
+        .flat_map(|channel| channel.iter())
+        .copied()
+        .max()
+        .unwrap_or(0) as usize;
     if max_val == 0 {
         return 1;
     }
 
-    let mut hist = vec![0u32; max_val + 1];
-    for &value in pixels {
-        hist[value as usize] += 1;
+    // Cap histogram at 4096 entries (16 KB). Values above the cap are clamped
+    // into the last bin, so a single hot pixel at 65535 does not force a
+    // 256 KB allocation every frame.
+    const MAX_BINS: usize = 4096;
+    let hist_size = max_val.min(MAX_BINS - 1) + 1;
+    let mut hist = vec![0u32; hist_size];
+    for channel in channels {
+        for &value in *channel {
+            hist[(value as usize).min(hist_size - 1)] += 1;
+        }
     }
 
     let percentile = percentile.clamp(0.0, 100.0);
-    let target = ((pixels.len() as f64 * percentile as f64 / 100.0).ceil() as u64)
-        .clamp(1, pixels.len() as u64);
+    let len = channels.iter().map(|channel| channel.len()).sum::<usize>();
+    let target =
+        ((len as f64 * percentile as f64 / 100.0).ceil() as u64).clamp(1, len.max(1) as u64);
     let mut cumulative = 0u64;
     for (value, &count) in hist.iter().enumerate() {
         cumulative += u64::from(count);
@@ -101,10 +124,10 @@ fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
         }
     }
 
-    max_val.max(1) as u16
+    hist_size.max(1) as u16
 }
 
-fn normalized_green(value: u16, max: f32) -> u8 {
+fn normalized_channel(value: u16, max: f32) -> u8 {
     let clamped = (value as f32).min(max);
     ((clamped / max).sqrt() * 255.0) as u8
 }
@@ -175,8 +198,10 @@ fn render_base_with_grid(
         let row_off = py * w;
 
         for px in 0..w {
-            let v = frame.pixels[row_off + px];
-            let g = u32::from(normalized_green(v, max));
+            let on_v = frame.pixels_on[row_off + px];
+            let off_v = frame.pixels_off[row_off + px];
+            let base_g = u32::from(normalized_channel(on_v, max).max(8));
+            let base_r = u32::from(normalized_channel(off_v, max).max(8));
 
             let gc = col_map[px];
             let cell = gr * grid_cols + gc;
@@ -194,8 +219,8 @@ fn render_base_with_grid(
             let a = tint[3];
             let inv = 255 - a;
             let off = (row_off + px) * 4;
-            rgba[off] = ((8 * inv + tint[0] * a) / 255) as u8;
-            rgba[off + 1] = ((g * inv + tint[1] * a) / 255) as u8;
+            rgba[off] = ((base_r * inv + tint[0] * a) / 255) as u8;
+            rgba[off + 1] = ((base_g * inv + tint[1] * a) / 255) as u8;
             rgba[off + 2] = ((8 * inv + tint[2] * a) / 255) as u8;
             rgba[off + 3] = 255;
         }
@@ -312,8 +337,10 @@ fn draw_rect_border(
             }
         }
     }
-    // Left and right edges.
-    for py in rect.y..y_end {
+    // Left and right edges — skip rows already covered by the top/bottom passes.
+    let inner_y = (rect.y + thickness).min(y_end);
+    let inner_y_end = y_end.saturating_sub(thickness).max(inner_y);
+    for py in inner_y..inner_y_end {
         for t in 0..thickness {
             if rect.x + t < x_end {
                 let idx = (py * width + rect.x + t) * 4;
@@ -330,7 +357,7 @@ fn draw_rect_border(
 
 #[cfg(test)]
 mod tests {
-    use super::percentile_value;
+    use super::{percentile_value, percentile_value_two};
 
     #[test]
     fn percentile_ignores_single_hotpixel_outlier() {
@@ -342,5 +369,12 @@ mod tests {
     fn percentile_returns_one_for_empty_or_all_zero() {
         assert_eq!(percentile_value(&[], 99.5), 1);
         assert_eq!(percentile_value(&[0, 0, 0], 99.5), 1);
+    }
+
+    #[test]
+    fn combined_percentile_uses_both_polarity_channels() {
+        let on = [0, 3];
+        let off = [0, 6];
+        assert_eq!(percentile_value_two(&on, &off, 75.0), 3);
     }
 }
