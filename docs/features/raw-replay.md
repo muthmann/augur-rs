@@ -35,9 +35,9 @@ The decoded replay path is intentionally narrow and matches the evt3-core decode
 - `.csv` — XYPT rows with a required `%geometry:W,H` header
 - `.bin` — `EVT3BIN\0` header + 14-byte packed XYPT records
 - `.npy` — structured NumPy array with fields `x`, `y`, `p`, padding, `t`; geometry is inferred from the event bounds with a minimum of `1280x720`
-- `.h5` / `.hdf5` — Prophesee HDF5 recordings using the `CD/events` dataset; geometry comes from the file-level `geometry` attribute when present, otherwise it is inferred from event bounds with a minimum of `1280x720`
+- `.h5` / `.hdf5` — Prophesee HDF5 recordings using the `CD/events` dataset; geometry comes from the file-level `geometry` attribute when present, whether it is stored as variable-length ASCII or variable-length Unicode, otherwise it is inferred from event bounds with a minimum of `1280x720`
 
-HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `augur-gui` and requires a system HDF5 installation.
+HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `augur-gui` and requires a system HDF5 installation. ECF-compressed Prophesee files also require the HDF5 ECF plugin via `HDF5_PLUGIN_PATH`; see [HDF5 File Support](./hdf5-file-support.md).
 
 ## GUI Workflow
 

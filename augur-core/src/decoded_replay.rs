@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[cfg(feature = "hdf5")]
-use hdf5::types::VarLenUnicode;
+use hdf5::types::{VarLenAscii, VarLenUnicode};
 
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THROTTLE_SLEEP_SLICE: Duration = Duration::from_millis(10);
@@ -737,12 +737,19 @@ fn parse_hdf5_geometry(file: &hdf5::File, path: &Path) -> Result<Option<(u32, u3
         Err(_) => return Ok(None),
     };
 
-    let geometry = attr.read_scalar::<VarLenUnicode>().map_err(|err| {
-        CameraError::Config(format!(
-            "hdf5 replay file {} has an unreadable geometry attribute: {err}",
-            path.display()
-        ))
-    })?;
+    let geometry = attr
+        .read_scalar::<VarLenAscii>()
+        .map(|geometry| geometry.as_str().to_string())
+        .or_else(|_| {
+            attr.read_scalar::<VarLenUnicode>()
+                .map(|geometry| geometry.to_string())
+        })
+        .map_err(|err| {
+            CameraError::Config(format!(
+                "hdf5 replay file {} has an unreadable geometry attribute: {err}",
+                path.display()
+            ))
+        })?;
     let geometry = geometry.as_str();
     let Some((raw_width, raw_height)) = geometry.split_once('x') else {
         return Err(CameraError::Config(format!(
@@ -824,7 +831,7 @@ mod tests {
     };
 
     #[cfg(feature = "hdf5")]
-    use hdf5::types::VarLenUnicode;
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
     #[cfg(feature = "hdf5")]
     use std::str::FromStr;
 
@@ -939,6 +946,29 @@ mod tests {
             .expect("CD events dataset must be created");
     }
 
+    #[cfg(feature = "hdf5")]
+    fn write_hdf5_ascii(path: &Path, geometry: Option<&str>, events: &[RawHdf5CdEvent]) {
+        let file = hdf5::File::create(path).expect("hdf5 sample must be created");
+
+        if let Some(geometry) = geometry {
+            let geometry = VarLenAscii::from_ascii(geometry.as_bytes())
+                .expect("geometry string must be ASCII");
+            file.new_attr::<VarLenAscii>()
+                .shape(())
+                .create("geometry")
+                .expect("geometry attribute must be created")
+                .write_scalar(&geometry)
+                .expect("geometry attribute must be written");
+        }
+
+        let group = file.create_group("CD").expect("CD group must be created");
+        group
+            .new_dataset_builder()
+            .with_data(events)
+            .create("events")
+            .expect("CD events dataset must be created");
+    }
+
     #[test]
     fn packed_event_decoder_handles_split_records() {
         let event = sample_events()[0];
@@ -1035,6 +1065,54 @@ mod tests {
     fn open_hdf5_replay_reads_geometry_and_events() {
         let path = temp_path("h5");
         write_hdf5(
+            &path,
+            Some("320x240"),
+            &[
+                RawHdf5CdEvent {
+                    x: 10,
+                    y: 20,
+                    p: 1,
+                    t: 100,
+                },
+                RawHdf5CdEvent {
+                    x: 11,
+                    y: 21,
+                    p: 0,
+                    t: 120,
+                },
+            ],
+        );
+
+        let (_camera, _controls, info, shared_events) =
+            DecodedEventFileCamera::open(&path).expect("hdf5 replay must open");
+        assert_eq!(info.width, 320);
+        assert_eq!(info.height, 240);
+        assert_eq!(
+            &*shared_events,
+            &[
+                CdEvent {
+                    x: 10,
+                    y: 20,
+                    polarity: true,
+                    timestamp: 100,
+                },
+                CdEvent {
+                    x: 11,
+                    y: 21,
+                    polarity: false,
+                    timestamp: 120,
+                },
+            ]
+        );
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn open_hdf5_replay_reads_ascii_geometry_and_events() {
+        let path = temp_path("h5");
+        write_hdf5_ascii(
             &path,
             Some("320x240"),
             &[

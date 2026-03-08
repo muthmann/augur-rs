@@ -13,6 +13,7 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 ## Index
 
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
+- [HDF5 File Support](./hdf5-file-support.md) — native HDF5 build requirements, ECF plugin installation, runtime environment setup
 - [Replay](./raw-replay.md) — `.raw` plus decoded-event replay, seekable transport controls, persisted EOF state
 - [Collapsible GUI Panels](./collapsible-panels.md) — toolbar toggles for the settings and analysis side panels
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types

@@ -9,13 +9,20 @@
 
 ## Build
 
+Binary releases do not include HDF5 replay support. Use a source build for `.h5` / `.hdf5` replay.
+
 ```bash
 cargo build --workspace
 
 # Optional: enable `.h5` / `.hdf5` replay in the GUI
 # Requires a system HDF5 installation such as `brew install hdf5`.
+export HDF5_DIR="$(brew --prefix hdf5)"   # macOS / Homebrew
+./scripts/install-ecf-plugin.sh
+export HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin"
 cargo build -p augur-gui --features hdf5
 ```
+
+`HDF5_PLUGIN_PATH` must be set before launching `augur-gui` for ECF-compressed Prophesee files and, on macOS, should also be present for HDF5-enabled build/test commands. See [HDF5 file support](./features/hdf5-file-support.md) for the manual plugin fallback and environment details.
 
 Optional local checks:
 
@@ -82,4 +89,5 @@ Suggested first run:
 - Use [Configuration reference](./configuration.md) to create a reusable TOML file
 - Use [CLI usage](./cli.md) for headless operation and scripting
 - Use [GUI usage](./gui.md) for hotpixel workflows and ROI-grid assistance
+- Use [HDF5 file support](./features/hdf5-file-support.md) when replaying `.h5` / `.hdf5` files
 - Read [Performance](./performance.md) for architecture and design rationale

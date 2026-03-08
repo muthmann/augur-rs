@@ -100,12 +100,17 @@ The disk writer uses a **bounded channel** — recording pauses if the OS falls 
 
 **Requirements:** Rust toolchain, Prophesee EVK4 over USB 3.
 
+Tagged binary releases do not include HDF5 replay support. Use a source build if you need `.h5` / `.hdf5` replay.
+
 ```bash
 # Build everything
 cargo build --workspace
 
 # Optional: enable `.h5` / `.hdf5` replay in the GUI
 # Requires a system HDF5 installation such as `brew install hdf5`.
+export HDF5_DIR="$(brew --prefix hdf5)"   # macOS / Homebrew
+./scripts/install-ecf-plugin.sh
+export HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin"
 cargo build -p augur-gui --features hdf5
 
 # Check camera connection
@@ -118,8 +123,10 @@ cargo run --bin augur -- record captures/run.raw --duration-s 30
 cargo run --bin augur-gui
 
 # Launch the GUI with optional HDF5 replay support
-cargo run --bin augur-gui --features hdf5
+HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin" cargo run --bin augur-gui --features hdf5
 ```
+
+For the full HDF5 / ECF setup, see [HDF5 File Support](./docs/features/hdf5-file-support.md).
 
 Copy the example config for a local profile:
 
@@ -217,6 +224,7 @@ Tagged releases ship a CLI archive and an unsigned macOS `.app` bundle.
 | [GUI Guide](./docs/gui.md) | Live preview, controls, the plugin panel, and the Plugin Manager |
 | [Recording Format](./docs/recording.md) | EVT3 output and pipeline behavior |
 | [Performance](./docs/performance.md) | Architecture and design rationale |
+| [HDF5 File Support](./docs/features/hdf5-file-support.md) | Native HDF5 + ECF plugin setup for `.h5` / `.hdf5` replay |
 | [Plugin Architecture](./docs/features/analysis-plugins.md) | Plugin API: FFI host, phases, context bus |
 | [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
 | [Technical Notes](./docs/features/README.md) | SDK internals, ROI grid, and feature details |
