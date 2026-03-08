@@ -54,7 +54,7 @@ pub struct ReplayControls {
 }
 
 impl ReplayControls {
-    fn new(info: &ReplayFileInfo, bytes_read: u64) -> Self {
+    pub(crate) fn new(info: &ReplayFileInfo, bytes_read: u64) -> Self {
         Self {
             paused: Arc::new(AtomicBool::new(false)),
             speed_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
@@ -388,9 +388,7 @@ fn scan_timestamp_window(file: &File, start: u64, len: u64) -> Result<(Option<u6
     decoder
         .decode_bytes(&bytes, &mut cd_events, &mut trigger_events)
         .map_err(|e| CameraError::Other(format!("failed to scan replay timestamps: {e}")))?;
-    // finish_stream may fail for older files whose EVT3 stream has no clean terminator;
-    // this is non-fatal — we already have whatever timestamps were decoded.
-    let _ = decoder.finish_stream();
+    decoder.finish_stream_lenient();
 
     Ok((
         cd_events.first().map(|event| event.timestamp),

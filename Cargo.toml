@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 eframe = "0.27"
 egui = "0.27"
-evt3-core = "=0.1.0"
+evt3-core = { path = "../evt3_core" }
 rusb = { version = "0.9", features = ["vendored"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"

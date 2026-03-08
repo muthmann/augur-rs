@@ -1432,8 +1432,6 @@ dependencies = [
 [[package]]
 name = "evt3-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fa93253382d4a186a01cbc1cd78de7338afbaa42d527b322feb088b7b6b9a94"
 dependencies = [
  "byteorder",
  "thiserror 1.0.69",

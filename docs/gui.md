@@ -19,7 +19,7 @@ The top toolbar provides the main session controls:
 | `Probe Camera` | Query the EVK4 and display model, serial, and firmware information |
 | `Preview` | Start live preview without writing to disk |
 | `Record` | Start recording to the configured output path |
-| `Open .raw` | Open a recorded EVT3 file in replay mode |
+| `Open Replay` | Open a recorded `.raw` file or decoded `.csv`, `.bin`, `.npy` event file in replay mode |
 | `Stop` | Stop preview, recording, or replay |
 | `Apply Settings` | Push pending runtime changes while previewing or recording |
 | `Settings Panel` / `Analysis Panel` | Show or hide the left and right side panels |
@@ -88,7 +88,17 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 ## Replay Mode
 
-Opening a `.raw` file starts a preview-only pipeline backed by `RawFileCamera`.
+Opening a replay file starts a preview-only pipeline:
+
+- `.raw` files use `RawFileCamera`
+- decoded `.csv`, `.bin`, and `.npy` files use `DecodedEventFileCamera`
+- all formats share the same transport controls, plugin path, and preview rendering
+
+Decoded replay files carry geometry differently:
+
+- `.csv` requires a `%geometry:W,H` header
+- `.bin` stores geometry in its binary header
+- `.npy` infers geometry from `max(x) + 1` / `max(y) + 1` with a minimum of `1280x720`
 
 The center panel switches to a `Replay` heading and adds transport controls below the preview:
 

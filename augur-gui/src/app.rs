@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
 };
 
 use augur_core::{
@@ -10,9 +10,11 @@ use augur_core::{
     camera::{DeviceInfo, EventCamera},
     config::CameraConfig,
     pipeline::{
-        spawn_pipeline, Evt3CorePreviewDecoder, PipelineController, PipelineOptions, PreviewFrame,
+        spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
+        PreviewFrame,
     },
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
+    DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
 use augur_plugin_api::PluginInput;
 use augur_prophesee::evk4::Evk4Camera;
@@ -57,6 +59,7 @@ pub struct CameraApp {
     latest_frame: Option<PreviewFrame>,
     replay_controls: Option<ReplayControls>,
     replay_file_info: Option<ReplayFileInfo>,
+    replay_decoded_events: Option<Arc<Vec<CdEvent>>>,
     replay_paused: bool,
     replay_finished: bool,
     replay_pause_after_seek_frame: bool,
@@ -100,6 +103,7 @@ impl CameraApp {
             latest_frame: None,
             replay_controls: None,
             replay_file_info: None,
+            replay_decoded_events: None,
             replay_paused: false,
             replay_finished: false,
             replay_pause_after_seek_frame: false,
@@ -264,7 +268,7 @@ impl CameraApp {
         }
 
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("RAW", &["raw"])
+            .add_filter("Replay Files", &["raw", "csv", "bin", "npy"])
             .pick_file()
         else {
             return;
@@ -276,28 +280,55 @@ impl CameraApp {
             camera_info: self.camera_info.clone(),
         };
 
-        let (camera, controls, info) = match RawFileCamera::open(&path) {
+        let open_result = match replay_file_extension(&path).as_deref() {
+            Some("raw") => match RawFileCamera::open(&path) {
+                Ok((camera, controls, info)) => {
+                    let replay_info = camera.device_info();
+                    spawn_pipeline(
+                        camera,
+                        Evt3CorePreviewDecoder::default(),
+                        replay_pipeline_config(&info),
+                        PipelineOptions::preview_only(info.width, info.height),
+                    )
+                    .map(|controller| (controller, controls, info, replay_info, None))
+                    .map_err(|err| format!("pipeline start failed: {err}"))
+                }
+                Err(err) => Err(format!("open replay file failed: {err}")),
+            },
+            Some("csv") | Some("bin") | Some("npy") => match DecodedEventFileCamera::open(&path) {
+                Ok((camera, controls, info, decoded_events)) => {
+                    let replay_info = camera.device_info();
+                    spawn_pipeline(
+                        camera,
+                        PackedEventPreviewDecoder::default(),
+                        replay_pipeline_config(&info),
+                        PipelineOptions::preview_only(info.width, info.height),
+                    )
+                    .map(|controller| {
+                        (
+                            controller,
+                            controls,
+                            info,
+                            replay_info,
+                            Some(decoded_events),
+                        )
+                    })
+                    .map_err(|err| format!("pipeline start failed: {err}"))
+                }
+                Err(err) => Err(format!("open replay file failed: {err}")),
+            },
+            Some(ext) => Err(format!("unsupported replay file extension: .{ext}")),
+            None => Err("replay file is missing an extension".into()),
+        };
+        let (controller, controls, info, replay_info, decoded_events) = match open_result {
             Ok(result) => result,
             Err(err) => {
-                self.last_error = Some(format!("open replay file failed: {err}"));
+                self.last_error = Some(err);
                 return;
             }
         };
         let (display_config, display_mask_file, replay_notice) =
             self.load_replay_display_settings(&path, info.width, info.height);
-        let replay_info = camera.device_info();
-        let controller = match spawn_pipeline(
-            camera,
-            Evt3CorePreviewDecoder::default(),
-            replay_pipeline_config(&info),
-            PipelineOptions::preview_only(info.width, info.height),
-        ) {
-            Ok(controller) => controller,
-            Err(err) => {
-                self.last_error = Some(format!("pipeline start failed: {err}"));
-                return;
-            }
-        };
 
         self.set_replay_paused_internal(&controls, false);
         self.set_replay_speed_internal(&controls, 1.0);
@@ -311,6 +342,7 @@ impl CameraApp {
         self.replay_path = Some(path.display().to_string());
         self.replay_controls = Some(controls);
         self.replay_file_info = Some(info);
+        self.replay_decoded_events = decoded_events;
         self.replay_paused = false;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
@@ -450,6 +482,7 @@ impl CameraApp {
             self.last_error = Some("replay file metadata is missing".into());
             return;
         };
+        let decoded_events = self.replay_decoded_events.clone();
         let desired_paused = self.replay_paused || self.replay_finished;
 
         if let Some(controller) = self.controller.take() {
@@ -461,34 +494,43 @@ impl CameraApp {
         let data_len = info.data_len();
         let fraction = fraction.clamp(0.0, 1.0);
         let target_rel = ((data_len as f64 * fraction as f64) as u64).min(data_len);
-        let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
-
-        let (camera, controls) = match RawFileCamera::open_at(&path, &info, target_byte) {
+        let reopen_result = if let Some(decoded_events) = decoded_events {
+            let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
+            match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
+                Ok((camera, controls)) => spawn_pipeline(
+                    camera,
+                    PackedEventPreviewDecoder::default(),
+                    replay_pipeline_config(&info),
+                    PipelineOptions::preview_only(info.width, info.height),
+                )
+                .map(|controller| (controller, controls))
+                .map_err(|err| format!("seek pipeline start failed: {err}")),
+                Err(err) => Err(format!("seek failed: {err}")),
+            }
+        } else {
+            let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
+            match RawFileCamera::open_at(&path, &info, target_byte) {
+                Ok((camera, controls)) => spawn_pipeline(
+                    camera,
+                    Evt3CorePreviewDecoder::default(),
+                    replay_pipeline_config(&info),
+                    PipelineOptions::preview_only(info.width, info.height),
+                )
+                .map(|controller| (controller, controls))
+                .map_err(|err| format!("seek pipeline start failed: {err}")),
+                Err(err) => Err(format!("seek failed: {err}")),
+            }
+        };
+        let (controller, controls) = match reopen_result {
             Ok(result) => result,
             Err(err) => {
                 self.replay_finished = true;
                 self.replay_paused = true;
                 self.replay_seek_drag_value = None;
-                self.last_error = Some(format!("seek failed: {err}"));
+                self.last_error = Some(err);
                 if let Some(existing_controls) = &self.replay_controls {
                     existing_controls.paused.store(true, Ordering::Relaxed);
                 }
-                return;
-            }
-        };
-
-        let controller = match spawn_pipeline(
-            camera,
-            Evt3CorePreviewDecoder::default(),
-            replay_pipeline_config(&info),
-            PipelineOptions::preview_only(info.width, info.height),
-        ) {
-            Ok(controller) => controller,
-            Err(err) => {
-                self.replay_finished = true;
-                self.replay_paused = true;
-                self.replay_seek_drag_value = None;
-                self.last_error = Some(format!("seek pipeline start failed: {err}"));
                 return;
             }
         };
@@ -530,6 +572,7 @@ impl CameraApp {
     fn clear_replay_state(&mut self) {
         self.replay_controls = None;
         self.replay_file_info = None;
+        self.replay_decoded_events = None;
         self.replay_paused = false;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
@@ -836,7 +879,7 @@ impl eframe::App for CameraApp {
                 }
 
                 if ui
-                    .add_enabled(mode == AppMode::Idle, egui::Button::new("Open .raw"))
+                    .add_enabled(mode == AppMode::Idle, egui::Button::new("Open Replay"))
                     .clicked()
                 {
                     self.open_replay_file();
@@ -1474,6 +1517,12 @@ fn replay_pipeline_config(info: &ReplayFileInfo) -> CameraConfig {
     config.roi.width = info.width;
     config.roi.height = info.height;
     config
+}
+
+fn replay_file_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
 }
 
 fn replay_config_path(raw_path: &Path) -> Option<PathBuf> {

@@ -13,7 +13,7 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 ## Index
 
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
-- [RAW Replay](./raw-replay.md) — fast-open file replay, seekable transport controls, persisted EOF state
+- [Replay](./raw-replay.md) — `.raw` plus decoded-event replay, seekable transport controls, persisted EOF state
 - [Collapsible GUI Panels](./collapsible-panels.md) — toolbar toggles for the settings and analysis side panels
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow

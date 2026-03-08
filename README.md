@@ -31,7 +31,7 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 - **Direct hardware path** — Treuzell USB transport + IMX636 register programming, no Metavision or OpenEB required
 - **Backpressured 3-thread pipeline** — USB reader → bounded disk writer → lossy preview decoder. Recording never blocks on the UI, never grows unbounded in memory
 - **Reproducible sessions** — every `.raw` file gets a `.toml` config sidecar written automatically
-- **Replay in the GUI** — open recorded `.raw` captures instantly, scrub them with a timeline, and run plugins through the same path used for live sessions
+- **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, and `.npy` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
 - **Throughput stats** — 1-second sliding window for Mev/s and MB/s, visible in the GUI and CLI
 
 ### Sensor Control

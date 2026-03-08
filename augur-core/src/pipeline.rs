@@ -22,7 +22,7 @@ pub const BUF_SIZE: usize = 65_536;
 pub const N_BUFFERS: usize = 8;
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdEvent {
     pub x: u16,
     pub y: u16,
@@ -35,6 +35,14 @@ pub trait PreviewDecoder: Send + 'static {
 
     fn finish_stream(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn estimate_event_count(bytes: &[u8]) -> u64
+    where
+        Self: Sized,
+    {
+        let _ = bytes;
+        0
     }
 }
 
@@ -66,9 +74,12 @@ impl PreviewDecoder for Evt3CorePreviewDecoder {
     }
 
     fn finish_stream(&mut self) -> Result<()> {
-        self.inner
-            .finish_stream()
-            .map_err(|e| CameraError::Other(format!("evt3 stream finalize failed: {e}")))
+        self.inner.finish_stream_lenient();
+        Ok(())
+    }
+
+    fn estimate_event_count(bytes: &[u8]) -> u64 {
+        estimate_evt3_cd_events(bytes)
     }
 }
 
@@ -368,7 +379,7 @@ where
 
             if let Ok(mut s) = stats_usb.lock() {
                 let now = Instant::now();
-                s.record_packet(now, len as u64, estimate_evt3_cd_events(&buf[..len]));
+                s.record_packet(now, len as u64, D::estimate_event_count(&buf[..len]));
             }
 
             let preview_copy = buf[..len].to_vec();
@@ -569,10 +580,14 @@ where
             }
         }
 
-        // finish_stream may fail for older files whose EVT3 stream has no
-        // clean terminator; this is not a pipeline error — all events before
-        // EOF were already decoded and delivered.
-        let _ = decoder.finish_stream();
+        if let Err(err) = decoder.finish_stream() {
+            report_pipeline_error(
+                &error_preview,
+                &stop_preview,
+                "preview",
+                format!("preview stream finalize failed: {err}"),
+            );
+        }
     });
 
     threads.push(preview_thread);
@@ -719,17 +734,16 @@ mod tests {
     }
 
     #[test]
-    fn finish_stream_reports_trailing_half_word() {
+    fn finish_stream_ignores_trailing_half_word() {
         let mut decoder = Evt3CorePreviewDecoder::default();
         let mut events = Vec::new();
 
         decoder
             .decode_bytes(&[0x34], &mut events)
             .expect("decoder must accept partial byte stream");
-        let err = decoder
+        decoder
             .finish_stream()
-            .expect_err("dangling half word must fail");
-        assert!(err.to_string().contains("finalize failed"));
+            .expect("dangling half word must be ignored for replay EOF");
     }
 
     #[test]
