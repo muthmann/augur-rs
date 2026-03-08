@@ -756,10 +756,11 @@ fn solve_linear_system(mut lhs: [[f64; 6]; 6], mut rhs: [f64; 6]) -> Option<[f64
         }
 
         let pivot_value = lhs[pivot][pivot];
-        for col in pivot..6 {
-            lhs[pivot][col] /= pivot_value;
+        for value in lhs[pivot].iter_mut().skip(pivot) {
+            *value /= pivot_value;
         }
         rhs[pivot] /= pivot_value;
+        let pivot_row = lhs[pivot];
 
         for row in 0..6 {
             if row == pivot {
@@ -769,8 +770,12 @@ fn solve_linear_system(mut lhs: [[f64; 6]; 6], mut rhs: [f64; 6]) -> Option<[f64
             if factor.abs() < 1e-12 {
                 continue;
             }
-            for col in pivot..6 {
-                lhs[row][col] -= factor * lhs[pivot][col];
+            for (lhs_value, pivot_value) in lhs[row]
+                .iter_mut()
+                .skip(pivot)
+                .zip(pivot_row.iter().skip(pivot))
+            {
+                *lhs_value -= factor * pivot_value;
             }
             rhs[row] -= factor * rhs[pivot];
         }
