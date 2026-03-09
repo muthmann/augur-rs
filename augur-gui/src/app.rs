@@ -1094,7 +1094,7 @@ impl eframe::App for CameraApp {
                         AppMode::Replaying => {
                             ui.label("Replay mode: camera settings are shown as read-only reference data.");
                             if let Some(notice) = &self.replay_notice {
-                                ui.colored_label(egui::Color32::YELLOW, notice);
+                                ui.colored_label(ui.visuals().warn_fg_color, notice);
                             }
                         }
                         AppMode::Idle => {
@@ -1143,7 +1143,7 @@ impl eframe::App for CameraApp {
                             .collect();
                         if !missing_dependencies.is_empty() {
                             ui.colored_label(
-                                egui::Color32::YELLOW,
+                                ui.visuals().warn_fg_color,
                                 format!("Missing dependency: {}", missing_dependencies.join(", ")),
                             );
                         }
@@ -1173,14 +1173,14 @@ impl eframe::App for CameraApp {
                             .collect();
                         if !missing_dependencies.is_empty() {
                             ui.colored_label(
-                                egui::Color32::YELLOW,
+                                ui.visuals().warn_fg_color,
                                 format!("Missing dependency: {}", missing_dependencies.join(", ")),
                             );
                         }
 
                         if let Err(err) = render_plugin_settings(ui, plugin) {
                             ui.colored_label(
-                                egui::Color32::RED,
+                                ui.visuals().error_fg_color,
                                 format!("Dynamic plugin UI failed: {err}"),
                             );
                         }
@@ -1244,9 +1244,9 @@ impl eframe::App for CameraApp {
                             ui.label(record.domain());
                             ui.label(record.phase_label());
                             let status_color = if record.load_error().is_some() {
-                                egui::Color32::YELLOW
+                                ui.visuals().warn_fg_color
                             } else {
-                                egui::Color32::from_rgb(88, 196, 92)
+                                status_success_color()
                             };
                             ui.colored_label(status_color, record.status_label());
 
@@ -1266,7 +1266,7 @@ impl eframe::App for CameraApp {
                             ui.end_row();
 
                             if let Some(error) = record.load_error() {
-                                ui.colored_label(egui::Color32::YELLOW, error);
+                                ui.colored_label(ui.visuals().warn_fg_color, error);
                                 ui.label("");
                                 ui.label("");
                                 ui.label("");
@@ -1379,7 +1379,7 @@ impl eframe::App for CameraApp {
                         });
 
                     if self.replay_finished {
-                        ui.colored_label(egui::Color32::LIGHT_GREEN, "Finished");
+                        ui.colored_label(status_success_color(), "Finished");
                     }
                 });
 
@@ -1469,7 +1469,7 @@ impl eframe::App for CameraApp {
             if mode != AppMode::Idle && mode != AppMode::Replaying {
                 if self.config_dirty || self.acq_dirty {
                     ui.colored_label(
-                        egui::Color32::YELLOW,
+                        ui.visuals().warn_fg_color,
                         "There are unapplied runtime changes.",
                     );
                 } else {
@@ -1481,7 +1481,7 @@ impl eframe::App for CameraApp {
                 ui.separator();
                 for warning in &self.analysis_output.warnings {
                     ui.colored_label(
-                        analysis_warning_color(warning.severity),
+                        analysis_warning_color(warning.severity, ui.visuals()),
                         format!("{}: {}", warning.source, warning.message),
                     );
                 }
@@ -1507,7 +1507,7 @@ impl eframe::App for CameraApp {
 
             if let Some(err) = &self.last_error {
                 ui.separator();
-                ui.colored_label(egui::Color32::RED, err);
+                ui.colored_label(ui.visuals().error_fg_color, err);
             }
         });
 
@@ -1517,11 +1517,19 @@ impl eframe::App for CameraApp {
     }
 }
 
-fn analysis_warning_color(severity: AnalysisSeverity) -> egui::Color32 {
+fn status_success_color() -> egui::Color32 {
+    egui::Color32::from_rgb(0, 160, 60)
+}
+
+fn analysis_info_color() -> egui::Color32 {
+    egui::Color32::from_rgb(30, 100, 220)
+}
+
+fn analysis_warning_color(severity: AnalysisSeverity, visuals: &egui::Visuals) -> egui::Color32 {
     match severity {
-        AnalysisSeverity::Info => egui::Color32::from_rgb(96, 160, 255),
-        AnalysisSeverity::Warning => egui::Color32::YELLOW,
-        AnalysisSeverity::Error => egui::Color32::RED,
+        AnalysisSeverity::Info => analysis_info_color(),
+        AnalysisSeverity::Warning => visuals.warn_fg_color,
+        AnalysisSeverity::Error => visuals.error_fg_color,
     }
 }
 

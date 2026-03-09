@@ -131,6 +131,16 @@ The same contrast setting is used for the base preview image and ROI-grid render
 
 ---
 
+## Status Colors
+
+Status, warning, and error labels adapt to the active GUI theme.
+
+- warning and error text uses egui's theme-aware foreground colors, so replay notices, missing-dependency warnings, load errors, and runtime error messages stay readable in both light and dark mode
+- replay and plugin success labels use a darker mid-green instead of a very bright light-green
+- analysis info messages use a darker blue for better contrast on light backgrounds
+
+---
+
 ## Runtime Notes
 
 - Acquisition time is only adjustable for live preview and recording

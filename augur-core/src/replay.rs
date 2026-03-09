@@ -22,6 +22,9 @@ const HEADER_END: &str = "% end";
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THROTTLE_SLEEP_SLICE: Duration = Duration::from_millis(10);
 const FAST_SCAN_WINDOW_BYTES: u64 = 128 * 1024;
+/// EVT3 timestamps are 24 bits wide (TIME_HIGH:12 | TIME_LOW:12), so they
+/// wrap around every 2^24 µs ≈ 16.8 seconds.
+const EVT3_TIMESTAMP_PERIOD_US: u64 = 1 << 24;
 
 #[derive(Debug, Clone)]
 pub struct ReplayFileInfo {
@@ -358,16 +361,64 @@ fn scan_duration_fast(
     let first_start = data_offset;
     let last_start =
         data_offset + align_relative_evt3_word_offset(data_len.saturating_sub(window_len));
-    let (first_ts, _) = scan_timestamp_window(file, first_start, window_len)?;
-    let (_, last_ts) = scan_timestamp_window(file, last_start, window_len)?;
+    // Capture both timestamps from the first window so we can compute a local
+    // bytes-per-µs rate without crossing window boundaries.
+    let (first_ts, first_window_last_ts) = scan_timestamp_window(file, first_start, window_len)?;
+    let (_, last_ts_raw) = scan_timestamp_window(file, last_start, window_len)?;
+
+    // Each scan window uses a fresh Evt3Decoder that has no knowledge of the
+    // recording history, so it decodes TIME_HIGH values modulo 4096.  The
+    // EVT3 24-bit timestamp wraps every 2^24 µs ≈ 16.8 s.  For recordings
+    // longer than one period the last window's `last_ts_raw` is smaller than
+    // the true absolute timestamp.  We estimate the total duration from the
+    // first window's internal rate and pick the rollover-corrected value of
+    // `last_ts_raw` that is closest to that estimate.
+    let first_window_duration_us = first_ts
+        .zip(first_window_last_ts)
+        .and_then(|(first, last)| last.checked_sub(first))
+        .filter(|&d| d > 0);
+
+    let last_ts: Option<u64> = match (first_ts, last_ts_raw, first_window_duration_us) {
+        (Some(first), Some(last_raw), Some(window_dur_us)) => {
+            let est_total_us =
+                (data_len as f64 / window_len as f64 * window_dur_us as f64).round() as u64;
+            Some(correct_evt3_rollover(first, last_raw, est_total_us))
+        }
+        (_, raw, _) => raw,
+    };
 
     let nominal_bytes_per_sec = first_ts
         .zip(last_ts)
         .and_then(|(first, last)| last.checked_sub(first))
-        .filter(|duration_us| *duration_us > 0)
-        .map(|duration_us| data_len as f64 / (duration_us as f64 / 1_000_000.0));
+        .filter(|&d| d > 0)
+        .map(|d| data_len as f64 / (d as f64 / 1_000_000.0));
 
     Ok((first_ts, last_ts, nominal_bytes_per_sec))
+}
+
+/// Corrects `last_ts_raw` for EVT3 24-bit timestamp rollover.
+///
+/// `last_ts_raw` comes from a fresh decoder that decoded only the tail of the
+/// recording, so it does not account for how many full 2^24 µs periods elapsed
+/// since the beginning.  Given an estimate of the total recording duration we
+/// pick the nearest rollover-adjusted candidate.
+fn correct_evt3_rollover(first_ts: u64, last_ts_raw: u64, est_total_us: u64) -> u64 {
+    let expected_last = first_ts.saturating_add(est_total_us);
+    let period = EVT3_TIMESTAMP_PERIOD_US;
+    let n = expected_last / period;
+    let candidates = [
+        n.saturating_sub(1)
+            .saturating_mul(period)
+            .saturating_add(last_ts_raw),
+        n.saturating_mul(period).saturating_add(last_ts_raw),
+        n.saturating_add(1)
+            .saturating_mul(period)
+            .saturating_add(last_ts_raw),
+    ];
+    candidates
+        .into_iter()
+        .min_by_key(|&c| c.abs_diff(expected_last))
+        .unwrap_or(last_ts_raw)
 }
 
 fn scan_timestamp_window(file: &File, start: u64, len: u64) -> Result<(Option<u64>, Option<u64>)> {
@@ -412,6 +463,41 @@ mod tests {
         env, fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    // ── correct_evt3_rollover ────────────────────────────────────────────────
+
+    #[test]
+    fn rollover_correction_no_rollover() {
+        // Short recording that never wraps: correction must be a no-op.
+        let first_ts = 1_000_u64;
+        let true_last = 5_000_000_u64; // 5 s
+        let corrected = correct_evt3_rollover(first_ts, true_last, true_last - first_ts);
+        assert_eq!(corrected, true_last);
+    }
+
+    #[test]
+    fn rollover_correction_one_rollover_25s() {
+        // A 25-second recording.  EVT3 period = 2^24 = 16,777,216 µs.
+        // first_ts = 1,000; true last_ts = 25,001,000.
+        // After one rollover: last_ts_raw = 25,001,000 - 16,777,216 = 8,223,784.
+        let first_ts = 1_000_u64;
+        let true_last = 25_001_000_u64;
+        let last_ts_raw = true_last - EVT3_TIMESTAMP_PERIOD_US; // 8,223,784
+        let est_total_us = true_last - first_ts; // 25,000,000
+        let corrected = correct_evt3_rollover(first_ts, last_ts_raw, est_total_us);
+        assert_eq!(corrected, true_last);
+    }
+
+    #[test]
+    fn rollover_correction_two_rollovers_40s() {
+        // A 40-second recording crosses the period boundary twice.
+        let first_ts = 500_u64;
+        let true_last = 40_000_500_u64;
+        let last_ts_raw = true_last - 2 * EVT3_TIMESTAMP_PERIOD_US;
+        let est_total_us = true_last - first_ts;
+        let corrected = correct_evt3_rollover(first_ts, last_ts_raw, est_total_us);
+        assert_eq!(corrected, true_last);
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
