@@ -407,9 +407,13 @@ fn correct_evt3_rollover(first_ts: u64, last_ts_raw: u64, est_total_us: u64) -> 
     let period = EVT3_TIMESTAMP_PERIOD_US;
     let n = expected_last / period;
     let candidates = [
-        n.saturating_sub(1).saturating_mul(period).saturating_add(last_ts_raw),
+        n.saturating_sub(1)
+            .saturating_mul(period)
+            .saturating_add(last_ts_raw),
         n.saturating_mul(period).saturating_add(last_ts_raw),
-        n.saturating_add(1).saturating_mul(period).saturating_add(last_ts_raw),
+        n.saturating_add(1)
+            .saturating_mul(period)
+            .saturating_add(last_ts_raw),
     ];
     candidates
         .into_iter()
