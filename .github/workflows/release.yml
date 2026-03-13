@@ -29,28 +29,125 @@ jobs:
       - name: Assemble macOS app bundle
         run: bash resources/macos-bundle.sh target/release/augur-gui dist
 
-      - name: Package release archive
+      - name: Create .dmg installer
+        run: |
+          STAGING_DIR="$RUNNER_TEMP/dmg-staging"
+          rm -rf "$STAGING_DIR"
+          mkdir -p "$STAGING_DIR"
+          cp -R dist/AugurGUI.app "$STAGING_DIR/"
+          ln -s /Applications "$STAGING_DIR/Applications"
+          hdiutil create \
+            -volname "AugurGUI" \
+            -srcfolder "$STAGING_DIR" \
+            -ov -format UDZO \
+            AugurGUI.dmg
+
+      - name: Package CLI archive
         run: |
           mkdir -p dist/augur-macos/bin
           cp target/release/augur dist/augur-macos/bin/
           cp target/release/augur-gui dist/augur-macos/bin/
-          cp README.md LICENSE CONTRIBUTING.md dist/augur-macos/
+          cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md dist/augur-macos/
           mkdir -p dist/augur-macos/examples
           cp examples/augur.toml dist/augur-macos/examples/
           ditto -c -k --sequesterRsrc --keepParent dist/augur-macos augur-macos.zip
-          ditto -c -k --sequesterRsrc --keepParent dist/AugurGUI.app AugurGUI.app.zip
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: augur-release-assets
+          name: augur-macos-assets
           path: |
             augur-macos.zip
-            AugurGUI.app.zip
+            AugurGUI.dmg
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             augur-macos.zip
-            AugurGUI.app.zip
+            AugurGUI.dmg
+
+  linux-release:
+    name: Build Linux release artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            pkg-config libhdf5-dev
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bin augur --bin augur-gui
+
+      - name: Package release archive
+        run: |
+          mkdir -p dist/augur-linux/bin
+          cp target/release/augur dist/augur-linux/bin/
+          cp target/release/augur-gui dist/augur-linux/bin/
+          cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md dist/augur-linux/
+          mkdir -p dist/augur-linux/examples
+          cp examples/augur.toml dist/augur-linux/examples/
+          tar -czf augur-linux.tar.gz -C dist augur-linux
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: augur-linux-assets
+          path: augur-linux.tar.gz
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: augur-linux.tar.gz
+
+  windows-release:
+    name: Build Windows release artifacts
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bin augur --bin augur-gui
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/augur-windows/bin | Out-Null
+          Copy-Item target/release/augur.exe dist/augur-windows/bin/
+          Copy-Item target/release/augur-gui.exe dist/augur-windows/bin/
+          Copy-Item README.md, LICENSE, CONTRIBUTING.md, CHANGELOG.md dist/augur-windows/
+          New-Item -ItemType Directory -Force -Path dist/augur-windows/examples | Out-Null
+          Copy-Item examples/augur.toml dist/augur-windows/examples/
+          Compress-Archive -Path dist/augur-windows -DestinationPath augur-windows.zip
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: augur-windows-assets
+          path: augur-windows.zip
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: augur-windows.zip
