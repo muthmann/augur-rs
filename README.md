@@ -210,7 +210,7 @@ Build a plugin crate, copy its `plugin.toml` plus the generated `.dylib/.so/.dll
 | Linux | CI-verified on every push |
 | Windows | CI-verified on every push |
 
-Tagged releases ship a CLI archive and an unsigned macOS `.app` bundle.
+Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned macOS `AugurGUI.dmg`. Optional HDF5 replay remains source-build-only.
 
 ---
 

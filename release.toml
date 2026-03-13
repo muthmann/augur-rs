@@ -1,0 +1,8 @@
+publish = false
+push = true
+sign-tag = false
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "🔖 chore: release v{{version}}"
+tag-message = "Release v{{version}}"

@@ -17,3 +17,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 001: Trait-Based Camera Abstraction](./001-trait-based-camera-abstraction.md)
 - [ADR 002: Three-Thread Streaming Pipeline](./002-streaming-pipeline-design.md)
 - [ADR 003: Dynamic Plugin Loading via C FFI and `libloading`](./003-dynamic-plugin-loading.md)
+- [ADR 004: Cross-Platform Release Pipeline With macOS DMG Distribution](./004-cross-platform-release-pipeline.md)
