@@ -16,22 +16,46 @@ All release artifacts are built by GitHub Actions and attached to every tagged r
 
 ## Release Workflow
 
-Before creating a release, update [`CHANGELOG.md`](../CHANGELOG.md) with the user-facing changes for the upcoming version.
+Releases are automated via [release-please](https://github.com/googleapis/release-please). No manual tagging is needed.
 
-Use `cargo-release` from the repository root to bump the shared workspace version, commit the version change, create the `v<version>` tag, and push it:
+### Day-to-day flow
 
-```bash
-cargo install cargo-release
-cargo release patch --dry-run
-cargo release patch --execute
-```
+1. Merge PRs to `main` using [conventional commits](https://www.conventionalcommits.org/):
+   - `feat: …` — new feature → minor version bump
+   - `fix: …` — bug fix → patch version bump
+   - `feat!: …` or `BREAKING CHANGE:` footer → major version bump
+   - `chore:`, `docs:`, `test:` — no version bump
+2. After each merge, release-please opens or updates a **"Release PR"** that accumulates `CHANGELOG.md` entries and bumps `Cargo.toml`.
+3. When the team is ready to ship, merge the Release PR.
+4. release-please pushes a `v<version>` tag → the CI release pipeline triggers automatically.
 
-On a pushed version tag, the CI pipeline:
+### What the CI release pipeline does
+
+On a pushed version tag, the pipeline:
 
 1. Builds `augur` and `augur-gui` on macOS, Linux, and Windows
 2. Packages the macOS CLI archive, Linux tarball, and Windows zip with binaries, docs, example config, and changelog
 3. Assembles `AugurGUI.app`, stages it alongside an `Applications` symlink, and wraps it in `AugurGUI.dmg`
 4. Uploads all four release artifacts to the GitHub Release
+
+### Manual release (fallback)
+
+If you need to release without release-please, use `cargo-release`:
+
+```bash
+cargo install cargo-release
+cargo release patch --dry-run   # preview changes
+cargo release patch --execute   # bump, tag, push → triggers CI
+```
+
+### Conventional commit → version bump reference
+
+| Commit prefix | Version bump |
+|---|---|
+| `fix:` | patch (0.1.0 → 0.1.1) |
+| `feat:` | minor (0.1.0 → 0.2.0) |
+| `feat!:` or `BREAKING CHANGE:` | major (0.1.0 → 1.0.0) |
+| `chore:`, `docs:`, `test:` | no bump |
 
 ## Known Limitations
 
