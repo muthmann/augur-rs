@@ -2,7 +2,7 @@ use augur_core::config::CameraConfig;
 
 const SENSOR_WIDTH: u16 = 1280;
 const SENSOR_HEIGHT: u16 = 720;
-const IMX636_DEM_SLOTS: usize = 64;
+pub(crate) const IMX636_DEM_SLOTS: usize = 64;
 
 pub fn draw_settings(
     ui: &mut egui::Ui,
