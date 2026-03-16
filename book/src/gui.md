@@ -8,22 +8,17 @@ The `augur-gui` desktop app wraps the same backend as the CLI with live preview,
 cargo run --bin augur-gui
 ```
 
-## Toolbar Workflow
+## Menu Bar
 
-The top toolbar provides the main session controls:
+A single menu bar row at the top of the window:
 
-- `Probe Camera`: query the EVK4 and display model, serial, and firmware information
-- `Preview`: start live preview without writing to disk
-- `Record`: start recording to the configured output path
-- `Open .raw`: open a recorded EVT3 file in replay mode
-- `Stop`: stop preview, recording, or replay
-- `Apply Settings`: push pending runtime changes while previewing or recording
-- `Settings Panel` / `Analysis Panel`: show or hide the left and right side panels
-- `Analysis`: enable or disable analysis plugins from a dropdown menu
-- `Plugins`: open the plugin manager, rescan `~/.augur/plugins/`, or open the plugin directory
-- `Save Config` / `Load Config`: store or restore TOML settings
+- `File` — output path/browse, Open Replay, Save/Load Config, Close Replay
+- `Camera` — Probe Camera, Preview, Record, Stop, Apply Settings, Acq time slider; replay mode adds Play/Pause, Restart, and Speed selection
+- `View` — toggle Settings/Analysis panels, switch 2D/3D view mode
+- `Plugins` — Plugin Manager, Scan for New Plugins, Open Plugins Folder
+- `Analysis` — per-plugin enable/disable checkboxes (shown only when plugins exist)
 
-The toolbar also shows the current session status and either the active replay file or the configured output path.
+The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), and the current camera/session status label.
 
 ## Settings Panel
 
@@ -45,6 +40,7 @@ The left panel groups camera-only controls into focused sections:
 - the panel becomes read-only
 - a companion `<capture>.toml` sidecar is shown when available
 - otherwise the GUI falls back to a geometry-matched default reference config
+- collapse and expand happen from the panel edge, and the panel body is scrollable
 
 ## Analysis Panel
 
@@ -55,8 +51,22 @@ When at least one analysis plugin is enabled, a right-side **Analysis Tools** pa
 - built-in ROI Grid settings still edit `CameraConfig` directly
 - runtime-loaded plugins expose declarative settings and status entries through the FFI host
 - plugins can exchange per-frame derived data through the shared context bus
+- the full panel body is scrollable and collapses from the panel edge
 
 Available plugin types include hotpixel detection, ROI grid analysis, molecule localization, and focus metrics.
+
+## Preview Workspace
+
+The center panel is now an interactive preview workspace.
+
+- hover the 2D preview to read sensor-space `x, y`
+- `Select ROI` enables rectangular drag-to-select ROI editing
+- `+`, `-`, `Fit`, and drag-panning control the zoomed view
+- `Crop to ROI` switches between full-frame and ROI-only rendering
+- `Enlarge` opens a larger popup that shares the same preview state
+- `View -> 3D` replaces the image preview with a raw-event point cloud
+
+The 3D view exposes controls for time range and max render limit, plus camera reset. Drag orbits the point cloud and the mouse wheel zooms it.
 
 ## Plugin Manager
 
@@ -72,14 +82,12 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 Opening a `.raw` file starts a preview-only pipeline backed by the file replay camera in `augur-core`.
 
-Replay adds a transport area below the preview with:
+Replay adds a visible transport bar between the canvas and the scrollable controls:
 
-- `Play` / `Pause`
-- `Restart`
-- speed selection (`0.25x` to `Max`)
-- a timeline slider for seeking
+- `▶` / `⏸` Play/Pause, `⏮` Restart, `⏹` Stop buttons
+- Speed combo box (`0.25x` to `Max`)
+- a full-width timeline slider for seeking
 - current / total replay time
-- MB progress
 
 Enabled analysis plugins continue to process replayed frames through the same `PreviewFrame` path used for live preview.
 
@@ -87,7 +95,7 @@ When replay reaches EOF, the pipeline threads stop but the app stays in replay m
 
 ## Preview Contrast
 
-A `Contrast` slider below the preview is available in both live and replay modes.
+A `Contrast` slider below the preview is available in 2D mode only (live and replay).
 
 - it uses percentile-based normalization instead of raw max-value normalization
 - this keeps single hotpixels from washing out the rest of the frame
@@ -106,3 +114,4 @@ Status, warning, and error labels adapt to the active GUI theme.
 - acquisition time is only adjustable for live preview and recording
 - output path editing is disabled during active recording and replay
 - collapsing either side panel gives more space back to the preview
+- the same embedded/popup preview controls work in both live and replay sessions
