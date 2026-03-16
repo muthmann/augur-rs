@@ -8,6 +8,7 @@ macro_rules! export_plugin {
                 schema_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 setting_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 status_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
+                accumulated_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
             }
 
             impl __AugurExportedPlugin {
@@ -17,6 +18,7 @@ macro_rules! export_plugin {
                         schema_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         setting_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         status_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
+                        accumulated_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                     }
                 }
             }
@@ -275,6 +277,45 @@ macro_rules! export_plugin {
                 }
             }
 
+            unsafe extern "C" fn __accumulated_localizations(
+                instance: *const ::std::ffi::c_void,
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) -> bool {
+                let result = ::std::panic::catch_unwind(|| {
+                    let Some(plugin) = __instance_ref(instance) else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    let Some(json) = plugin.plugin.accumulated_localizations() else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.accumulated_json,
+                            json,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
+                    true
+                });
+                match result {
+                    Ok(has_data) => has_data,
+                    Err(_) => {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        false
+                    }
+                }
+            }
+
             static __AUGUR_PLUGIN_VTABLE: $crate::PluginVTable = $crate::PluginVTable {
                 create: __create,
                 destroy: __destroy,
@@ -291,6 +332,7 @@ macro_rules! export_plugin {
                 get_setting: __get_setting,
                 set_setting: __set_setting,
                 status_entries: __status_entries,
+                accumulated_localizations: __accumulated_localizations,
             };
 
             #[no_mangle]

@@ -4,7 +4,9 @@ mod helpers;
 mod macros;
 mod settings;
 
-pub use context::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS};
+pub use context::{
+    Localization, LocalizationResults, LocalizationRow, LocalizationTable, CTX_LOCALIZATION_RESULTS,
+};
 pub use ffi::{
     AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
     FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginEntry, PluginInput,
@@ -57,7 +59,10 @@ pub mod __private {
 #[cfg(test)]
 mod tests {
     use super::{
-        context::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS},
+        context::{
+            Localization, LocalizationResults, LocalizationRow, LocalizationTable,
+            CTX_LOCALIZATION_RESULTS,
+        },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiPixel, FfiSlice, FfiString,
         FfiSubpixelMarker, PluginInput,
@@ -128,6 +133,31 @@ mod tests {
             serde_json::from_slice(&json).expect("results must deserialize");
         assert_eq!(decoded, results);
         assert_eq!(CTX_LOCALIZATION_RESULTS, "augur.localization.results");
+    }
+
+    #[test]
+    fn localization_table_round_trips_through_json() {
+        let table = LocalizationTable {
+            rows: vec![LocalizationRow {
+                id: 7,
+                frame: 3,
+                x_nm: 812.5,
+                y_nm: 455.0,
+                sigma_nm: 132.0,
+                intensity: 4_200.0,
+                offset: 14.0,
+                uncertainty_xy_nm: 19.5,
+                timestamp_us: 12_345,
+            }],
+            nm_per_pixel: 65.0,
+            sensor_width: 1280,
+            sensor_height: 720,
+        };
+
+        let json = serde_json::to_vec(&table).expect("table must serialize");
+        let decoded: LocalizationTable =
+            serde_json::from_slice(&json).expect("table must deserialize");
+        assert_eq!(decoded, table);
     }
 
     #[test]
