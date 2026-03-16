@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use augur_core::{config::RoiConfig, pipeline::CdEvent};
 
+use crate::app::PANEL_ROUNDING;
 const DEFAULT_TIME_WINDOW_MS: f32 = 120.0;
 const MIN_TIME_WINDOW_MS: f32 = 5.0;
 const MAX_TIME_WINDOW_MS: f32 = 2_000.0;
@@ -15,14 +16,12 @@ const MAX_HISTORY_MS: f32 = 5_000.0;
 pub struct PointCloudMetrics {
     pub visible_points: usize,
     pub rendered_points: usize,
-    pub max_time_offset_ms: f32,
 }
 
 #[derive(Debug, Clone)]
 pub struct PointCloudState {
     history: VecDeque<CdEvent>,
     pub time_window_ms: f32,
-    pub time_offset_ms: f32,
     pub point_limit: usize,
     azimuth: f32,
     elevation: f32,
@@ -34,7 +33,6 @@ impl Default for PointCloudState {
         Self {
             history: VecDeque::with_capacity(32_768),
             time_window_ms: DEFAULT_TIME_WINDOW_MS,
-            time_offset_ms: 0.0,
             point_limit: DEFAULT_POINT_LIMIT,
             azimuth: 0.65,
             elevation: 0.55,
@@ -46,7 +44,6 @@ impl Default for PointCloudState {
 impl PointCloudState {
     pub fn clear(&mut self) {
         self.history.clear();
-        self.time_offset_ms = 0.0;
     }
 
     pub fn reset_camera(&mut self) {
@@ -71,19 +68,6 @@ impl PointCloudState {
 
         self.history.extend(events.iter().copied());
         self.trim_history();
-        self.time_offset_ms = self.time_offset_ms.min(self.max_time_offset_ms());
-    }
-
-    pub fn max_time_offset_ms(&self) -> f32 {
-        let Some(latest) = self.history.back() else {
-            return 0.0;
-        };
-        let Some(oldest) = self.history.front() else {
-            return 0.0;
-        };
-
-        let history_ms = latest.timestamp.saturating_sub(oldest.timestamp) as f32 / 1_000.0;
-        (history_ms - self.time_window_ms.max(MIN_TIME_WINDOW_MS)).max(0.0)
     }
 
     pub fn sanitize_controls(&mut self) {
@@ -91,7 +75,6 @@ impl PointCloudState {
             .time_window_ms
             .clamp(MIN_TIME_WINDOW_MS, MAX_TIME_WINDOW_MS);
         self.point_limit = self.point_limit.clamp(MIN_POINT_LIMIT, MAX_POINT_LIMIT);
-        self.time_offset_ms = self.time_offset_ms.clamp(0.0, self.max_time_offset_ms());
     }
 
     pub fn draw(
@@ -110,10 +93,10 @@ impl PointCloudState {
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
         let painter = ui.painter_at(rect);
 
-        painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
+        painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
         painter.rect_stroke(
             rect,
-            6.0,
+            PANEL_ROUNDING,
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
 
@@ -173,39 +156,36 @@ impl PointCloudState {
         };
 
         let roi = sanitize_roi(roi);
-        let end_ts = latest
-            .timestamp
-            .saturating_sub((self.time_offset_ms * 1_000.0).round() as u64);
+        let end_ts = latest.timestamp;
         let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
-        let max_time_offset_ms = self.max_time_offset_ms();
 
         // Binary-search the sorted history to get only the time-windowed slice.
         // This avoids iterating the full (up to 400 K) history on every frame.
         let lo = self.history.partition_point(|e| e.timestamp < start_ts);
         let hi = self.history.partition_point(|e| e.timestamp <= end_ts);
-        let time_slice = self.history.range(lo..hi);
-
-        let visible_points = time_slice.filter(|e| roi_contains(e, &roi)).count();
-        if visible_points == 0 {
-            return PointCloudMetrics {
-                max_time_offset_ms,
-                ..PointCloudMetrics::default()
-            };
+        let slice_len = hi - lo;
+        if slice_len == 0 {
+            return PointCloudMetrics::default();
         }
 
-        let step = visible_points.div_ceil(self.point_limit).max(1);
+        // Use the full slice length to compute a downsample step, avoiding a
+        // separate counting pass over the ROI-filtered iterator. This is
+        // conservative (step may be slightly larger than needed) but halves the
+        // per-frame iteration cost.
+        let step = slice_len.div_ceil(self.point_limit).max(1);
+
         // Precompute the camera transform once — avoids sin/cos per point.
         let cam = CameraView::new(self.azimuth, self.elevation, self.distance, rect);
         draw_axes(painter, cam);
 
+        let mut visible_points = 0usize;
         let mut rendered_points = 0usize;
-        for (visible_index, event) in self
-            .history
-            .range(lo..hi)
-            .filter(|e| roi_contains(e, &roi))
-            .enumerate()
-        {
-            if visible_index % step != 0 {
+        for (idx, event) in self.history.range(lo..hi).enumerate() {
+            if !roi_contains(event, &roi) {
+                continue;
+            }
+            visible_points += 1;
+            if idx % step != 0 {
                 continue;
             }
             let Some(projected) = project_event(event, &roi, start_ts, end_ts, cam) else {
@@ -227,7 +207,6 @@ impl PointCloudState {
         PointCloudMetrics {
             visible_points,
             rendered_points,
-            max_time_offset_ms,
         }
     }
 }
@@ -389,7 +368,6 @@ mod tests {
 
         state.push_events(&events);
 
-        assert!(state.max_time_offset_ms() >= 0.0);
         assert!(state.point_limit >= 1_000);
     }
 
