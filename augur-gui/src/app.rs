@@ -2660,6 +2660,12 @@ fn format_replay_time(duration_us: u64) -> String {
     format!("{minutes:02}:{seconds:02}.{tenths}")
 }
 
+impl Drop for CameraApp {
+    fn drop(&mut self) {
+        self.stop_pipeline();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2691,8 +2697,10 @@ mod tests {
         config.roi.width = 320;
         config.roi.height = 180;
 
-        let mut workspace = PreviewWorkspaceState::default();
-        workspace.crop_to_roi = true;
+        let mut workspace = PreviewWorkspaceState {
+            crop_to_roi: true,
+            ..Default::default()
+        };
         let viewport = build_preview_viewport(&frame, &config, &mut workspace);
 
         assert_eq!(viewport.base_sensor_rect.min, egui::pos2(120.0, 90.0));
@@ -2703,9 +2711,11 @@ mod tests {
     fn preview_viewport_clamps_pan_inside_base_rect() {
         let frame = test_frame();
         let config = CameraConfig::default();
-        let mut workspace = PreviewWorkspaceState::default();
-        workspace.zoom = PREVIEW_ZOOM_MAX;
-        workspace.pan = egui::vec2(10_000.0, -10_000.0);
+        let mut workspace = PreviewWorkspaceState {
+            zoom: PREVIEW_ZOOM_MAX,
+            pan: egui::vec2(10_000.0, -10_000.0),
+            ..Default::default()
+        };
 
         let viewport = build_preview_viewport(&frame, &config, &mut workspace);
 
@@ -2725,11 +2735,5 @@ mod tests {
         assert_eq!(roi.y, 20);
         assert_eq!(roi.width, 16);
         assert_eq!(roi.height, 10);
-    }
-}
-
-impl Drop for CameraApp {
-    fn drop(&mut self) {
-        self.stop_pipeline();
     }
 }
