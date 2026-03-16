@@ -2,13 +2,13 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 
 use augur_core::{
     analysis::{AnalysisOutput, AnalysisSeverity, Overlay},
     camera::{DeviceInfo, EventCamera},
-    config::CameraConfig,
+    config::{CameraConfig, RoiConfig},
     pipeline::{
         spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
         PreviewFrame,
@@ -20,9 +20,13 @@ use augur_plugin_api::PluginInput;
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
-    plugin::AnalysisPlugin, plugin_loader::PluginManager,
-    plugin_settings_ui::render_plugin_settings, plugins::create_all_plugins,
-    preview::frame_to_color_image, settings::draw_settings,
+    plugin::AnalysisPlugin,
+    plugin_loader::PluginManager,
+    plugin_settings_ui::render_plugin_settings,
+    plugins::create_all_plugins,
+    point_cloud::{PointCloudMetrics, PointCloudState},
+    preview::frame_to_color_image,
+    settings::draw_settings,
 };
 
 const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
@@ -33,6 +37,22 @@ const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
     (4.0, "4x"),
     (f32::INFINITY, "Max"),
 ];
+const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
+pub(crate) const PANEL_ROUNDING: f32 = 6.0;
+const PREVIEW_ZOOM_MIN: f32 = 1.0;
+const PREVIEW_ZOOM_MAX: f32 = 16.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Preview2d,
+    PointCloud3d,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewTool {
+    None,
+    SelectRoi,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppMode {
@@ -47,6 +67,122 @@ struct SavedLiveState {
     config: CameraConfig,
     mask_file: String,
     camera_info: Option<DeviceInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct PreviewWorkspaceState {
+    view_mode: ViewMode,
+    tool: PreviewTool,
+    popup_open: bool,
+    zoom: f32,
+    pan: egui::Vec2,
+    crop_to_roi: bool,
+    hover_sensor: Option<(u16, u16)>,
+    selection_anchor: Option<egui::Pos2>,
+    pending_roi: Option<egui::Rect>,
+    point_cloud: PointCloudState,
+}
+
+impl Default for PreviewWorkspaceState {
+    fn default() -> Self {
+        Self {
+            view_mode: ViewMode::Preview2d,
+            tool: PreviewTool::None,
+            popup_open: false,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            crop_to_roi: false,
+            hover_sensor: None,
+            selection_anchor: None,
+            pending_roi: None,
+            point_cloud: PointCloudState::default(),
+        }
+    }
+}
+
+impl PreviewWorkspaceState {
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.pending_roi = None;
+        self.tool = PreviewTool::None;
+    }
+
+    fn clear_session_state(&mut self) {
+        self.hover_sensor = None;
+        self.selection_anchor = None;
+        self.pending_roi = None;
+        self.point_cloud.clear();
+    }
+
+    fn reset_zoom(&mut self) {
+        self.zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
+    }
+
+    fn set_view_mode(&mut self, view_mode: ViewMode) {
+        self.view_mode = view_mode;
+        if view_mode != ViewMode::Preview2d {
+            self.clear_selection();
+        }
+    }
+}
+
+struct PopupSharedData {
+    texture: Option<egui::TextureHandle>,
+    mode: AppMode,
+    view_mode: ViewMode,
+    roi: RoiConfig,
+    frame_width: u16,
+    frame_height: u16,
+    // replay
+    replay_paused: bool,
+    replay_finished: bool,
+    replay_speed: f32,
+    replay_fraction: f32,
+    replay_duration_us: u64,
+    replay_time_us: u64,
+    replay_bytes_read: u64,
+    replay_data_len: u64,
+    // actions from popup -> main
+    close_requested: bool,
+    toggle_pause: bool,
+    restart: bool,
+    seek_to: Option<f32>,
+    set_speed: Option<f32>,
+    // popup-internal drag tracking
+    seek_drag: Option<f32>,
+}
+
+impl Default for PopupSharedData {
+    fn default() -> Self {
+        Self {
+            texture: None,
+            mode: AppMode::Idle,
+            view_mode: ViewMode::Preview2d,
+            roi: RoiConfig {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            frame_width: 0,
+            frame_height: 0,
+            replay_paused: false,
+            replay_finished: false,
+            replay_speed: 1.0,
+            replay_fraction: 0.0,
+            replay_duration_us: 0,
+            replay_time_us: 0,
+            replay_bytes_read: 0,
+            replay_data_len: 0,
+            close_requested: false,
+            toggle_pause: false,
+            restart: false,
+            seek_to: None,
+            set_speed: None,
+            seek_drag: None,
+        }
+    }
 }
 
 pub struct CameraApp {
@@ -76,6 +212,7 @@ pub struct CameraApp {
     acq_dirty: bool,
     config_dirty: bool,
     contrast_percentile: f32,
+    preview_workspace: PreviewWorkspaceState,
     lock_settings_while_recording: bool,
     settings_panel_open: bool,
     analysis_panel_open: bool,
@@ -86,6 +223,7 @@ pub struct CameraApp {
     last_error: Option<String>,
     camera_info: Option<DeviceInfo>,
     camera_status: String,
+    popup_shared: Arc<Mutex<PopupSharedData>>,
 }
 
 impl CameraApp {
@@ -120,6 +258,7 @@ impl CameraApp {
             acq_dirty: false,
             config_dirty: false,
             contrast_percentile: 99.5,
+            preview_workspace: PreviewWorkspaceState::default(),
             lock_settings_while_recording: true,
             settings_panel_open: true,
             analysis_panel_open: true,
@@ -130,6 +269,7 @@ impl CameraApp {
             last_error: plugin_scan_error,
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
+            popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
         }
     }
 
@@ -158,10 +298,14 @@ impl CameraApp {
             })
     }
 
+    fn raw_events_required(&self) -> bool {
+        self.preview_workspace.view_mode == ViewMode::PointCloud3d || self.plugins_need_raw_events()
+    }
+
     fn sync_pipeline_requirements(&self, controller: &PipelineController) {
         controller
             .raw_events_needed
-            .store(self.plugins_need_raw_events(), Ordering::Relaxed);
+            .store(self.raw_events_required(), Ordering::Relaxed);
     }
 
     fn sync_active_pipeline_requirements(&self) {
@@ -230,6 +374,7 @@ impl CameraApp {
                 self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
                 self.mode = AppMode::Previewing;
+                self.preview_workspace.clear_session_state();
                 self.reset_analysis();
                 self.config_dirty = false;
                 self.acq_dirty = false;
@@ -252,6 +397,7 @@ impl CameraApp {
                 self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
                 self.mode = AppMode::Recording;
+                self.preview_workspace.clear_session_state();
                 self.reset_analysis();
                 self.config_dirty = false;
                 self.acq_dirty = false;
@@ -337,6 +483,7 @@ impl CameraApp {
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
         self.mode = AppMode::Replaying;
+        self.preview_workspace.clear_session_state();
         self.camera_info = Some(replay_info);
         self.config = display_config;
         self.mask_file = display_mask_file;
@@ -549,6 +696,7 @@ impl CameraApp {
         self.replay_pause_after_seek_frame = pause_after_first_frame;
         self.replay_seek_drag_value = None;
         self.last_error = None;
+        self.preview_workspace.clear_session_state();
         self.camera_status = format!(
             "Replaying {}.",
             path.file_name()
@@ -597,6 +745,7 @@ impl CameraApp {
         }
         self.texture = None;
         self.latest_frame = None;
+        self.preview_workspace.clear_session_state();
         self.reset_analysis();
         self.mode = AppMode::Idle;
         self.camera_status =
@@ -733,6 +882,9 @@ impl CameraApp {
             &self.analysis_output.overlays,
             self.contrast_percentile,
         );
+        if let Some(events) = frame.events.as_deref() {
+            self.preview_workspace.point_cloud.push_events(events);
+        }
         self.latest_frame = Some(frame);
         if let Some(texture) = &mut self.texture {
             texture.set(image, egui::TextureOptions::LINEAR);
@@ -806,8 +958,108 @@ impl CameraApp {
         pixels
     }
 
+    fn draw_replay_transport(&mut self, ui: &mut egui::Ui) {
+        let Some(info) = self.replay_file_info.clone() else {
+            return;
+        };
+
+        // Precompute time label so we can measure its width for the slider.
+        let time_text = format!(
+            "{} / {}",
+            format_replay_time(self.current_replay_time_us()),
+            format_replay_time(info.total_duration_us)
+        );
+
+        // Collect deferred actions to avoid borrow issues inside closures.
+        let mut new_speed: Option<f32> = None;
+        let mut stop_requested = false;
+
+        let current_speed = self.replay_speed;
+
+        ui.horizontal(|ui| {
+            // Play/Pause
+            let play_pause = if self.replay_paused {
+                "\u{25B6}"
+            } else {
+                "\u{23F8}"
+            };
+            if ui
+                .add_enabled(!self.replay_finished, egui::Button::new(play_pause))
+                .clicked()
+            {
+                self.set_replay_paused(!self.replay_paused);
+            }
+
+            // Restart
+            if ui.button("\u{23EE}").clicked() {
+                self.restart_replay();
+            }
+
+            // Stop
+            if ui.button("\u{23F9}").clicked() {
+                stop_requested = true;
+            }
+
+            ui.separator();
+
+            // Speed combo box — use id_salt for stable identity
+            let selected_label = replay_speed_label(current_speed);
+            egui::ComboBox::from_id_source("replay_speed_combo")
+                .selected_text(format!("Speed: {selected_label}"))
+                .show_ui(ui, |ui| {
+                    for (speed, label) in REPLAY_SPEED_OPTIONS {
+                        if ui
+                            .selectable_label(replay_speed_matches(current_speed, speed), label)
+                            .clicked()
+                        {
+                            new_speed = Some(speed);
+                        }
+                    }
+                });
+
+            ui.separator();
+
+            // Measure time label width so the slider fills the rest.
+            let time_width =
+                ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        time_text.clone(),
+                        egui::FontId::default(),
+                        egui::Color32::WHITE,
+                    )
+                })
+                .size()
+                .x + ui.spacing().item_spacing.x * 2.0;
+
+            // Timeline slider — fill remaining width minus time label
+            let mut timeline_fraction = self
+                .replay_seek_drag_value
+                .unwrap_or_else(|| self.current_replay_fraction());
+            let slider = egui::Slider::new(&mut timeline_fraction, 0.0..=1.0).show_value(false);
+            let slider_width = (ui.available_width() - time_width).max(80.0);
+            let response = ui.add_sized([slider_width, ui.spacing().interact_size.y], slider);
+            if response.dragged() {
+                self.replay_seek_drag_value = Some(timeline_fraction);
+            }
+            if response.drag_stopped() || (response.changed() && !response.dragged()) {
+                self.replay_seek_drag_value = None;
+                self.seek_replay(timeline_fraction);
+            }
+
+            // Time label
+            ui.label(&time_text);
+        });
+
+        if let Some(speed) = new_speed {
+            self.set_replay_speed(speed);
+        }
+        if stop_requested {
+            self.stop_pipeline();
+        }
+    }
+
     fn copy_detected_hotpixels_to_mask(&mut self) {
-        const IMX636_DEM_SLOTS: usize = 64;
+        use crate::settings::IMX636_DEM_SLOTS;
 
         let detected = self.latest_detected_hotpixels();
         if detected.is_empty() {
@@ -848,95 +1100,224 @@ impl eframe::App for CameraApp {
         self.poll_pipeline_state();
 
         let mode = self.mode;
+        let settings_locked = self.settings_are_locked();
         let mut plugin_toggle_changed = false;
+        let mut view_mode_changed = false;
         let mut plugin_scan_requested = false;
         let mut open_plugins_dir_requested = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(mode == AppMode::Idle, egui::Button::new("Probe Camera"))
-                    .clicked()
-                {
-                    self.probe_camera();
-                }
-
-                if ui
-                    .add_enabled(
-                        mode == AppMode::Idle && self.camera_info.is_some(),
-                        egui::Button::new("Preview"),
-                    )
-                    .clicked()
-                {
-                    self.start_preview();
-                }
-
-                if ui
-                    .add_enabled(
-                        mode == AppMode::Idle || mode == AppMode::Previewing,
-                        egui::Button::new("Record"),
-                    )
-                    .clicked()
-                {
-                    self.start_recording();
-                }
-
-                if ui
-                    .add_enabled(mode == AppMode::Idle, egui::Button::new("Open Replay"))
-                    .clicked()
-                {
-                    self.open_replay_file();
-                }
-
-                if ui
-                    .add_enabled(mode != AppMode::Idle, egui::Button::new("Stop"))
-                    .clicked()
-                {
-                    self.stop_pipeline();
-                }
-
-                if ui
-                    .add_enabled(
-                        (mode == AppMode::Previewing || mode == AppMode::Recording)
-                            && !self.settings_are_locked(),
-                        egui::Button::new("Apply Settings"),
-                    )
-                    .clicked()
-                {
-                    self.apply_runtime_changes();
-                }
-
-                ui.separator();
-                if ui
-                    .selectable_label(self.settings_panel_open, "Settings Panel")
-                    .clicked()
-                {
-                    self.settings_panel_open = !self.settings_panel_open;
-                }
-                if ui
-                    .selectable_label(self.analysis_panel_open, "Analysis Panel")
-                    .clicked()
-                {
-                    self.analysis_panel_open = !self.analysis_panel_open;
-                }
-                ui.menu_button("Analysis", |ui| {
-                    for plugin in &mut self.builtin_plugins {
-                        let mut enabled = plugin.enabled();
-                        if ui.checkbox(&mut enabled, plugin.name()).changed() {
-                            plugin.set_enabled(enabled);
-                            plugin_toggle_changed = true;
+            egui::menu::bar(ui, |ui| {
+                // ── File ──────────────────────────────────────────────────────
+                ui.menu_button("File", |ui| {
+                    if mode == AppMode::Replaying {
+                        if let Some(path) = &self.replay_path {
+                            let fname = PathBuf::from(path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.clone());
+                            ui.add_enabled(
+                                false,
+                                egui::Label::new(
+                                    egui::RichText::new(format!("Replaying: {fname}")).weak(),
+                                ),
+                            );
                         }
+                        if ui.button("Close Replay").clicked() {
+                            self.stop_pipeline();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                    } else {
+                        let output_enabled = mode != AppMode::Recording;
+                        ui.horizontal(|ui| {
+                            ui.label("Output:");
+                            ui.add_enabled(
+                                output_enabled,
+                                egui::TextEdit::singleline(&mut self.output_path)
+                                    .desired_width(180.0),
+                            );
+                            if ui
+                                .add_enabled(output_enabled, egui::Button::new("Browse…"))
+                                .clicked()
+                            {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_file_name("output.raw")
+                                    .add_filter("RAW", &["raw"])
+                                    .save_file()
+                                {
+                                    self.output_path = path.display().to_string();
+                                }
+                                ui.close_menu();
+                            }
+                        });
+                        ui.separator();
+                        if ui
+                            .add_enabled(mode == AppMode::Idle, egui::Button::new("Open Replay…"))
+                            .clicked()
+                        {
+                            self.open_replay_file();
+                            ui.close_menu();
+                        }
+                        ui.separator();
                     }
-                    for record in self.plugin_manager.records_mut() {
-                        let Some(plugin) = record.plugin_mut() else {
-                            continue;
-                        };
-                        let mut enabled = plugin.enabled();
-                        if ui.checkbox(&mut enabled, plugin.name()).changed() {
-                            plugin.set_enabled(enabled);
-                            plugin_toggle_changed = true;
+                    if ui
+                        .add_enabled(
+                            mode != AppMode::Replaying,
+                            egui::Button::new("Save Config…"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("augur.toml")
+                            .add_filter("TOML", &["toml"])
+                            .save_file()
+                        {
+                            if let Err(e) = self.config.save_to_path(&path) {
+                                self.last_error = Some(format!("save config failed: {e}"));
+                            }
                         }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            mode != AppMode::Recording && mode != AppMode::Replaying,
+                            egui::Button::new("Load Config…"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("TOML", &["toml"])
+                            .pick_file()
+                        {
+                            match CameraConfig::load_from_path(&path) {
+                                Ok(cfg) => {
+                                    self.mask_file = cfg
+                                        .pixel_mask
+                                        .mask_file
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default();
+                                    self.config = cfg;
+                                    self.config_dirty = self.controller.is_some();
+                                    self.last_error = None;
+                                }
+                                Err(e) => {
+                                    self.last_error = Some(format!("load config failed: {e}"));
+                                }
+                            }
+                        }
+                        ui.close_menu();
                     }
                 });
+
+                // ── Camera ────────────────────────────────────────────────────
+                ui.menu_button("Camera", |ui| {
+                    if ui
+                        .add_enabled(mode == AppMode::Idle, egui::Button::new("Probe Camera"))
+                        .clicked()
+                    {
+                        self.probe_camera();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            mode == AppMode::Idle && self.camera_info.is_some(),
+                            egui::Button::new("Preview"),
+                        )
+                        .clicked()
+                    {
+                        self.start_preview();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            mode == AppMode::Idle || mode == AppMode::Previewing,
+                            egui::Button::new("Record"),
+                        )
+                        .clicked()
+                    {
+                        self.start_recording();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(mode != AppMode::Idle, egui::Button::new("Stop"))
+                        .clicked()
+                    {
+                        self.stop_pipeline();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            (mode == AppMode::Previewing || mode == AppMode::Recording)
+                                && !settings_locked,
+                            egui::Button::new("Apply Settings"),
+                        )
+                        .clicked()
+                    {
+                        self.apply_runtime_changes();
+                        ui.close_menu();
+                    }
+                    if mode == AppMode::Replaying {
+                        ui.separator();
+                        let play_pause_label = if self.replay_paused { "Play" } else { "Pause" };
+                        if ui
+                            .add_enabled(!self.replay_finished, egui::Button::new(play_pause_label))
+                            .clicked()
+                        {
+                            self.set_replay_paused(!self.replay_paused);
+                            ui.close_menu();
+                        }
+                        if ui.button("Restart").clicked() {
+                            self.restart_replay();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.label("Speed:");
+                        for (speed, label) in REPLAY_SPEED_OPTIONS {
+                            if ui
+                                .selectable_label(
+                                    replay_speed_matches(self.replay_speed, speed),
+                                    label,
+                                )
+                                .clicked()
+                            {
+                                self.set_replay_speed(speed);
+                            }
+                        }
+                    } else {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Acq time [ms]");
+                            if ui
+                                .add_enabled(
+                                    !settings_locked,
+                                    egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
+                                )
+                                .changed()
+                            {
+                                self.acq_dirty = true;
+                            }
+                        });
+                    }
+                });
+
+                // ── View ──────────────────────────────────────────────────────
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
+                    ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
+                    ui.separator();
+                    let mut view_mode = self.preview_workspace.view_mode;
+                    let r2d = ui.radio_value(&mut view_mode, ViewMode::Preview2d, "2D Preview");
+                    let r3d =
+                        ui.radio_value(&mut view_mode, ViewMode::PointCloud3d, "3D Point Cloud");
+                    if r2d.changed() || r3d.changed() {
+                        view_mode_changed = true;
+                        self.preview_workspace.set_view_mode(view_mode);
+                    }
+                });
+
+                // ── Plugins ───────────────────────────────────────────────────
                 ui.menu_button("Plugins", |ui| {
                     if ui
                         .button(if self.plugins_window_open {
@@ -959,87 +1340,55 @@ impl eframe::App for CameraApp {
                     }
                 });
 
-                ui.separator();
-
-                let output_enabled = mode != AppMode::Recording && mode != AppMode::Replaying;
-                ui.label("Output");
-                ui.add_enabled(
-                    output_enabled,
-                    egui::TextEdit::singleline(&mut self.output_path).desired_width(200.0),
-                );
-                if ui
-                    .add_enabled(output_enabled, egui::Button::new("Browse…"))
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("output.raw")
-                        .add_filter("RAW", &["raw"])
-                        .save_file()
-                    {
-                        self.output_path = path.display().to_string();
-                    }
-                }
-
-                ui.separator();
-
-                if ui
-                    .add_enabled(mode != AppMode::Replaying, egui::Button::new("Save Config"))
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("augur.toml")
-                        .add_filter("TOML", &["toml"])
-                        .save_file()
-                    {
-                        if let Err(e) = self.config.save_to_path(&path) {
-                            self.last_error = Some(format!("save config failed: {e}"));
-                        }
-                    }
-                }
-
-                if ui
-                    .add_enabled(
-                        mode != AppMode::Recording && mode != AppMode::Replaying,
-                        egui::Button::new("Load Config"),
-                    )
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("TOML", &["toml"])
-                        .pick_file()
-                    {
-                        match CameraConfig::load_from_path(&path) {
-                            Ok(cfg) => {
-                                self.mask_file = cfg
-                                    .pixel_mask
-                                    .mask_file
-                                    .as_ref()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_default();
-                                self.config = cfg;
-                                self.config_dirty = self.controller.is_some();
-                                self.last_error = None;
-                            }
-                            Err(e) => {
-                                self.last_error = Some(format!("load config failed: {e}"));
+                // ── Analysis ──────────────────────────────────────────────────
+                let has_plugins = !self.builtin_plugins.is_empty()
+                    || self
+                        .plugin_manager
+                        .records()
+                        .iter()
+                        .any(|r| r.plugin().is_some());
+                if has_plugins {
+                    ui.menu_button("Analysis", |ui| {
+                        for plugin in &mut self.builtin_plugins {
+                            let mut enabled = plugin.enabled();
+                            if ui.checkbox(&mut enabled, plugin.name()).changed() {
+                                plugin.set_enabled(enabled);
+                                plugin_toggle_changed = true;
                             }
                         }
-                    }
+                        for record in self.plugin_manager.records_mut() {
+                            let Some(plugin) = record.plugin_mut() else {
+                                continue;
+                            };
+                            let mut enabled = plugin.enabled();
+                            if ui.checkbox(&mut enabled, plugin.name()).changed() {
+                                plugin.set_enabled(enabled);
+                                plugin_toggle_changed = true;
+                            }
+                        }
+                    });
                 }
-            });
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Camera: {}", self.camera_status));
-                ui.separator();
-                if let Some(replay_path) = &self.replay_path {
-                    ui.label(format!("Replay: {replay_path}"));
-                } else {
-                    ui.label(format!("Output: {}", self.output_path.trim()));
-                }
-                if mode == AppMode::Recording {
+                // ── Right-aligned status area ────────────────────────────────
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(&self.camera_status);
                     ui.separator();
-                    ui.label("Output path changes apply only to the next recording.");
-                }
+                    let mut view_mode = self.preview_workspace.view_mode;
+                    let r3d = ui.selectable_value(&mut view_mode, ViewMode::PointCloud3d, "3D");
+                    let r2d = ui.selectable_value(&mut view_mode, ViewMode::Preview2d, "2D");
+                    if r2d.changed() || r3d.changed() {
+                        view_mode_changed = true;
+                        self.preview_workspace.set_view_mode(view_mode);
+                    }
+                    if mode == AppMode::Recording {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::from_rgb(220, 50, 50), "● REC");
+                    }
+                    if mode == AppMode::Replaying && self.replay_finished {
+                        ui.separator();
+                        ui.colored_label(status_success_color(), "Finished");
+                    }
+                });
             });
         });
 
@@ -1063,56 +1412,107 @@ impl eframe::App for CameraApp {
         if plugin_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
-            self.sync_active_pipeline_requirements();
+        }
+
+        if settings_locked {
+            self.preview_workspace.clear_selection();
         }
 
         if self.settings_panel_open {
             egui::SidePanel::left("settings")
                 .min_width(340.0)
                 .show(ctx, |ui| {
-                    let locked = self.settings_are_locked();
-
-                    ui.heading("Settings");
-                    ui.separator();
-                    if mode != AppMode::Replaying {
-                        ui.checkbox(
-                            &mut self.lock_settings_while_recording,
-                            "Lock settings while recording",
-                        );
-                    }
-
-                    match mode {
-                        AppMode::Recording if locked => {
-                            ui.label("Recording: settings are locked.");
-                        }
-                        AppMode::Recording => {
-                            ui.label("Recording: edits stay local until you click Apply Settings.");
-                        }
-                        AppMode::Previewing => {
-                            ui.label("Previewing: edits stay local until you click Apply Settings.");
-                        }
-                        AppMode::Replaying => {
-                            ui.label("Replay mode: camera settings are shown as read-only reference data.");
-                            if let Some(notice) = &self.replay_notice {
-                                ui.colored_label(ui.visuals().warn_fg_color, notice);
+                    ui.horizontal(|ui| {
+                        ui.heading("Settings");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("◀")
+                                            .size(14.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.settings_panel_open = false;
                             }
-                        }
-                        AppMode::Idle => {
-                            ui.label("Idle: edits change the local config for the next recording.");
-                        }
-                    }
-
+                        });
+                    });
                     ui.separator();
-                    ui.add_enabled_ui(!locked, |ui| {
-                        let changed = draw_settings(
-                            ui,
-                            &mut self.config,
-                            &mut self.mask_x,
-                            &mut self.mask_y,
-                            &mut self.mask_file,
-                        );
-                        if changed {
-                            self.config_dirty = true;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if mode != AppMode::Replaying {
+                                ui.checkbox(
+                                    &mut self.lock_settings_while_recording,
+                                    "Lock settings while recording",
+                                );
+                            }
+
+                            match mode {
+                                AppMode::Recording if settings_locked => {
+                                    ui.label("Recording: settings are locked.");
+                                }
+                                AppMode::Recording => {
+                                    ui.label(
+                                        "Recording: edits stay local until you click Apply Settings.",
+                                    );
+                                }
+                                AppMode::Previewing => {
+                                    ui.label(
+                                        "Previewing: edits stay local until you click Apply Settings.",
+                                    );
+                                }
+                                AppMode::Replaying => {
+                                    ui.label(
+                                        "Replay mode: camera settings are shown as read-only reference data.",
+                                    );
+                                    if let Some(notice) = &self.replay_notice {
+                                        ui.colored_label(ui.visuals().warn_fg_color, notice);
+                                    }
+                                }
+                                AppMode::Idle => {
+                                    ui.label(
+                                        "Idle: edits change the local config for the next recording.",
+                                    );
+                                }
+                            }
+
+                            ui.separator();
+                            ui.add_enabled_ui(!settings_locked, |ui| {
+                                let changed = draw_settings(
+                                    ui,
+                                    &mut self.config,
+                                    &mut self.mask_x,
+                                    &mut self.mask_y,
+                                    &mut self.mask_file,
+                                );
+                                if changed {
+                                    self.config_dirty = true;
+                                }
+                            });
+                        });
+                });
+        } else {
+            egui::SidePanel::left("settings-collapsed")
+                .exact_width(COLLAPSED_PANEL_WIDTH)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("▶")
+                                        .size(14.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.settings_panel_open = true;
                         }
                     });
                 });
@@ -1124,69 +1524,116 @@ impl eframe::App for CameraApp {
             egui::SidePanel::right("analysis")
                 .min_width(360.0)
                 .show(ctx, |ui| {
-                    ui.heading("Analysis Tools");
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("▶")
+                                            .size(14.0)
+                                            .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.analysis_panel_open = false;
+                            }
+                        });
+                        ui.heading("Analysis Tools");
+                    });
                     ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let (plugins, config) = (&mut self.builtin_plugins, &mut self.config);
+                            for plugin in plugins.iter_mut() {
+                                if !plugin.enabled() {
+                                    continue;
+                                }
 
-                    let (plugins, config) = (&mut self.builtin_plugins, &mut self.config);
-                    for plugin in plugins.iter_mut() {
-                        if !plugin.enabled() {
-                            continue;
+                                let missing_dependencies: Vec<&str> = plugin
+                                    .dependencies()
+                                    .iter()
+                                    .copied()
+                                    .filter(|dependency| {
+                                        !enabled_plugin_names.iter().any(|name| name == dependency)
+                                    })
+                                    .collect();
+                                if !missing_dependencies.is_empty() {
+                                    ui.colored_label(
+                                        ui.visuals().warn_fg_color,
+                                        format!(
+                                            "Missing dependency: {}",
+                                            missing_dependencies.join(", ")
+                                        ),
+                                    );
+                                }
+
+                                if plugin.ui_settings(ui, config) {
+                                    builtin_plugin_config_changed = true;
+                                }
+
+                                ui.separator();
+                            }
+
+                            for record in self.plugin_manager.records_mut() {
+                                let Some(plugin) = record.plugin_mut() else {
+                                    continue;
+                                };
+                                if !plugin.enabled() {
+                                    continue;
+                                }
+
+                                let missing_dependencies: Vec<String> = plugin
+                                    .dependencies()
+                                    .iter()
+                                    .filter(|dependency| {
+                                        !enabled_plugin_names.iter().any(|name| name == *dependency)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                if !missing_dependencies.is_empty() {
+                                    ui.colored_label(
+                                        ui.visuals().warn_fg_color,
+                                        format!(
+                                            "Missing dependency: {}",
+                                            missing_dependencies.join(", ")
+                                        ),
+                                    );
+                                }
+
+                                if let Err(err) = render_plugin_settings(ui, plugin) {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        format!("Dynamic plugin UI failed: {err}"),
+                                    );
+                                }
+
+                                ui.separator();
+                            }
+                        });
+                });
+        } else if !enabled_plugin_names.is_empty() {
+            egui::SidePanel::right("analysis-collapsed")
+                .exact_width(COLLAPSED_PANEL_WIDTH)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("◀")
+                                        .size(14.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.analysis_panel_open = true;
                         }
-
-                        let missing_dependencies: Vec<&str> = plugin
-                            .dependencies()
-                            .iter()
-                            .copied()
-                            .filter(|dependency| {
-                                !enabled_plugin_names.iter().any(|name| name == dependency)
-                            })
-                            .collect();
-                        if !missing_dependencies.is_empty() {
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                format!("Missing dependency: {}", missing_dependencies.join(", ")),
-                            );
-                        }
-
-                        if plugin.ui_settings(ui, config) {
-                            builtin_plugin_config_changed = true;
-                        }
-
-                        ui.separator();
-                    }
-
-                    for record in self.plugin_manager.records_mut() {
-                        let Some(plugin) = record.plugin_mut() else {
-                            continue;
-                        };
-                        if !plugin.enabled() {
-                            continue;
-                        }
-
-                        let missing_dependencies: Vec<String> = plugin
-                            .dependencies()
-                            .iter()
-                            .filter(|dependency| {
-                                !enabled_plugin_names.iter().any(|name| name == *dependency)
-                            })
-                            .cloned()
-                            .collect();
-                        if !missing_dependencies.is_empty() {
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                format!("Missing dependency: {}", missing_dependencies.join(", ")),
-                            );
-                        }
-
-                        if let Err(err) = render_plugin_settings(ui, plugin) {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                format!("Dynamic plugin UI failed: {err}"),
-                            );
-                        }
-
-                        ui.separator();
-                    }
+                    });
                 });
         }
 
@@ -1310,15 +1757,11 @@ impl eframe::App for CameraApp {
         if plugin_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
-            self.sync_active_pipeline_requirements();
         }
 
+        let mut pc_metrics: Option<PointCloudMetrics> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(if mode == AppMode::Replaying {
-                "Replay"
-            } else {
-                "Live Preview"
-            });
+            ui.heading(preview_heading(mode, self.preview_workspace.view_mode));
             ui.separator();
 
             if let Some(info) = &self.camera_info {
@@ -1330,191 +1773,831 @@ impl eframe::App for CameraApp {
                 ));
             }
 
-            if let Some(texture) = &self.texture {
-                let available = ui.available_size();
-                let size = texture.size_vec2();
-                let scale = (available.x / size.x).min(available.y / size.y).max(0.1);
-                ui.add(egui::Image::new(texture).fit_to_exact_size(size * scale));
+            // Reserve space for controls below so the canvas never crowds them out.
+            let controls_reserve = 190.0;
+
+            if self.preview_workspace.popup_open {
+                // When the popup is open, show a placeholder in the main window.
+                draw_preview_toolbar(ui, &mut self.preview_workspace, settings_locked, "Enlarge");
+                let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
+                let placeholder_height = max_image_height;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), placeholder_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
+                painter.rect_stroke(
+                    rect,
+                    PANEL_ROUNDING,
+                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Preview open in separate window",
+                    egui::FontId::proportional(16.0),
+                    ui.visuals().weak_text_color(),
+                );
             } else {
-                match mode {
-                    AppMode::Replaying => {
-                        ui.label("No replay frame yet. Use the timeline or wait for playback to decode the next frame.");
+                match self.preview_workspace.view_mode {
+                    ViewMode::Preview2d => {
+                        draw_preview_toolbar(
+                            ui,
+                            &mut self.preview_workspace,
+                            settings_locked,
+                            "Enlarge",
+                        );
+                        let max_image_height =
+                            (ui.available_size().y - controls_reserve).max(180.0);
+                        if let (Some(texture), Some(frame)) =
+                            (self.texture.as_ref(), self.latest_frame.as_ref())
+                        {
+                            if draw_preview_canvas(
+                                ui,
+                                texture,
+                                frame,
+                                &mut self.config,
+                                &mut self.preview_workspace,
+                                settings_locked,
+                                max_image_height,
+                            ) && mode != AppMode::Replaying
+                            {
+                                self.config_dirty = true;
+                            }
+                        } else {
+                            self.preview_workspace.hover_sensor = None;
+                            draw_empty_preview_placeholder(
+                                ui,
+                                max_image_height,
+                                mode,
+                                self.preview_workspace.view_mode,
+                            );
+                        }
                     }
-                    _ => {
-                        ui.label("No preview yet. Probe the camera, then click Preview or Record.");
+                    ViewMode::PointCloud3d => {
+                        draw_point_cloud_toolbar(ui, &mut self.preview_workspace, "Enlarge");
+                        let max_image_height =
+                            (ui.available_size().y - controls_reserve).max(180.0);
+                        pc_metrics = Some(self.preview_workspace.point_cloud.draw(
+                            ui,
+                            self.config.roi,
+                            max_image_height,
+                        ));
                     }
                 }
             }
 
             if mode == AppMode::Replaying {
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    let play_pause = if self.replay_paused { "Play" } else { "Pause" };
-                    if ui
-                        .add_enabled(!self.replay_finished, egui::Button::new(play_pause))
-                        .clicked()
-                    {
-                        self.set_replay_paused(!self.replay_paused);
-                    }
+                ui.add_space(4.0);
+                self.draw_replay_transport(ui);
+            }
 
-                    if ui.button("Restart").clicked() {
-                        self.restart_replay();
-                    }
-
-                    ui.label("Speed");
-                    egui::ComboBox::from_id_source("replay-speed")
-                        .selected_text(replay_speed_label(self.replay_speed))
-                        .show_ui(ui, |ui| {
-                            for (speed, label) in REPLAY_SPEED_OPTIONS {
-                                if ui
-                                    .selectable_label(
-                                        replay_speed_matches(self.replay_speed, speed),
-                                        label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.set_replay_speed(speed);
-                                }
+            // ── Scrollable controls below the canvas ─────────────────────────
+            egui::ScrollArea::vertical()
+                .max_height(controls_reserve)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.separator();
+                    match self.preview_workspace.view_mode {
+                        ViewMode::Preview2d => {
+                            ui.horizontal(|ui| {
+                                ui.label("Contrast");
+                                ui.add(egui::Slider::new(
+                                    &mut self.contrast_percentile,
+                                    90.0..=100.0,
+                                ));
+                                ui.label(format!("{:.1}th percentile", self.contrast_percentile));
+                            });
+                        }
+                        ViewMode::PointCloud3d => {
+                            if let Some(metrics) = pc_metrics {
+                                draw_point_cloud_metrics(ui, metrics);
                             }
-                        });
-
-                    if self.replay_finished {
-                        ui.colored_label(status_success_color(), "Finished");
-                    }
-                });
-
-                if let Some(info) = self.replay_file_info.clone() {
-                    let mut timeline_fraction =
-                        self.replay_seek_drag_value.unwrap_or_else(|| self.current_replay_fraction());
-                    let slider = egui::Slider::new(&mut timeline_fraction, 0.0..=1.0)
-                        .show_value(false)
-                        .text("Timeline");
-                    let slider_width = ui.available_width().max(420.0);
-                    let response = ui.add_sized([slider_width, 0.0], slider);
-                    if response.dragged() {
-                        self.replay_seek_drag_value = Some(timeline_fraction);
-                    }
-                    if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                        self.replay_seek_drag_value = None;
-                        self.seek_replay(timeline_fraction);
-                    }
-
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!(
-                            "{} / {}",
-                            format_replay_time(self.current_replay_time_us()),
-                            format_replay_time(info.total_duration_us)
-                        ));
-                        ui.separator();
-                        ui.label(format!(
-                            "{:.1} / {:.1} MB",
-                            self.current_replay_bytes_read() as f64 / (1024.0 * 1024.0),
-                            info.data_len() as f64 / (1024.0 * 1024.0)
-                        ));
-                    });
-                }
-            } else {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Acq time [ms]");
-                    let changed = ui
-                        .add_enabled(
-                            !self.settings_are_locked(),
-                            egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
-                        )
-                        .changed();
-                    if changed {
-                        self.acq_dirty = true;
-                    }
-                    if mode != AppMode::Idle {
-                        if self.settings_are_locked() {
-                            ui.label("Preview changes are locked during recording.");
-                        } else {
-                            ui.label("Click Apply Settings to push preview timing.");
                         }
                     }
+
+                    if let Some(ctrl) = &self.controller {
+                        let s = ctrl.stats_snapshot();
+                        ui.label(format!(
+                            "{:.2} Mev/s  |  {:.2} MB/s  |  {:02}:{:02}:{:02} elapsed",
+                            s.mev_per_s,
+                            s.mb_per_s,
+                            (s.elapsed_s as u64) / 3600,
+                            (s.elapsed_s as u64 % 3600) / 60,
+                            s.elapsed_s as u64 % 60
+                        ));
+                    }
+                    if let Some(frame) = &self.latest_frame {
+                        let total = frame.on_count + frame.off_count;
+                        if total > 0 {
+                            let on_pct = frame.on_count as f64 * 100.0 / total as f64;
+                            let off_pct = frame.off_count as f64 * 100.0 / total as f64;
+                            ui.label(format!(
+                                "ON {:.1}%  |  OFF {:.1}%  ({} ev this frame)",
+                                on_pct, off_pct, total
+                            ));
+                        }
+                    }
+
+                    if mode != AppMode::Idle && mode != AppMode::Replaying {
+                        if self.config_dirty || self.acq_dirty {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "There are unapplied runtime changes.",
+                            );
+                        } else {
+                            ui.label("Runtime settings on the camera are up to date.");
+                        }
+                    }
+
+                    if !self.analysis_output.warnings.is_empty() {
+                        ui.separator();
+                        for warning in &self.analysis_output.warnings {
+                            ui.colored_label(
+                                analysis_warning_color(warning.severity, ui.visuals()),
+                                format!("{}: {}", warning.source, warning.message),
+                            );
+                        }
+
+                        let detected_pixels = self.latest_detected_hotpixels();
+                        if !detected_pixels.is_empty() {
+                            let can_copy = !settings_locked;
+                            if ui
+                                .add_enabled(can_copy, egui::Button::new("Mask detected hotpixels"))
+                                .clicked()
+                            {
+                                self.copy_detected_hotpixels_to_mask();
+                            }
+                            if !can_copy {
+                                ui.label(
+                                    "Unlock runtime settings to copy detections into the DEM mask.",
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some(notice) = &self.analysis_notice {
+                        ui.label(notice);
+                    }
+
+                    if let Some(err) = &self.last_error {
+                        ui.separator();
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
                 });
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Contrast");
-                ui.add(egui::Slider::new(&mut self.contrast_percentile, 90.0..=100.0));
-                ui.label(format!("{:.1}th percentile", self.contrast_percentile));
-            });
-
-            if let Some(ctrl) = &self.controller {
-                let s = ctrl.stats_snapshot();
-                ui.label(format!(
-                    "{:.2} Mev/s current | {:.2} MB/s current | {:02}:{:02}:{:02} elapsed",
-                    s.mev_per_s,
-                    s.mb_per_s,
-                    (s.elapsed_s as u64) / 3600,
-                    (s.elapsed_s as u64 % 3600) / 60,
-                    s.elapsed_s as u64 % 60
-                ));
-            }
-            if let Some(frame) = &self.latest_frame {
-                let total = frame.on_count + frame.off_count;
-                if total > 0 {
-                    let on_pct = frame.on_count as f64 * 100.0 / total as f64;
-                    let off_pct = frame.off_count as f64 * 100.0 / total as f64;
-                    ui.label(format!(
-                        "ON {:.1}%  |  OFF {:.1}%  ({} ev this frame)",
-                        on_pct, off_pct, total
-                    ));
-                }
-            }
-
-            if mode != AppMode::Idle && mode != AppMode::Replaying {
-                if self.config_dirty || self.acq_dirty {
-                    ui.colored_label(
-                        ui.visuals().warn_fg_color,
-                        "There are unapplied runtime changes.",
-                    );
-                } else {
-                    ui.label("Runtime settings on the camera are up to date.");
-                }
-            }
-
-            if !self.analysis_output.warnings.is_empty() {
-                ui.separator();
-                for warning in &self.analysis_output.warnings {
-                    ui.colored_label(
-                        analysis_warning_color(warning.severity, ui.visuals()),
-                        format!("{}: {}", warning.source, warning.message),
-                    );
-                }
-
-                let detected_pixels = self.latest_detected_hotpixels();
-                if !detected_pixels.is_empty() {
-                    let can_copy = !self.settings_are_locked();
-                    if ui
-                        .add_enabled(can_copy, egui::Button::new("Mask detected hotpixels"))
-                        .clicked()
-                    {
-                        self.copy_detected_hotpixels_to_mask();
-                    }
-                    if !can_copy {
-                        ui.label("Unlock runtime settings to copy detections into the DEM mask.");
-                    }
-                }
-            }
-
-            if let Some(notice) = &self.analysis_notice {
-                ui.label(notice);
-            }
-
-            if let Some(err) = &self.last_error {
-                ui.separator();
-                ui.colored_label(ui.visuals().error_fg_color, err);
-            }
         });
+
+        if self.preview_workspace.popup_open {
+            // Update shared data for the popup viewport.
+            {
+                let mut data = self.popup_shared.lock().unwrap();
+                data.texture = self.texture.clone();
+                data.mode = mode;
+                data.view_mode = self.preview_workspace.view_mode;
+                data.roi = self.config.roi;
+                if let Some(frame) = &self.latest_frame {
+                    data.frame_width = frame.width;
+                    data.frame_height = frame.height;
+                } else {
+                    data.frame_width = 0;
+                    data.frame_height = 0;
+                }
+                data.replay_paused = self.replay_paused;
+                data.replay_finished = self.replay_finished;
+                data.replay_speed = self.replay_speed;
+                data.replay_fraction = self.current_replay_fraction();
+                data.replay_time_us = self.current_replay_time_us();
+                data.replay_bytes_read = self.current_replay_bytes_read();
+                if let Some(info) = &self.replay_file_info {
+                    data.replay_duration_us = info.total_duration_us;
+                    data.replay_data_len = info.data_len();
+                } else {
+                    data.replay_duration_us = 0;
+                    data.replay_data_len = 0;
+                }
+            }
+
+            let shared = Arc::clone(&self.popup_shared);
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of("popup_preview"),
+                egui::ViewportBuilder::default()
+                    .with_title("Preview \u{2014} AugurRS")
+                    .with_inner_size([1280.0, 820.0]),
+                move |ctx, class| match class {
+                    egui::viewport::ViewportClass::Deferred => {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render_popup_content(ui, &shared);
+                        });
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            if let Ok(mut d) = shared.lock() {
+                                d.close_requested = true;
+                            }
+                        }
+                    }
+                    egui::viewport::ViewportClass::Embedded => {
+                        let mut open = true;
+                        egui::Window::new("Preview \u{2014} AugurRS")
+                            .open(&mut open)
+                            .default_size([1100.0, 760.0])
+                            .show(ctx, |ui| {
+                                render_popup_content(ui, &shared);
+                            });
+                        if !open {
+                            if let Ok(mut d) = shared.lock() {
+                                d.close_requested = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+            );
+
+            // Drain actions from the popup — extract values before dropping
+            // the MutexGuard so we can call &mut self methods afterwards.
+            let (close, toggle_pause, restart, seek_to, set_speed) = {
+                let mut data = self.popup_shared.lock().unwrap();
+                let close = data.close_requested;
+                let toggle = data.toggle_pause;
+                let restart = data.restart;
+                let seek = data.seek_to.take();
+                let speed = data.set_speed.take();
+                data.close_requested = false;
+                data.toggle_pause = false;
+                data.restart = false;
+                (close, toggle, restart, seek, speed)
+            };
+            if close {
+                self.preview_workspace.popup_open = false;
+            }
+            if toggle_pause {
+                let new_paused = !self.replay_paused;
+                self.set_replay_paused(new_paused);
+            }
+            if restart {
+                self.restart_replay();
+            }
+            if let Some(fraction) = seek_to {
+                self.seek_replay(fraction);
+            }
+            if let Some(speed) = set_speed {
+                self.set_replay_speed(speed);
+            }
+        }
+
+        self.sync_active_pipeline_requirements();
 
         if self.mode != AppMode::Idle && self.controller.is_some() {
             ctx.request_repaint();
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewViewport {
+    base_sensor_rect: egui::Rect,
+    visible_sensor_rect: egui::Rect,
+    /// ROI rect in sensor coordinates, if the config ROI is valid for this frame.
+    roi_rect: Option<egui::Rect>,
+}
+
+impl PreviewViewport {
+    fn display_size(&self, available: egui::Vec2) -> egui::Vec2 {
+        let sensor_size = self.base_sensor_rect.size();
+        let scale = (available.x / sensor_size.x)
+            .min(available.y / sensor_size.y)
+            .max(0.1);
+        sensor_size * scale
+    }
+
+    fn uv_rect(&self, frame: &PreviewFrame) -> egui::Rect {
+        let width = frame.width.max(1) as f32;
+        let height = frame.height.max(1) as f32;
+        egui::Rect::from_min_max(
+            egui::pos2(
+                self.visible_sensor_rect.min.x / width,
+                self.visible_sensor_rect.min.y / height,
+            ),
+            egui::pos2(
+                self.visible_sensor_rect.max.x / width,
+                self.visible_sensor_rect.max.y / height,
+            ),
+        )
+    }
+
+    fn screen_to_sensor(
+        &self,
+        image_rect: egui::Rect,
+        pointer_pos: egui::Pos2,
+    ) -> Option<(u16, u16)> {
+        if !image_rect.contains(pointer_pos) {
+            return None;
+        }
+
+        let rel_x = ((pointer_pos.x - image_rect.min.x) / image_rect.width()).clamp(0.0, 1.0);
+        let rel_y = ((pointer_pos.y - image_rect.min.y) / image_rect.height()).clamp(0.0, 1.0);
+        let sensor_x = (self.visible_sensor_rect.min.x + rel_x * self.visible_sensor_rect.width())
+            .floor()
+            .max(0.0) as u16;
+        let sensor_y = (self.visible_sensor_rect.min.y + rel_y * self.visible_sensor_rect.height())
+            .floor()
+            .max(0.0) as u16;
+        Some((sensor_x, sensor_y))
+    }
+
+    fn sensor_to_screen(&self, image_rect: egui::Rect, sensor_pos: egui::Pos2) -> egui::Pos2 {
+        let rel_x =
+            (sensor_pos.x - self.visible_sensor_rect.min.x) / self.visible_sensor_rect.width();
+        let rel_y =
+            (sensor_pos.y - self.visible_sensor_rect.min.y) / self.visible_sensor_rect.height();
+        egui::pos2(
+            image_rect.min.x + rel_x * image_rect.width(),
+            image_rect.min.y + rel_y * image_rect.height(),
+        )
+    }
+}
+
+fn preview_heading(mode: AppMode, view_mode: ViewMode) -> &'static str {
+    match (mode, view_mode) {
+        (AppMode::Replaying, ViewMode::Preview2d) => "Replay",
+        (AppMode::Replaying, ViewMode::PointCloud3d) => "Replay 3D View",
+        (_, ViewMode::Preview2d) => "Live Preview",
+        (_, ViewMode::PointCloud3d) => "3D Point Cloud",
+    }
+}
+
+fn empty_preview_message(mode: AppMode, view_mode: ViewMode) -> &'static str {
+    match (mode, view_mode) {
+        (AppMode::Idle, ViewMode::Preview2d) => {
+            "No camera probed. Click Probe Camera to connect, or open a replay file."
+        }
+        (AppMode::Replaying, ViewMode::Preview2d) => {
+            "No replay frame yet. Use the timeline or wait for playback to decode the next frame."
+        }
+        (_, ViewMode::Preview2d) => {
+            "No preview yet. Probe the camera, then click Preview or Record."
+        }
+        (_, ViewMode::PointCloud3d) => "No recent raw events available for the 3D view yet.",
+    }
+}
+
+fn draw_preview_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut PreviewWorkspaceState,
+    settings_locked: bool,
+    popup_button_label: &str,
+) {
+    ui.horizontal_wrapped(|ui| {
+        let mut select_roi_button = ui.add_enabled(
+            !settings_locked,
+            egui::SelectableLabel::new(workspace.tool == PreviewTool::SelectRoi, "Select ROI"),
+        );
+        if settings_locked {
+            select_roi_button = select_roi_button.on_hover_text(
+                "ROI editing is disabled while replay is active or settings are locked.",
+            );
+        }
+        if select_roi_button.clicked() {
+            if workspace.tool == PreviewTool::SelectRoi {
+                workspace.clear_selection();
+            } else {
+                workspace.tool = PreviewTool::SelectRoi;
+                workspace.selection_anchor = None;
+                workspace.pending_roi = None;
+            }
+        }
+
+        if ui.button("-").clicked() {
+            workspace.zoom = (workspace.zoom / 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+            if (workspace.zoom - PREVIEW_ZOOM_MIN).abs() < f32::EPSILON {
+                workspace.pan = egui::Vec2::ZERO;
+            }
+        }
+        if ui.button("+").clicked() {
+            workspace.zoom = (workspace.zoom * 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+        }
+        if ui.button("Fit").clicked() {
+            workspace.reset_zoom();
+        }
+
+        ui.checkbox(&mut workspace.crop_to_roi, "Crop to ROI");
+
+        if ui.button(popup_button_label).clicked() {
+            workspace.popup_open = !workspace.popup_open;
+        }
+
+        ui.separator();
+        if let Some((x, y)) = workspace.hover_sensor {
+            ui.monospace(format!("x {x}, y {y}"));
+        } else {
+            ui.weak("Hover preview for x/y");
+        }
+    });
+}
+
+fn draw_point_cloud_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut PreviewWorkspaceState,
+    popup_button_label: &str,
+) {
+    workspace.point_cloud.sanitize_controls();
+
+    egui::Grid::new("pc_controls_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Time range [ms]")
+                .on_hover_text("How far back in time to show events");
+            ui.add(
+                egui::DragValue::new(&mut workspace.point_cloud.time_window_ms)
+                    .speed(5.0)
+                    .clamp_range(5.0..=2_000.0),
+            );
+            ui.end_row();
+
+            ui.label("Max render")
+                .on_hover_text("Limits rendered points for smoother interaction");
+            ui.add(
+                egui::DragValue::new(&mut workspace.point_cloud.point_limit)
+                    .speed(250.0)
+                    .clamp_range(1_000..=100_000),
+            );
+            ui.end_row();
+        });
+
+    ui.horizontal(|ui| {
+        if ui.button("Reset Camera").clicked() {
+            workspace.point_cloud.reset_camera();
+        }
+        if ui.button(popup_button_label).clicked() {
+            workspace.popup_open = !workspace.popup_open;
+        }
+        ui.small("Drag to orbit. Scroll to zoom.");
+    });
+}
+
+fn draw_point_cloud_metrics(ui: &mut egui::Ui, metrics: PointCloudMetrics) {
+    if metrics.visible_points == 0 {
+        ui.label("No events in view");
+    } else if metrics.rendered_points < metrics.visible_points {
+        ui.label(format!(
+            "Showing {} of {} events (downsampled)",
+            metrics.rendered_points, metrics.visible_points
+        ));
+    } else {
+        ui.label(format!("Showing {} events", metrics.rendered_points));
+    }
+}
+
+fn draw_empty_preview_placeholder(
+    ui: &mut egui::Ui,
+    max_image_height: f32,
+    mode: AppMode,
+    view_mode: ViewMode,
+) {
+    let placeholder_height = max_image_height;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), placeholder_height),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
+    painter.rect_stroke(
+        rect,
+        PANEL_ROUNDING,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        empty_preview_message(mode, view_mode),
+        egui::FontId::proportional(16.0),
+        ui.visuals().weak_text_color(),
+    );
+}
+
+fn render_popup_content(ui: &mut egui::Ui, shared: &Arc<Mutex<PopupSharedData>>) {
+    let data = shared.lock().unwrap();
+
+    // Extract everything we need, then drop the lock before rendering.
+    let texture = data.texture.clone();
+    let view_mode = data.view_mode;
+    let mode = data.mode;
+    let is_replay = mode == AppMode::Replaying && data.replay_duration_us > 0;
+    let fraction = data.seek_drag.unwrap_or(data.replay_fraction);
+    let paused = data.replay_paused;
+    let finished = data.replay_finished;
+    let speed = data.replay_speed;
+    let duration_us = data.replay_duration_us;
+    let time_us = data.replay_time_us;
+    let bytes_read = data.replay_bytes_read;
+    let data_len = data.replay_data_len;
+    drop(data);
+
+    match view_mode {
+        ViewMode::Preview2d => {
+            if let Some(texture) = &texture {
+                let reserve = if is_replay { 80.0 } else { 0.0 };
+                let available = ui.available_size();
+                let max_h = (available.y - reserve).max(100.0);
+                ui.add(
+                    egui::Image::new(texture)
+                        .shrink_to_fit()
+                        .max_size(egui::vec2(available.x, max_h)),
+                );
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("No preview available").weak().italics());
+                });
+            }
+        }
+        ViewMode::PointCloud3d => {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("3D view available in main window")
+                        .weak()
+                        .italics(),
+                );
+            });
+        }
+    }
+
+    // Replay controls
+    if is_replay {
+        ui.separator();
+        ui.horizontal(|ui| {
+            let play_label = if paused { "Play" } else { "Pause" };
+            if ui
+                .add_enabled(!finished, egui::Button::new(play_label))
+                .clicked()
+            {
+                shared.lock().unwrap().toggle_pause = true;
+            }
+            if ui.button("Restart").clicked() {
+                shared.lock().unwrap().restart = true;
+            }
+            ui.label("Speed:");
+            ui.label(format!(
+                "{:.1}x",
+                if speed.is_infinite() {
+                    f32::INFINITY
+                } else {
+                    speed
+                }
+            ));
+        });
+
+        let mut timeline = fraction;
+        let slider = egui::Slider::new(&mut timeline, 0.0..=1.0)
+            .show_value(false)
+            .text("Timeline");
+        let response = ui.add_sized([ui.available_width().max(300.0), 0.0], slider);
+        if response.dragged() {
+            shared.lock().unwrap().seek_drag = Some(timeline);
+        }
+        if response.drag_stopped() || (response.changed() && !response.dragged()) {
+            let mut d = shared.lock().unwrap();
+            d.seek_drag = None;
+            d.seek_to = Some(timeline);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} / {}",
+                format_replay_time(time_us),
+                format_replay_time(duration_us)
+            ));
+            ui.separator();
+            ui.label(format!(
+                "{:.1} / {:.1} MB",
+                bytes_read as f64 / (1024.0 * 1024.0),
+                data_len as f64 / (1024.0 * 1024.0)
+            ));
+        });
+    }
+}
+
+fn draw_preview_canvas(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    frame: &PreviewFrame,
+    config: &mut CameraConfig,
+    workspace: &mut PreviewWorkspaceState,
+    settings_locked: bool,
+    max_height: f32,
+) -> bool {
+    let viewport = build_preview_viewport(frame, config, workspace);
+    let available = ui.available_size_before_wrap();
+    let display_size = viewport.display_size(egui::vec2(available.x, available.y.min(max_height)));
+    let response = ui.add(
+        egui::Image::new(texture)
+            .uv(viewport.uv_rect(frame))
+            .fit_to_exact_size(display_size)
+            .sense(egui::Sense::click_and_drag()),
+    );
+
+    workspace.hover_sensor = response
+        .hover_pos()
+        .and_then(|pos| viewport.screen_to_sensor(response.rect, pos));
+
+    let mut roi_committed = false;
+    if workspace.tool == PreviewTool::SelectRoi && !settings_locked {
+        if response.drag_started() {
+            if let Some(pointer_pos) = response
+                .interact_pointer_pos()
+                .and_then(|pos| viewport.screen_to_sensor(response.rect, pos))
+            {
+                let anchor = egui::pos2(pointer_pos.0 as f32, pointer_pos.1 as f32);
+                workspace.selection_anchor = Some(anchor);
+                workspace.pending_roi = Some(sensor_rect_from_points(anchor, anchor, frame));
+            }
+        }
+
+        if response.dragged() {
+            if let (Some(anchor), Some(pointer_pos)) = (
+                workspace.selection_anchor,
+                response
+                    .interact_pointer_pos()
+                    .and_then(|pos| viewport.screen_to_sensor(response.rect, pos)),
+            ) {
+                workspace.pending_roi = Some(sensor_rect_from_points(
+                    anchor,
+                    egui::pos2(pointer_pos.0 as f32, pointer_pos.1 as f32),
+                    frame,
+                ));
+            }
+        }
+
+        if response.drag_stopped() {
+            if let Some(pending_roi) = workspace.pending_roi.take() {
+                if let Some(roi) = sensor_rect_to_roi_config(pending_roi, frame) {
+                    config.roi = roi;
+                    roi_committed = true;
+                    if workspace.crop_to_roi {
+                        workspace.reset_zoom();
+                    }
+                }
+            }
+            workspace.selection_anchor = None;
+        }
+    } else if response.dragged() && workspace.zoom > PREVIEW_ZOOM_MIN {
+        let delta = ui.ctx().input(|input| input.pointer.delta());
+        workspace.pan += egui::vec2(
+            -delta.x * viewport.visible_sensor_rect.width() / response.rect.width().max(1.0),
+            -delta.y * viewport.visible_sensor_rect.height() / response.rect.height().max(1.0),
+        );
+    }
+
+    let painter = ui.painter().with_clip_rect(response.rect);
+    if let Some(current_roi) = viewport.roi_rect {
+        if !workspace.crop_to_roi {
+            paint_sensor_rect(
+                &painter,
+                response.rect,
+                viewport,
+                current_roi,
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 196, 64)),
+            );
+        }
+    }
+    if let Some(pending_roi) = workspace.pending_roi {
+        paint_sensor_rect(
+            &painter,
+            response.rect,
+            viewport,
+            pending_roi,
+            egui::Stroke::new(2.0, egui::Color32::WHITE),
+        );
+    }
+
+    roi_committed
+}
+
+fn build_preview_viewport(
+    frame: &PreviewFrame,
+    config: &CameraConfig,
+    workspace: &mut PreviewWorkspaceState,
+) -> PreviewViewport {
+    workspace.zoom = workspace.zoom.clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+
+    let full_sensor_rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(frame.width as f32, frame.height as f32),
+    );
+    let roi_rect = roi_sensor_rect(config, frame);
+    let base_sensor_rect = if workspace.crop_to_roi {
+        roi_rect.unwrap_or(full_sensor_rect)
+    } else {
+        full_sensor_rect
+    };
+
+    let visible_size = egui::vec2(
+        (base_sensor_rect.width() / workspace.zoom).max(1.0),
+        (base_sensor_rect.height() / workspace.zoom).max(1.0),
+    );
+    let max_pan = egui::vec2(
+        ((base_sensor_rect.width() - visible_size.x) * 0.5).max(0.0),
+        ((base_sensor_rect.height() - visible_size.y) * 0.5).max(0.0),
+    );
+    workspace.pan.x = workspace.pan.x.clamp(-max_pan.x, max_pan.x);
+    workspace.pan.y = workspace.pan.y.clamp(-max_pan.y, max_pan.y);
+
+    let center = base_sensor_rect.center() + workspace.pan;
+    let min = egui::pos2(
+        (center.x - visible_size.x * 0.5).clamp(
+            base_sensor_rect.min.x,
+            base_sensor_rect.max.x - visible_size.x,
+        ),
+        (center.y - visible_size.y * 0.5).clamp(
+            base_sensor_rect.min.y,
+            base_sensor_rect.max.y - visible_size.y,
+        ),
+    );
+
+    PreviewViewport {
+        base_sensor_rect,
+        visible_sensor_rect: egui::Rect::from_min_size(min, visible_size),
+        roi_rect,
+    }
+}
+
+fn roi_sensor_rect(config: &CameraConfig, frame: &PreviewFrame) -> Option<egui::Rect> {
+    if frame.width == 0 || frame.height == 0 {
+        return None;
+    }
+
+    let min_x = config.roi.x.min(frame.width.saturating_sub(1)) as f32;
+    let min_y = config.roi.y.min(frame.height.saturating_sub(1)) as f32;
+    let max_x =
+        (u32::from(config.roi.x) + u32::from(config.roi.width)).min(u32::from(frame.width)) as f32;
+    let max_y = (u32::from(config.roi.y) + u32::from(config.roi.height))
+        .min(u32::from(frame.height)) as f32;
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    Some(egui::Rect::from_min_max(
+        egui::pos2(min_x, min_y),
+        egui::pos2(max_x, max_y),
+    ))
+}
+
+fn sensor_rect_from_points(start: egui::Pos2, end: egui::Pos2, frame: &PreviewFrame) -> egui::Rect {
+    let max_x = frame.width.max(1) as f32;
+    let max_y = frame.height.max(1) as f32;
+    let min_x = start.x.min(end.x).floor().clamp(0.0, max_x - 1.0);
+    let min_y = start.y.min(end.y).floor().clamp(0.0, max_y - 1.0);
+    let max_x_rect = start.x.max(end.x).ceil().clamp(min_x + 1.0, max_x);
+    let max_y_rect = start.y.max(end.y).ceil().clamp(min_y + 1.0, max_y);
+    egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x_rect, max_y_rect))
+}
+
+fn sensor_rect_to_roi_config(sensor_rect: egui::Rect, frame: &PreviewFrame) -> Option<RoiConfig> {
+    if frame.width == 0 || frame.height == 0 {
+        return None;
+    }
+
+    let min_x = sensor_rect
+        .min
+        .x
+        .floor()
+        .clamp(0.0, frame.width as f32 - 1.0) as u16;
+    let min_y = sensor_rect
+        .min
+        .y
+        .floor()
+        .clamp(0.0, frame.height as f32 - 1.0) as u16;
+    let max_x = sensor_rect
+        .max
+        .x
+        .ceil()
+        .clamp(min_x as f32 + 1.0, frame.width as f32) as u16;
+    let max_y = sensor_rect
+        .max
+        .y
+        .ceil()
+        .clamp(min_y as f32 + 1.0, frame.height as f32) as u16;
+
+    Some(RoiConfig {
+        x: min_x,
+        y: min_y,
+        width: max_x.saturating_sub(min_x).max(1),
+        height: max_y.saturating_sub(min_y).max(1),
+    })
+}
+
+fn paint_sensor_rect(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    sensor_rect: egui::Rect,
+    stroke: egui::Stroke,
+) {
+    let screen_rect = egui::Rect::from_min_max(
+        viewport.sensor_to_screen(image_rect, sensor_rect.min),
+        viewport.sensor_to_screen(image_rect, sensor_rect.max),
+    );
+    painter.rect_stroke(screen_rect, 0.0, stroke);
 }
 
 fn status_success_color() -> egui::Color32 {
@@ -1553,10 +2636,12 @@ fn replay_config_path(raw_path: &Path) -> Option<PathBuf> {
 }
 
 fn replay_speed_label(speed: f32) -> &'static str {
-    REPLAY_SPEED_OPTIONS
-        .iter()
-        .find_map(|(candidate, label)| replay_speed_matches(speed, *candidate).then_some(*label))
-        .unwrap_or("Custom")
+    for &(s, label) in &REPLAY_SPEED_OPTIONS {
+        if replay_speed_matches(speed, s) {
+            return label;
+        }
+    }
+    "1x"
 }
 
 fn replay_speed_matches(current: f32, candidate: f32) -> bool {
@@ -1578,5 +2663,77 @@ fn format_replay_time(duration_us: u64) -> String {
 impl Drop for CameraApp {
     fn drop(&mut self) {
         self.stop_pipeline();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_preview_viewport, sensor_rect_to_roi_config, PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
+    };
+    use augur_core::{config::CameraConfig, pipeline::PreviewFrame};
+
+    fn test_frame() -> PreviewFrame {
+        PreviewFrame {
+            width: 1280,
+            height: 720,
+            pixels: vec![0; 1280 * 720],
+            pixels_on: vec![0; 1280 * 720],
+            pixels_off: vec![0; 1280 * 720],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 0,
+        }
+    }
+
+    #[test]
+    fn preview_viewport_uses_roi_when_crop_is_enabled() {
+        let frame = test_frame();
+        let mut config = CameraConfig::default();
+        config.roi.x = 120;
+        config.roi.y = 90;
+        config.roi.width = 320;
+        config.roi.height = 180;
+
+        let mut workspace = PreviewWorkspaceState {
+            crop_to_roi: true,
+            ..Default::default()
+        };
+        let viewport = build_preview_viewport(&frame, &config, &mut workspace);
+
+        assert_eq!(viewport.base_sensor_rect.min, egui::pos2(120.0, 90.0));
+        assert_eq!(viewport.base_sensor_rect.size(), egui::vec2(320.0, 180.0));
+    }
+
+    #[test]
+    fn preview_viewport_clamps_pan_inside_base_rect() {
+        let frame = test_frame();
+        let config = CameraConfig::default();
+        let mut workspace = PreviewWorkspaceState {
+            zoom: PREVIEW_ZOOM_MAX,
+            pan: egui::vec2(10_000.0, -10_000.0),
+            ..Default::default()
+        };
+
+        let viewport = build_preview_viewport(&frame, &config, &mut workspace);
+
+        assert!(viewport.visible_sensor_rect.min.x >= 0.0);
+        assert!(viewport.visible_sensor_rect.min.y >= 0.0);
+        assert!(viewport.visible_sensor_rect.max.x <= frame.width as f32);
+        assert!(viewport.visible_sensor_rect.max.y <= frame.height as f32);
+    }
+
+    #[test]
+    fn roi_conversion_rounds_selection_to_sensor_bounds() {
+        let frame = test_frame();
+        let rect = egui::Rect::from_min_max(egui::pos2(10.2, 20.1), egui::pos2(25.8, 30.0));
+        let roi = sensor_rect_to_roi_config(rect, &frame).expect("roi should be produced");
+
+        assert_eq!(roi.x, 10);
+        assert_eq!(roi.y, 20);
+        assert_eq!(roi.width, 16);
+        assert_eq!(roi.height, 10);
     }
 }

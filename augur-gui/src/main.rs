@@ -3,6 +3,7 @@ mod plugin;
 mod plugin_loader;
 mod plugin_settings_ui;
 mod plugins;
+mod point_cloud;
 mod preview;
 mod settings;
 
@@ -10,7 +11,9 @@ use app::CameraApp;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 860.0])
+            .with_resizable(true),
         ..Default::default()
     };
 

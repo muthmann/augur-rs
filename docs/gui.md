@@ -10,28 +10,28 @@ cargo run --bin augur-gui
 
 ---
 
-## Toolbar
+## Menu Bar
 
-The top toolbar provides the main session controls:
+A single menu bar row at the top of the window:
 
-| Button | Action |
+| Menu | Contents |
 |---|---|
-| `Probe Camera` | Query the EVK4 and display model, serial, and firmware information |
-| `Preview` | Start live preview without writing to disk |
-| `Record` | Start recording to the configured output path |
-| `Open Replay` | Open a recorded `.raw` file or decoded `.csv`, `.bin`, `.npy`, or optional `.h5` / `.hdf5` event file in replay mode |
-| `Stop` | Stop preview, recording, or replay |
-| `Apply Settings` | Push pending runtime changes while previewing or recording |
-| `Settings Panel` / `Analysis Panel` | Show or hide the left and right side panels |
-| `Analysis` | Enable or disable plugins from a dropdown menu |
-| `Plugins` | Open the plugin manager, rescan `~/.augur/plugins/`, or open the plugin directory |
-| `Save Config` / `Load Config` | Store or restore TOML settings |
+| `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay |
+| `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings, Acq time slider; replay mode adds Play/Pause, Restart, and Speed selection |
+| `View` | Toggle Settings/Analysis panels, switch 2D/3D view mode |
+| `Plugins` | Plugin Manager, Scan for New Plugins, Open Plugins Folder |
+| `Analysis` | Per-plugin enable/disable checkboxes (shown only when plugins exist) |
+
+The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), and the current camera/session status label.
 
 ---
 
 ## Settings Panel (Left)
 
 Camera-only controls are shown in the left panel.
+
+- the panel collapses from a separator-edge arrow instead of the toolbar
+- the full panel body is scrollable
 
 ### Live camera sessions
 
@@ -64,6 +64,8 @@ When at least one analysis plugin is enabled, a right-side **Analysis Tools** pa
 - plugins can exchange per-frame derived data through the shared context bus
 - hiding the panel does not disable plugin execution
 - disabling all plugins hides the panel automatically
+- the full panel body is scrollable
+- collapse and expand happen from the panel edge, not the top toolbar
 
 ### Available plugin types
 
@@ -86,6 +88,32 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 ---
 
+## Preview Workspace
+
+The center panel is now an interactive preview workspace shared by the embedded view and the enlarged popup.
+
+### 2D preview tools
+
+- hover the preview to read the current sensor-space `x, y` cursor position
+- `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`
+- `+`, `-`, and `Fit` control zoom
+- when zoomed in, dragging the image pans the viewport
+- `Crop to ROI` switches between full-frame and ROI-only rendering
+- `Enlarge` opens a larger resizable popup that reuses the same zoom/crop/ROI state as the main preview
+
+If a ROI is configured, the full-frame preview shows its outline. While dragging a new ROI, the pending selection rectangle is drawn live on top of the image.
+
+### 3D point-cloud view
+
+Switch the toolbar `View` control to `3D` to replace the image preview with a point cloud built from recent raw `CdEvent`s.
+
+- `Time range [ms]` controls how far back in time to show events
+- `Max render` caps the rendered sample count for performance
+- `Reset Camera` resets the orbit camera
+- drag the point cloud to orbit and use the mouse wheel to zoom
+
+The point cloud always shows the most recent events and is filtered to the currently configured hardware ROI.
+
 ## Replay Mode
 
 Opening a replay file starts a preview-only pipeline:
@@ -93,6 +121,7 @@ Opening a replay file starts a preview-only pipeline:
 - `.raw` files use `RawFileCamera`
 - decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` files use `DecodedEventFileCamera`
 - all formats share the same transport controls, plugin path, and preview rendering
+- the same replay session can be viewed in either 2D or 3D via the toolbar `View` toggle
 
 Decoded replay files carry geometry differently:
 
@@ -103,14 +132,12 @@ Decoded replay files carry geometry differently:
 
 HDF5 replay is optional at build time. Build or run `augur-gui` with `--features hdf5` on a machine with the HDF5 system library installed to enable `.h5` / `.hdf5` support.
 
-The center panel switches to a `Replay` heading and adds transport controls below the preview:
+The center panel switches to a `Replay` heading and shows a transport bar between the canvas and the scrollable controls area:
 
-- `Play` / `Pause`
-- `Restart`
-- replay speed selector (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
-- a timeline slider for seeking within the recording
+- `▶` / `⏸` Play/Pause, `⏮` Restart, `⏹` Stop buttons
+- a Speed combo box (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
+- a full-width timeline slider for seeking within the recording
 - current / total replay time
-- replay MB progress as secondary info
 
 Enabled plugins continue to process replayed frames through the normal `PreviewFrame` path.
 
@@ -120,7 +147,7 @@ At EOF, replay shuts down its controller threads but stays in replay mode so the
 
 ## Preview Contrast
 
-A `Contrast` slider below the preview is available in both live and replay modes.
+A `Contrast` slider below the preview is available in 2D mode only (live and replay). In 3D mode, point cloud metrics are shown instead.
 
 - the slider controls percentile-based normalization (`90.0` to `100.0`)
 - this prevents a single hotpixel from dominating the entire frame
