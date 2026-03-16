@@ -17,7 +17,8 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [HDF5 File Support](./hdf5-file-support.md) — native HDF5 build requirements, ECF plugin installation, runtime environment setup
 - [Replay](./raw-replay.md) — `.raw` plus decoded-event replay, seekable transport controls, persisted EOF state
 - [Theme-Aware GUI Status Colors](./theme-aware-gui-status-colors.md) — theme-adaptive warning/error labels plus contrast-safe success/info colors
-- [Collapsible GUI Panels](./collapsible-panels.md) — toolbar toggles for the settings and analysis side panels
+- [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
+- [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection

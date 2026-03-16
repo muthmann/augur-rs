@@ -2,13 +2,16 @@
 
 ## Summary
 
-The GUI settings panel and analysis panel can now be collapsed independently from the toolbar. This lets users reclaim horizontal space for the preview without disabling plugins or losing their current configuration state.
+The GUI settings panel and analysis panel can now be collapsed independently from arrow controls placed on the panel separator edges. Both side panels also scroll end to end, so long settings/plugin lists remain reachable without sacrificing preview space.
 
 ## Behavior
 
-- `Settings Panel` toggles the left-side camera settings panel
-- `Analysis Panel` toggles the right-side plugin panel
-- both toggles are available in the top toolbar
+- the left settings panel collapses to a narrow 22 px edge strip with a frameless `▶` arrow
+- the right analysis panel collapses to a narrow 22 px edge strip with a frameless `◀` arrow
+- collapsed arrows use 14 px weak text color for a minimal, non-button appearance; hover highlights are still present
+- each expanded panel shows its collapse arrow on the inner separator edge
+- panel visibility can also be toggled from the `View` menu in the menu bar
+- both panel bodies are wrapped in a vertical scroll area
 - panel visibility does not reset plugin enablement or camera settings
 
 When the analysis panel is hidden, plugins still run if they are enabled. Hiding the panel only affects layout.
@@ -23,12 +26,13 @@ When the analysis panel is hidden, plugins still run if they are enabled. Hiding
 
 | File | Role |
 |---|---|
-| `augur-gui/src/app.rs` | Toolbar toggle buttons and conditional side-panel rendering |
+| `augur-gui/src/app.rs` | Edge toggle buttons, collapsed strips, and scrollable side-panel rendering |
 | `docs/gui.md` | User-facing GUI workflow documentation |
 | `book/src/gui.md` | mdBook GUI guide |
 
 ## Verification
 
 - open the GUI
-- toggle each panel independently
+- collapse and expand each panel from its separator-edge button
+- confirm long settings/plugin content scrolls to the end
 - confirm the preview resizes and no plugin/camera state is lost

@@ -65,7 +65,7 @@ pub struct BiasConfig {
     pub refr: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RoiConfig {
     pub x: u16,
     pub y: u16,
