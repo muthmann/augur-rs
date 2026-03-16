@@ -35,3 +35,4 @@ rfd = "0.15"
 rustfft = "6"
 serde_json = "1"
 libloading = "0.8"
+image = { version = "0.24.9", default-features = false, features = ["png", "tiff"] }

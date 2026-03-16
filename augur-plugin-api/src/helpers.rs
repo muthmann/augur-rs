@@ -177,4 +177,8 @@ pub trait Plugin: Default {
     fn status_entries(&self) -> Vec<StatusEntry> {
         Vec::new()
     }
+
+    fn accumulated_localizations(&self) -> Option<Vec<u8>> {
+        None
+    }
 }

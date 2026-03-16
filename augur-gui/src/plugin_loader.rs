@@ -15,8 +15,8 @@ use augur_core::{
 };
 use augur_plugin_api::{
     AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginEntry, PluginInput,
-    PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
+    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, LocalizationTable, PluginEntry,
+    PluginInput, PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -234,6 +234,21 @@ impl DynPlugin {
 
     pub fn status_entries(&self) -> Result<Vec<StatusEntry>, String> {
         self.read_json(self.vtable.status_entries)
+    }
+
+    pub fn accumulated_localizations(&self) -> Result<Option<LocalizationTable>, String> {
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+        let has_data = unsafe {
+            (self.vtable.accumulated_localizations)(self.instance, &mut out_ptr, &mut out_len)
+        };
+        if !has_data {
+            return Ok(None);
+        }
+        let bytes = unsafe { bytes_from_out_ptr(out_ptr, out_len) };
+        serde_json::from_slice(bytes)
+            .map(Some)
+            .map_err(|err| format!("accumulated localizations JSON invalid: {err}"))
     }
 
     pub fn process_frame(

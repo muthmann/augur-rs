@@ -5,6 +5,7 @@ mod plugin_settings_ui;
 mod plugins;
 mod point_cloud;
 mod preview;
+mod reconstruction;
 mod settings;
 
 use app::CameraApp;
