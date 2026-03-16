@@ -2324,7 +2324,6 @@ fn render_popup_content(ui: &mut egui::Ui, shared: &Arc<Mutex<PopupSharedData>>)
 
     // Replay controls
     if is_replay {
-
         ui.separator();
         ui.horizontal(|ui| {
             let play_label = if paused { "Play" } else { "Pause" };
