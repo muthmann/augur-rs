@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc, Mutex},
+    time::SystemTime,
 };
 
 use augur_core::{
@@ -185,9 +186,54 @@ impl Default for PopupSharedData {
     }
 }
 
+fn format_timestamp_now() -> String {
+    let dur = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs();
+    // Manual UTC breakdown (no chrono needed)
+    let secs_per_day: u64 = 86400;
+    let days = total_secs / secs_per_day;
+    let day_secs = total_secs % secs_per_day;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    // Days since epoch -> year/month/day (civil calendar)
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}{mo:02}{d:02}_{h:02}{m:02}{s:02}")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+/// Algorithm from Howard Hinnant (public domain).
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+fn insert_timestamp_suffix(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("raw");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let ts = format_timestamp_now();
+    parent.join(format!("{stem}_{ts}.{ext}"))
+}
+
 pub struct CameraApp {
     config: CameraConfig,
     output_path: String,
+    always_timestamp: bool,
     replay_path: Option<String>,
     mode: AppMode,
     controller: Option<PipelineController>,
@@ -233,7 +279,8 @@ impl CameraApp {
 
         Self {
             config: CameraConfig::default(),
-            output_path: "./output.raw".into(),
+            output_path: format!("./output_{}.raw", format_timestamp_now()),
+            always_timestamp: false,
             replay_path: None,
             mode: AppMode::Idle,
             controller: None,
@@ -337,7 +384,17 @@ impl CameraApp {
         if p.is_empty() {
             return Err("output path must not be empty".into());
         }
-        Ok(PathBuf::from(p))
+        let mut path = PathBuf::from(p);
+
+        if self.always_timestamp {
+            path = insert_timestamp_suffix(&path);
+        }
+
+        if path.exists() {
+            path = insert_timestamp_suffix(&path);
+        }
+
+        Ok(path)
     }
 
     fn probe_camera(&mut self) {
@@ -1140,8 +1197,9 @@ impl eframe::App for CameraApp {
                                 .add_enabled(output_enabled, egui::Button::new("Browse…"))
                                 .clicked()
                             {
+                                let default_name = format!("output_{}.raw", format_timestamp_now());
                                 if let Some(path) = rfd::FileDialog::new()
-                                    .set_file_name("output.raw")
+                                    .set_file_name(&default_name)
                                     .add_filter("RAW", &["raw"])
                                     .save_file()
                                 {
@@ -1149,6 +1207,15 @@ impl eframe::App for CameraApp {
                                 }
                                 ui.close_menu();
                             }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_enabled(
+                                output_enabled,
+                                egui::Checkbox::new(
+                                    &mut self.always_timestamp,
+                                    "Always add timestamp",
+                                ),
+                            );
                         });
                         ui.separator();
                         if ui
