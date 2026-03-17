@@ -1,4 +1,5 @@
 mod app;
+mod host_views;
 mod plugin;
 mod plugin_loader;
 mod plugin_settings_ui;

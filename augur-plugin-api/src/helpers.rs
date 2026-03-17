@@ -6,6 +6,7 @@ use crate::{
         FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginInput,
     },
     settings::{SettingsSchema, StatusEntry},
+    HostViewRegistry,
 };
 
 pub struct PluginFrame<'a> {
@@ -176,5 +177,20 @@ pub trait Plugin: Default {
 
     fn status_entries(&self) -> Vec<StatusEntry> {
         Vec::new()
+    }
+
+    fn host_views(&self) -> HostViewRegistry {
+        HostViewRegistry::default()
+    }
+
+    fn host_view_dataset(&self, _dataset_id: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Deprecated compatibility hook for legacy hosts.
+    ///
+    /// Prefer `host_views()` plus `host_view_dataset()` for new plugins.
+    fn accumulated_localizations(&self) -> Option<Vec<u8>> {
+        None
     }
 }

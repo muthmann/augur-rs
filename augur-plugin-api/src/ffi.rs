@@ -222,6 +222,42 @@ pub struct PluginVTable {
     pub status_entries: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PluginVTableV2 {
+    pub base: PluginVTable,
+    pub host_views: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
+    pub host_view_dataset:
+        unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
+    pub accumulated_localizations:
+        unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize) -> bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAbiDescriptor {
+    pub abi_version: u32,
+    pub vtable_size: usize,
+    pub vtable: usize,
+}
+
+impl PluginAbiDescriptor {
+    pub const fn new(abi_version: u32, vtable_size: usize, vtable: usize) -> Self {
+        Self {
+            abi_version,
+            vtable_size,
+            vtable,
+        }
+    }
+
+    pub fn vtable_ptr<T>(&self) -> *const T {
+        self.vtable as *const T
+    }
+}
+
 pub type PluginEntry = unsafe extern "C" fn() -> *const PluginVTable;
+pub type PluginEntryV2 = unsafe extern "C" fn() -> PluginAbiDescriptor;
 
 pub const PLUGIN_ENTRY_SYMBOL: &str = "augur_plugin_vtable";
+pub const PLUGIN_ENTRY_V2_SYMBOL: &str = "augur_plugin_entry_v2";
+pub const PLUGIN_ABI_VERSION_V2: u32 = 2;

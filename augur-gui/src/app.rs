@@ -17,10 +17,18 @@ use augur_core::{
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
-use augur_plugin_api::PluginInput;
+use augur_plugin_api::{HostViewKind, PluginInput};
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
+    host_views::{
+        decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
+        render_compact_table, render_density2d_view, render_density_window_viewport,
+        render_table_window, render_table_window_viewport, reset_provider_for_dataset,
+        resolve_host_view_registry, DensityWindowViewportData, HostDatasetSnapshot,
+        HostRegistryContribution, HostViewImageFormat, HostViewProviderKey, HostViewRenderState,
+        HostViewUiActions, ResolvedHostView, ResolvedHostViewRegistry, TableWindowViewportData,
+    },
     plugin::AnalysisPlugin,
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
@@ -42,6 +50,8 @@ const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
+
+type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -191,20 +201,16 @@ fn format_timestamp_now() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let total_secs = dur.as_secs();
-    // Manual UTC breakdown (no chrono needed)
     let secs_per_day: u64 = 86400;
     let days = total_secs / secs_per_day;
     let day_secs = total_secs % secs_per_day;
     let h = day_secs / 3600;
     let m = (day_secs % 3600) / 60;
     let s = day_secs % 60;
-    // Days since epoch -> year/month/day (civil calendar)
     let (y, mo, d) = civil_from_days(days as i64);
     format!("{y:04}{mo:02}{d:02}_{h:02}{m:02}{s:02}")
 }
 
-/// Convert days since Unix epoch to (year, month, day).
-/// Algorithm from Howard Hinnant (public domain).
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -270,6 +276,11 @@ pub struct CameraApp {
     camera_info: Option<DeviceInfo>,
     camera_status: String,
     popup_shared: Arc<Mutex<PopupSharedData>>,
+    host_view_registry: ResolvedHostViewRegistry,
+    host_view_window_open: HashMap<String, bool>,
+    host_view_render_state: HashMap<String, HostViewRenderState>,
+    host_view_dataset_cache: HashMap<String, CachedHostDataset>,
+    host_view_resolution_warnings: Vec<String>,
 }
 
 impl CameraApp {
@@ -277,7 +288,7 @@ impl CameraApp {
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
 
-        Self {
+        let mut app = Self {
             config: CameraConfig::default(),
             output_path: format!("./output_{}.raw", format_timestamp_now()),
             always_timestamp: false,
@@ -317,7 +328,14 @@ impl CameraApp {
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
             popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
-        }
+            host_view_registry: ResolvedHostViewRegistry::default(),
+            host_view_window_open: HashMap::new(),
+            host_view_render_state: HashMap::new(),
+            host_view_dataset_cache: HashMap::new(),
+            host_view_resolution_warnings: Vec::new(),
+        };
+        app.refresh_host_view_registry();
+        app
     }
 
     fn reset_analysis(&mut self) {
@@ -332,6 +350,611 @@ impl CameraApp {
         self.plugin_context_data.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
+        self.mark_host_view_datasets_stale();
+        self.refresh_host_view_registry();
+    }
+
+    fn mark_host_view_datasets_stale(&mut self) {
+        self.host_view_dataset_cache.clear();
+        for state in self.host_view_render_state.values_mut() {
+            state.mark_dirty();
+        }
+    }
+
+    fn refresh_host_view_registry(&mut self) {
+        let mut contributions = Vec::new();
+        let mut warnings = Vec::new();
+
+        for (index, plugin) in self.builtin_plugins.iter().enumerate() {
+            if !plugin.enabled() {
+                continue;
+            }
+
+            contributions.push(HostRegistryContribution {
+                provider: HostViewProviderKey::Builtin(index),
+                provider_name: plugin.name().to_owned(),
+                registry: plugin.host_views(),
+            });
+        }
+
+        for (index, record) in self.plugin_manager.records().iter().enumerate() {
+            let Some(plugin) = record.plugin() else {
+                continue;
+            };
+            if !plugin.enabled() {
+                continue;
+            }
+
+            match plugin.host_views() {
+                Ok(registry) => contributions.push(HostRegistryContribution {
+                    provider: HostViewProviderKey::Runtime(index),
+                    provider_name: plugin.name().to_owned(),
+                    registry,
+                }),
+                Err(err) => warnings.push(format!(
+                    "Failed to read host views from {}: {err}",
+                    plugin.name()
+                )),
+            }
+        }
+
+        let resolved = resolve_host_view_registry(contributions);
+        warnings.extend(resolved.warnings().iter().cloned());
+        if warnings != self.host_view_resolution_warnings {
+            for warning in &warnings {
+                eprintln!("host view registry warning: {warning}");
+            }
+            self.host_view_resolution_warnings = warnings;
+        }
+
+        self.host_view_window_open
+            .retain(|view_id, _| resolved.view(view_id).is_some());
+        self.host_view_render_state
+            .retain(|view_id, _| resolved.view(view_id).is_some());
+        self.host_view_dataset_cache
+            .retain(|dataset_id, _| resolved.dataset(dataset_id).is_some());
+        self.host_view_registry = resolved;
+    }
+
+    fn load_host_view_dataset_snapshot(&self, dataset_id: &str) -> CachedHostDataset {
+        let Some(dataset) = self.host_view_registry.dataset(dataset_id) else {
+            return Err(format!("unknown host dataset {dataset_id}"));
+        };
+
+        let bytes = match dataset.provider {
+            HostViewProviderKey::Builtin(index) => self
+                .builtin_plugins
+                .get(index)
+                .and_then(|plugin| {
+                    plugin
+                        .enabled()
+                        .then(|| plugin.host_view_dataset(dataset_id))
+                })
+                .flatten(),
+            HostViewProviderKey::Runtime(index) => {
+                let Some(record) = self.plugin_manager.records().get(index) else {
+                    return Err(format!(
+                        "runtime provider index {index} is out of range for dataset {dataset_id}"
+                    ));
+                };
+                let Some(plugin) = record.plugin() else {
+                    return Err(format!(
+                        "runtime provider {} is unavailable for dataset {dataset_id}",
+                        record.name()
+                    ));
+                };
+                plugin.host_view_dataset(dataset_id)?
+            }
+        };
+
+        match bytes {
+            Some(bytes) => decode_dataset_snapshot(&dataset.descriptor, &bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn ensure_host_view_dataset_cached(&mut self, dataset_id: &str) {
+        if self.host_view_dataset_cache.contains_key(dataset_id) {
+            return;
+        }
+        let snapshot = self.load_host_view_dataset_snapshot(dataset_id);
+        self.host_view_dataset_cache
+            .insert(dataset_id.to_owned(), snapshot);
+    }
+
+    fn export_host_view_csv(&mut self, view: &ResolvedHostView) {
+        let Some(dataset) = self
+            .host_view_registry
+            .dataset(&view.descriptor.dataset_id)
+            .cloned()
+        else {
+            self.last_error = Some(format!(
+                "dataset {} is no longer available",
+                view.descriptor.dataset_id
+            ));
+            return;
+        };
+
+        self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
+        let Some(cache_entry) = self
+            .host_view_dataset_cache
+            .get(&view.descriptor.dataset_id)
+        else {
+            self.last_error = Some("host dataset cache is unavailable".into());
+            return;
+        };
+
+        let table = match cache_entry {
+            Ok(Some(HostDatasetSnapshot::Table(table))) => table,
+            Ok(None) => {
+                self.last_error = Some("no dataset is available to export".into());
+                return;
+            }
+            Err(err) => {
+                self.last_error = Some(err.clone());
+                return;
+            }
+        };
+
+        let default_name = format!("{}.csv", sanitize_file_stem(&view.descriptor.title));
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("CSV", &["csv"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_table_csv_to_path(
+            &path,
+            dataset.descriptor.kind.table_schema(),
+            table.as_ref(),
+        ) {
+            Ok(()) => self.last_error = None,
+            Err(err) => self.last_error = Some(err),
+        }
+    }
+
+    fn export_host_view_image(&mut self, view: &ResolvedHostView, format: HostViewImageFormat) {
+        let image = match self.host_view_render_state.get(&view.descriptor.id) {
+            Some(HostViewRenderState::Density2d(state)) => state.image(),
+            _ => None,
+        };
+        let Some(image) = image else {
+            self.last_error = Some("no host view image is available to export".into());
+            return;
+        };
+
+        let default_name = format!(
+            "{}.{}",
+            sanitize_file_stem(&view.descriptor.title),
+            format.extension()
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PNG", &["png"])
+            .add_filter("TIFF", &["tif", "tiff"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_image_to_path(&path, image) {
+            Ok(()) => self.last_error = None,
+            Err(err) => self.last_error = Some(err),
+        }
+    }
+
+    fn clear_host_view_provider(&mut self, dataset_id: &str) {
+        let Some(dataset) = self.host_view_registry.dataset(dataset_id).cloned() else {
+            return;
+        };
+
+        reset_provider_for_dataset(
+            &dataset,
+            |index| {
+                if let Some(plugin) = self.builtin_plugins.get_mut(index) {
+                    plugin.reset();
+                }
+            },
+            |index| {
+                if let Some(plugin) = self
+                    .plugin_manager
+                    .records_mut()
+                    .get_mut(index)
+                    .and_then(|record| record.plugin_mut())
+                {
+                    plugin.reset();
+                }
+            },
+        );
+
+        self.mark_host_view_datasets_stale();
+        self.refresh_host_view_registry();
+    }
+
+    fn handle_host_view_actions(&mut self, view: &ResolvedHostView, actions: HostViewUiActions) {
+        if actions.clear_requested {
+            self.clear_host_view_provider(&view.descriptor.dataset_id);
+        }
+        if actions.export_csv {
+            self.export_host_view_csv(view);
+        }
+        if let Some(format) = actions.export_image {
+            self.export_host_view_image(view, format);
+        }
+    }
+
+    fn render_host_view_content(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        view: &ResolvedHostView,
+    ) {
+        let Some(dataset) = self
+            .host_view_registry
+            .dataset(&view.descriptor.dataset_id)
+            .cloned()
+        else {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Dataset {} is unavailable.", view.descriptor.dataset_id),
+            );
+            return;
+        };
+
+        self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
+        let schema = dataset.descriptor.kind.table_schema();
+
+        match &view.descriptor.kind {
+            HostViewKind::CompactTable => match self
+                .host_view_dataset_cache
+                .get(&view.descriptor.dataset_id)
+            {
+                Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => {
+                    render_compact_table(
+                        ui,
+                        schema,
+                        Some(table.as_ref()),
+                        &dataset.descriptor.empty_message,
+                    );
+                }
+                Some(Ok(None)) | None => {
+                    render_compact_table(ui, schema, None, &dataset.descriptor.empty_message);
+                }
+                Some(Err(err)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                }
+            },
+            HostViewKind::TableWindow => {
+                let actions = match self
+                    .host_view_dataset_cache
+                    .get(&view.descriptor.dataset_id)
+                {
+                    Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => render_table_window(
+                        ui,
+                        schema,
+                        Some(table.as_ref()),
+                        &dataset.descriptor.empty_message,
+                    ),
+                    Some(Ok(None)) | None => {
+                        render_table_window(ui, schema, None, &dataset.descriptor.empty_message)
+                    }
+                    Some(Err(err)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                        HostViewUiActions::default()
+                    }
+                };
+                self.handle_host_view_actions(view, actions);
+            }
+            HostViewKind::Density2dFromTable { x_column, y_column } => {
+                let actions = {
+                    let dataset_entry = self
+                        .host_view_dataset_cache
+                        .get(&view.descriptor.dataset_id);
+                    let state = self
+                        .host_view_render_state
+                        .entry(view.descriptor.id.clone())
+                        .or_default()
+                        .density_state();
+
+                    let table = match dataset_entry {
+                        Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => Some(table.as_ref()),
+                        Some(Ok(None)) | None => None,
+                        Some(Err(err)) => {
+                            ui.colored_label(ui.visuals().error_fg_color, err);
+                            return;
+                        }
+                    };
+
+                    if let Err(err) = state.render_if_needed(ctx, schema, table, x_column, y_column)
+                    {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                        return;
+                    }
+
+                    render_density2d_view(
+                        ui,
+                        &view.descriptor.id,
+                        state,
+                        table,
+                        &dataset.descriptor.empty_message,
+                        true,
+                    )
+                };
+                self.handle_host_view_actions(view, actions);
+            }
+        }
+    }
+
+    fn render_provider_host_views(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        provider: HostViewProviderKey,
+    ) {
+        let views: Vec<ResolvedHostView> = self
+            .host_view_registry
+            .panel_views_for_provider(provider)
+            .cloned()
+            .collect();
+        if views.is_empty() {
+            return;
+        }
+
+        egui::CollapsingHeader::new("Host Views")
+            .default_open(false)
+            .show(ui, |ui| {
+                for (index, view) in views.iter().enumerate() {
+                    ui.label(egui::RichText::new(&view.descriptor.title).strong());
+                    self.render_host_view_content(ctx, ui, view);
+                    if index + 1 < views.len() {
+                        ui.separator();
+                    }
+                }
+            });
+    }
+
+    fn render_host_view_windows(&mut self, ctx: &egui::Context) {
+        let views: Vec<ResolvedHostView> =
+            self.host_view_registry.window_views().cloned().collect();
+        for view in views {
+            if !self
+                .host_view_window_open
+                .get(&view.descriptor.id)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let Some(dataset) = self
+                .host_view_registry
+                .dataset(&view.descriptor.dataset_id)
+                .cloned()
+            else {
+                self.host_view_window_open
+                    .insert(view.descriptor.id.clone(), false);
+                continue;
+            };
+
+            self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
+            let cache_entry = self
+                .host_view_dataset_cache
+                .get(&view.descriptor.dataset_id)
+                .cloned();
+            let viewport_id =
+                egui::ViewportId::from_hash_of(("host_view_window", view.descriptor.id.clone()));
+            let title = format!("{} — AugurRS", view.descriptor.title);
+
+            match &view.descriptor.kind {
+                HostViewKind::TableWindow => {
+                    let shared = Arc::new(Mutex::new(TableWindowViewportData {
+                        schema: dataset.descriptor.kind.table_schema().clone(),
+                        dataset: match cache_entry {
+                            Some(Ok(Some(HostDatasetSnapshot::Table(ref table)))) => {
+                                Some(Arc::clone(table))
+                            }
+                            _ => None,
+                        },
+                        empty_message: dataset.descriptor.empty_message.clone(),
+                        error_message: match cache_entry {
+                            Some(Err(ref err)) => Some(err.clone()),
+                            _ => None,
+                        },
+                        close_requested: false,
+                        export_csv_requested: false,
+                    }));
+                    let shared_for_viewport = Arc::clone(&shared);
+                    ctx.show_viewport_deferred(
+                        viewport_id,
+                        egui::ViewportBuilder::default()
+                            .with_title(&title)
+                            .with_inner_size([1100.0, 760.0]),
+                        move |ctx, class| match class {
+                            egui::viewport::ViewportClass::Deferred => {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    render_table_window_viewport(ui, &shared_for_viewport);
+                                });
+                                if ctx.input(|i| i.viewport().close_requested()) {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            egui::viewport::ViewportClass::Embedded => {
+                                let mut open = true;
+                                egui::Window::new(&title)
+                                    .open(&mut open)
+                                    .default_size([1100.0, 760.0])
+                                    .show(ctx, |ui| {
+                                        render_table_window_viewport(ui, &shared_for_viewport);
+                                    });
+                                if !open {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                    );
+
+                    let (close, export_csv) = {
+                        let mut data = shared.lock().unwrap();
+                        let close = data.close_requested;
+                        let export_csv = data.export_csv_requested;
+                        data.close_requested = false;
+                        data.export_csv_requested = false;
+                        (close, export_csv)
+                    };
+
+                    if close {
+                        self.host_view_window_open
+                            .insert(view.descriptor.id.clone(), false);
+                    }
+                    if export_csv {
+                        self.export_host_view_csv(&view);
+                    }
+                }
+                HostViewKind::Density2dFromTable { x_column, y_column } => {
+                    let (settings, texture, rendered_size, total_rows, error_message) = {
+                        let state = self
+                            .host_view_render_state
+                            .entry(view.descriptor.id.clone())
+                            .or_default()
+                            .density_state();
+
+                        let table = match cache_entry.as_ref() {
+                            Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => {
+                                Some(table.as_ref())
+                            }
+                            Some(Ok(None)) | None => None,
+                            Some(Err(_)) => None,
+                        };
+
+                        let render_result = state.render_if_needed(
+                            ctx,
+                            dataset.descriptor.kind.table_schema(),
+                            table,
+                            x_column,
+                            y_column,
+                        );
+                        let error_message = match (&cache_entry, render_result) {
+                            (Some(Err(err)), _) => Some(err.clone()),
+                            (_, Err(err)) => Some(err),
+                            _ => None,
+                        };
+
+                        let total_rows = table.map(|table| table.row_count()).unwrap_or(0);
+                        (
+                            state.settings(),
+                            state.texture().cloned(),
+                            state.rendered_size(),
+                            total_rows,
+                            error_message,
+                        )
+                    };
+
+                    let shared = Arc::new(Mutex::new(DensityWindowViewportData {
+                        texture,
+                        total_rows,
+                        rendered_width: rendered_size[0],
+                        rendered_height: rendered_size[1],
+                        settings,
+                        empty_message: dataset.descriptor.empty_message.clone(),
+                        error_message,
+                        close_requested: false,
+                        export_csv_requested: false,
+                        export_image_requested: None,
+                        clear_requested: false,
+                    }));
+                    let shared_for_viewport = Arc::clone(&shared);
+                    let view_id = view.descriptor.id.clone();
+                    ctx.show_viewport_deferred(
+                        viewport_id,
+                        egui::ViewportBuilder::default()
+                            .with_title(&title)
+                            .with_inner_size([1200.0, 860.0]),
+                        move |ctx, class| match class {
+                            egui::viewport::ViewportClass::Deferred => {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    render_density_window_viewport(
+                                        ui,
+                                        &view_id,
+                                        &shared_for_viewport,
+                                    );
+                                });
+                                if ctx.input(|i| i.viewport().close_requested()) {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            egui::viewport::ViewportClass::Embedded => {
+                                let mut open = true;
+                                egui::Window::new(&title)
+                                    .open(&mut open)
+                                    .default_size([1100.0, 760.0])
+                                    .show(ctx, |ui| {
+                                        render_density_window_viewport(
+                                            ui,
+                                            &view_id,
+                                            &shared_for_viewport,
+                                        );
+                                    });
+                                if !open {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                    );
+
+                    let (close, export_csv, export_image, clear_requested, next_settings) = {
+                        let mut data = shared.lock().unwrap();
+                        let close = data.close_requested;
+                        let export_csv = data.export_csv_requested;
+                        let export_image = data.export_image_requested.take();
+                        let clear_requested = data.clear_requested;
+                        let next_settings = data.settings;
+                        data.close_requested = false;
+                        data.export_csv_requested = false;
+                        data.clear_requested = false;
+                        (
+                            close,
+                            export_csv,
+                            export_image,
+                            clear_requested,
+                            next_settings,
+                        )
+                    };
+
+                    self.host_view_render_state
+                        .entry(view.descriptor.id.clone())
+                        .or_default()
+                        .density_state()
+                        .set_settings(next_settings);
+
+                    if close {
+                        self.host_view_window_open
+                            .insert(view.descriptor.id.clone(), false);
+                    }
+                    if clear_requested {
+                        self.clear_host_view_provider(&view.descriptor.dataset_id);
+                    }
+                    if export_csv {
+                        self.export_host_view_csv(&view);
+                    }
+                    if let Some(format) = export_image {
+                        self.export_host_view_image(&view, format);
+                    }
+                }
+                HostViewKind::CompactTable => {}
+            }
+        }
     }
 
     fn plugins_need_raw_events(&self) -> bool {
@@ -908,6 +1531,8 @@ impl CameraApp {
                 }
             }
         }
+
+        self.mark_host_view_datasets_stale();
     }
 
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
@@ -1155,6 +1780,7 @@ impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
+        self.refresh_host_view_registry();
 
         let mode = self.mode;
         let settings_locked = self.settings_are_locked();
@@ -1373,6 +1999,15 @@ impl eframe::App for CameraApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
                     ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
+                    let window_views: Vec<ResolvedHostView> =
+                        self.host_view_registry.window_views().cloned().collect();
+                    for view in window_views {
+                        let open = self
+                            .host_view_window_open
+                            .entry(view.descriptor.id.clone())
+                            .or_insert(false);
+                        ui.checkbox(open, &view.descriptor.title);
+                    }
                     ui.separator();
                     let mut view_mode = self.preview_workspace.view_mode;
                     let r2d = ui.radio_value(&mut view_mode, ViewMode::Preview2d, "2D Preview");
@@ -1613,71 +2248,97 @@ impl eframe::App for CameraApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            let (plugins, config) = (&mut self.builtin_plugins, &mut self.config);
-                            for plugin in plugins.iter_mut() {
-                                if !plugin.enabled() {
-                                    continue;
-                                }
+                            for index in 0..self.builtin_plugins.len() {
+                                let rendered = {
+                                    let plugin = &mut self.builtin_plugins[index];
+                                    if !plugin.enabled() {
+                                        continue;
+                                    }
 
-                                let missing_dependencies: Vec<&str> = plugin
-                                    .dependencies()
-                                    .iter()
-                                    .copied()
-                                    .filter(|dependency| {
-                                        !enabled_plugin_names.iter().any(|name| name == dependency)
-                                    })
-                                    .collect();
-                                if !missing_dependencies.is_empty() {
-                                    ui.colored_label(
-                                        ui.visuals().warn_fg_color,
-                                        format!(
-                                            "Missing dependency: {}",
-                                            missing_dependencies.join(", ")
-                                        ),
+                                    let missing_dependencies: Vec<&str> = plugin
+                                        .dependencies()
+                                        .iter()
+                                        .copied()
+                                        .filter(|dependency| {
+                                            !enabled_plugin_names
+                                                .iter()
+                                                .any(|name| name == dependency)
+                                        })
+                                        .collect();
+                                    if !missing_dependencies.is_empty() {
+                                        ui.colored_label(
+                                            ui.visuals().warn_fg_color,
+                                            format!(
+                                                "Missing dependency: {}",
+                                                missing_dependencies.join(", ")
+                                            ),
+                                        );
+                                    }
+
+                                    if plugin.ui_settings(ui, &mut self.config) {
+                                        builtin_plugin_config_changed = true;
+                                    }
+                                    true
+                                };
+
+                                if rendered {
+                                    self.render_provider_host_views(
+                                        ctx,
+                                        ui,
+                                        HostViewProviderKey::Builtin(index),
                                     );
+                                    ui.separator();
                                 }
-
-                                if plugin.ui_settings(ui, config) {
-                                    builtin_plugin_config_changed = true;
-                                }
-
-                                ui.separator();
                             }
 
-                            for record in self.plugin_manager.records_mut() {
-                                let Some(plugin) = record.plugin_mut() else {
-                                    continue;
+                            let runtime_count = self.plugin_manager.records().len();
+                            for index in 0..runtime_count {
+                                let rendered = {
+                                    let record = &mut self.plugin_manager.records_mut()[index];
+                                    let Some(plugin) = record.plugin_mut() else {
+                                        continue;
+                                    };
+                                    if !plugin.enabled() {
+                                        continue;
+                                    }
+
+                                    let missing_dependencies: Vec<String> = plugin
+                                        .dependencies()
+                                        .iter()
+                                        .filter(|dependency| {
+                                            !enabled_plugin_names
+                                                .iter()
+                                                .any(|name| name == *dependency)
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    if !missing_dependencies.is_empty() {
+                                        ui.colored_label(
+                                            ui.visuals().warn_fg_color,
+                                            format!(
+                                                "Missing dependency: {}",
+                                                missing_dependencies.join(", ")
+                                            ),
+                                        );
+                                    }
+
+                                    if let Err(err) = render_plugin_settings(ui, plugin) {
+                                        ui.colored_label(
+                                            ui.visuals().error_fg_color,
+                                            format!("Dynamic plugin UI failed: {err}"),
+                                        );
+                                    }
+                                    true
                                 };
-                                if !plugin.enabled() {
-                                    continue;
-                                }
 
-                                let missing_dependencies: Vec<String> = plugin
-                                    .dependencies()
-                                    .iter()
-                                    .filter(|dependency| {
-                                        !enabled_plugin_names.iter().any(|name| name == *dependency)
-                                    })
-                                    .cloned()
-                                    .collect();
-                                if !missing_dependencies.is_empty() {
-                                    ui.colored_label(
-                                        ui.visuals().warn_fg_color,
-                                        format!(
-                                            "Missing dependency: {}",
-                                            missing_dependencies.join(", ")
-                                        ),
+                                if rendered {
+                                    self.render_provider_host_views(
+                                        ctx,
+                                        ui,
+                                        HostViewProviderKey::Runtime(index),
                                     );
+                                    ui.separator();
                                 }
-
-                                if let Err(err) = render_plugin_settings(ui, plugin) {
-                                    ui.colored_label(
-                                        ui.visuals().error_fg_color,
-                                        format!("Dynamic plugin UI failed: {err}"),
-                                    );
-                                }
-
-                                ui.separator();
                             }
                         });
                 });
@@ -2112,9 +2773,13 @@ impl eframe::App for CameraApp {
             }
         }
 
+        self.render_host_view_windows(ctx);
+
         self.sync_active_pipeline_requirements();
 
-        if self.mode != AppMode::Idle && self.controller.is_some() {
+        if self.host_view_window_open.values().any(|open| *open)
+            || (self.mode != AppMode::Idle && self.controller.is_some())
+        {
             ctx.request_repaint();
         }
     }
@@ -2725,6 +3390,24 @@ fn format_replay_time(duration_us: u64) -> String {
     let seconds = (total_tenths % 600) / 10;
     let tenths = total_tenths % 10;
     format!("{minutes:02}:{seconds:02}.{tenths}")
+}
+
+fn sanitize_file_stem(title: &str) -> String {
+    let mut stem = String::with_capacity(title.len());
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            stem.push(ch.to_ascii_lowercase());
+        } else if !stem.ends_with('_') {
+            stem.push('_');
+        }
+    }
+
+    let stem = stem.trim_matches('_').to_owned();
+    if stem.is_empty() {
+        "host_view".into()
+    } else {
+        stem
+    }
 }
 
 impl Drop for CameraApp {
