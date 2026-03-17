@@ -329,13 +329,16 @@ impl Density2dViewState {
             self.settings.colormap,
         )?;
         self.rendered_size = rendered.size;
-        self.image = Some(rendered.image.clone());
         if let Some(texture) = &mut self.texture {
-            texture.set(rendered.image, TextureOptions::LINEAR);
+            texture.set(rendered.image.clone(), TextureOptions::LINEAR);
         } else {
-            self.texture =
-                Some(ctx.load_texture("host_view_density", rendered.image, TextureOptions::LINEAR));
+            self.texture = Some(ctx.load_texture(
+                "host_view_density",
+                rendered.image.clone(),
+                TextureOptions::LINEAR,
+            ));
         }
+        self.image = Some(rendered.image);
         self.dirty = false;
         Ok(())
     }
@@ -493,49 +496,26 @@ pub fn render_density2d_view(
 
         let mut settings = state.settings();
         ui.label("Pixel size");
-        if ui
-            .add(egui::Slider::new(&mut settings.pixel_size, 5.0..=100.0))
-            .changed()
-        {
-            state.settings = settings;
-            state.mark_dirty();
-        }
+        ui.add(egui::Slider::new(&mut settings.pixel_size, 5.0..=100.0));
         ui.label("Contrast");
-        if ui
-            .add(egui::Slider::new(
-                &mut settings.contrast_percentile,
-                90.0..=100.0,
-            ))
-            .changed()
-        {
-            state.settings = settings;
-            state.mark_dirty();
-        }
+        ui.add(egui::Slider::new(
+            &mut settings.contrast_percentile,
+            90.0..=100.0,
+        ));
         egui::ComboBox::from_id_source(format!("{view_id}_colormap"))
             .selected_text(settings.colormap.label())
             .show_ui(ui, |ui| {
-                if ui
-                    .selectable_value(&mut settings.colormap, HostViewColormap::Hot, "Hot")
-                    .changed()
-                {
-                    state.settings = settings;
-                    state.mark_dirty();
-                }
-                if ui
-                    .selectable_value(&mut settings.colormap, HostViewColormap::Gray, "Gray")
-                    .changed()
-                {
-                    state.settings = settings;
-                    state.mark_dirty();
-                }
+                ui.selectable_value(&mut settings.colormap, HostViewColormap::Hot, "Hot");
+                ui.selectable_value(&mut settings.colormap, HostViewColormap::Gray, "Gray");
             });
         ui.label("Zoom");
-        if ui
-            .add(egui::Slider::new(&mut settings.zoom, 0.5..=8.0).logarithmic(true))
-            .changed()
-        {
-            state.settings = settings;
-        }
+        ui.add(egui::Slider::new(&mut settings.zoom, 0.5..=8.0).logarithmic(true));
+        // Zoom only affects display scaling -- exclude it from the dirty check
+        // so that zooming does not trigger an expensive image re-render.
+        let zoom = settings.zoom;
+        settings.zoom = state.settings.zoom;
+        state.set_settings(settings);
+        state.settings.zoom = zoom;
     });
 
     ui.separator();
@@ -608,7 +588,7 @@ pub fn render_table_window_viewport(
     shared: &Arc<Mutex<TableWindowViewportData>>,
 ) {
     let (schema, dataset, empty_message, error_message) = {
-        let data = shared.lock().unwrap();
+        let data = shared.lock().expect("table viewport mutex poisoned");
         (
             data.schema.clone(),
             data.dataset.clone(),
@@ -624,7 +604,7 @@ pub fn render_table_window_viewport(
 
     let actions = render_table_window(ui, &schema, dataset.as_deref(), &empty_message);
     if actions.export_csv {
-        let mut data = shared.lock().unwrap();
+        let mut data = shared.lock().expect("table viewport mutex poisoned");
         data.export_csv_requested = true;
     }
 }
@@ -643,7 +623,7 @@ pub fn render_density_window_viewport(
         empty_message,
         error_message,
     ) = {
-        let mut data = shared.lock().unwrap();
+        let mut data = shared.lock().expect("density viewport mutex poisoned");
 
         ui.horizontal_wrapped(|ui| {
             if ui.button("Export CSV").clicked() {
@@ -852,22 +832,19 @@ fn render_density_image(
     let (x_min, x_max, y_min, y_max) = if let Some(space) = coordinate_space {
         (space.x_min, space.x_max, space.y_min, space.y_max)
     } else {
-        let xs = collect_numeric_column(x_values, x_column)?;
-        let ys = collect_numeric_column(y_values, y_column)?;
-        if xs.is_empty() || ys.is_empty() {
-            (0.0, pixel_size, 0.0, pixel_size)
-        } else {
-            (
-                xs.iter().copied().fold(f64::INFINITY, f64::min),
-                xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                ys.iter().copied().fold(f64::INFINITY, f64::min),
-                ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-            )
+        let x_bounds = numeric_column_bounds(x_values, x_column)?;
+        let y_bounds = numeric_column_bounds(y_values, y_column)?;
+        match (x_bounds, y_bounds) {
+            (Some((x_lo, x_hi)), Some((y_lo, y_hi))) => (x_lo, x_hi, y_lo, y_hi),
+            _ => (0.0, pixel_size, 0.0, pixel_size),
         }
     };
 
-    let width = (((x_max - x_min).max(0.0) / pixel_size).ceil() as usize).max(1);
-    let height = (((y_max - y_min).max(0.0) / pixel_size).ceil() as usize).max(1);
+    const MAX_IMAGE_DIMENSION: usize = 8192;
+    let width =
+        (((x_max - x_min).max(0.0) / pixel_size).ceil() as usize).clamp(1, MAX_IMAGE_DIMENSION);
+    let height =
+        (((y_max - y_min).max(0.0) / pixel_size).ceil() as usize).clamp(1, MAX_IMAGE_DIMENSION);
     let mut bins = vec![0u32; width * height];
 
     for row in 0..dataset.row_count() {
@@ -890,30 +867,47 @@ fn render_density_image(
     }
 
     let max_value = percentile_nonzero(&bins, contrast_percentile).max(1.0);
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    for count in bins {
-        let normalized = ((count as f32 / max_value).clamp(0.0, 1.0)).sqrt();
-        rgba.extend_from_slice(&colormap_color(colormap, normalized).to_array());
-    }
+    let pixels: Vec<Color32> = bins
+        .iter()
+        .map(|&count| {
+            let normalized = ((count as f32 / max_value).clamp(0.0, 1.0)).sqrt();
+            colormap_color(colormap, normalized)
+        })
+        .collect();
 
     Ok(RenderedDensityImage {
-        image: ColorImage::from_rgba_unmultiplied([width, height], &rgba),
+        image: ColorImage {
+            size: [width, height],
+            pixels,
+        },
         size: [width, height],
     })
 }
 
-fn collect_numeric_column(
+fn numeric_column_bounds(
     column: &augur_plugin_api::TableColumnData,
     column_id: &str,
-) -> Result<Vec<f64>, String> {
-    let mut values = Vec::with_capacity(column.len());
+) -> Result<Option<(f64, f64)>, String> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut found = false;
     for index in 0..column.len() {
         let Some(value) = column.values.numeric_value(index) else {
             return Err(format!("column {column_id} is not numeric"));
         };
-        values.push(value);
+        if value < min {
+            min = value;
+        }
+        if value > max {
+            max = value;
+        }
+        found = true;
     }
-    Ok(values)
+    if found {
+        Ok(Some((min, max)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn percentile_nonzero(values: &[u32], percentile: f32) -> f32 {

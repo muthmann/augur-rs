@@ -1,4 +1,4 @@
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 pub const CTX_LOCALIZATION_RESULTS: &str = "augur.localization.results";
 
@@ -304,8 +304,8 @@ impl TableColumnValues {
 
     pub fn numeric_value(&self, index: usize) -> Option<f64> {
         match self {
-            Self::U64(values) => values.get(index).map(|value| *value as f64),
-            Self::I64(values) => values.get(index).map(|value| *value as f64),
+            Self::U64(values) => values.get(index).copied().map(|v| v as f64),
+            Self::I64(values) => values.get(index).copied().map(|v| v as f64),
             Self::F64(values) => values.get(index).copied(),
             Self::String(_) | Self::Bool(_) => None,
         }

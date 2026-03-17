@@ -256,22 +256,10 @@ impl DynPlugin {
         let Some(accessors) = self.host_view_accessors else {
             return Ok(None);
         };
-        let mut out_ptr = std::ptr::null();
-        let mut out_len = 0usize;
-        let found = unsafe {
-            (accessors.host_view_dataset)(
-                self.instance,
-                FfiString::from(dataset_id),
-                &mut out_ptr,
-                &mut out_len,
-            )
-        };
-        if !found {
-            return Ok(None);
-        }
-        Ok(Some(
-            unsafe { bytes_from_out_ptr(out_ptr, out_len) }.to_vec(),
-        ))
+        let bytes = self.call_optional_bytes(|inst, ptr, len| unsafe {
+            (accessors.host_view_dataset)(inst, FfiString::from(dataset_id), ptr, len)
+        });
+        Ok(bytes.map(|b| b.to_vec()))
     }
 
     #[allow(dead_code)]
@@ -279,18 +267,26 @@ impl DynPlugin {
         let Some(accessors) = self.host_view_accessors else {
             return Ok(None);
         };
-        let mut out_ptr = std::ptr::null();
-        let mut out_len = 0usize;
-        let has_data = unsafe {
-            (accessors.accumulated_localizations)(self.instance, &mut out_ptr, &mut out_len)
-        };
-        if !has_data {
+        let Some(bytes) = self.call_optional_bytes(|inst, ptr, len| unsafe {
+            (accessors.accumulated_localizations)(inst, ptr, len)
+        }) else {
             return Ok(None);
-        }
-        let bytes = unsafe { bytes_from_out_ptr(out_ptr, out_len) };
+        };
         serde_json::from_slice(bytes)
             .map(Some)
             .map_err(|err| format!("accumulated localizations JSON invalid: {err}"))
+    }
+
+    fn call_optional_bytes(
+        &self,
+        call: impl FnOnce(*const c_void, *mut *const u8, *mut usize) -> bool,
+    ) -> Option<&[u8]> {
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+        if !call(self.instance, &mut out_ptr, &mut out_len) {
+            return None;
+        }
+        Some(unsafe { bytes_from_out_ptr(out_ptr, out_len) })
     }
 
     pub fn process_frame(
@@ -591,50 +587,51 @@ unsafe extern "C" fn get_context_value(
     if out_ptr.is_null() || out_len.is_null() {
         return false;
     }
-    let Some(bridge) = ctx.cast::<ContextBridge>().as_mut() else {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return false;
-    };
-    let Ok(key) = key.as_str() else {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return false;
-    };
-    let Some(bytes) = bridge.data.get(key) else {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return false;
-    };
-    *out_ptr = bytes.as_ptr();
-    *out_len = bytes.len();
-    true
+
+    let found = (|| {
+        let bridge = ctx.cast::<ContextBridge>().as_mut()?;
+        let key = key.as_str().ok()?;
+        bridge.data.get(key)
+    })();
+
+    match found {
+        Some(bytes) => {
+            *out_ptr = bytes.as_ptr();
+            *out_len = bytes.len();
+            true
+        }
+        None => {
+            *out_ptr = std::ptr::null();
+            *out_len = 0;
+            false
+        }
+    }
 }
 
 unsafe fn load_plugin_api(lib: &Library) -> Result<LoadedPluginApi, String> {
-    let symbol_name_v2 = format!("{PLUGIN_ENTRY_V2_SYMBOL}\0");
-    match lib.get::<PluginEntryV2>(symbol_name_v2.as_bytes()) {
-        Ok(entry) => {
-            let descriptor = entry();
-            api_from_v2_descriptor(descriptor)
-        }
+    match lib.get::<PluginEntryV2>(b"augur_plugin_entry_v2\0") {
+        Ok(entry) => api_from_v2_descriptor(entry()),
         Err(err) => {
-            if !matches!(err, libloading::Error::DlSym { .. }) {
-                let text = err.to_string();
-                if !text.contains("symbol not found") && !text.contains("undefined symbol") {
-                    return Err(format!(
-                        "loading symbol {PLUGIN_ENTRY_V2_SYMBOL} failed: {err}"
-                    ));
-                }
+            if !is_missing_symbol_error(&err) {
+                return Err(format!(
+                    "loading symbol {PLUGIN_ENTRY_V2_SYMBOL} failed: {err}"
+                ));
             }
 
-            let symbol_name = format!("{PLUGIN_ENTRY_SYMBOL}\0");
             let entry = lib
-                .get::<PluginEntry>(symbol_name.as_bytes())
+                .get::<PluginEntry>(b"augur_plugin_vtable\0")
                 .map_err(|err| format!("loading symbol {PLUGIN_ENTRY_SYMBOL} failed: {err}"))?;
             api_from_legacy_vtable(entry())
         }
     }
+}
+
+fn is_missing_symbol_error(err: &libloading::Error) -> bool {
+    if matches!(err, libloading::Error::DlSym { .. }) {
+        return true;
+    }
+    let text = err.to_string();
+    text.contains("symbol not found") || text.contains("undefined symbol")
 }
 
 fn api_from_v2_descriptor(descriptor: PluginAbiDescriptor) -> Result<LoadedPluginApi, String> {
@@ -681,11 +678,7 @@ fn api_from_legacy_vtable(vtable_ptr: *const PluginVTable) -> Result<LoadedPlugi
 
 fn ffi_string_to_option(ffi: FfiString, context: &str) -> Result<Option<String>, String> {
     let text = unsafe { ffi.as_str() }.map_err(|err| format!("{context}: {err}"))?;
-    Ok(if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    })
+    Ok((!text.is_empty()).then(|| text.to_owned()))
 }
 
 unsafe fn bytes_from_out_ptr<'a>(ptr: *const u8, len: usize) -> &'a [u8] {

@@ -359,7 +359,7 @@ macro_rules! export_plugin {
                 out_ptr: *mut *const u8,
                 out_len: *mut usize,
             ) -> bool {
-                let result = ::std::panic::catch_unwind(|| {
+                ::std::panic::catch_unwind(|| {
                     let Some(plugin) = __instance_ref(instance) else {
                         unsafe {
                             $crate::__private::clear_out_bytes(out_ptr, out_len);
@@ -381,16 +381,13 @@ macro_rules! export_plugin {
                         );
                     }
                     true
-                });
-                match result {
-                    Ok(has_data) => has_data,
-                    Err(_) => {
-                        unsafe {
-                            $crate::__private::clear_out_bytes(out_ptr, out_len);
-                        }
-                        false
+                })
+                .unwrap_or_else(|_| {
+                    unsafe {
+                        $crate::__private::clear_out_bytes(out_ptr, out_len);
                     }
-                }
+                    false
+                })
             }
 
             static __AUGUR_PLUGIN_VTABLE: $crate::PluginVTable = $crate::PluginVTable {

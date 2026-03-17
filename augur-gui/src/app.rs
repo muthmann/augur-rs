@@ -17,7 +17,7 @@ use augur_core::{
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
-use augur_plugin_api::{HostViewKind, PluginInput};
+use augur_plugin_api::{HostViewKind, PluginInput, TableDatasetV1};
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
@@ -52,6 +52,17 @@ const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
+
+/// Extract a table reference from a cached dataset entry.
+/// Returns `Ok(Some(table))` if data is available, `Ok(None)` if absent, or
+/// `Err(message)` if loading failed.
+fn cached_table(entry: Option<&CachedHostDataset>) -> Result<Option<&TableDatasetV1>, &str> {
+    match entry {
+        Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => Ok(Some(table.as_ref())),
+        Some(Ok(None)) | None => Ok(None),
+        Some(Err(err)) => Err(err.as_str()),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -277,6 +288,7 @@ pub struct CameraApp {
     camera_status: String,
     popup_shared: Arc<Mutex<PopupSharedData>>,
     host_view_registry: ResolvedHostViewRegistry,
+    host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
     host_view_render_state: HashMap<String, HostViewRenderState>,
     host_view_dataset_cache: HashMap<String, CachedHostDataset>,
@@ -329,6 +341,7 @@ impl CameraApp {
             camera_status: "Camera not probed yet.".into(),
             popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
             host_view_registry: ResolvedHostViewRegistry::default(),
+            host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
             host_view_render_state: HashMap::new(),
             host_view_dataset_cache: HashMap::new(),
@@ -361,7 +374,15 @@ impl CameraApp {
         }
     }
 
+    fn refresh_host_view_registry_if_dirty(&mut self) {
+        if !self.host_view_registry_dirty {
+            return;
+        }
+        self.refresh_host_view_registry();
+    }
+
     fn refresh_host_view_registry(&mut self) {
+        self.host_view_registry_dirty = false;
         let mut contributions = Vec::new();
         let mut warnings = Vec::new();
 
@@ -476,22 +497,17 @@ impl CameraApp {
         };
 
         self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
-        let Some(cache_entry) = self
-            .host_view_dataset_cache
-            .get(&view.descriptor.dataset_id)
-        else {
-            self.last_error = Some("host dataset cache is unavailable".into());
-            return;
-        };
-
-        let table = match cache_entry {
-            Ok(Some(HostDatasetSnapshot::Table(table))) => table,
+        let table = match cached_table(
+            self.host_view_dataset_cache
+                .get(&view.descriptor.dataset_id),
+        ) {
+            Ok(Some(table)) => table,
             Ok(None) => {
                 self.last_error = Some("no dataset is available to export".into());
                 return;
             }
             Err(err) => {
-                self.last_error = Some(err.clone());
+                self.last_error = Some(err.to_owned());
                 return;
             }
         };
@@ -505,11 +521,7 @@ impl CameraApp {
             return;
         };
 
-        match export_table_csv_to_path(
-            &path,
-            dataset.descriptor.kind.table_schema(),
-            table.as_ref(),
-        ) {
+        match export_table_csv_to_path(&path, dataset.descriptor.kind.table_schema(), table) {
             Ok(()) => self.last_error = None,
             Err(err) => self.last_error = Some(err),
         }
@@ -605,42 +617,25 @@ impl CameraApp {
 
         self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
         let schema = dataset.descriptor.kind.table_schema();
+        let cache_entry = self
+            .host_view_dataset_cache
+            .get(&view.descriptor.dataset_id);
 
         match &view.descriptor.kind {
-            HostViewKind::CompactTable => match self
-                .host_view_dataset_cache
-                .get(&view.descriptor.dataset_id)
-            {
-                Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => {
-                    render_compact_table(
-                        ui,
-                        schema,
-                        Some(table.as_ref()),
-                        &dataset.descriptor.empty_message,
-                    );
+            HostViewKind::CompactTable => match cached_table(cache_entry) {
+                Ok(table) => {
+                    render_compact_table(ui, schema, table, &dataset.descriptor.empty_message);
                 }
-                Some(Ok(None)) | None => {
-                    render_compact_table(ui, schema, None, &dataset.descriptor.empty_message);
-                }
-                Some(Err(err)) => {
+                Err(err) => {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
             },
             HostViewKind::TableWindow => {
-                let actions = match self
-                    .host_view_dataset_cache
-                    .get(&view.descriptor.dataset_id)
-                {
-                    Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => render_table_window(
-                        ui,
-                        schema,
-                        Some(table.as_ref()),
-                        &dataset.descriptor.empty_message,
-                    ),
-                    Some(Ok(None)) | None => {
-                        render_table_window(ui, schema, None, &dataset.descriptor.empty_message)
+                let actions = match cached_table(cache_entry) {
+                    Ok(table) => {
+                        render_table_window(ui, schema, table, &dataset.descriptor.empty_message)
                     }
-                    Some(Err(err)) => {
+                    Err(err) => {
                         ui.colored_label(ui.visuals().error_fg_color, err);
                         HostViewUiActions::default()
                     }
@@ -649,19 +644,15 @@ impl CameraApp {
             }
             HostViewKind::Density2dFromTable { x_column, y_column } => {
                 let actions = {
-                    let dataset_entry = self
-                        .host_view_dataset_cache
-                        .get(&view.descriptor.dataset_id);
                     let state = self
                         .host_view_render_state
                         .entry(view.descriptor.id.clone())
                         .or_default()
                         .density_state();
 
-                    let table = match dataset_entry {
-                        Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => Some(table.as_ref()),
-                        Some(Ok(None)) | None => None,
-                        Some(Err(err)) => {
+                    let table = match cached_table(cache_entry) {
+                        Ok(table) => table,
+                        Err(err) => {
                             ui.colored_label(ui.visuals().error_fg_color, err);
                             return;
                         }
@@ -744,24 +735,23 @@ impl CameraApp {
                 .get(&view.descriptor.dataset_id)
                 .cloned();
             let viewport_id =
-                egui::ViewportId::from_hash_of(("host_view_window", view.descriptor.id.clone()));
+                egui::ViewportId::from_hash_of(("host_view_window", &view.descriptor.id));
             let title = format!("{} — AugurRS", view.descriptor.title);
 
             match &view.descriptor.kind {
                 HostViewKind::TableWindow => {
+                    let (table_arc, error_message) = match &cache_entry {
+                        Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => {
+                            (Some(Arc::clone(table)), None)
+                        }
+                        Some(Err(err)) => (None, Some(err.clone())),
+                        _ => (None, None),
+                    };
                     let shared = Arc::new(Mutex::new(TableWindowViewportData {
                         schema: dataset.descriptor.kind.table_schema().clone(),
-                        dataset: match cache_entry {
-                            Some(Ok(Some(HostDatasetSnapshot::Table(ref table)))) => {
-                                Some(Arc::clone(table))
-                            }
-                            _ => None,
-                        },
+                        dataset: table_arc,
                         empty_message: dataset.descriptor.empty_message.clone(),
-                        error_message: match cache_entry {
-                            Some(Err(ref err)) => Some(err.clone()),
-                            _ => None,
-                        },
+                        error_message,
                         close_requested: false,
                         export_csv_requested: false,
                     }));
@@ -801,14 +791,14 @@ impl CameraApp {
                     );
 
                     let (close, export_csv) = {
-                        let mut data = shared.lock().unwrap();
-                        let close = data.close_requested;
-                        let export_csv = data.export_csv_requested;
+                        let Ok(mut data) = shared.lock() else {
+                            continue;
+                        };
+                        let result = (data.close_requested, data.export_csv_requested);
                         data.close_requested = false;
                         data.export_csv_requested = false;
-                        (close, export_csv)
+                        result
                     };
-
                     if close {
                         self.host_view_window_open
                             .insert(view.descriptor.id.clone(), false);
@@ -825,13 +815,7 @@ impl CameraApp {
                             .or_default()
                             .density_state();
 
-                        let table = match cache_entry.as_ref() {
-                            Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => {
-                                Some(table.as_ref())
-                            }
-                            Some(Ok(None)) | None => None,
-                            Some(Err(_)) => None,
-                        };
+                        let table = cached_table(cache_entry.as_ref()).unwrap_or(None);
 
                         let render_result = state.render_if_needed(
                             ctx,
@@ -913,23 +897,21 @@ impl CameraApp {
                         },
                     );
 
-                    let (close, export_csv, export_image, clear_requested, next_settings) = {
-                        let mut data = shared.lock().unwrap();
-                        let close = data.close_requested;
-                        let export_csv = data.export_csv_requested;
-                        let export_image = data.export_image_requested.take();
-                        let clear_requested = data.clear_requested;
-                        let next_settings = data.settings;
+                    let (next_settings, close, clear, export_csv, export_image) = {
+                        let Ok(mut data) = shared.lock() else {
+                            continue;
+                        };
+                        let result = (
+                            data.settings,
+                            data.close_requested,
+                            data.clear_requested,
+                            data.export_csv_requested,
+                            data.export_image_requested.take(),
+                        );
                         data.close_requested = false;
                         data.export_csv_requested = false;
                         data.clear_requested = false;
-                        (
-                            close,
-                            export_csv,
-                            export_image,
-                            clear_requested,
-                            next_settings,
-                        )
+                        result
                     };
 
                     self.host_view_render_state
@@ -942,7 +924,7 @@ impl CameraApp {
                         self.host_view_window_open
                             .insert(view.descriptor.id.clone(), false);
                     }
-                    if clear_requested {
+                    if clear {
                         self.clear_host_view_provider(&view.descriptor.dataset_id);
                     }
                     if export_csv {
@@ -1780,7 +1762,7 @@ impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
-        self.refresh_host_view_registry();
+        self.refresh_host_view_registry_if_dirty();
 
         let mode = self.mode;
         let settings_locked = self.settings_are_locked();
@@ -2114,6 +2096,7 @@ impl eframe::App for CameraApp {
         if plugin_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
+            self.host_view_registry_dirty = true;
         }
 
         if settings_locked {
@@ -2485,6 +2468,7 @@ impl eframe::App for CameraApp {
         if plugin_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
+            self.host_view_registry_dirty = true;
         }
 
         let mut pc_metrics: Option<PointCloudMetrics> = None;
