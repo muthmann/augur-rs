@@ -224,10 +224,7 @@ fn insert_timestamp_suffix(path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("raw");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("raw");
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let ts = format_timestamp_now();
     parent.join(format!("{stem}_{ts}.{ext}"))
@@ -1200,8 +1197,7 @@ impl eframe::App for CameraApp {
                                 .add_enabled(output_enabled, egui::Button::new("Browse…"))
                                 .clicked()
                             {
-                                let default_name =
-                                    format!("output_{}.raw", format_timestamp_now());
+                                let default_name = format!("output_{}.raw", format_timestamp_now());
                                 if let Some(path) = rfd::FileDialog::new()
                                     .set_file_name(&default_name)
                                     .add_filter("RAW", &["raw"])
