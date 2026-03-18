@@ -140,6 +140,10 @@ Current assignments:
 - `ROI Grid` — built-in `FrameOnly`
 - `Hotpixel Detection` — dynamic `FrameOnly`
 - `Molecule Localization` — dynamic `RawEvents`
+- `EVE Candidate Finding` — dynamic `RawEvents` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
+- `EVE Candidate Fitting` — dynamic `DerivedData` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
+- `EVE Post-Processing` — dynamic `DerivedData` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
+- `Localization Reconstruction` — dynamic `DerivedData` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
 - `Focus Metrics` — dynamic `DerivedData`
 
 ## Context Bus
