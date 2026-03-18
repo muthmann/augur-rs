@@ -15,7 +15,7 @@ Each plugin lives in its own subdirectory:
 
 ```toml
 name = "Hotpixel Detection"
-version = "0.1.0"
+version = "0.2.0"
 description = "Detects persistently noisy pixels."
 domain = "general"
 library = "augur_plugin_hotpixel"

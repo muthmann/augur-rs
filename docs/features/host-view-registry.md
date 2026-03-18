@@ -32,15 +32,11 @@ for frame processing.
 - conflicting duplicate ids are ignored and logged
 - views whose dataset ids do not resolve are ignored and logged
 
-## Loading and Compatibility
+## Loading Contract
 
-Runtime plugins can now export ABI v2 through `augur_plugin_entry_v2`. The host:
-
-- validates the ABI version, vtable size, and non-null vtable pointer
-- prefers ABI v2 when present
-- falls back to the legacy `augur_plugin_vtable` symbol when ABI v2 is absent
-
-Legacy plugins still load, but they contribute an empty host-view registry.
+Host-view callbacks now live directly on the flat `PluginVTable` exported through
+`augur_plugin_vtable`. The host requires a current `augur-plugin-api` build and does not keep a
+legacy ABI fallback path anymore.
 
 ## Host Rendering
 

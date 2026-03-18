@@ -4,7 +4,8 @@
 
 The `Molecule Localization` plugin detects candidate emitters in the preview stream, fits sub-pixel Gaussian spots, renders crosshair markers, and publishes `LocalizationResults` into the plugin context for downstream consumers.
 
-The implementation lives in the runtime-loaded plugin layer (`plugins/localization/` in this workspace).
+The implementation now lives in the runtime-loaded plugin layer maintained in
+[augur-plugins](https://github.com/muthmann/augur-plugins).
 
 ## Pipeline
 

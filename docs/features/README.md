@@ -4,7 +4,9 @@ These notes capture feature-level behavior and implementation constraints useful
 
 ## Plugin Ecosystem
 
-This repository defines the plugin API, runtime loader, and a small set of reference dynamic plugin crates. The long-term home for the broader plugin registry remains **[augur-plugins](https://github.com/muthmann/augur-plugins)**.
+This repository defines the plugin API, runtime loader, host-side analysis UI, and the built-in
+ROI-grid tool. The broader runtime plugin registry lives in
+**[augur-plugins](https://github.com/muthmann/augur-plugins)**.
 
 See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dynamic Plugin Loading](./dynamic-plugins.md) for the install/reload workflow.
 
@@ -20,6 +22,7 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
+- [Plugin API v0.2](./plugin-api-v0-2.md) — flat runtime ABI, EventStore history, persistent plugin context, and repo split cleanup
 - [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables and density views
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection

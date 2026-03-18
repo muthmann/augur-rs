@@ -1,4 +1,5 @@
 mod context;
+mod event_store;
 mod ffi;
 mod helpers;
 mod macros;
@@ -10,13 +11,13 @@ pub use context::{
     TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
     TableSchema, TableValueType, CTX_LOCALIZATION_RESULTS,
 };
+pub use event_store::{EventStore, FrameBoundary};
 pub use ffi::{
-    AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginAbiDescriptor, PluginEntry,
-    PluginEntryV2, PluginInput, PluginVTable, PluginVTableV2, PLUGIN_ABI_VERSION_V2,
-    PLUGIN_ENTRY_SYMBOL, PLUGIN_ENTRY_V2_SYMBOL,
+    AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
+    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginEntry,
+    PluginInput, PluginVTable, PLUGIN_ENTRY_SYMBOL,
 };
-pub use helpers::{HostContext, HostOutput, Plugin, PluginFrame};
+pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
 
 #[doc(hidden)]
@@ -71,8 +72,8 @@ mod tests {
             CTX_LOCALIZATION_RESULTS,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
-        AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiPixel, FfiSlice, FfiString,
-        FfiSubpixelMarker, PluginAbiDescriptor, PluginInput, PLUGIN_ABI_VERSION_V2,
+        AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle, FfiPixel, FfiSlice,
+        FfiString, FfiSubpixelMarker, PluginInput, PluginVTable,
     };
 
     #[test]
@@ -83,6 +84,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiColorRgba>(), 4);
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
+        assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
+        assert_eq!(std::mem::size_of::<PluginVTable>(), 136);
     }
 
     #[test]
@@ -299,15 +302,5 @@ mod tests {
         let err = serde_json::from_value::<TableDatasetV1>(json)
             .expect_err("dataset must reject mismatched lengths");
         assert!(err.to_string().contains("identical lengths"));
-    }
-
-    #[test]
-    fn plugin_abi_descriptor_round_trips_through_json() {
-        let descriptor = PluginAbiDescriptor::new(PLUGIN_ABI_VERSION_V2, 123, 456);
-
-        let json = serde_json::to_vec(&descriptor).expect("descriptor must serialize");
-        let decoded: PluginAbiDescriptor =
-            serde_json::from_slice(&json).expect("descriptor must deserialize");
-        assert_eq!(decoded, descriptor);
     }
 }

@@ -1,0 +1,62 @@
+# ADR 007: Host-Owned EventStore for Plugin History
+
+## Status
+
+Accepted
+
+## Context
+
+Runtime plugins increasingly need more than the current frame:
+
+- sliding-window event analysis
+- cross-frame correlation and accumulation
+- lightweight state that survives between frames without inventing custom host hooks
+
+Letting every plugin buffer its own event history would duplicate memory use, duplicate decoding
+work, and make retention behavior inconsistent across plugins.
+
+## Decision
+
+Adopt a host-owned `EventStore` inside `augur-gui` and expose it through
+`augur-plugin-api::EventStoreHandle`.
+
+The host:
+
+- converts decoded events into FFI form once per frame
+- appends them to a memory-budgeted retained history
+- passes a read-only history handle into every dynamic plugin call
+- keeps two JSON context scopes:
+  - per-frame context, cleared on each frame
+  - persistent context, cleared on analysis reset / topology reset
+
+This ships together with the v0.2 plugin API cleanup:
+
+- one flat `PluginVTable`
+- one exported entry symbol
+- no ABI-v1/v2 fallback split
+
+## Consequences
+
+### Positive
+
+- plugins can query retained event history without owning duplicate buffers
+- retention limits are explicit, host-controlled, and testable
+- persistent cross-frame state is available without adding plugin-specific callbacks
+- the plugin boundary stays small and uniform
+
+### Negative
+
+- `augur-gui` now owns additional runtime state and memory-budget UI
+- changing the `process_frame` signature is a coordinated rebuild for all plugins
+- retained history increases host memory usage when event-heavy plugins are enabled
+
+## Alternatives Considered
+
+### Per-Plugin History Buffers
+
+Rejected because it duplicates memory and makes retention semantics inconsistent.
+
+### Another Optional ABI Layer
+
+Rejected because the host-view transition already created unnecessary complexity. The v0.2 cleanup
+uses one flat ABI and asks plugins to recompile once instead.

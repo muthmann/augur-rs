@@ -17,7 +17,7 @@ use augur_core::{
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
-use augur_plugin_api::{HostViewKind, PluginInput, TableDatasetV1};
+use augur_plugin_api::{EventStore, FfiCdEvent, HostViewKind, PluginInput, TableDatasetV1};
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
@@ -47,6 +47,7 @@ const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
     (f32::INFINITY, "Max"),
 ];
 const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
+const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
@@ -269,6 +270,8 @@ pub struct CameraApp {
     builtin_plugins: Vec<Box<dyn AnalysisPlugin>>,
     plugin_manager: PluginManager,
     plugin_context_data: HashMap<String, Vec<u8>>,
+    persistent_context_data: HashMap<String, Vec<u8>>,
+    event_store: EventStore,
     analysis_output: AnalysisOutput,
     analysis_notice: Option<String>,
     acq_time_ms: u64,
@@ -322,6 +325,8 @@ impl CameraApp {
             builtin_plugins: create_all_plugins(),
             plugin_manager,
             plugin_context_data: HashMap::new(),
+            persistent_context_data: HashMap::new(),
+            event_store: EventStore::default(),
             analysis_output: AnalysisOutput::default(),
             analysis_notice: None,
             acq_time_ms: 50,
@@ -361,6 +366,8 @@ impl CameraApp {
             }
         }
         self.plugin_context_data.clear();
+        self.persistent_context_data.clear();
+        self.event_store.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
         self.mark_host_view_datasets_stale();
@@ -1488,6 +1495,20 @@ impl CameraApp {
     fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
+        let ffi_events: Vec<FfiCdEvent> = frame
+            .events
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|event| FfiCdEvent {
+                timestamp: event.timestamp,
+                x: event.x,
+                y: event.y,
+                polarity: u8::from(event.polarity),
+            })
+            .collect();
+        self.event_store
+            .push_frame(&ffi_events, frame.window_start_us, frame.window_end_us);
 
         for phase in [
             PluginInput::FrameOnly,
@@ -1507,8 +1528,11 @@ impl CameraApp {
                 if plugin.enabled() && plugin.input_kind() == phase {
                     plugin.process_frame(
                         frame,
+                        &ffi_events,
+                        &self.event_store,
                         &mut self.analysis_output,
                         &mut self.plugin_context_data,
+                        &mut self.persistent_context_data,
                     );
                 }
             }
@@ -2094,9 +2118,7 @@ impl eframe::App for CameraApp {
         }
 
         if plugin_toggle_changed {
-            self.analysis_output = AnalysisOutput::default();
-            self.analysis_notice = None;
-            self.host_view_registry_dirty = true;
+            self.reset_analysis();
         }
 
         if settings_locked {
@@ -2164,6 +2186,28 @@ impl eframe::App for CameraApp {
                                     );
                                 }
                             }
+
+                            ui.separator();
+                            ui.label("Analysis runtime");
+                            let mut event_store_budget_mb =
+                                (self.event_store.memory_budget_bytes() / EVENT_STORE_MEBIBYTE)
+                                    .max(1);
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut event_store_budget_mb, 1..=1024)
+                                        .text("Event history budget (MB)"),
+                                )
+                                .changed()
+                            {
+                                self.event_store
+                                    .set_memory_budget(event_store_budget_mb * EVENT_STORE_MEBIBYTE);
+                            }
+                            ui.small(format!(
+                                "Retained {:.1} MiB across {} frame(s).",
+                                self.event_store.memory_usage_bytes() as f32
+                                    / EVENT_STORE_MEBIBYTE as f32,
+                                self.event_store.frame_count()
+                            ));
 
                             ui.separator();
                             ui.add_enabled_ui(!settings_locked, |ui| {
