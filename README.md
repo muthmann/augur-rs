@@ -9,7 +9,9 @@
 [![CI](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/muthmann/augur-rs/actions/workflows/release.yml/badge.svg)](https://github.com/muthmann/augur-rs/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+![macOS](https://img.shields.io/github/actions/workflow/status/muthmann/augur-rs/ci.yml?label=macOS&logo=apple&branch=main)
+![Linux](https://img.shields.io/github/actions/workflow/status/muthmann/augur-rs/ci.yml?label=Linux&logo=linux&logoColor=white&branch=main)
+![Windows](https://img.shields.io/github/actions/workflow/status/muthmann/augur-rs/ci.yml?label=Windows&logo=windows&branch=main)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 </div>
