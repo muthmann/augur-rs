@@ -217,6 +217,9 @@ pub struct FfiPluginContext {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PluginVTable {
+    /// Size of this struct in bytes. The host uses this to detect plugins
+    /// compiled against an older (smaller) API before copying the vtable.
+    pub vtable_size: usize,
     pub create: unsafe extern "C" fn() -> *mut c_void,
     pub destroy: unsafe extern "C" fn(*mut c_void),
     pub name: unsafe extern "C" fn(*const c_void) -> FfiString,

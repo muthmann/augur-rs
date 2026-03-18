@@ -72,6 +72,15 @@ impl DynPlugin {
             return Err("plugin entry returned a null vtable pointer".into());
         }
 
+        let expected_size = std::mem::size_of::<PluginVTable>();
+        let reported_size = unsafe { (*vtable_ptr).vtable_size };
+        if reported_size != expected_size {
+            return Err(format!(
+                "plugin vtable size mismatch (plugin: {reported_size}, host: {expected_size}) — \
+                 rebuild the plugin against the current augur-plugin-api"
+            ));
+        }
+
         let instance = unsafe { ((*vtable_ptr).create)() };
         if instance.is_null() {
             return Err("plugin create() returned a null instance".into());
