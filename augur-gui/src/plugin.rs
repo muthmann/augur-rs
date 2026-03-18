@@ -1,5 +1,5 @@
 use augur_core::{analysis::AnalysisOutput, config::CameraConfig, pipeline::PreviewFrame};
-use augur_plugin_api::PluginInput;
+use augur_plugin_api::{HostViewRegistry, PluginInput};
 
 pub trait AnalysisPlugin {
     fn name(&self) -> &str;
@@ -24,6 +24,14 @@ pub trait AnalysisPlugin {
 
     fn dependencies(&self) -> &[&str] {
         &[]
+    }
+
+    fn host_views(&self) -> HostViewRegistry {
+        HostViewRegistry::default()
+    }
+
+    fn host_view_dataset(&self, _dataset_id: &str) -> Option<Vec<u8>> {
+        None
     }
 
     fn reset(&mut self);

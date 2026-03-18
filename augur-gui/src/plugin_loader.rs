@@ -15,8 +15,10 @@ use augur_core::{
 };
 use augur_plugin_api::{
     AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginEntry, PluginInput,
-    PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
+    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostViewRegistry, LocalizationTable,
+    PluginAbiDescriptor, PluginEntry, PluginEntryV2, PluginInput, PluginVTable, PluginVTableV2,
+    SettingsSchema, StatusEntry, PLUGIN_ABI_VERSION_V2, PLUGIN_ENTRY_SYMBOL,
+    PLUGIN_ENTRY_V2_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -52,9 +54,25 @@ struct PluginSpec {
     manifest: PluginManifest,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HostViewAccessors {
+    host_views: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
+    host_view_dataset:
+        unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
+    accumulated_localizations:
+        unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize) -> bool,
+}
+
+#[derive(Clone, Copy)]
+struct LoadedPluginApi {
+    vtable: PluginVTable,
+    host_views: Option<HostViewAccessors>,
+}
+
 pub struct DynPlugin {
     _lib: Library,
     vtable: PluginVTable,
+    host_view_accessors: Option<HostViewAccessors>,
     instance: *mut c_void,
     manifest: PluginManifest,
     cached_name: String,
@@ -70,26 +88,17 @@ impl DynPlugin {
         let lib = unsafe { Library::new(&library_path) }
             .map_err(|err| format!("loading {} failed: {err}", library_path.display()))?;
 
-        let vtable = unsafe {
-            let symbol_name = format!("{PLUGIN_ENTRY_SYMBOL}\0");
-            let entry = lib
-                .get::<PluginEntry>(symbol_name.as_bytes())
-                .map_err(|err| format!("loading symbol {PLUGIN_ENTRY_SYMBOL} failed: {err}"))?;
-            let vtable_ptr = entry();
-            if vtable_ptr.is_null() {
-                return Err("plugin entry returned a null vtable pointer".into());
-            }
-            *vtable_ptr
-        };
+        let api = unsafe { load_plugin_api(&lib)? };
 
-        let instance = unsafe { (vtable.create)() };
+        let instance = unsafe { (api.vtable.create)() };
         if instance.is_null() {
             return Err("plugin create() returned a null instance".into());
         }
 
         let mut plugin = Self {
             _lib: lib,
-            vtable,
+            vtable: api.vtable,
+            host_view_accessors: api.host_views,
             instance,
             manifest: spec.manifest,
             cached_name: String::new(),
@@ -234,6 +243,50 @@ impl DynPlugin {
 
     pub fn status_entries(&self) -> Result<Vec<StatusEntry>, String> {
         self.read_json(self.vtable.status_entries)
+    }
+
+    pub fn host_views(&self) -> Result<HostViewRegistry, String> {
+        let Some(accessors) = self.host_view_accessors else {
+            return Ok(HostViewRegistry::default());
+        };
+        self.read_json(accessors.host_views)
+    }
+
+    pub fn host_view_dataset(&self, dataset_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some(accessors) = self.host_view_accessors else {
+            return Ok(None);
+        };
+        let bytes = self.call_optional_bytes(|inst, ptr, len| unsafe {
+            (accessors.host_view_dataset)(inst, FfiString::from(dataset_id), ptr, len)
+        });
+        Ok(bytes.map(|b| b.to_vec()))
+    }
+
+    #[allow(dead_code)]
+    pub fn accumulated_localizations(&self) -> Result<Option<LocalizationTable>, String> {
+        let Some(accessors) = self.host_view_accessors else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.call_optional_bytes(|inst, ptr, len| unsafe {
+            (accessors.accumulated_localizations)(inst, ptr, len)
+        }) else {
+            return Ok(None);
+        };
+        serde_json::from_slice(bytes)
+            .map(Some)
+            .map_err(|err| format!("accumulated localizations JSON invalid: {err}"))
+    }
+
+    fn call_optional_bytes(
+        &self,
+        call: impl FnOnce(*const c_void, *mut *const u8, *mut usize) -> bool,
+    ) -> Option<&[u8]> {
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+        if !call(self.instance, &mut out_ptr, &mut out_len) {
+            return None;
+        }
+        Some(unsafe { bytes_from_out_ptr(out_ptr, out_len) })
     }
 
     pub fn process_frame(
@@ -534,33 +587,98 @@ unsafe extern "C" fn get_context_value(
     if out_ptr.is_null() || out_len.is_null() {
         return false;
     }
-    let Some(bridge) = ctx.cast::<ContextBridge>().as_mut() else {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return false;
-    };
-    let Ok(key) = key.as_str() else {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return false;
-    };
-    let Some(bytes) = bridge.data.get(key) else {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return false;
-    };
-    *out_ptr = bytes.as_ptr();
-    *out_len = bytes.len();
-    true
+
+    let found = (|| {
+        let bridge = ctx.cast::<ContextBridge>().as_mut()?;
+        let key = key.as_str().ok()?;
+        bridge.data.get(key)
+    })();
+
+    match found {
+        Some(bytes) => {
+            *out_ptr = bytes.as_ptr();
+            *out_len = bytes.len();
+            true
+        }
+        None => {
+            *out_ptr = std::ptr::null();
+            *out_len = 0;
+            false
+        }
+    }
+}
+
+unsafe fn load_plugin_api(lib: &Library) -> Result<LoadedPluginApi, String> {
+    match lib.get::<PluginEntryV2>(b"augur_plugin_entry_v2\0") {
+        Ok(entry) => api_from_v2_descriptor(entry()),
+        Err(err) => {
+            if !is_missing_symbol_error(&err) {
+                return Err(format!(
+                    "loading symbol {PLUGIN_ENTRY_V2_SYMBOL} failed: {err}"
+                ));
+            }
+
+            let entry = lib
+                .get::<PluginEntry>(b"augur_plugin_vtable\0")
+                .map_err(|err| format!("loading symbol {PLUGIN_ENTRY_SYMBOL} failed: {err}"))?;
+            api_from_legacy_vtable(entry())
+        }
+    }
+}
+
+fn is_missing_symbol_error(err: &libloading::Error) -> bool {
+    if matches!(err, libloading::Error::DlSym { .. }) {
+        return true;
+    }
+    let text = err.to_string();
+    text.contains("symbol not found") || text.contains("undefined symbol")
+}
+
+fn api_from_v2_descriptor(descriptor: PluginAbiDescriptor) -> Result<LoadedPluginApi, String> {
+    if descriptor.abi_version != PLUGIN_ABI_VERSION_V2 {
+        return Err(format!(
+            "plugin ABI version {} is incompatible with host ABI {}",
+            descriptor.abi_version, PLUGIN_ABI_VERSION_V2
+        ));
+    }
+    if descriptor.vtable_size < std::mem::size_of::<PluginVTableV2>() {
+        return Err(format!(
+            "plugin vtable size {} is smaller than expected {}",
+            descriptor.vtable_size,
+            std::mem::size_of::<PluginVTableV2>()
+        ));
+    }
+
+    let vtable_ptr = descriptor.vtable_ptr::<PluginVTableV2>();
+    if vtable_ptr.is_null() {
+        return Err("plugin ABI descriptor returned a null vtable pointer".into());
+    }
+
+    let vtable = unsafe { *vtable_ptr };
+    Ok(LoadedPluginApi {
+        vtable: vtable.base,
+        host_views: Some(HostViewAccessors {
+            host_views: vtable.host_views,
+            host_view_dataset: vtable.host_view_dataset,
+            accumulated_localizations: vtable.accumulated_localizations,
+        }),
+    })
+}
+
+fn api_from_legacy_vtable(vtable_ptr: *const PluginVTable) -> Result<LoadedPluginApi, String> {
+    if vtable_ptr.is_null() {
+        return Err("plugin entry returned a null vtable pointer".into());
+    }
+
+    Ok(LoadedPluginApi {
+        vtable: unsafe { *vtable_ptr },
+        host_views: None,
+    })
 }
 
 fn ffi_string_to_option(ffi: FfiString, context: &str) -> Result<Option<String>, String> {
     let text = unsafe { ffi.as_str() }.map_err(|err| format!("{context}: {err}"))?;
-    Ok(if text.is_empty() {
-        None
-    } else {
-        Some(text.to_owned())
-    })
+    Ok((!text.is_empty()).then(|| text.to_owned()))
 }
 
 unsafe fn bytes_from_out_ptr<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
@@ -729,5 +847,167 @@ pub fn plugin_phase_label(input: PluginInput) -> &'static str {
         PluginInput::FrameOnly => "FrameOnly",
         PluginInput::RawEvents => "RawEvents",
         PluginInput::DerivedData => "DerivedData",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use augur_plugin_api::PluginVTableV2;
+
+    unsafe extern "C" fn create() -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn destroy(_instance: *mut c_void) {}
+
+    unsafe extern "C" fn name(_instance: *const c_void) -> FfiString {
+        FfiString::default()
+    }
+
+    unsafe extern "C" fn description(_instance: *const c_void) -> FfiString {
+        FfiString::default()
+    }
+
+    unsafe extern "C" fn enabled(_instance: *const c_void) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn set_enabled(_instance: *mut c_void, _enabled: bool) {}
+
+    unsafe extern "C" fn reset(_instance: *mut c_void) {}
+
+    unsafe extern "C" fn input_kind(_instance: *const c_void) -> PluginInput {
+        PluginInput::FrameOnly
+    }
+
+    unsafe extern "C" fn num_dependencies(_instance: *const c_void) -> usize {
+        0
+    }
+
+    unsafe extern "C" fn dependency(_instance: *const c_void, _index: usize) -> FfiString {
+        FfiString::default()
+    }
+
+    unsafe extern "C" fn process_frame(
+        _instance: *mut c_void,
+        _frame: *const FfiPreviewFrame,
+        _output: *mut FfiOutputCallbacks,
+        _context: *mut FfiPluginContext,
+    ) {
+    }
+
+    unsafe extern "C" fn write_empty_json(
+        _instance: *const c_void,
+        out_ptr: *mut *const u8,
+        out_len: *mut usize,
+    ) {
+        if !out_ptr.is_null() {
+            *out_ptr = std::ptr::null();
+        }
+        if !out_len.is_null() {
+            *out_len = 0;
+        }
+    }
+
+    unsafe extern "C" fn get_setting(
+        _instance: *const c_void,
+        _key: FfiString,
+        _out_ptr: *mut *const u8,
+        _out_len: *mut usize,
+    ) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn set_setting(
+        _instance: *mut c_void,
+        _key: FfiString,
+        _value: FfiSlice<u8>,
+    ) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn accumulated_localizations(
+        _instance: *const c_void,
+        _out_ptr: *mut *const u8,
+        _out_len: *mut usize,
+    ) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn host_view_dataset(
+        _instance: *const c_void,
+        _dataset_id: FfiString,
+        _out_ptr: *mut *const u8,
+        _out_len: *mut usize,
+    ) -> bool {
+        false
+    }
+
+    static LEGACY_VTABLE: PluginVTable = PluginVTable {
+        create,
+        destroy,
+        name,
+        description,
+        enabled,
+        set_enabled,
+        reset,
+        input_kind,
+        num_dependencies,
+        dependency,
+        process_frame,
+        settings_schema: write_empty_json,
+        get_setting,
+        set_setting,
+        status_entries: write_empty_json,
+    };
+
+    static V2_VTABLE: PluginVTableV2 = PluginVTableV2 {
+        base: LEGACY_VTABLE,
+        host_views: write_empty_json,
+        host_view_dataset,
+        accumulated_localizations,
+    };
+
+    #[test]
+    fn api_from_v2_descriptor_uses_host_view_accessors() {
+        let descriptor = PluginAbiDescriptor::new(
+            PLUGIN_ABI_VERSION_V2,
+            std::mem::size_of::<PluginVTableV2>(),
+            (&V2_VTABLE as *const PluginVTableV2) as usize,
+        );
+
+        let api = api_from_v2_descriptor(descriptor).expect("v2 descriptor must load");
+        assert!(api.host_views.is_some());
+    }
+
+    #[test]
+    fn api_from_v2_descriptor_rejects_invalid_metadata() {
+        let err = match api_from_v2_descriptor(PluginAbiDescriptor::new(
+            PLUGIN_ABI_VERSION_V2 + 1,
+            std::mem::size_of::<PluginVTableV2>(),
+            (&V2_VTABLE as *const PluginVTableV2) as usize,
+        )) {
+            Ok(_) => panic!("unexpected ABI version must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("incompatible"));
+
+        let err = match api_from_v2_descriptor(PluginAbiDescriptor::new(
+            PLUGIN_ABI_VERSION_V2,
+            std::mem::size_of::<PluginVTable>(),
+            (&V2_VTABLE as *const PluginVTableV2) as usize,
+        )) {
+            Ok(_) => panic!("undersized vtable must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("smaller than expected"));
+    }
+
+    #[test]
+    fn api_from_legacy_vtable_falls_back_without_host_views() {
+        let api =
+            api_from_legacy_vtable(&LEGACY_VTABLE as *const PluginVTable).expect("legacy vtable");
+        assert!(api.host_views.is_none());
     }
 }

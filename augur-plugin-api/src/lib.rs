@@ -4,11 +4,17 @@ mod helpers;
 mod macros;
 mod settings;
 
-pub use context::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS};
+pub use context::{
+    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, Localization, LocalizationResults, LocalizationRow, LocalizationTable,
+    TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
+    TableSchema, TableValueType, CTX_LOCALIZATION_RESULTS,
+};
 pub use ffi::{
     AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginEntry, PluginInput,
-    PluginVTable, PLUGIN_ENTRY_SYMBOL,
+    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginAbiDescriptor, PluginEntry,
+    PluginEntryV2, PluginInput, PluginVTable, PluginVTableV2, PLUGIN_ABI_VERSION_V2,
+    PLUGIN_ENTRY_SYMBOL, PLUGIN_ENTRY_V2_SYMBOL,
 };
 pub use helpers::{HostContext, HostOutput, Plugin, PluginFrame};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
@@ -57,10 +63,16 @@ pub mod __private {
 #[cfg(test)]
 mod tests {
     use super::{
-        context::{Localization, LocalizationResults, CTX_LOCALIZATION_RESULTS},
+        context::{
+            HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
+            HostViewPlacement, HostViewRegistry, Localization, LocalizationResults,
+            LocalizationRow, LocalizationTable, TableColumn, TableColumnData, TableColumnValues,
+            TableCoordinateSpace2d, TableDatasetV1, TableSchema, TableValueType,
+            CTX_LOCALIZATION_RESULTS,
+        },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiPixel, FfiSlice, FfiString,
-        FfiSubpixelMarker, PluginInput,
+        FfiSubpixelMarker, PluginAbiDescriptor, PluginInput, PLUGIN_ABI_VERSION_V2,
     };
 
     #[test]
@@ -131,6 +143,31 @@ mod tests {
     }
 
     #[test]
+    fn localization_table_round_trips_through_json() {
+        let table = LocalizationTable {
+            rows: vec![LocalizationRow {
+                id: 7,
+                frame: 3,
+                x_nm: 812.5,
+                y_nm: 455.0,
+                sigma_nm: 132.0,
+                intensity: 4_200.0,
+                offset: 14.0,
+                uncertainty_xy_nm: 19.5,
+                timestamp_us: 12_345,
+            }],
+            nm_per_pixel: 65.0,
+            sensor_width: 1280,
+            sensor_height: 720,
+        };
+
+        let json = serde_json::to_vec(&table).expect("table must serialize");
+        let decoded: LocalizationTable =
+            serde_json::from_slice(&json).expect("table must deserialize");
+        assert_eq!(decoded, table);
+    }
+
+    #[test]
     fn ffi_string_and_slice_helpers_preserve_contents() {
         let text = "hello";
         let ffi = FfiString::from(text);
@@ -153,5 +190,124 @@ mod tests {
         assert_eq!(phase, "\"derived_data\"");
         assert_eq!(severity, "\"warning\"");
         assert!(status.contains("\"text\""));
+    }
+
+    #[test]
+    fn host_view_registry_round_trips_through_json() {
+        let registry = HostViewRegistry {
+            datasets: vec![HostDatasetDescriptor {
+                id: "table.localization".into(),
+                title: "Localizations".into(),
+                kind: HostDatasetKind::TableV1(TableSchema {
+                    columns: vec![
+                        TableColumn {
+                            id: "frame".into(),
+                            title: "Frame".into(),
+                            value_type: TableValueType::U64,
+                        },
+                        TableColumn {
+                            id: "x_nm".into(),
+                            title: "X [nm]".into(),
+                            value_type: TableValueType::F64,
+                        },
+                        TableColumn {
+                            id: "y_nm".into(),
+                            title: "Y [nm]".into(),
+                            value_type: TableValueType::F64,
+                        },
+                    ],
+                    coordinate_space_2d: Some(TableCoordinateSpace2d {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                        x_min: 0.0,
+                        x_max: 100.0,
+                        y_min: 0.0,
+                        y_max: 100.0,
+                    }),
+                }),
+                empty_message: "No rows yet".into(),
+            }],
+            views: vec![
+                HostViewDescriptor {
+                    id: "panel.localization".into(),
+                    title: "Localization Preview".into(),
+                    dataset_id: "table.localization".into(),
+                    placement: HostViewPlacement::AnalysisPanel,
+                    kind: HostViewKind::CompactTable,
+                },
+                HostViewDescriptor {
+                    id: "window.localization".into(),
+                    title: "Localization Window".into(),
+                    dataset_id: "table.localization".into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::Density2dFromTable {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                    },
+                },
+            ],
+        };
+
+        let json = serde_json::to_vec(&registry).expect("registry must serialize");
+        let decoded: HostViewRegistry =
+            serde_json::from_slice(&json).expect("registry must deserialize");
+        assert_eq!(decoded, registry);
+    }
+
+    #[test]
+    fn table_dataset_v1_round_trips_through_json() {
+        let dataset = TableDatasetV1::new(vec![
+            TableColumnData {
+                column_id: "frame".into(),
+                values: TableColumnValues::U64(vec![1, 2]),
+            },
+            TableColumnData {
+                column_id: "x_nm".into(),
+                values: TableColumnValues::F64(vec![12.5, 13.5]),
+            },
+        ])
+        .expect("dataset must validate");
+
+        let json = serde_json::to_vec(&dataset).expect("dataset must serialize");
+        let decoded: TableDatasetV1 =
+            serde_json::from_slice(&json).expect("dataset must deserialize");
+        assert_eq!(decoded, dataset);
+        assert_eq!(decoded.row_count(), 2);
+    }
+
+    #[test]
+    fn table_dataset_v1_rejects_mismatched_column_lengths() {
+        let json = serde_json::json!({
+            "columns": [
+                {
+                    "column_id": "frame",
+                    "values": {
+                        "value_type": "u64",
+                        "values": [1, 2]
+                    }
+                },
+                {
+                    "column_id": "x_nm",
+                    "values": {
+                        "value_type": "f64",
+                        "values": [12.5]
+                    }
+                }
+            ]
+        });
+
+        let err = serde_json::from_value::<TableDatasetV1>(json)
+            .expect_err("dataset must reject mismatched lengths");
+        assert!(err.to_string().contains("identical lengths"));
+    }
+
+    #[test]
+    fn plugin_abi_descriptor_round_trips_through_json() {
+        let descriptor = PluginAbiDescriptor::new(PLUGIN_ABI_VERSION_V2, 123, 456);
+
+        let json = serde_json::to_vec(&descriptor).expect("descriptor must serialize");
+        let decoded: PluginAbiDescriptor =
+            serde_json::from_slice(&json).expect("descriptor must deserialize");
+        assert_eq!(decoded, descriptor);
     }
 }

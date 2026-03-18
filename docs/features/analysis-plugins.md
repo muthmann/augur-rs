@@ -9,6 +9,9 @@
 
 This keeps `augur-core` free of domain logic while removing the need to recompile `augur-gui` whenever a plugin changes.
 
+The host now also supports a generic dataset/view registry so plugins can expose structured results
+to host-rendered tables and windows without adding plugin-specific GUI code.
+
 ## Runtime Model
 
 Each dynamic plugin ships as:
@@ -22,8 +25,9 @@ At startup or on rescan, `augur-gui`:
 1. walks `~/.augur/plugins/`
 2. parses each `plugin.toml`
 3. resolves the matching library file
-4. loads the exported `augur_plugin_vtable` entry with `libloading`
-5. instantiates the plugin and caches its declarative settings schema
+4. prefers the exported `augur_plugin_entry_v2` ABI descriptor when present
+5. falls back to `augur_plugin_vtable` when ABI v2 is absent
+6. instantiates the plugin and caches its declarative settings schema
 
 Loader failures are non-fatal and stay visible in the Plugin Manager window.
 
@@ -37,12 +41,89 @@ The standalone `augur-plugin-api` crate defines the cross-library boundary:
 - `HostOutput`: safe overlay and warning callbacks back into the GUI host
 - `HostContext`: string-keyed context publishing and lookup using serialized JSON bytes
 - `SettingsSchema` / `StatusEntry`: declarative UI and read-only status reporting
+- `HostViewRegistry`: declarative dataset/view metadata for host-rendered analysis views
 
 Shared science-facing context types live in `augur-plugin-api/src/context.rs`, including:
 
 - `Localization`
 - `LocalizationResults`
+- `HostViewRegistry`
+- `TableDatasetV1`
 - `CTX_LOCALIZATION_RESULTS`
+
+## Host Views
+
+Plugins can now describe host-rendered outputs through:
+
+- `host_views()`, which returns dataset and view descriptors
+- `host_view_dataset(dataset_id)`, which returns a serialized payload on demand
+
+The host resolves duplicate ids in plugin execution order:
+
+- later providers win only when descriptor metadata matches exactly
+- conflicting duplicate ids are ignored and logged
+- dataset payloads are fetched lazily, only when a visible panel or open window needs them
+
+Legacy plugins that export only the old vtable still load, but contribute no host views.
+
+### Example
+
+```rust
+use augur_plugin_api::{
+    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
+    HostViewPlacement, HostViewRegistry, Plugin, TableColumn, TableDatasetV1,
+    TableSchema, TableValueType,
+};
+
+fn host_views(&self) -> HostViewRegistry {
+    HostViewRegistry {
+        datasets: vec![HostDatasetDescriptor {
+            id: "molecules.table".into(),
+            title: "Localized Molecules".into(),
+            kind: HostDatasetKind::TableV1(TableSchema {
+                columns: vec![
+                    TableColumn {
+                        id: "frame".into(),
+                        title: "Frame".into(),
+                        value_type: TableValueType::U64,
+                    },
+                    TableColumn {
+                        id: "x_nm".into(),
+                        title: "X [nm]".into(),
+                        value_type: TableValueType::F64,
+                    },
+                    TableColumn {
+                        id: "y_nm".into(),
+                        title: "Y [nm]".into(),
+                        value_type: TableValueType::F64,
+                    },
+                ],
+                coordinate_space_2d: None,
+            }),
+            empty_message: "No localizations available yet.".into(),
+        }],
+        views: vec![
+            HostViewDescriptor {
+                id: "molecules.panel".into(),
+                title: "Localization Preview".into(),
+                dataset_id: "molecules.table".into(),
+                placement: HostViewPlacement::AnalysisPanel,
+                kind: HostViewKind::CompactTable,
+            },
+            HostViewDescriptor {
+                id: "molecules.window".into(),
+                title: "Localization Density".into(),
+                dataset_id: "molecules.table".into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::Density2dFromTable {
+                    x_column: "x_nm".into(),
+                    y_column: "y_nm".into(),
+                },
+            },
+        ],
+    }
+}
+```
 
 ## Execution Phases
 
@@ -59,6 +140,10 @@ Current assignments:
 - `ROI Grid` — built-in `FrameOnly`
 - `Hotpixel Detection` — dynamic `FrameOnly`
 - `Molecule Localization` — dynamic `RawEvents`
+- `EVE Candidate Finding` — dynamic `RawEvents` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
+- `EVE Candidate Fitting` — dynamic `DerivedData` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
+- `EVE Post-Processing` — dynamic `DerivedData` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
+- `Localization Reconstruction` — dynamic `DerivedData` (in [augur-plugins](https://github.com/muthmann/augur-plugins))
 - `Focus Metrics` — dynamic `DerivedData`
 
 ## Context Bus

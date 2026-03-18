@@ -8,6 +8,9 @@ macro_rules! export_plugin {
                 schema_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 setting_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 status_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
+                host_views_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
+                host_view_dataset_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
+                accumulated_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
             }
 
             impl __AugurExportedPlugin {
@@ -17,6 +20,9 @@ macro_rules! export_plugin {
                         schema_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         setting_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         status_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
+                        host_views_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
+                        host_view_dataset_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
+                        accumulated_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                     }
                 }
             }
@@ -275,6 +281,115 @@ macro_rules! export_plugin {
                 }
             }
 
+            unsafe extern "C" fn __host_views(
+                instance: *const ::std::ffi::c_void,
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) {
+                let result = ::std::panic::catch_unwind(|| {
+                    let Some(plugin) = __instance_ref(instance) else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return;
+                    };
+                    let json =
+                        ::serde_json::to_vec(&plugin.plugin.host_views()).unwrap_or_default();
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.host_views_json,
+                            json,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
+                });
+                if result.is_err() {
+                    unsafe {
+                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                    }
+                }
+            }
+
+            unsafe extern "C" fn __host_view_dataset(
+                instance: *const ::std::ffi::c_void,
+                dataset_id: $crate::FfiString,
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) -> bool {
+                ::std::panic::catch_unwind(|| {
+                    let Some(plugin) = __instance_ref(instance) else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    let Ok(dataset_id) = dataset_id.as_str() else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    let Some(bytes) = plugin.plugin.host_view_dataset(dataset_id) else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.host_view_dataset_json,
+                            bytes,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
+                    true
+                })
+                .unwrap_or_else(|_| {
+                    unsafe {
+                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                    }
+                    false
+                })
+            }
+
+            unsafe extern "C" fn __accumulated_localizations(
+                instance: *const ::std::ffi::c_void,
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) -> bool {
+                ::std::panic::catch_unwind(|| {
+                    let Some(plugin) = __instance_ref(instance) else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    let Some(json) = plugin.plugin.accumulated_localizations() else {
+                        unsafe {
+                            $crate::__private::clear_out_bytes(out_ptr, out_len);
+                        }
+                        return false;
+                    };
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.accumulated_json,
+                            json,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
+                    true
+                })
+                .unwrap_or_else(|_| {
+                    unsafe {
+                        $crate::__private::clear_out_bytes(out_ptr, out_len);
+                    }
+                    false
+                })
+            }
+
             static __AUGUR_PLUGIN_VTABLE: $crate::PluginVTable = $crate::PluginVTable {
                 create: __create,
                 destroy: __destroy,
@@ -293,9 +408,25 @@ macro_rules! export_plugin {
                 status_entries: __status_entries,
             };
 
+            static __AUGUR_PLUGIN_VTABLE_V2: $crate::PluginVTableV2 = $crate::PluginVTableV2 {
+                base: __AUGUR_PLUGIN_VTABLE,
+                host_views: __host_views,
+                host_view_dataset: __host_view_dataset,
+                accumulated_localizations: __accumulated_localizations,
+            };
+
             #[no_mangle]
             pub extern "C" fn augur_plugin_vtable() -> *const $crate::PluginVTable {
                 &__AUGUR_PLUGIN_VTABLE
+            }
+
+            #[no_mangle]
+            pub extern "C" fn augur_plugin_entry_v2() -> $crate::PluginAbiDescriptor {
+                $crate::PluginAbiDescriptor::new(
+                    $crate::PLUGIN_ABI_VERSION_V2,
+                    ::std::mem::size_of::<$crate::PluginVTableV2>(),
+                    (&__AUGUR_PLUGIN_VTABLE_V2 as *const $crate::PluginVTableV2) as usize,
+                )
             }
         };
     };
