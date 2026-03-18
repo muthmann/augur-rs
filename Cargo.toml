@@ -5,16 +5,13 @@ members = [
   "augur-cli",
   "augur-gui",
   "augur-plugin-api",
-  "plugins/hotpixel",
-  "plugins/localization",
-  "plugins/focus-metrics",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
 
 [workspace.dependencies]

@@ -25,9 +25,8 @@ At startup or on rescan, `augur-gui`:
 1. walks `~/.augur/plugins/`
 2. parses each `plugin.toml`
 3. resolves the matching library file
-4. prefers the exported `augur_plugin_entry_v2` ABI descriptor when present
-5. falls back to `augur_plugin_vtable` when ABI v2 is absent
-6. instantiates the plugin and caches its declarative settings schema
+4. loads the exported `augur_plugin_vtable` symbol
+5. instantiates the plugin and caches its declarative settings schema
 
 Loader failures are non-fatal and stay visible in the Plugin Manager window.
 
@@ -39,7 +38,8 @@ The standalone `augur-plugin-api` crate defines the cross-library boundary:
 - `export_plugin!`: exports a panic-safe C vtable
 - `PluginFrame`: zero-copy access to preview pixels and optional raw events
 - `HostOutput`: safe overlay and warning callbacks back into the GUI host
-- `HostContext`: string-keyed context publishing and lookup using serialized JSON bytes
+- `HostContext`: per-frame plus persistent string-keyed JSON context publishing and lookup
+- `EventStoreHandle`: read-only access to the host-retained decoded event history
 - `SettingsSchema` / `StatusEntry`: declarative UI and read-only status reporting
 - `HostViewRegistry`: declarative dataset/view metadata for host-rendered analysis views
 
@@ -64,7 +64,8 @@ The host resolves duplicate ids in plugin execution order:
 - conflicting duplicate ids are ignored and logged
 - dataset payloads are fetched lazily, only when a visible panel or open window needs them
 
-Legacy plugins that export only the old vtable still load, but contribute no host views.
+Host views are part of the single flat runtime vtable. Plugins must rebuild against the current
+`augur-plugin-api` before loading into the host.
 
 ### Example
 
@@ -154,7 +155,10 @@ The old type-indexed `PluginContext` is gone for dynamic plugins. The host now s
 HashMap<String, Vec<u8>>
 ```
 
-Plugins publish and read JSON-serialized values under well-known keys. This keeps the boundary debuggable and works across independently compiled dynamic libraries.
+for per-frame data, plus a second persistent `HashMap<String, Vec<u8>>` that survives between
+frames until analysis state resets. Plugins publish and read JSON-serialized values under
+well-known keys. This keeps the boundary debuggable and works across independently compiled
+dynamic libraries.
 
 ## Settings and Status
 
@@ -169,6 +173,9 @@ Dynamic plugins no longer render `egui` directly. Instead they expose:
 
 `PreviewFrame` still carries optional raw events. The pipeline only fills them when at least one enabled plugin declares `PluginInput::RawEvents`, so the default preview path stays cheap when event-domain plugins are disabled.
 
+In addition, `augur-gui` now retains a memory-budgeted history of decoded events in the host-owned
+EventStore and passes it into every runtime plugin through `EventStoreHandle`.
+
 ## Writing a Dynamic Plugin
 
 1. Create a crate with `crate-type = ["cdylib", "rlib"]`
@@ -182,11 +189,8 @@ The `Plugin` trait includes an optional `dependencies()` method that returns a s
 
 See [augur-plugins](https://github.com/muthmann/augur-plugins) for the template and full contributor guide.
 
-This workspace includes reference plugin crates under:
-
-- `plugins/hotpixel`
-- `plugins/localization`
-- `plugins/focus-metrics`
+This workspace keeps only the built-in ROI-grid implementation. Runtime plugin examples and
+maintained scientific plugins live in [augur-plugins](https://github.com/muthmann/augur-plugins).
 
 ## Files
 
@@ -199,11 +203,11 @@ This workspace includes reference plugin crates under:
 | `augur-gui/src/plugin_settings_ui.rs` | declarative settings and status renderer |
 | `augur-gui/src/plugin.rs` | built-in ROI Grid trait surface |
 | `augur-gui/src/plugins/roi_grid.rs` | built-in ROI Grid implementation |
-| `plugins/*/src/lib.rs` | reference dynamic plugins |
+| `augur-plugins/plugins/*/src/lib.rs` | maintained runtime plugin implementations |
 
 ## Verification
 
 ```bash
 cargo build --workspace
-cargo test -p augur-plugin-api -p augur-plugin-hotpixel -p augur-plugin-localization -p augur-plugin-focus-metrics -p augur-gui
+cargo test -p augur-plugin-api -p augur-gui
 ```

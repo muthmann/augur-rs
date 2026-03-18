@@ -1,5 +1,0 @@
-name = "Focus Metrics"
-version = "0.1.0"
-domain = "Reference"
-description = "Tracks focus quality from localization fits or a frequency-domain sharpness estimate."
-library = "augur_plugin_focus_metrics"

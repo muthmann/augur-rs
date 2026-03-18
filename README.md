@@ -151,15 +151,18 @@ captures/
 
 ## Plugin Ecosystem
 
-The core AugurRS repo defines the plugin API and hosts the runtime loader. Reference dynamic plugins currently live in this workspace under `plugins/`, and the long-term home for the broader plugin registry remains **[augur-plugins](https://github.com/muthmann/augur-plugins)**.
+The core AugurRS repo defines the plugin API and hosts the runtime loader. Runtime analysis
+plugins live in the companion **[augur-plugins](https://github.com/muthmann/augur-plugins)**
+repository; this workspace keeps only the built-in ROI-grid tool plus the host/runtime API.
 
 The plugin system is a first-class extension point, not an afterthought. Plugins:
 
 - run live alongside the preview stream, frame by frame
 - are loaded at runtime from `~/.augur/plugins/`
-- share derived data with each other through a per-frame string-keyed context bus
+- share derived data through per-frame and persistent string-keyed JSON context buses
 - declare their input kind (decoded frame, raw events, or upstream plugin results)
 - run in ordered phases so one plugin can feed the next within the same frame
+- can query retained decoded-event history through the host-owned EventStore
 - expose settings and status through a declarative JSON schema instead of direct `egui` access
 
 Anyone can write a plugin. The API is documented in [Plugin Architecture](./docs/features/analysis-plugins.md).
@@ -174,16 +177,14 @@ Plugins can operate on anything the preview pipeline produces:
 | Raw `CdEvent` stream | Event-based reconstruction, spatiotemporal filtering, spike detection |
 | Upstream plugin results | Chained metrics, decision logic that consumes another plugin's output |
 
-### Available Plugins
-
-This workspace currently includes reference dynamic plugins for:
+### Built-In / Runtime Split
 
 | Plugin | What it does |
 |---|---|
-| **Hotpixel Detection** | Detects persistently noisy pixels live and highlights them in the preview |
 | **ROI Grid** | Built-in plugin that partitions the sensor around masked hotpixels and offers one-click "Use as ROI" |
-| **Molecule Localization** | Wavelet denoising, center-of-mass seeding, sub-pixel elliptical Gaussian fitting — SMLM-grade localization from the live event stream |
-| **Focus Metrics** | Mean PSF sigma, FFT high-frequency power, and astigmatic ratio — live focus feedback for event-camera imaging |
+
+Scientific runtime plugins such as Hotpixel Detection, Molecule Localization, Focus Metrics, and
+the `eveSMLM` chain are maintained in [augur-plugins](https://github.com/muthmann/augur-plugins).
 
 Build a plugin crate, copy its `plugin.toml` plus the generated `.dylib/.so/.dll` into `~/.augur/plugins/<plugin-name>/`, then use the GUI's **Plugins** menu and **Plugin Manager** window to scan, enable, disable, and reload it without recompiling `augur-gui`.
 

@@ -16,7 +16,7 @@ FFI surface one ad hoc field at a time.
 
 ## Decision
 
-Adopt a host-owned dataset/view registry with a versioned ABI v2 entrypoint.
+Adopt a host-owned dataset/view registry on the shared runtime plugin vtable.
 
 The new model splits plugin-facing contributions into:
 
@@ -24,13 +24,8 @@ The new model splits plugin-facing contributions into:
 - view descriptors, which declare stable ids, placements, and host-rendered view kinds
 - on-demand dataset payload fetches keyed by dataset id
 
-Runtime plugins now export both:
-
-- the legacy `augur_plugin_vtable` symbol for backward compatibility
-- a new `augur_plugin_entry_v2` descriptor that points to a `PluginVTableV2`
-
-The host prefers ABI v2 when available and falls back to the legacy vtable only when the new
-symbol is absent.
+Runtime plugins export a single `augur_plugin_vtable`, and the host-view callbacks live directly
+on that flat vtable.
 
 Descriptor conflicts are resolved in existing plugin execution order:
 
@@ -44,14 +39,14 @@ Descriptor conflicts are resolved in existing plugin execution order:
 
 - `augur-gui` can host generic tables and density views without plugin-specific UI code
 - built-in and runtime plugins now share one host-view path
-- legacy plugins keep loading unchanged
+- built-in and runtime plugins now share one host-view path
 - plugin outputs stay machine-readable and easier to migrate across repositories
 
 ### Negative
 
 - the host now owns more UI state: resolved registries, dataset caches, and per-view render state
 - plugin authors must keep descriptor metadata stable when intentionally sharing ids
-- the ABI surface is slightly larger and requires explicit version validation
+- the runtime ABI surface is slightly larger and requires coordinated plugin rebuilds when it changes
 
 ## Alternatives Considered
 

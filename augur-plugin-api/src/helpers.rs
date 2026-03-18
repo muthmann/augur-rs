@@ -2,8 +2,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     ffi::{
-        AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-        FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginInput,
+        AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle, FfiOutputCallbacks,
+        FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
+        PluginInput,
     },
     settings::{SettingsSchema, StatusEntry},
     HostViewRegistry,
@@ -90,6 +91,42 @@ impl<'a> HostOutput<'a> {
     }
 }
 
+pub struct EventStoreHandle<'a> {
+    raw: &'a FfiEventStoreHandle,
+}
+
+impl<'a> EventStoreHandle<'a> {
+    pub fn new(raw: &'a FfiEventStoreHandle) -> Self {
+        Self { raw }
+    }
+
+    pub fn all_events(&self) -> &[FfiCdEvent] {
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+        unsafe {
+            (self.raw.all_events)(self.raw.ctx, &mut out_ptr, &mut out_len);
+        }
+        unsafe { slice_from_parts(out_ptr, out_len) }
+    }
+
+    pub fn events_in_range(&self, start_us: u64, end_us: u64) -> &[FfiCdEvent] {
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+        unsafe {
+            (self.raw.events_in_range)(self.raw.ctx, start_us, end_us, &mut out_ptr, &mut out_len);
+        }
+        unsafe { slice_from_parts(out_ptr, out_len) }
+    }
+
+    pub fn oldest_timestamp_us(&self) -> u64 {
+        unsafe { (self.raw.oldest_timestamp_us)(self.raw.ctx) }
+    }
+
+    pub fn frame_count(&self) -> usize {
+        unsafe { (self.raw.frame_count)(self.raw.ctx) }
+    }
+}
+
 pub struct HostContext<'a> {
     raw: &'a mut FfiPluginContext,
 }
@@ -110,16 +147,52 @@ impl<'a> HostContext<'a> {
                 self.raw.ctx,
                 FfiString::from(key),
                 FfiSlice::from_slice(&json),
+            )
+        };
+        Ok(())
+    }
+
+    pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, serde_json::Error> {
+        self.get_with(self.raw.get, key)
+    }
+
+    pub fn publish_persistent<T: Serialize>(
+        &mut self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), serde_json::Error> {
+        let json = serde_json::to_vec(value)?;
+        unsafe {
+            (self.raw.publish_persistent)(
+                self.raw.ctx,
+                FfiString::from(key),
+                FfiSlice::from_slice(&json),
             );
         }
         Ok(())
     }
 
-    pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, serde_json::Error> {
+    pub fn get_persistent<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, serde_json::Error> {
+        self.get_with(self.raw.get_persistent, key)
+    }
+
+    fn get_with<T: DeserializeOwned>(
+        &self,
+        callback: unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            FfiString,
+            *mut *const u8,
+            *mut usize,
+        ) -> bool,
+        key: &str,
+    ) -> Result<Option<T>, serde_json::Error> {
         let mut out_ptr = std::ptr::null();
         let mut out_len = 0usize;
         let found = unsafe {
-            (self.raw.get)(
+            callback(
                 self.raw.ctx,
                 FfiString::from(key),
                 &mut out_ptr,
@@ -161,6 +234,7 @@ pub trait Plugin: Default {
         frame: &PluginFrame<'_>,
         output: &mut HostOutput<'_>,
         context: &mut HostContext<'_>,
+        event_store: &EventStoreHandle<'_>,
     );
 
     fn settings_schema(&self) -> SettingsSchema {
@@ -186,11 +260,12 @@ pub trait Plugin: Default {
     fn host_view_dataset(&self, _dataset_id: &str) -> Option<Vec<u8>> {
         None
     }
+}
 
-    /// Deprecated compatibility hook for legacy hosts.
-    ///
-    /// Prefer `host_views()` plus `host_view_dataset()` for new plugins.
-    fn accumulated_localizations(&self) -> Option<Vec<u8>> {
-        None
+unsafe fn slice_from_parts<'a>(ptr: *const FfiCdEvent, len: usize) -> &'a [FfiCdEvent] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, len)
     }
 }

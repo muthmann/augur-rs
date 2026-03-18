@@ -14,11 +14,10 @@ use augur_core::{
     pipeline::PreviewFrame,
 };
 use augur_plugin_api::{
-    AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostViewRegistry, LocalizationTable,
-    PluginAbiDescriptor, PluginEntry, PluginEntryV2, PluginInput, PluginVTable, PluginVTableV2,
-    SettingsSchema, StatusEntry, PLUGIN_ABI_VERSION_V2, PLUGIN_ENTRY_SYMBOL,
-    PLUGIN_ENTRY_V2_SYMBOL,
+    AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle,
+    FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
+    FfiSubpixelMarker, HostViewRegistry, PluginEntry, PluginInput, PluginVTable, SettingsSchema,
+    StatusEntry, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -33,46 +32,24 @@ pub struct PluginManifest {
     pub library: Option<String>,
 }
 
-impl PluginManifest {
-    fn fallback(entry_dir: &Path) -> Self {
-        Self {
-            name: entry_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Unknown Plugin".into()),
-            version: "-".into(),
-            description: None,
-            domain: None,
-            library: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PluginSpec {
     entry_dir: PathBuf,
-    manifest: PluginManifest,
+    manifest: Option<PluginManifest>,
+    display_name: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct HostViewAccessors {
-    host_views: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
-    host_view_dataset:
-        unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
-    accumulated_localizations:
-        unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize) -> bool,
-}
-
-#[derive(Clone, Copy)]
-struct LoadedPluginApi {
-    vtable: PluginVTable,
-    host_views: Option<HostViewAccessors>,
+impl PluginSpec {
+    fn manifest(&self) -> Result<&PluginManifest, String> {
+        self.manifest
+            .as_ref()
+            .ok_or_else(|| format!("plugin manifest missing for {}", self.entry_dir.display()))
+    }
 }
 
 pub struct DynPlugin {
     _lib: Library,
     vtable: PluginVTable,
-    host_view_accessors: Option<HostViewAccessors>,
     instance: *mut c_void,
     manifest: PluginManifest,
     cached_name: String,
@@ -83,24 +60,37 @@ pub struct DynPlugin {
 }
 
 impl DynPlugin {
-    fn load(spec: PluginSpec) -> Result<Self, String> {
-        let library_path = find_library_file(&spec.entry_dir, &spec.manifest)?;
+    fn load(spec: &PluginSpec) -> Result<Self, String> {
+        let manifest = spec.manifest()?;
+        let library_path = find_library_file(&spec.entry_dir, manifest)?;
         let lib = unsafe { Library::new(&library_path) }
             .map_err(|err| format!("loading {} failed: {err}", library_path.display()))?;
+        let entry = unsafe { lib.get::<PluginEntry>(b"augur_plugin_vtable\0") }
+            .map_err(|err| format!("loading symbol {PLUGIN_ENTRY_SYMBOL} failed: {err}"))?;
+        let vtable_ptr = unsafe { entry() };
+        if vtable_ptr.is_null() {
+            return Err("plugin entry returned a null vtable pointer".into());
+        }
 
-        let api = unsafe { load_plugin_api(&lib)? };
+        let expected_size = std::mem::size_of::<PluginVTable>();
+        let reported_size = unsafe { (*vtable_ptr).vtable_size };
+        if reported_size != expected_size {
+            return Err(format!(
+                "plugin vtable size mismatch (plugin: {reported_size}, host: {expected_size}) — \
+                 rebuild the plugin against the current augur-plugin-api"
+            ));
+        }
 
-        let instance = unsafe { (api.vtable.create)() };
+        let instance = unsafe { ((*vtable_ptr).create)() };
         if instance.is_null() {
             return Err("plugin create() returned a null instance".into());
         }
 
         let mut plugin = Self {
             _lib: lib,
-            vtable: api.vtable,
-            host_view_accessors: api.host_views,
+            vtable: unsafe { *vtable_ptr },
             instance,
-            manifest: spec.manifest,
+            manifest: manifest.clone(),
             cached_name: String::new(),
             cached_description: String::new(),
             cached_schema: SettingsSchema::default(),
@@ -246,35 +236,14 @@ impl DynPlugin {
     }
 
     pub fn host_views(&self) -> Result<HostViewRegistry, String> {
-        let Some(accessors) = self.host_view_accessors else {
-            return Ok(HostViewRegistry::default());
-        };
-        self.read_json(accessors.host_views)
+        self.read_json(self.vtable.host_views)
     }
 
     pub fn host_view_dataset(&self, dataset_id: &str) -> Result<Option<Vec<u8>>, String> {
-        let Some(accessors) = self.host_view_accessors else {
-            return Ok(None);
-        };
         let bytes = self.call_optional_bytes(|inst, ptr, len| unsafe {
-            (accessors.host_view_dataset)(inst, FfiString::from(dataset_id), ptr, len)
+            (self.vtable.host_view_dataset)(inst, FfiString::from(dataset_id), ptr, len)
         });
         Ok(bytes.map(|b| b.to_vec()))
-    }
-
-    #[allow(dead_code)]
-    pub fn accumulated_localizations(&self) -> Result<Option<LocalizationTable>, String> {
-        let Some(accessors) = self.host_view_accessors else {
-            return Ok(None);
-        };
-        let Some(bytes) = self.call_optional_bytes(|inst, ptr, len| unsafe {
-            (accessors.accumulated_localizations)(inst, ptr, len)
-        }) else {
-            return Ok(None);
-        };
-        serde_json::from_slice(bytes)
-            .map(Some)
-            .map_err(|err| format!("accumulated localizations JSON invalid: {err}"))
     }
 
     fn call_optional_bytes(
@@ -292,31 +261,17 @@ impl DynPlugin {
     pub fn process_frame(
         &mut self,
         frame: &PreviewFrame,
+        raw_events: &[FfiCdEvent],
+        event_store: &EventStore,
         analysis_output: &mut AnalysisOutput,
         context_data: &mut HashMap<String, Vec<u8>>,
+        persistent_data: &mut HashMap<String, Vec<u8>>,
     ) {
-        // Only pay the conversion cost when the plugin actually consumes events.
-        let raw_events: Vec<FfiCdEvent> = if self.input_kind == PluginInput::FrameOnly {
-            Vec::new()
-        } else {
-            frame
-                .events
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|event| FfiCdEvent {
-                    timestamp: event.timestamp,
-                    x: event.x,
-                    y: event.y,
-                    polarity: u8::from(event.polarity),
-                })
-                .collect()
-        };
         let ffi_frame = FfiPreviewFrame {
             width: frame.width,
             height: frame.height,
             pixels: FfiSlice::from_slice(&frame.pixels),
-            events: FfiSlice::from_slice(&raw_events),
+            events: FfiSlice::from_slice(raw_events),
             window_start_us: frame.window_start_us,
             window_end_us: frame.window_end_us,
         };
@@ -324,7 +279,11 @@ impl DynPlugin {
         let mut output_bridge = OutputBridge {
             output: analysis_output,
         };
-        let mut context_bridge = ContextBridge { data: context_data };
+        let mut context_bridge = ContextBridge {
+            data: context_data,
+            persistent_data,
+        };
+        let store_bridge = EventStoreBridge { store: event_store };
         let mut callbacks = FfiOutputCallbacks {
             ctx: (&mut output_bridge as *mut OutputBridge).cast(),
             add_highlight_pixels,
@@ -333,9 +292,18 @@ impl DynPlugin {
         };
         let mut plugin_context = FfiPluginContext {
             ctx: (&mut context_bridge as *mut ContextBridge).cast(),
-            raw_events: FfiSlice::from_slice(&raw_events),
+            raw_events: FfiSlice::from_slice(raw_events),
             publish: publish_context_value,
             get: get_context_value,
+            publish_persistent: publish_persistent_context_value,
+            get_persistent: get_persistent_context_value,
+        };
+        let ffi_event_store = FfiEventStoreHandle {
+            ctx: (&store_bridge as *const EventStoreBridge).cast(),
+            all_events: all_events_callback,
+            events_in_range: events_in_range_callback,
+            oldest_timestamp_us: oldest_timestamp_callback,
+            frame_count: frame_count_callback,
         };
 
         unsafe {
@@ -344,6 +312,7 @@ impl DynPlugin {
                 &ffi_frame,
                 &mut callbacks,
                 &mut plugin_context,
+                &ffi_event_store,
             );
         }
     }
@@ -380,22 +349,42 @@ impl ManagedPlugin {
         self.plugin
             .as_ref()
             .map(|plugin| plugin.name())
-            .unwrap_or(&self.spec.manifest.name)
+            .or_else(|| {
+                self.spec
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| manifest.name.as_str())
+            })
+            .unwrap_or(&self.spec.display_name)
     }
 
     pub fn description(&self) -> &str {
         self.plugin
             .as_ref()
             .map(|plugin| plugin.description())
-            .unwrap_or_else(|| self.spec.manifest.description.as_deref().unwrap_or(""))
+            .or_else(|| {
+                self.spec
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.description.as_deref())
+            })
+            .unwrap_or("")
     }
 
     pub fn domain(&self) -> &str {
-        self.spec.manifest.domain.as_deref().unwrap_or("-")
+        self.spec
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.domain.as_deref())
+            .unwrap_or("-")
     }
 
     pub fn version(&self) -> &str {
-        &self.spec.manifest.version
+        self.spec
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.version.as_str())
+            .unwrap_or("-")
     }
 
     pub fn status_label(&self) -> &'static str {
@@ -467,19 +456,13 @@ impl PluginManager {
         let Some(record) = self.records.get_mut(index) else {
             return Err(format!("plugin index {index} is out of range"));
         };
-        let spec = record.spec.clone();
-        match DynPlugin::load(spec) {
-            Ok(plugin) => {
-                record.plugin = Some(plugin);
-                record.load_error = None;
-                Ok(())
-            }
-            Err(err) => {
-                record.plugin = None;
-                record.load_error = Some(err.clone());
-                Err(err)
-            }
-        }
+        let refreshed = load_record(record.spec.entry_dir.clone());
+        let result = match &refreshed.load_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        };
+        *record = refreshed;
+        result
     }
     pub fn open_plugins_dir(&self) -> Result<(), String> {
         fs::create_dir_all(&self.plugins_dir)
@@ -494,6 +477,11 @@ struct OutputBridge<'a> {
 
 struct ContextBridge<'a> {
     data: &'a mut HashMap<String, Vec<u8>>,
+    persistent_data: &'a mut HashMap<String, Vec<u8>>,
+}
+
+struct EventStoreBridge<'a> {
+    store: &'a EventStore,
 }
 
 unsafe extern "C" fn add_highlight_pixels(
@@ -578,6 +566,22 @@ unsafe extern "C" fn publish_context_value(ctx: *mut c_void, key: FfiString, dat
     bridge.data.insert(key.to_owned(), data.as_slice().to_vec());
 }
 
+unsafe extern "C" fn publish_persistent_context_value(
+    ctx: *mut c_void,
+    key: FfiString,
+    data: FfiSlice<u8>,
+) {
+    let Some(bridge) = ctx.cast::<ContextBridge>().as_mut() else {
+        return;
+    };
+    let Ok(key) = key.as_str() else {
+        return;
+    };
+    bridge
+        .persistent_data
+        .insert(key.to_owned(), data.as_slice().to_vec());
+}
+
 unsafe extern "C" fn get_context_value(
     ctx: *mut c_void,
     key: FfiString,
@@ -608,72 +612,95 @@ unsafe extern "C" fn get_context_value(
     }
 }
 
-unsafe fn load_plugin_api(lib: &Library) -> Result<LoadedPluginApi, String> {
-    match lib.get::<PluginEntryV2>(b"augur_plugin_entry_v2\0") {
-        Ok(entry) => api_from_v2_descriptor(entry()),
-        Err(err) => {
-            if !is_missing_symbol_error(&err) {
-                return Err(format!(
-                    "loading symbol {PLUGIN_ENTRY_V2_SYMBOL} failed: {err}"
-                ));
-            }
+unsafe extern "C" fn get_persistent_context_value(
+    ctx: *mut c_void,
+    key: FfiString,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> bool {
+    if out_ptr.is_null() || out_len.is_null() {
+        return false;
+    }
 
-            let entry = lib
-                .get::<PluginEntry>(b"augur_plugin_vtable\0")
-                .map_err(|err| format!("loading symbol {PLUGIN_ENTRY_SYMBOL} failed: {err}"))?;
-            api_from_legacy_vtable(entry())
+    let found = (|| {
+        let bridge = ctx.cast::<ContextBridge>().as_mut()?;
+        let key = key.as_str().ok()?;
+        bridge.persistent_data.get(key)
+    })();
+
+    match found {
+        Some(bytes) => {
+            *out_ptr = bytes.as_ptr();
+            *out_len = bytes.len();
+            true
+        }
+        None => {
+            *out_ptr = std::ptr::null();
+            *out_len = 0;
+            false
         }
     }
 }
 
-fn is_missing_symbol_error(err: &libloading::Error) -> bool {
-    if matches!(err, libloading::Error::DlSym { .. }) {
-        return true;
-    }
-    let text = err.to_string();
-    text.contains("symbol not found") || text.contains("undefined symbol")
+unsafe extern "C" fn all_events_callback(
+    ctx: *const c_void,
+    out_ptr: *mut *const FfiCdEvent,
+    out_len: *mut usize,
+) {
+    let events = ctx
+        .cast::<EventStoreBridge>()
+        .as_ref()
+        .map(|bridge| bridge.store.all_events())
+        .unwrap_or(&[]);
+    write_event_slice(events, out_ptr, out_len);
 }
 
-fn api_from_v2_descriptor(descriptor: PluginAbiDescriptor) -> Result<LoadedPluginApi, String> {
-    if descriptor.abi_version != PLUGIN_ABI_VERSION_V2 {
-        return Err(format!(
-            "plugin ABI version {} is incompatible with host ABI {}",
-            descriptor.abi_version, PLUGIN_ABI_VERSION_V2
-        ));
-    }
-    if descriptor.vtable_size < std::mem::size_of::<PluginVTableV2>() {
-        return Err(format!(
-            "plugin vtable size {} is smaller than expected {}",
-            descriptor.vtable_size,
-            std::mem::size_of::<PluginVTableV2>()
-        ));
-    }
-
-    let vtable_ptr = descriptor.vtable_ptr::<PluginVTableV2>();
-    if vtable_ptr.is_null() {
-        return Err("plugin ABI descriptor returned a null vtable pointer".into());
-    }
-
-    let vtable = unsafe { *vtable_ptr };
-    Ok(LoadedPluginApi {
-        vtable: vtable.base,
-        host_views: Some(HostViewAccessors {
-            host_views: vtable.host_views,
-            host_view_dataset: vtable.host_view_dataset,
-            accumulated_localizations: vtable.accumulated_localizations,
-        }),
-    })
+unsafe extern "C" fn events_in_range_callback(
+    ctx: *const c_void,
+    start_us: u64,
+    end_us: u64,
+    out_ptr: *mut *const FfiCdEvent,
+    out_len: *mut usize,
+) {
+    let events = ctx
+        .cast::<EventStoreBridge>()
+        .as_ref()
+        .map(|bridge| bridge.store.events_in_range(start_us, end_us))
+        .unwrap_or(&[]);
+    write_event_slice(events, out_ptr, out_len);
 }
 
-fn api_from_legacy_vtable(vtable_ptr: *const PluginVTable) -> Result<LoadedPluginApi, String> {
-    if vtable_ptr.is_null() {
-        return Err("plugin entry returned a null vtable pointer".into());
+unsafe extern "C" fn oldest_timestamp_callback(ctx: *const c_void) -> u64 {
+    ctx.cast::<EventStoreBridge>()
+        .as_ref()
+        .and_then(|bridge| bridge.store.oldest_timestamp_us())
+        .unwrap_or(0)
+}
+
+unsafe extern "C" fn frame_count_callback(ctx: *const c_void) -> usize {
+    ctx.cast::<EventStoreBridge>()
+        .as_ref()
+        .map(|bridge| bridge.store.frame_count())
+        .unwrap_or(0)
+}
+
+unsafe fn write_event_slice(
+    events: &[FfiCdEvent],
+    out_ptr: *mut *const FfiCdEvent,
+    out_len: *mut usize,
+) {
+    if out_ptr.is_null() || out_len.is_null() {
+        return;
     }
 
-    Ok(LoadedPluginApi {
-        vtable: unsafe { *vtable_ptr },
-        host_views: None,
-    })
+    if events.is_empty() {
+        *out_ptr = std::ptr::null();
+        *out_len = 0;
+        return;
+    }
+
+    *out_ptr = events.as_ptr();
+    *out_len = events.len();
 }
 
 fn ffi_string_to_option(ffi: FfiString, context: &str) -> Result<Option<String>, String> {
@@ -690,13 +717,18 @@ unsafe fn bytes_from_out_ptr<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 }
 
 fn load_record(entry_dir: PathBuf) -> ManagedPlugin {
+    let display_name = entry_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Unknown Plugin".into());
     let manifest = match read_manifest(&entry_dir) {
-        Ok(manifest) => manifest,
+        Ok(manifest) => Some(manifest),
         Err(err) => {
             return ManagedPlugin {
                 spec: PluginSpec {
-                    entry_dir: entry_dir.clone(),
-                    manifest: PluginManifest::fallback(&entry_dir),
+                    entry_dir,
+                    manifest: None,
+                    display_name,
                 },
                 plugin: None,
                 load_error: Some(err),
@@ -707,8 +739,9 @@ fn load_record(entry_dir: PathBuf) -> ManagedPlugin {
     let spec = PluginSpec {
         entry_dir,
         manifest,
+        display_name,
     };
-    match DynPlugin::load(spec.clone()) {
+    match DynPlugin::load(&spec) {
         Ok(plugin) => ManagedPlugin {
             spec,
             plugin: Some(plugin),
@@ -853,161 +886,83 @@ pub fn plugin_phase_label(input: PluginInput) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use augur_plugin_api::PluginVTableV2;
 
-    unsafe extern "C" fn create() -> *mut c_void {
-        std::ptr::null_mut()
-    }
-
-    unsafe extern "C" fn destroy(_instance: *mut c_void) {}
-
-    unsafe extern "C" fn name(_instance: *const c_void) -> FfiString {
-        FfiString::default()
-    }
-
-    unsafe extern "C" fn description(_instance: *const c_void) -> FfiString {
-        FfiString::default()
-    }
-
-    unsafe extern "C" fn enabled(_instance: *const c_void) -> bool {
-        false
-    }
-
-    unsafe extern "C" fn set_enabled(_instance: *mut c_void, _enabled: bool) {}
-
-    unsafe extern "C" fn reset(_instance: *mut c_void) {}
-
-    unsafe extern "C" fn input_kind(_instance: *const c_void) -> PluginInput {
-        PluginInput::FrameOnly
-    }
-
-    unsafe extern "C" fn num_dependencies(_instance: *const c_void) -> usize {
-        0
-    }
-
-    unsafe extern "C" fn dependency(_instance: *const c_void, _index: usize) -> FfiString {
-        FfiString::default()
-    }
-
-    unsafe extern "C" fn process_frame(
-        _instance: *mut c_void,
-        _frame: *const FfiPreviewFrame,
-        _output: *mut FfiOutputCallbacks,
-        _context: *mut FfiPluginContext,
-    ) {
-    }
-
-    unsafe extern "C" fn write_empty_json(
-        _instance: *const c_void,
-        out_ptr: *mut *const u8,
-        out_len: *mut usize,
-    ) {
-        if !out_ptr.is_null() {
-            *out_ptr = std::ptr::null();
-        }
-        if !out_len.is_null() {
-            *out_len = 0;
+    fn event(timestamp: u64, x: u16) -> FfiCdEvent {
+        FfiCdEvent {
+            timestamp,
+            x,
+            y: 0,
+            polarity: 1,
         }
     }
-
-    unsafe extern "C" fn get_setting(
-        _instance: *const c_void,
-        _key: FfiString,
-        _out_ptr: *mut *const u8,
-        _out_len: *mut usize,
-    ) -> bool {
-        false
-    }
-
-    unsafe extern "C" fn set_setting(
-        _instance: *mut c_void,
-        _key: FfiString,
-        _value: FfiSlice<u8>,
-    ) -> bool {
-        false
-    }
-
-    unsafe extern "C" fn accumulated_localizations(
-        _instance: *const c_void,
-        _out_ptr: *mut *const u8,
-        _out_len: *mut usize,
-    ) -> bool {
-        false
-    }
-
-    unsafe extern "C" fn host_view_dataset(
-        _instance: *const c_void,
-        _dataset_id: FfiString,
-        _out_ptr: *mut *const u8,
-        _out_len: *mut usize,
-    ) -> bool {
-        false
-    }
-
-    static LEGACY_VTABLE: PluginVTable = PluginVTable {
-        create,
-        destroy,
-        name,
-        description,
-        enabled,
-        set_enabled,
-        reset,
-        input_kind,
-        num_dependencies,
-        dependency,
-        process_frame,
-        settings_schema: write_empty_json,
-        get_setting,
-        set_setting,
-        status_entries: write_empty_json,
-    };
-
-    static V2_VTABLE: PluginVTableV2 = PluginVTableV2 {
-        base: LEGACY_VTABLE,
-        host_views: write_empty_json,
-        host_view_dataset,
-        accumulated_localizations,
-    };
 
     #[test]
-    fn api_from_v2_descriptor_uses_host_view_accessors() {
-        let descriptor = PluginAbiDescriptor::new(
-            PLUGIN_ABI_VERSION_V2,
-            std::mem::size_of::<PluginVTableV2>(),
-            (&V2_VTABLE as *const PluginVTableV2) as usize,
+    fn event_store_callbacks_expose_retained_history() {
+        let mut store = EventStore::default();
+        store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
+        store.push_frame(&[event(30, 3)], 30, 30);
+        let bridge = EventStoreBridge { store: &store };
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+
+        unsafe {
+            all_events_callback(
+                (&bridge as *const EventStoreBridge).cast(),
+                &mut out_ptr,
+                &mut out_len,
+            );
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
+        assert_eq!(slice, store.all_events());
+        assert_eq!(
+            unsafe { oldest_timestamp_callback((&bridge as *const EventStoreBridge).cast()) },
+            10
         );
-
-        let api = api_from_v2_descriptor(descriptor).expect("v2 descriptor must load");
-        assert!(api.host_views.is_some());
+        assert_eq!(
+            unsafe { frame_count_callback((&bridge as *const EventStoreBridge).cast()) },
+            2
+        );
     }
 
     #[test]
-    fn api_from_v2_descriptor_rejects_invalid_metadata() {
-        let err = match api_from_v2_descriptor(PluginAbiDescriptor::new(
-            PLUGIN_ABI_VERSION_V2 + 1,
-            std::mem::size_of::<PluginVTableV2>(),
-            (&V2_VTABLE as *const PluginVTableV2) as usize,
-        )) {
-            Ok(_) => panic!("unexpected ABI version must fail"),
-            Err(err) => err,
-        };
-        assert!(err.contains("incompatible"));
+    fn range_callback_filters_event_history() {
+        let mut store = EventStore::default();
+        store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
+        store.push_frame(&[event(30, 3), event(40, 4)], 30, 40);
+        let bridge = EventStoreBridge { store: &store };
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
 
-        let err = match api_from_v2_descriptor(PluginAbiDescriptor::new(
-            PLUGIN_ABI_VERSION_V2,
-            std::mem::size_of::<PluginVTable>(),
-            (&V2_VTABLE as *const PluginVTableV2) as usize,
-        )) {
-            Ok(_) => panic!("undersized vtable must fail"),
-            Err(err) => err,
-        };
-        assert!(err.contains("smaller than expected"));
+        unsafe {
+            events_in_range_callback(
+                (&bridge as *const EventStoreBridge).cast(),
+                15,
+                35,
+                &mut out_ptr,
+                &mut out_len,
+            );
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
+        assert_eq!(slice, &[event(20, 2), event(30, 3)]);
     }
 
     #[test]
-    fn api_from_legacy_vtable_falls_back_without_host_views() {
-        let api =
-            api_from_legacy_vtable(&LEGACY_VTABLE as *const PluginVTable).expect("legacy vtable");
-        assert!(api.host_views.is_none());
+    fn missing_manifest_uses_directory_name_for_display() {
+        let record = ManagedPlugin {
+            spec: PluginSpec {
+                entry_dir: PathBuf::from("/tmp/example-plugin"),
+                manifest: None,
+                display_name: "example-plugin".into(),
+            },
+            plugin: None,
+            load_error: Some("manifest missing".into()),
+        };
+
+        assert_eq!(record.name(), "example-plugin");
+        assert_eq!(record.description(), "");
+        assert_eq!(record.domain(), "-");
+        assert_eq!(record.version(), "-");
     }
 }

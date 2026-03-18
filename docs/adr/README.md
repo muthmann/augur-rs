@@ -20,3 +20,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 004: Cross-Platform Release Pipeline With macOS DMG Distribution](./004-cross-platform-release-pipeline.md)
 - [ADR 005: Shared Preview Workspace State for 2D/3D GUI Views](./005-shared-preview-workspace.md)
 - [ADR 006: Host-Owned Dataset/View Registry for Plugin Outputs](./006-host-view-registry.md)
+- [ADR 007: Host-Owned EventStore for Plugin History](./007-event-store-history.md)

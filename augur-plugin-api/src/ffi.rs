@@ -186,6 +186,22 @@ pub struct FfiOutputCallbacks {
 pub type ContextPublishFn = unsafe extern "C" fn(*mut c_void, FfiString, FfiSlice<u8>);
 pub type ContextGetFn =
     unsafe extern "C" fn(*mut c_void, FfiString, *mut *const u8, *mut usize) -> bool;
+pub type EventStoreAllEventsFn =
+    unsafe extern "C" fn(*const c_void, *mut *const FfiCdEvent, *mut usize);
+pub type EventStoreQueryRangeFn =
+    unsafe extern "C" fn(*const c_void, u64, u64, *mut *const FfiCdEvent, *mut usize);
+pub type EventStoreOldestTsFn = unsafe extern "C" fn(*const c_void) -> u64;
+pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiEventStoreHandle {
+    pub ctx: *const c_void,
+    pub all_events: EventStoreAllEventsFn,
+    pub events_in_range: EventStoreQueryRangeFn,
+    pub oldest_timestamp_us: EventStoreOldestTsFn,
+    pub frame_count: EventStoreFrameCountFn,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -194,11 +210,16 @@ pub struct FfiPluginContext {
     pub raw_events: FfiSlice<FfiCdEvent>,
     pub publish: ContextPublishFn,
     pub get: ContextGetFn,
+    pub publish_persistent: ContextPublishFn,
+    pub get_persistent: ContextGetFn,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PluginVTable {
+    /// Size of this struct in bytes. The host uses this to detect plugins
+    /// compiled against an older (smaller) API before copying the vtable.
+    pub vtable_size: usize,
     pub create: unsafe extern "C" fn() -> *mut c_void,
     pub destroy: unsafe extern "C" fn(*mut c_void),
     pub name: unsafe extern "C" fn(*const c_void) -> FfiString,
@@ -214,50 +235,18 @@ pub struct PluginVTable {
         *const FfiPreviewFrame,
         *mut FfiOutputCallbacks,
         *mut FfiPluginContext,
+        *const FfiEventStoreHandle,
     ),
     pub settings_schema: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub get_setting:
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
     pub set_setting: unsafe extern "C" fn(*mut c_void, FfiString, FfiSlice<u8>) -> bool,
     pub status_entries: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PluginVTableV2 {
-    pub base: PluginVTable,
     pub host_views: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub host_view_dataset:
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
-    pub accumulated_localizations:
-        unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize) -> bool,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginAbiDescriptor {
-    pub abi_version: u32,
-    pub vtable_size: usize,
-    pub vtable: usize,
-}
-
-impl PluginAbiDescriptor {
-    pub const fn new(abi_version: u32, vtable_size: usize, vtable: usize) -> Self {
-        Self {
-            abi_version,
-            vtable_size,
-            vtable,
-        }
-    }
-
-    pub fn vtable_ptr<T>(&self) -> *const T {
-        self.vtable as *const T
-    }
 }
 
 pub type PluginEntry = unsafe extern "C" fn() -> *const PluginVTable;
-pub type PluginEntryV2 = unsafe extern "C" fn() -> PluginAbiDescriptor;
 
 pub const PLUGIN_ENTRY_SYMBOL: &str = "augur_plugin_vtable";
-pub const PLUGIN_ENTRY_V2_SYMBOL: &str = "augur_plugin_entry_v2";
-pub const PLUGIN_ABI_VERSION_V2: u32 = 2;

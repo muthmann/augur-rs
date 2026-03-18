@@ -33,7 +33,7 @@ Each plugin directory must contain a `plugin.toml`:
 
 ```toml
 name = "Hotpixel Detection"
-version = "0.1.0"
+version = "0.2.0"
 description = "Detects persistently noisy pixels."
 domain = "general"
 library = "augur_plugin_hotpixel"
@@ -62,24 +62,11 @@ The GUI exposes a dedicated Plugin Manager window:
 
 Load failures are recorded per plugin instead of aborting the app.
 
-## Reference Plugins in This Workspace
+## Runtime Plugin Sources
 
-This repository currently includes reference plugin crates that exercise the runtime:
-
-- `plugins/hotpixel`
-- `plugins/localization`
-- `plugins/focus-metrics`
-
-Example build flow:
-
-```bash
-cargo build -p augur-plugin-hotpixel --release
-mkdir -p ~/.augur/plugins/hotpixel
-cp plugins/hotpixel/plugin.toml ~/.augur/plugins/hotpixel/
-cp target/release/libaugur_plugin_hotpixel.dylib ~/.augur/plugins/hotpixel/
-```
-
-After copying the files, launch `augur-gui` and use **Plugins → Scan for New Plugins**.
+Maintained scientific runtime plugins now live in
+[augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin there, then copy its
+`plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
 
 ## Troubleshooting
 
@@ -100,7 +87,8 @@ A source folder was copied instead of the built library. Build in `--release` mo
 
 ### "loading symbol augur_plugin_vtable failed"
 
-The library was built against the old compile-time plugin API. Port it to `augur-plugin-api::Plugin` and export it with `export_plugin!`.
+The library was built against an older runtime plugin API. Rebuild it against the current
+`augur-plugin-api` branch or release before loading it into this host.
 
 ## Why C FFI + `libloading`
 
