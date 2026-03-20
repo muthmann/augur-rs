@@ -38,8 +38,8 @@ The standalone `augur-plugin-api` crate defines the cross-library boundary:
 - `export_plugin!`: exports a panic-safe C vtable
 - `PluginFrame`: zero-copy access to preview pixels and optional raw events
 - `HostOutput`: safe overlay and warning callbacks back into the GUI host
-- `HostContext`: per-frame plus persistent string-keyed JSON context publishing and lookup
-- `EventStoreHandle`: read-only access to the host-retained decoded event history
+- `HostContext`: per-frame plus persistent string-keyed context publishing and lookup, with both JSON helpers and raw-byte publishing helpers
+- `EventStoreHandle`: read-only access to the host-retained decoded event history through frame-based windows
 - `SettingsSchema` / `StatusEntry`: declarative UI and read-only status reporting
 - `HostViewRegistry`: declarative dataset/view metadata for host-rendered analysis views
 
@@ -57,12 +57,14 @@ Plugins can now describe host-rendered outputs through:
 
 - `host_views()`, which returns dataset and view descriptors
 - `host_view_dataset(dataset_id)`, which returns a serialized payload on demand
+- `host_view_dataset_generation(dataset_id)`, which tells the host whether a cached dataset snapshot is still valid
 
 The host resolves duplicate ids in plugin execution order:
 
 - later providers win only when descriptor metadata matches exactly
 - conflicting duplicate ids are ignored and logged
 - dataset payloads are fetched lazily, only when a visible panel or open window needs them
+- dataset payloads stay cached until the plugin reports a higher generation for that dataset id
 
 Host views are part of the single flat runtime vtable. Plugins must rebuild against the current
 `augur-plugin-api` before loading into the host.
@@ -156,9 +158,9 @@ HashMap<String, Vec<u8>>
 ```
 
 for per-frame data, plus a second persistent `HashMap<String, Vec<u8>>` that survives between
-frames until analysis state resets. Plugins publish and read JSON-serialized values under
-well-known keys. This keeps the boundary debuggable and works across independently compiled
-dynamic libraries.
+frames until analysis state resets. Plugins can keep using JSON-serialized values under
+well-known keys, or they can call the raw publish helpers when they already own a serialized byte
+buffer and want to avoid repeated `serde_json::to_vec` work.
 
 ## Settings and Status
 
@@ -174,7 +176,9 @@ Dynamic plugins no longer render `egui` directly. Instead they expose:
 `PreviewFrame` still carries optional raw events. The pipeline only fills them when at least one enabled plugin declares `PluginInput::RawEvents`, so the default preview path stays cheap when event-domain plugins are disabled.
 
 In addition, `augur-gui` now retains a memory-budgeted history of decoded events in the host-owned
-EventStore and passes it into every runtime plugin through `EventStoreHandle`.
+EventStore and passes it into every runtime plugin through `EventStoreHandle`. The retained
+history is segmented by preview frame, so plugins iterate frame windows instead of relying on one
+contiguous memmoved event slice.
 
 ## Writing a Dynamic Plugin
 

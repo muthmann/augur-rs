@@ -1,8 +1,24 @@
+use std::cell::RefCell;
+
 use augur_core::{
     analysis::{roi_grid::RoiGrid, Overlay},
     pipeline::PreviewFrame,
 };
-use egui::ColorImage;
+use egui::{Color32, ColorImage};
+
+thread_local! {
+    static PREVIEW_SCRATCH: RefCell<PreviewRenderScratch> = RefCell::new(PreviewRenderScratch::default());
+}
+
+#[derive(Default)]
+struct PreviewRenderScratch {
+    hist: Vec<u32>,
+    grid_col_map: Vec<usize>,
+    grid_row_map: Vec<usize>,
+    grid_x_line: Vec<bool>,
+    grid_y_line: Vec<bool>,
+    grid_cell_highlight: Vec<bool>,
+}
 
 #[derive(Clone, Copy)]
 struct PixelRect {
@@ -20,7 +36,7 @@ pub fn frame_to_color_image(
     let w = frame.width as usize;
     let h = frame.height as usize;
     let max = percentile_value_two(&frame.pixels_on, &frame.pixels_off, contrast_percentile) as f32;
-    let mut rgba = vec![0u8; w * h * 4];
+    let mut image = ColorImage::new([w, h], Color32::TRANSPARENT);
 
     // Look for a ROI grid overlay to merge into the base rendering pass.
     let roi = overlays.iter().find_map(|o| match o {
@@ -32,52 +48,26 @@ pub fn frame_to_color_image(
     });
 
     if let Some((grid, top_n)) = roi {
-        render_base_with_grid(frame, grid, top_n, max, w, h, &mut rgba);
+        PREVIEW_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            render_base_with_grid(
+                frame,
+                grid,
+                top_n,
+                max,
+                w,
+                h,
+                &mut image.pixels,
+                &mut scratch,
+            );
+        });
     } else {
-        for i in 0..(w * h) {
-            let r = normalized_channel(frame.pixels_off[i], max);
-            let g = normalized_channel(frame.pixels_on[i], max);
-            let off = i * 4;
-            rgba[off] = r.max(8);
-            rgba[off + 1] = g.max(8);
-            rgba[off + 2] = 8;
-            rgba[off + 3] = 255;
-        }
+        render_base(frame, max, &mut image.pixels);
     }
 
-    // Sparse overlays (HighlightPixels) as a separate pass — only touches marked pixels.
-    for overlay in overlays {
-        match overlay {
-            Overlay::HighlightPixels { pixels, color } => {
-                for pixel in pixels {
-                    if pixel.x >= frame.width || pixel.y >= frame.height {
-                        continue;
-                    }
-                    let idx = (pixel.y as usize * w + pixel.x as usize) * 4;
-                    blend_rgba(&mut rgba[idx..idx + 4], *color);
-                }
-            }
-            Overlay::CrosshairMarkers {
-                markers,
-                color,
-                arm_len,
-            } => {
-                for marker in markers {
-                    draw_crosshair(
-                        &mut rgba,
-                        [w, h],
-                        marker.x,
-                        marker.y,
-                        usize::from(*arm_len),
-                        *color,
-                    );
-                }
-            }
-            Overlay::RoiGrid { .. } => {}
-        }
-    }
+    render_overlays(frame, overlays, &mut image.pixels, w, h);
 
-    ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+    image
 }
 
 #[cfg(test)]
@@ -90,6 +80,17 @@ fn percentile_value_two(on: &[u16], off: &[u16], percentile: f32) -> u16 {
 }
 
 fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
+    PREVIEW_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        percentile_value_from_slices_with_hist(channels, percentile, &mut scratch.hist)
+    })
+}
+
+fn percentile_value_from_slices_with_hist(
+    channels: &[&[u16]],
+    percentile: f32,
+    hist_scratch: &mut Vec<u32>,
+) -> u16 {
     let max_val = channels
         .iter()
         .flat_map(|channel| channel.iter())
@@ -105,10 +106,11 @@ fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
     // 256 KB allocation every frame.
     const MAX_BINS: usize = 4096;
     let hist_size = max_val.min(MAX_BINS - 1) + 1;
-    let mut hist = vec![0u32; hist_size];
+    hist_scratch.resize(hist_size, 0);
+    hist_scratch.fill(0);
     for channel in channels {
         for &value in *channel {
-            hist[(value as usize).min(hist_size - 1)] += 1;
+            hist_scratch[(value as usize).min(hist_size - 1)] += 1;
         }
     }
 
@@ -117,7 +119,7 @@ fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
     let target =
         ((len as f64 * percentile as f64 / 100.0).ceil() as u64).clamp(1, len.max(1) as u64);
     let mut cumulative = 0u64;
-    for (value, &count) in hist.iter().enumerate() {
+    for (value, &count) in hist_scratch.iter().enumerate() {
         cumulative += u64::from(count);
         if cumulative >= target {
             return value.max(1) as u16;
@@ -125,6 +127,14 @@ fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
     }
 
     hist_size.max(1) as u16
+}
+
+fn render_base(frame: &PreviewFrame, max: f32, pixels: &mut [Color32]) {
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        let r = normalized_channel(frame.pixels_off[i], max);
+        let g = normalized_channel(frame.pixels_on[i], max);
+        *pixel = Color32::from_rgb(r.max(8), g.max(8), 8);
+    }
 }
 
 fn normalized_channel(value: u16, max: f32) -> u8 {
@@ -138,6 +148,7 @@ fn normalized_channel(value: u16, max: f32) -> u8 {
 /// scan over the pixel buffer, replacing the previous multi-pass approach that
 /// called `fill_rect` per grid cell, `draw_vline`/`draw_hline` per boundary,
 /// and `fill_rect` again per highlight rect.
+#[allow(clippy::too_many_arguments)]
 fn render_base_with_grid(
     frame: &PreviewFrame,
     grid: &RoiGrid,
@@ -145,34 +156,40 @@ fn render_base_with_grid(
     max: f32,
     w: usize,
     h: usize,
-    rgba: &mut [u8],
+    pixels: &mut [Color32],
+    scratch: &mut PreviewRenderScratch,
 ) {
     let grid_cols = grid.cols();
     let grid_rows = grid.rows();
 
     // O(W + H): map each pixel coordinate to its grid cell index.
-    let col_map = build_pixel_to_grid_map(&grid.x_bounds, w);
-    let row_map = build_pixel_to_grid_map(&grid.y_bounds, h);
+    build_pixel_to_grid_map(&grid.x_bounds, w, &mut scratch.grid_col_map);
+    build_pixel_to_grid_map(&grid.y_bounds, h, &mut scratch.grid_row_map);
 
     // O(W + H): boolean flags for grid line positions.
-    let mut x_on_line = vec![false; w];
+    scratch.grid_x_line.resize(w, false);
+    scratch.grid_x_line.fill(false);
     for &xb in &grid.x_bounds {
         let xb = xb as usize;
         if xb > 0 && xb < w {
-            x_on_line[xb] = true;
+            scratch.grid_x_line[xb] = true;
         }
     }
-    let mut y_on_line = vec![false; h];
+    scratch.grid_y_line.resize(h, false);
+    scratch.grid_y_line.fill(false);
     for &yb in &grid.y_bounds {
         let yb = yb as usize;
         if yb > 0 && yb < h {
-            y_on_line[yb] = true;
+            scratch.grid_y_line[yb] = true;
         }
     }
 
     // Mark grid cells inside top-N highlight rectangles.
     let n = top_n.min(grid.largest_rects.len());
-    let mut cell_highlighted = vec![false; grid_rows * grid_cols];
+    scratch
+        .grid_cell_highlight
+        .resize(grid_rows * grid_cols, false);
+    scratch.grid_cell_highlight.fill(false);
     for rect in &grid.largest_rects[..n] {
         let c0 = grid_bound_index(&grid.x_bounds, rect.x);
         let c1 = grid_bound_index(&grid.x_bounds, rect.x + rect.width).min(grid_cols);
@@ -180,7 +197,7 @@ fn render_base_with_grid(
         let r1 = grid_bound_index(&grid.y_bounds, rect.y + rect.height).min(grid_rows);
         for r in r0..r1 {
             for c in c0..c1 {
-                cell_highlighted[r * grid_cols + c] = true;
+                scratch.grid_cell_highlight[r * grid_cols + c] = true;
             }
         }
     }
@@ -191,10 +208,10 @@ fn render_base_with_grid(
     const FREE: [u32; 4] = [40, 220, 80, 36];
     const BLOCKED: [u32; 4] = [255, 40, 40, 80];
 
-    // Single sequential pass — perfect cache locality, no per-cell function calls.
+    // Single sequential pass - perfect cache locality, no per-cell function calls.
     for py in 0..h {
-        let gr = row_map[py];
-        let on_hline = y_on_line[py];
+        let gr = scratch.grid_row_map[py];
+        let on_hline = scratch.grid_y_line[py];
         let row_off = py * w;
 
         for px in 0..w {
@@ -203,12 +220,12 @@ fn render_base_with_grid(
             let base_g = u32::from(normalized_channel(on_v, max).max(8));
             let base_r = u32::from(normalized_channel(off_v, max).max(8));
 
-            let gc = col_map[px];
+            let gc = scratch.grid_col_map[px];
             let cell = gr * grid_cols + gc;
 
-            let tint = if on_hline || x_on_line[px] {
+            let tint = if on_hline || scratch.grid_x_line[px] {
                 LINE
-            } else if cell_highlighted[cell] {
+            } else if scratch.grid_cell_highlight[cell] {
                 HIGHLIGHT
             } else if grid.blocked[cell] {
                 BLOCKED
@@ -218,19 +235,18 @@ fn render_base_with_grid(
 
             let a = tint[3];
             let inv = 255 - a;
-            let off = (row_off + px) * 4;
-            rgba[off] = ((base_r * inv + tint[0] * a) / 255) as u8;
-            rgba[off + 1] = ((base_g * inv + tint[1] * a) / 255) as u8;
-            rgba[off + 2] = ((8 * inv + tint[2] * a) / 255) as u8;
-            rgba[off + 3] = 255;
+            let r = ((base_r * inv + tint[0] * a) / 255) as u8;
+            let g = ((base_g * inv + tint[1] * a) / 255) as u8;
+            let b = ((8 * inv + tint[2] * a) / 255) as u8;
+            pixels[row_off + px] = Color32::from_rgb(r, g, b);
         }
     }
 
-    // Yellow borders for highlight rects — thin lines, negligible cost.
+    // Yellow borders for highlight rects - thin lines, negligible cost.
     let border_color = [255u8, 220, 0, 200];
     for rect in &grid.largest_rects[..n] {
         draw_rect_border(
-            rgba,
+            pixels,
             [w, h],
             PixelRect {
                 x: rect.x as usize,
@@ -245,17 +261,16 @@ fn render_base_with_grid(
 }
 
 /// Linear sweep mapping each pixel coordinate to its grid cell index.
-fn build_pixel_to_grid_map(bounds: &[u16], size: usize) -> Vec<usize> {
+fn build_pixel_to_grid_map(bounds: &[u16], size: usize, out: &mut Vec<usize>) {
+    out.resize(size, 0);
     let max_idx = bounds.len().saturating_sub(2);
-    let mut map = vec![0usize; size];
     let mut gi = 0;
-    for (px, slot) in map.iter_mut().enumerate() {
+    for (px, slot) in out.iter_mut().enumerate() {
         while gi < max_idx && (px as u16) >= bounds[gi + 1] {
             gi += 1;
         }
         *slot = gi;
     }
-    map
 }
 
 /// Find the boundary index for a grid-aligned value.
@@ -263,19 +278,19 @@ fn grid_bound_index(bounds: &[u16], val: u16) -> usize {
     bounds.partition_point(|&b| b < val)
 }
 
-fn blend_rgba(dst: &mut [u8], src: [u8; 4]) {
+fn blend_color(dst: &mut Color32, src: [u8; 4]) {
+    let [dr, dg, db, _da] = dst.to_array();
     let alpha = u32::from(src[3]);
     let inv_alpha = 255 - alpha;
 
-    for channel in 0..3 {
-        let blended = (u32::from(dst[channel]) * inv_alpha + u32::from(src[channel]) * alpha) / 255;
-        dst[channel] = blended as u8;
-    }
-    dst[3] = 255;
+    let r = ((u32::from(dr) * inv_alpha + u32::from(src[0]) * alpha) / 255) as u8;
+    let g = ((u32::from(dg) * inv_alpha + u32::from(src[1]) * alpha) / 255) as u8;
+    let b = ((u32::from(db) * inv_alpha + u32::from(src[2]) * alpha) / 255) as u8;
+    *dst = Color32::from_rgb(r, g, b);
 }
 
 fn draw_crosshair(
-    rgba: &mut [u8],
+    pixels: &mut [Color32],
     size: [usize; 2],
     x: f32,
     y: f32,
@@ -291,27 +306,34 @@ fn draw_crosshair(
         if dx.abs() <= 1 {
             continue;
         }
-        blend_pixel(rgba, width, height, cx + dx, cy, color);
+        blend_pixel(pixels, width, height, cx + dx, cy, color);
     }
     for dy in -arm_len..=arm_len {
         if dy.abs() <= 1 {
             continue;
         }
-        blend_pixel(rgba, width, height, cx, cy + dy, color);
+        blend_pixel(pixels, width, height, cx, cy + dy, color);
     }
-    blend_pixel(rgba, width, height, cx, cy, color);
+    blend_pixel(pixels, width, height, cx, cy, color);
 }
 
-fn blend_pixel(rgba: &mut [u8], width: usize, height: usize, x: isize, y: isize, color: [u8; 4]) {
+fn blend_pixel(
+    pixels: &mut [Color32],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    color: [u8; 4],
+) {
     if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
         return;
     }
-    let idx = (y as usize * width + x as usize) * 4;
-    blend_rgba(&mut rgba[idx..idx + 4], color);
+    let idx = y as usize * width + x as usize;
+    blend_color(&mut pixels[idx], color);
 }
 
 fn draw_rect_border(
-    rgba: &mut [u8],
+    pixels: &mut [Color32],
     size: [usize; 2],
     rect: PixelRect,
     thickness: usize,
@@ -325,39 +347,87 @@ fn draw_rect_border(
     for t in 0..thickness {
         if rect.y + t < y_end {
             for px in rect.x..x_end {
-                let idx = ((rect.y + t) * width + px) * 4;
-                blend_rgba(&mut rgba[idx..idx + 4], color);
+                let idx = (rect.y + t) * width + px;
+                blend_color(&mut pixels[idx], color);
             }
         }
         if y_end > t && y_end - 1 - t >= rect.y {
             let by = y_end - 1 - t;
             for px in rect.x..x_end {
-                let idx = (by * width + px) * 4;
-                blend_rgba(&mut rgba[idx..idx + 4], color);
+                let idx = by * width + px;
+                blend_color(&mut pixels[idx], color);
             }
         }
     }
-    // Left and right edges — skip rows already covered by the top/bottom passes.
+    // Left and right edges - skip rows already covered by the top/bottom passes.
     let inner_y = (rect.y + thickness).min(y_end);
     let inner_y_end = y_end.saturating_sub(thickness).max(inner_y);
     for py in inner_y..inner_y_end {
         for t in 0..thickness {
             if rect.x + t < x_end {
-                let idx = (py * width + rect.x + t) * 4;
-                blend_rgba(&mut rgba[idx..idx + 4], color);
+                let idx = py * width + rect.x + t;
+                blend_color(&mut pixels[idx], color);
             }
             if x_end > t && x_end - 1 - t >= rect.x {
                 let rx = x_end - 1 - t;
-                let idx = (py * width + rx) * 4;
-                blend_rgba(&mut rgba[idx..idx + 4], color);
+                let idx = py * width + rx;
+                blend_color(&mut pixels[idx], color);
             }
+        }
+    }
+}
+
+fn render_overlays(
+    frame: &PreviewFrame,
+    overlays: &[Overlay],
+    pixels: &mut [Color32],
+    w: usize,
+    h: usize,
+) {
+    // Sparse overlays (HighlightPixels) as a separate pass - only touches marked pixels.
+    for overlay in overlays {
+        match overlay {
+            Overlay::HighlightPixels {
+                pixels: highlighted,
+                color,
+            } => {
+                for pixel in highlighted {
+                    if pixel.x >= frame.width || pixel.y >= frame.height {
+                        continue;
+                    }
+                    let idx = pixel.y as usize * w + pixel.x as usize;
+                    blend_color(&mut pixels[idx], *color);
+                }
+            }
+            Overlay::CrosshairMarkers {
+                markers,
+                color,
+                arm_len,
+            } => {
+                for marker in markers {
+                    draw_crosshair(
+                        pixels,
+                        [w, h],
+                        marker.x,
+                        marker.y,
+                        usize::from(*arm_len),
+                        *color,
+                    );
+                }
+            }
+            Overlay::RoiGrid { .. } => {}
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{percentile_value, percentile_value_two};
+    use super::{frame_to_color_image, percentile_value, percentile_value_two};
+    use augur_core::{
+        analysis::{roi_grid::compute_roi_grid, Overlay, Pixel, SubpixelMarker},
+        pipeline::PreviewFrame,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn percentile_ignores_single_hotpixel_outlier() {
@@ -376,5 +446,65 @@ mod tests {
         let on = [0, 3];
         let off = [0, 6];
         assert_eq!(percentile_value_two(&on, &off, 75.0), 3);
+    }
+
+    #[test]
+    fn frame_to_color_image_renders_sparse_overlays_with_direct_color32_pixels() {
+        let frame = PreviewFrame {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 20],
+            pixels_on: vec![5, 25],
+            pixels_off: vec![7, 30],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+        let overlays = vec![
+            Overlay::HighlightPixels {
+                pixels: vec![Pixel::new(1, 0)],
+                color: [255, 0, 0, 255],
+            },
+            Overlay::CrosshairMarkers {
+                markers: vec![SubpixelMarker { x: 0.0, y: 0.0 }],
+                color: [0, 255, 0, 255],
+                arm_len: 2,
+            },
+        ];
+
+        let image = frame_to_color_image(&frame, &overlays, 80.0);
+
+        assert_eq!(image.size, [2, 1]);
+        assert_eq!(image.pixels.len(), 2);
+        assert!(image.pixels[1].to_array()[0] >= image.pixels[0].to_array()[0]);
+        assert_eq!(image.pixels[0].to_array()[1], 255);
+    }
+
+    #[test]
+    fn roi_grid_overlay_renders_without_allocating_rgba_intermediates() {
+        let grid = compute_roi_grid(&[(0, 0)], 2, 2, 1);
+        let frame = PreviewFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![1, 2, 3, 4],
+            pixels_on: vec![1, 2, 3, 4],
+            pixels_off: vec![1, 2, 3, 4],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+        let overlays = vec![Overlay::RoiGrid {
+            grid: Arc::new(grid),
+            highlight_top_n: 1,
+        }];
+
+        let image = frame_to_color_image(&frame, &overlays, 50.0);
+
+        assert_eq!(image.size, [2, 2]);
+        assert_eq!(image.pixels.len(), 4);
     }
 }

@@ -159,6 +159,40 @@ impl FfiColorRgba {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FfiEventFrame {
+    pub events: FfiSlice<FfiCdEvent>,
+    pub window_start_us: u64,
+    pub window_end_us: u64,
+}
+
+impl FfiEventFrame {
+    pub const fn empty() -> Self {
+        Self {
+            events: FfiSlice::empty(),
+            window_start_us: 0,
+            window_end_us: 0,
+        }
+    }
+
+    pub fn from_slice(events: &[FfiCdEvent], window_start_us: u64, window_end_us: u64) -> Self {
+        Self {
+            events: FfiSlice::from_slice(events),
+            window_start_us,
+            window_end_us,
+        }
+    }
+
+    /// Returns the raw event slice carried by this frame.
+    ///
+    /// # Safety
+    /// The underlying pointer must remain valid for the duration of the returned borrow.
+    pub unsafe fn as_slice<'a>(&self) -> &'a [FfiCdEvent] {
+        unsafe { self.events.as_slice() }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FfiPreviewFrame {
     pub width: u16,
@@ -186,21 +220,22 @@ pub struct FfiOutputCallbacks {
 pub type ContextPublishFn = unsafe extern "C" fn(*mut c_void, FfiString, FfiSlice<u8>);
 pub type ContextGetFn =
     unsafe extern "C" fn(*mut c_void, FfiString, *mut *const u8, *mut usize) -> bool;
-pub type EventStoreAllEventsFn =
-    unsafe extern "C" fn(*const c_void, *mut *const FfiCdEvent, *mut usize);
-pub type EventStoreQueryRangeFn =
-    unsafe extern "C" fn(*const c_void, u64, u64, *mut *const FfiCdEvent, *mut usize);
+pub type EventStoreFrameAtFn =
+    unsafe extern "C" fn(*const c_void, usize, *mut FfiEventFrame) -> bool;
+pub type EventStoreFrameRangeForTimestampsFn =
+    unsafe extern "C" fn(*const c_void, u64, u64, *mut usize, *mut usize) -> bool;
 pub type EventStoreOldestTsFn = unsafe extern "C" fn(*const c_void) -> u64;
 pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
+pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FfiEventStoreHandle {
     pub ctx: *const c_void,
-    pub all_events: EventStoreAllEventsFn,
-    pub events_in_range: EventStoreQueryRangeFn,
-    pub oldest_timestamp_us: EventStoreOldestTsFn,
     pub frame_count: EventStoreFrameCountFn,
+    pub frame_at: EventStoreFrameAtFn,
+    pub frame_range_for_timestamps: EventStoreFrameRangeForTimestampsFn,
+    pub oldest_timestamp_us: EventStoreOldestTsFn,
 }
 
 #[repr(C)]
@@ -245,6 +280,7 @@ pub struct PluginVTable {
     pub host_views: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub host_view_dataset:
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
+    pub host_view_dataset_generation: HostViewDatasetGenerationFn,
 }
 
 pub type PluginEntry = unsafe extern "C" fn() -> *const PluginVTable;

@@ -263,6 +263,7 @@ pub struct Density2dViewState {
     image: Option<ColorImage>,
     texture: Option<TextureHandle>,
     rendered_size: [usize; 2],
+    rendered_generation: Option<u64>,
     dirty: bool,
     settings: Density2dRenderSettings,
 }
@@ -272,6 +273,7 @@ impl Density2dViewState {
         self.image = None;
         self.texture = None;
         self.rendered_size = [0, 0];
+        self.rendered_generation = None;
         self.dirty = false;
     }
 
@@ -307,10 +309,11 @@ impl Density2dViewState {
         ctx: &egui::Context,
         schema: &TableSchema,
         dataset: Option<&TableDatasetV1>,
+        dataset_generation: u64,
         x_column: &str,
         y_column: &str,
     ) -> Result<(), String> {
-        if !self.dirty {
+        if !self.dirty && self.rendered_generation == Some(dataset_generation) {
             return Ok(());
         }
 
@@ -339,6 +342,7 @@ impl Density2dViewState {
             ));
         }
         self.image = Some(rendered.image);
+        self.rendered_generation = Some(dataset_generation);
         self.dirty = false;
         Ok(())
     }

@@ -49,6 +49,10 @@ legacy ABI fallback path anymore.
 Dataset payloads are fetched lazily and cached per dataset id only when at least one visible panel
 or open window needs them.
 
+The host also tracks `host_view_dataset_generation(dataset_id)` and only reloads a cached dataset
+snapshot when the provider reports a newer generation. Density render state stays alive until
+either the dataset generation changes or the view settings change.
+
 ## Verification
 
 ```bash

@@ -11,11 +11,12 @@ pub use context::{
     TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
     TableSchema, TableValueType, CTX_LOCALIZATION_RESULTS,
 };
-pub use event_store::{EventStore, FrameBoundary};
+pub use event_store::EventStore;
 pub use ffi::{
-    AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
-    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, PluginEntry,
-    PluginInput, PluginVTable, PLUGIN_ENTRY_SYMBOL,
+    AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
+    FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
+    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
+    HostViewDatasetGenerationFn, PluginEntry, PluginInput, PluginVTable, PLUGIN_ENTRY_SYMBOL,
 };
 pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
@@ -72,8 +73,9 @@ mod tests {
             CTX_LOCALIZATION_RESULTS,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
-        AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle, FfiPixel, FfiSlice,
-        FfiString, FfiSubpixelMarker, PluginInput, PluginVTable,
+        AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
+        FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiPixel, FfiSlice, FfiString,
+        FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginInput, PluginVTable,
     };
 
     #[test]
@@ -81,11 +83,18 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiSlice<u8>>(), 16);
         assert_eq!(std::mem::size_of::<FfiString>(), 16);
         assert_eq!(std::mem::size_of::<FfiCdEvent>(), 16);
+        assert_eq!(std::mem::size_of::<FfiEventFrame>(), 32);
         assert_eq!(std::mem::size_of::<FfiColorRgba>(), 4);
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
-        assert_eq!(std::mem::size_of::<PluginVTable>(), 144);
+        assert_eq!(std::mem::size_of::<PluginVTable>(), 152);
+        assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
+        assert_eq!(
+            std::mem::size_of::<EventStoreFrameRangeForTimestampsFn>(),
+            8
+        );
+        assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
     }
 
     #[test]

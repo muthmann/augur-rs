@@ -40,7 +40,7 @@ pub fn render_plugin_settings(ui: &mut egui::Ui, plugin: &mut DynPlugin) -> Resu
         }
     }
 
-    let status_entries = plugin.status_entries()?;
+    let status_entries = plugin.status_entries_cached()?;
     if !status_entries.is_empty() {
         ui.separator();
         for entry in &status_entries {
@@ -59,7 +59,7 @@ fn render_setting_item(
     match &item.kind {
         SettingKind::Bool { default } => {
             let mut value = plugin
-                .get_setting_value(&item.key)?
+                .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_bool())
                 .unwrap_or(*default);
             let response = ui.checkbox(&mut value, &item.label);
@@ -75,7 +75,7 @@ fn render_setting_item(
             suffix,
         } => {
             let mut value = plugin
-                .get_setting_value(&item.key)?
+                .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_f64())
                 .unwrap_or(*default);
             let mut slider = egui::Slider::new(&mut value, *min..=*max).text(&item.label);
@@ -95,7 +95,7 @@ fn render_setting_item(
             suffix,
         } => {
             let mut value = plugin
-                .get_setting_value(&item.key)?
+                .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_i64())
                 .unwrap_or(*default);
             let mut slider = egui::Slider::new(&mut value, *min..=*max).text(&item.label);
@@ -115,7 +115,7 @@ fn render_setting_item(
             default,
         } => {
             let mut value = plugin
-                .get_setting_value(&item.key)?
+                .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_f64())
                 .unwrap_or(*default);
             let response = ui.horizontal(|ui| {
@@ -133,7 +133,7 @@ fn render_setting_item(
         }
         SettingKind::I64Drag { min, max, default } => {
             let mut value = plugin
-                .get_setting_value(&item.key)?
+                .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_i64())
                 .unwrap_or(*default);
             let response = ui.horizontal(|ui| {
@@ -147,7 +147,7 @@ fn render_setting_item(
         }
         SettingKind::Enum { variants, default } => {
             let mut value = plugin
-                .get_setting_value(&item.key)?
+                .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_u64())
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(*default);

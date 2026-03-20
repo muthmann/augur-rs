@@ -1,99 +1,150 @@
-use std::mem;
+use std::collections::VecDeque;
 
-use crate::FfiCdEvent;
+use crate::{FfiCdEvent, FfiEventFrame};
 
 const DEFAULT_MEMORY_BUDGET_BYTES: usize = 100 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameBoundary {
-    pub start_index: usize,
-    pub end_index: usize,
-    pub start_timestamp_us: u64,
-    pub end_timestamp_us: u64,
+#[derive(Debug, Clone)]
+struct StoredFrame {
+    events: Box<[FfiCdEvent]>,
+    window_start_us: u64,
+    window_end_us: u64,
+    byte_len: usize,
+    event_count: usize,
+}
+
+impl StoredFrame {
+    fn new(events: &[FfiCdEvent], window_start_us: u64, window_end_us: u64) -> Self {
+        let events = events.to_vec().into_boxed_slice();
+        let event_count = events.len();
+        let byte_len = event_count * std::mem::size_of::<FfiCdEvent>();
+        Self {
+            events,
+            window_start_us,
+            window_end_us,
+            byte_len,
+            event_count,
+        }
+    }
+
+    fn as_ffi_frame(&self) -> FfiEventFrame {
+        FfiEventFrame::from_slice(&self.events, self.window_start_us, self.window_end_us)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EventStore {
-    events: Vec<FfiCdEvent>,
-    boundaries: Vec<FrameBoundary>,
+    frames: VecDeque<StoredFrame>,
     memory_budget_bytes: usize,
+    memory_usage_bytes: usize,
 }
 
 impl Default for EventStore {
     fn default() -> Self {
         Self {
-            events: Vec::new(),
-            boundaries: Vec::new(),
+            frames: VecDeque::new(),
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            memory_usage_bytes: 0,
         }
     }
 }
 
 impl EventStore {
-    pub fn push_frame(
-        &mut self,
-        events: &[FfiCdEvent],
-        start_timestamp_us: u64,
-        end_timestamp_us: u64,
-    ) {
-        let start_index = self.events.len();
-        self.events.extend_from_slice(events);
-        let end_index = self.events.len();
-        self.boundaries.push(FrameBoundary {
-            start_index,
-            end_index,
-            start_timestamp_us,
-            end_timestamp_us,
-        });
+    pub fn push_frame(&mut self, events: &[FfiCdEvent], window_start_us: u64, window_end_us: u64) {
+        let frame = StoredFrame::new(events, window_start_us, window_end_us);
+        self.memory_usage_bytes += frame.byte_len;
+        self.frames.push_back(frame);
         self.enforce_memory_budget();
     }
 
-    pub fn events_in_range(&self, start_timestamp_us: u64, end_timestamp_us: u64) -> &[FfiCdEvent] {
-        if self.events.is_empty() || start_timestamp_us > end_timestamp_us {
-            return &[];
-        }
-
-        let first_boundary = self
-            .boundaries
-            .partition_point(|boundary| boundary.end_timestamp_us < start_timestamp_us);
-        let last_boundary_exclusive = self
-            .boundaries
-            .partition_point(|boundary| boundary.start_timestamp_us <= end_timestamp_us);
-
-        if first_boundary >= last_boundary_exclusive {
-            return &[];
-        }
-
-        let start_index = self.boundaries[first_boundary].start_index;
-        let end_index = self.boundaries[last_boundary_exclusive - 1].end_index;
-        let candidate = &self.events[start_index..end_index];
-
-        let event_start = candidate.partition_point(|event| event.timestamp < start_timestamp_us);
-        let event_end = candidate.partition_point(|event| event.timestamp <= end_timestamp_us);
-        &candidate[event_start..event_end]
-    }
-
-    pub fn all_events(&self) -> &[FfiCdEvent] {
-        &self.events
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
     }
 
     pub fn oldest_timestamp_us(&self) -> Option<u64> {
-        self.boundaries
-            .first()
-            .map(|boundary| boundary.start_timestamp_us)
+        self.frames.front().map(|frame| frame.window_start_us)
     }
 
-    pub fn frame_count(&self) -> usize {
-        self.boundaries.len()
+    pub fn frame(&self, index: usize) -> Option<FfiEventFrame> {
+        self.frames.get(index).map(StoredFrame::as_ffi_frame)
     }
 
-    pub fn frame_boundaries(&self) -> &[FrameBoundary] {
-        &self.boundaries
+    pub fn frames(&self) -> Vec<FfiEventFrame> {
+        self.frames.iter().map(StoredFrame::as_ffi_frame).collect()
+    }
+
+    pub fn frame_range_for_timestamps(
+        &self,
+        start_timestamp_us: u64,
+        end_timestamp_us: u64,
+    ) -> Option<(usize, usize)> {
+        if self.frames.is_empty() || start_timestamp_us > end_timestamp_us {
+            return None;
+        }
+
+        let start_index = self.first_frame_with_window_end_at_or_after(start_timestamp_us)?;
+        let end_index = self.first_frame_with_window_start_after(end_timestamp_us);
+        if start_index >= end_index {
+            None
+        } else {
+            Some((start_index, end_index))
+        }
+    }
+
+    pub fn frames_in_range(
+        &self,
+        start_timestamp_us: u64,
+        end_timestamp_us: u64,
+    ) -> Vec<FfiEventFrame> {
+        let Some((start_index, end_index)) =
+            self.frame_range_for_timestamps(start_timestamp_us, end_timestamp_us)
+        else {
+            return Vec::new();
+        };
+
+        let mut frames = Vec::with_capacity(end_index.saturating_sub(start_index));
+        for index in start_index..end_index {
+            if let Some(frame) = self.frame(index) {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    pub fn collect_events_in_range(
+        &self,
+        start_timestamp_us: u64,
+        end_timestamp_us: u64,
+        out: &mut Vec<FfiCdEvent>,
+    ) {
+        out.clear();
+        let Some((start_index, end_index)) =
+            self.frame_range_for_timestamps(start_timestamp_us, end_timestamp_us)
+        else {
+            return;
+        };
+
+        let mut total_events = 0usize;
+        for index in start_index..end_index {
+            total_events += self.frames[index].event_count;
+        }
+        out.reserve(total_events);
+
+        for index in start_index..end_index {
+            let frame = &self.frames[index];
+            let start = frame
+                .events
+                .partition_point(|event| event.timestamp < start_timestamp_us);
+            let end = frame
+                .events
+                .partition_point(|event| event.timestamp <= end_timestamp_us);
+            out.extend_from_slice(&frame.events[start..end]);
+        }
     }
 
     pub fn clear(&mut self) {
-        self.events.clear();
-        self.boundaries.clear();
+        self.frames.clear();
+        self.memory_usage_bytes = 0;
     }
 
     pub fn set_memory_budget(&mut self, memory_budget_bytes: usize) {
@@ -106,45 +157,52 @@ impl EventStore {
     }
 
     pub fn memory_usage_bytes(&self) -> usize {
-        self.events.len() * mem::size_of::<FfiCdEvent>()
+        self.memory_usage_bytes
+    }
+
+    fn first_frame_with_window_end_at_or_after(&self, timestamp_us: u64) -> Option<usize> {
+        let mut left = 0usize;
+        let mut right = self.frames.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.frames[mid].window_end_us < timestamp_us {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        (left < self.frames.len()).then_some(left)
+    }
+
+    fn first_frame_with_window_start_after(&self, timestamp_us: u64) -> usize {
+        let mut left = 0usize;
+        let mut right = self.frames.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.frames[mid].window_start_us <= timestamp_us {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        left
     }
 
     fn enforce_memory_budget(&mut self) {
-        if self.boundaries.len() <= 1 {
-            return;
-        }
-
-        let event_size = mem::size_of::<FfiCdEvent>();
-        let mut trim_events = 0usize;
-        let mut trim_frames = 0usize;
-        let mut remaining_bytes = self.memory_usage_bytes();
-
-        while self.boundaries.len().saturating_sub(trim_frames) > 1
-            && remaining_bytes > self.memory_budget_bytes
-        {
-            let boundary = self.boundaries[trim_frames];
-            trim_events = boundary.end_index;
-            remaining_bytes = remaining_bytes
-                .saturating_sub((boundary.end_index - boundary.start_index) * event_size);
-            trim_frames += 1;
-        }
-
-        if trim_frames == 0 {
-            return;
-        }
-
-        self.events.drain(..trim_events);
-        self.boundaries.drain(..trim_frames);
-        for boundary in &mut self.boundaries {
-            boundary.start_index -= trim_events;
-            boundary.end_index -= trim_events;
+        while self.frames.len() > 1 && self.memory_usage_bytes > self.memory_budget_bytes {
+            let Some(frame) = self.frames.pop_front() else {
+                break;
+            };
+            self.memory_usage_bytes = self.memory_usage_bytes.saturating_sub(frame.byte_len);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EventStore, FrameBoundary};
+    use super::EventStore;
     use crate::FfiCdEvent;
 
     fn event(timestamp: u64, x: u16) -> FfiCdEvent {
@@ -157,31 +215,42 @@ mod tests {
     }
 
     #[test]
-    fn push_frame_tracks_boundaries_and_range_queries() {
+    fn push_frame_tracks_frame_windows_and_range_queries() {
         let mut store = EventStore::default();
         store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
         store.push_frame(&[event(30, 3), event(40, 4)], 30, 40);
 
         assert_eq!(store.frame_count(), 2);
         assert_eq!(store.oldest_timestamp_us(), Some(10));
+
+        let first_frame = store.frame(0).expect("first frame");
+        let second_frame = store.frame(1).expect("second frame");
         assert_eq!(
-            store.frame_boundaries(),
-            &[
-                FrameBoundary {
-                    start_index: 0,
-                    end_index: 2,
-                    start_timestamp_us: 10,
-                    end_timestamp_us: 20,
-                },
-                FrameBoundary {
-                    start_index: 2,
-                    end_index: 4,
-                    start_timestamp_us: 30,
-                    end_timestamp_us: 40,
-                },
-            ]
+            unsafe { first_frame.as_slice() },
+            &[event(10, 1), event(20, 2)]
         );
-        assert_eq!(store.events_in_range(15, 35), &[event(20, 2), event(30, 3)]);
+        assert_eq!(
+            unsafe { second_frame.as_slice() },
+            &[event(30, 3), event(40, 4)]
+        );
+
+        assert_eq!(store.frame_range_for_timestamps(15, 35), Some((0, 2)));
+        assert_eq!(store.frames_in_range(15, 35).len(), 2);
+
+        let frames = store.frames();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            unsafe { frames[0].as_slice() },
+            &[event(10, 1), event(20, 2)]
+        );
+        assert_eq!(
+            unsafe { frames[1].as_slice() },
+            &[event(30, 3), event(40, 4)]
+        );
+
+        let mut flattened = Vec::new();
+        store.collect_events_in_range(15, 35, &mut flattened);
+        assert_eq!(flattened, &[event(20, 2), event(30, 3)]);
     }
 
     #[test]
@@ -195,15 +264,10 @@ mod tests {
 
         assert_eq!(store.frame_count(), 1);
         assert_eq!(store.oldest_timestamp_us(), Some(30));
-        assert_eq!(store.all_events(), &[event(30, 3), event(40, 4)]);
+        assert_eq!(store.memory_usage_bytes(), event_size * 2);
         assert_eq!(
-            store.frame_boundaries(),
-            &[FrameBoundary {
-                start_index: 0,
-                end_index: 2,
-                start_timestamp_us: 30,
-                end_timestamp_us: 40,
-            }]
+            unsafe { store.frame(0).expect("remaining frame").as_slice() },
+            &[event(30, 3), event(40, 4)]
         );
     }
 
@@ -216,6 +280,10 @@ mod tests {
         store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
 
         assert_eq!(store.frame_count(), 1);
-        assert_eq!(store.all_events().len(), 2);
+        assert_eq!(store.memory_usage_bytes(), event_size * 2);
+        assert_eq!(
+            unsafe { store.frame(0).expect("remaining frame").as_slice() },
+            &[event(10, 1), event(20, 2)]
+        );
     }
 }
