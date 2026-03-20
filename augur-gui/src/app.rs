@@ -2,8 +2,9 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc, Mutex},
-    time::SystemTime,
+    sync::{atomic::Ordering, mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use augur_core::{
@@ -51,17 +52,33 @@ const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
+const PREVIEW_PROCESS_INTERVAL: Duration = Duration::from_millis(33);
+const POINT_CLOUD_PROCESS_INTERVAL: Duration = Duration::from_millis(67);
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
+
+#[derive(Debug, Clone)]
+struct HostDatasetCacheEntry {
+    generation: u64,
+    snapshot: CachedHostDataset,
+}
 
 /// Extract a table reference from a cached dataset entry.
 /// Returns `Ok(Some(table))` if data is available, `Ok(None)` if absent, or
 /// `Err(message)` if loading failed.
-fn cached_table(entry: Option<&CachedHostDataset>) -> Result<Option<&TableDatasetV1>, &str> {
+fn cached_table(entry: Option<&HostDatasetCacheEntry>) -> Result<Option<&TableDatasetV1>, &str> {
     match entry {
-        Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => Ok(Some(table.as_ref())),
-        Some(Ok(None)) | None => Ok(None),
-        Some(Err(err)) => Err(err.as_str()),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(Some(HostDatasetSnapshot::Table(table))),
+            ..
+        }) => Ok(Some(table.as_ref())),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(None), ..
+        })
+        | None => Ok(None),
+        Some(HostDatasetCacheEntry {
+            snapshot: Err(err), ..
+        }) => Err(err.as_str()),
     }
 }
 
@@ -90,6 +107,20 @@ struct SavedLiveState {
     config: CameraConfig,
     mask_file: String,
     camera_info: Option<DeviceInfo>,
+}
+
+struct OpenedReplay {
+    controller: PipelineController,
+    controls: ReplayControls,
+    info: ReplayFileInfo,
+    replay_info: DeviceInfo,
+    decoded_events: Option<Arc<Vec<CdEvent>>>,
+}
+
+struct ReplayOpenTask {
+    path: PathBuf,
+    saved_live_state: SavedLiveState,
+    rx: mpsc::Receiver<Result<OpenedReplay, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +288,7 @@ pub struct CameraApp {
     controller: Option<PipelineController>,
     texture: Option<egui::TextureHandle>,
     latest_frame: Option<PreviewFrame>,
+    last_preview_process_at: Option<Instant>,
     replay_controls: Option<ReplayControls>,
     replay_file_info: Option<ReplayFileInfo>,
     replay_decoded_events: Option<Arc<Vec<CdEvent>>>,
@@ -266,6 +298,7 @@ pub struct CameraApp {
     replay_speed: f32,
     replay_notice: Option<String>,
     replay_seek_drag_value: Option<f32>,
+    replay_open_task: Option<ReplayOpenTask>,
     saved_live_state: Option<SavedLiveState>,
     builtin_plugins: Vec<Box<dyn AnalysisPlugin>>,
     plugin_manager: PluginManager,
@@ -294,7 +327,7 @@ pub struct CameraApp {
     host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
     host_view_render_state: HashMap<String, HostViewRenderState>,
-    host_view_dataset_cache: HashMap<String, CachedHostDataset>,
+    host_view_dataset_cache: HashMap<String, HostDatasetCacheEntry>,
     host_view_resolution_warnings: Vec<String>,
 }
 
@@ -312,6 +345,7 @@ impl CameraApp {
             controller: None,
             texture: None,
             latest_frame: None,
+            last_preview_process_at: None,
             replay_controls: None,
             replay_file_info: None,
             replay_decoded_events: None,
@@ -321,6 +355,7 @@ impl CameraApp {
             replay_speed: 1.0,
             replay_notice: None,
             replay_seek_drag_value: None,
+            replay_open_task: None,
             saved_live_state: None,
             builtin_plugins: create_all_plugins(),
             plugin_manager,
@@ -481,13 +516,67 @@ impl CameraApp {
         }
     }
 
+    fn current_host_view_dataset_generation(&self, dataset_id: &str) -> Result<u64, String> {
+        let Some(dataset) = self.host_view_registry.dataset(dataset_id) else {
+            return Err(format!("unknown host dataset {dataset_id}"));
+        };
+
+        Ok(match dataset.provider {
+            HostViewProviderKey::Builtin(index) => self
+                .builtin_plugins
+                .get(index)
+                .and_then(|plugin| {
+                    plugin
+                        .enabled()
+                        .then(|| plugin.host_view_dataset_generation(dataset_id))
+                })
+                .unwrap_or(0),
+            HostViewProviderKey::Runtime(index) => {
+                let Some(record) = self.plugin_manager.records().get(index) else {
+                    return Err(format!(
+                        "runtime provider index {index} is out of range for dataset {dataset_id}"
+                    ));
+                };
+                let Some(plugin) = record.plugin() else {
+                    return Err(format!(
+                        "runtime provider {} is unavailable for dataset {dataset_id}",
+                        record.name()
+                    ));
+                };
+                plugin.host_view_dataset_generation(dataset_id)
+            }
+        })
+    }
+
     fn ensure_host_view_dataset_cached(&mut self, dataset_id: &str) {
-        if self.host_view_dataset_cache.contains_key(dataset_id) {
+        let generation = match self.current_host_view_dataset_generation(dataset_id) {
+            Ok(generation) => generation,
+            Err(err) => {
+                self.host_view_dataset_cache.insert(
+                    dataset_id.to_owned(),
+                    HostDatasetCacheEntry {
+                        generation: 0,
+                        snapshot: Err(err),
+                    },
+                );
+                return;
+            }
+        };
+
+        if self
+            .host_view_dataset_cache
+            .get(dataset_id)
+            .is_some_and(|entry| entry.generation == generation)
+        {
             return;
         }
-        let snapshot = self.load_host_view_dataset_snapshot(dataset_id);
-        self.host_view_dataset_cache
-            .insert(dataset_id.to_owned(), snapshot);
+        self.host_view_dataset_cache.insert(
+            dataset_id.to_owned(),
+            HostDatasetCacheEntry {
+                generation,
+                snapshot: self.load_host_view_dataset_snapshot(dataset_id),
+            },
+        );
     }
 
     fn export_host_view_csv(&mut self, view: &ResolvedHostView) {
@@ -656,6 +745,7 @@ impl CameraApp {
                         .entry(view.descriptor.id.clone())
                         .or_default()
                         .density_state();
+                    let dataset_generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
 
                     let table = match cached_table(cache_entry) {
                         Ok(table) => table,
@@ -665,8 +755,14 @@ impl CameraApp {
                         }
                     };
 
-                    if let Err(err) = state.render_if_needed(ctx, schema, table, x_column, y_column)
-                    {
+                    if let Err(err) = state.render_if_needed(
+                        ctx,
+                        schema,
+                        table,
+                        dataset_generation,
+                        x_column,
+                        y_column,
+                    ) {
                         ui.colored_label(ui.visuals().error_fg_color, err);
                         return;
                     }
@@ -748,10 +844,13 @@ impl CameraApp {
             match &view.descriptor.kind {
                 HostViewKind::TableWindow => {
                     let (table_arc, error_message) = match &cache_entry {
-                        Some(Ok(Some(HostDatasetSnapshot::Table(table)))) => {
-                            (Some(Arc::clone(table)), None)
-                        }
-                        Some(Err(err)) => (None, Some(err.clone())),
+                        Some(HostDatasetCacheEntry {
+                            snapshot: Ok(Some(HostDatasetSnapshot::Table(table))),
+                            ..
+                        }) => (Some(Arc::clone(table)), None),
+                        Some(HostDatasetCacheEntry {
+                            snapshot: Err(err), ..
+                        }) => (None, Some(err.clone())),
                         _ => (None, None),
                     };
                     let shared = Arc::new(Mutex::new(TableWindowViewportData {
@@ -821,6 +920,10 @@ impl CameraApp {
                             .entry(view.descriptor.id.clone())
                             .or_default()
                             .density_state();
+                        let dataset_generation = cache_entry
+                            .as_ref()
+                            .map(|entry| entry.generation)
+                            .unwrap_or(0);
 
                         let table = cached_table(cache_entry.as_ref()).unwrap_or(None);
 
@@ -828,11 +931,17 @@ impl CameraApp {
                             ctx,
                             dataset.descriptor.kind.table_schema(),
                             table,
+                            dataset_generation,
                             x_column,
                             y_column,
                         );
                         let error_message = match (&cache_entry, render_result) {
-                            (Some(Err(err)), _) => Some(err.clone()),
+                            (
+                                Some(HostDatasetCacheEntry {
+                                    snapshot: Err(err), ..
+                                }),
+                                _,
+                            ) => Some(err.clone()),
                             (_, Err(err)) => Some(err),
                             _ => None,
                         };
@@ -1035,13 +1144,14 @@ impl CameraApp {
     }
 
     fn start_preview(&mut self) {
-        if self.mode != AppMode::Idle {
+        if self.mode != AppMode::Idle || self.replay_open_task.is_some() {
             return;
         }
         match self.start_pipeline_inner(true) {
             Ok(controller) => {
                 self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
+                self.last_preview_process_at = None;
                 self.mode = AppMode::Previewing;
                 self.preview_workspace.clear_session_state();
                 self.reset_analysis();
@@ -1055,7 +1165,7 @@ impl CameraApp {
     }
 
     fn start_recording(&mut self) {
-        if self.mode == AppMode::Recording {
+        if self.mode == AppMode::Recording || self.replay_open_task.is_some() {
             return;
         }
         if self.mode == AppMode::Previewing {
@@ -1065,6 +1175,7 @@ impl CameraApp {
             Ok(controller) => {
                 self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
+                self.last_preview_process_at = None;
                 self.mode = AppMode::Recording;
                 self.preview_workspace.clear_session_state();
                 self.reset_analysis();
@@ -1078,7 +1189,7 @@ impl CameraApp {
     }
 
     fn open_replay_file(&mut self) {
-        if self.mode != AppMode::Idle {
+        if self.mode != AppMode::Idle || self.replay_open_task.is_some() {
             return;
         }
 
@@ -1095,7 +1206,8 @@ impl CameraApp {
             camera_info: self.camera_info.clone(),
         };
 
-        let open_result = match replay_file_extension(&path).as_deref() {
+        let extension = replay_file_extension(&path);
+        let open_result = match extension.as_deref() {
             Some("raw") => match RawFileCamera::open(&path) {
                 Ok((camera, controls, info)) => {
                     let replay_info = camera.device_info();
@@ -1105,45 +1217,84 @@ impl CameraApp {
                         replay_pipeline_config(&info),
                         PipelineOptions::preview_only(info.width, info.height),
                     )
-                    .map(|controller| (controller, controls, info, replay_info, None))
+                    .map(|controller| OpenedReplay {
+                        controller,
+                        controls,
+                        info,
+                        replay_info,
+                        decoded_events: None,
+                    })
                     .map_err(|err| format!("pipeline start failed: {err}"))
                 }
                 Err(err) => Err(format!("open replay file failed: {err}")),
             },
             Some("csv") | Some("bin") | Some("npy") | Some("h5") | Some("hdf5") => {
-                match DecodedEventFileCamera::open(&path) {
-                    Ok((camera, controls, info, decoded_events)) => {
-                        let replay_info = camera.device_info();
-                        spawn_pipeline(
-                            camera,
-                            PackedEventPreviewDecoder::default(),
-                            replay_pipeline_config(&info),
-                            PipelineOptions::preview_only(info.width, info.height),
-                        )
-                        .map(|controller| {
-                            (
+                let (tx, rx) = mpsc::channel();
+                let path_for_thread = path.clone();
+                thread::spawn(move || {
+                    let result = match DecodedEventFileCamera::open(&path_for_thread) {
+                        Ok((camera, controls, info, decoded_events)) => {
+                            let replay_info = camera.device_info();
+                            spawn_pipeline(
+                                camera,
+                                PackedEventPreviewDecoder::default(),
+                                replay_pipeline_config(&info),
+                                PipelineOptions::preview_only(info.width, info.height),
+                            )
+                            .map(|controller| OpenedReplay {
                                 controller,
                                 controls,
                                 info,
                                 replay_info,
-                                Some(decoded_events),
-                            )
-                        })
-                        .map_err(|err| format!("pipeline start failed: {err}"))
-                    }
-                    Err(err) => Err(format!("open replay file failed: {err}")),
-                }
+                                decoded_events: Some(decoded_events),
+                            })
+                            .map_err(|err| format!("pipeline start failed: {err}"))
+                        }
+                        Err(err) => Err(format!("open replay file failed: {err}")),
+                    };
+                    let _ = tx.send(result);
+                });
+                self.replay_open_task = Some(ReplayOpenTask {
+                    path: path.clone(),
+                    saved_live_state,
+                    rx,
+                });
+                self.replay_notice = Some("Opening replay...".into());
+                self.last_error = None;
+                self.camera_status = format!(
+                    "Opening {}…",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                );
+                return;
             }
             Some(ext) => Err(format!("unsupported replay file extension: .{ext}")),
             None => Err("replay file is missing an extension".into()),
         };
-        let (controller, controls, info, replay_info, decoded_events) = match open_result {
+        let opened = match open_result {
             Ok(result) => result,
             Err(err) => {
                 self.last_error = Some(err);
                 return;
             }
         };
+        self.finish_opened_replay(path, saved_live_state, opened);
+    }
+
+    fn finish_opened_replay(
+        &mut self,
+        path: PathBuf,
+        saved_live_state: SavedLiveState,
+        opened: OpenedReplay,
+    ) {
+        let OpenedReplay {
+            controller,
+            controls,
+            info,
+            replay_info,
+            decoded_events,
+        } = opened;
         let (display_config, display_mask_file, replay_notice) =
             self.load_replay_display_settings(&path, info.width, info.height);
 
@@ -1151,6 +1302,7 @@ impl CameraApp {
         self.set_replay_speed_internal(&controls, 1.0);
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
+        self.last_preview_process_at = None;
         self.mode = AppMode::Replaying;
         self.preview_workspace.clear_session_state();
         self.camera_info = Some(replay_info);
@@ -1177,6 +1329,35 @@ impl CameraApp {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string())
         );
+    }
+
+    fn poll_replay_open_task(&mut self) {
+        let Some(task) = self.replay_open_task.take() else {
+            return;
+        };
+
+        match task.rx.try_recv() {
+            Ok(Ok(opened)) => {
+                self.finish_opened_replay(task.path, task.saved_live_state, opened);
+            }
+            Ok(Err(err)) => {
+                self.replay_notice = None;
+                self.last_error = Some(err);
+                self.camera_status =
+                    "Camera idle. Current local settings will be used for the next recording."
+                        .into();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.replay_open_task = Some(task);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.replay_notice = None;
+                self.last_error = Some("replay open worker disconnected unexpectedly".into());
+                self.camera_status =
+                    "Camera idle. Current local settings will be used for the next recording."
+                        .into();
+            }
+        }
     }
 
     fn load_replay_display_settings(
@@ -1358,6 +1539,7 @@ impl CameraApp {
         self.set_replay_speed_internal(&controls, self.replay_speed);
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
+        self.last_preview_process_at = None;
         self.replay_controls = Some(controls);
         self.replay_file_info = Some(info);
         self.replay_paused = desired_paused;
@@ -1414,6 +1596,7 @@ impl CameraApp {
         }
         self.texture = None;
         self.latest_frame = None;
+        self.last_preview_process_at = None;
         self.preview_workspace.clear_session_state();
         self.reset_analysis();
         self.mode = AppMode::Idle;
@@ -1495,20 +1678,31 @@ impl CameraApp {
     fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
-        let ffi_events: Vec<FfiCdEvent> = frame
-            .events
-            .as_deref()
-            .unwrap_or(&[])
+        let runtime_plugins_enabled = self
+            .plugin_manager
+            .records()
             .iter()
-            .map(|event| FfiCdEvent {
-                timestamp: event.timestamp,
-                x: event.x,
-                y: event.y,
-                polarity: u8::from(event.polarity),
-            })
-            .collect();
-        self.event_store
-            .push_frame(&ffi_events, frame.window_start_us, frame.window_end_us);
+            .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()));
+        let ffi_events = if runtime_plugins_enabled {
+            let ffi_events: Vec<FfiCdEvent> = frame
+                .events
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|event| FfiCdEvent {
+                    timestamp: event.timestamp,
+                    x: event.x,
+                    y: event.y,
+                    polarity: u8::from(event.polarity),
+                })
+                .collect();
+            self.event_store
+                .push_frame(&ffi_events, frame.window_start_us, frame.window_end_us);
+            ffi_events
+        } else {
+            self.event_store.clear();
+            Vec::new()
+        };
 
         for phase in [
             PluginInput::FrameOnly,
@@ -1537,8 +1731,6 @@ impl CameraApp {
                 }
             }
         }
-
-        self.mark_host_view_datasets_stale();
     }
 
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
@@ -1555,6 +1747,19 @@ impl CameraApp {
             return;
         };
 
+        let needs_texture = self.preview_workspace.view_mode == ViewMode::Preview2d
+            || self.preview_workspace.popup_open;
+        let force_process =
+            (needs_texture && self.texture.is_none()) || self.replay_pause_after_seek_frame;
+        let process_interval = self.active_preview_process_interval();
+        if !force_process
+            && self
+                .last_preview_process_at
+                .is_some_and(|at| at.elapsed() < process_interval)
+        {
+            return;
+        }
+
         if self.mode == AppMode::Replaying && self.replay_pause_after_seek_frame {
             if let Some(controls) = &self.replay_controls {
                 self.set_replay_paused_internal(controls, true);
@@ -1565,20 +1770,24 @@ impl CameraApp {
 
         self.run_analysis_plugins(&frame);
 
-        let image = frame_to_color_image(
-            &frame,
-            &self.analysis_output.overlays,
-            self.contrast_percentile,
-        );
+        if needs_texture {
+            let image = frame_to_color_image(
+                &frame,
+                &self.analysis_output.overlays,
+                self.contrast_percentile,
+            );
+            if let Some(texture) = &mut self.texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture =
+                    Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
+            }
+        }
         if let Some(events) = frame.events.as_deref() {
             self.preview_workspace.point_cloud.push_events(events);
         }
         self.latest_frame = Some(frame);
-        if let Some(texture) = &mut self.texture {
-            texture.set(image, egui::TextureOptions::LINEAR);
-        } else {
-            self.texture = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
-        }
+        self.last_preview_process_at = Some(Instant::now());
     }
 
     fn settings_are_locked(&self) -> bool {
@@ -1625,6 +1834,14 @@ impl CameraApp {
 
         ((self.current_replay_fraction() as f64 * info.total_duration_us as f64).round() as u64)
             .min(info.total_duration_us)
+    }
+
+    fn active_preview_process_interval(&self) -> Duration {
+        if self.preview_workspace.view_mode == ViewMode::PointCloud3d {
+            POINT_CLOUD_PROCESS_INTERVAL
+        } else {
+            PREVIEW_PROCESS_INTERVAL
+        }
     }
 
     fn latest_detected_hotpixels(&self) -> Vec<(u16, u16)> {
@@ -1784,6 +2001,7 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_replay_open_task();
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
         self.refresh_host_view_registry_if_dirty();
@@ -2643,6 +2861,16 @@ impl eframe::App for CameraApp {
                             (s.elapsed_s as u64 % 3600) / 60,
                             s.elapsed_s as u64 % 60
                         ));
+                        ui.small(format!(
+                            "Preview drops: {} packets / {} frames  |  Preview queues HW: {} / {}  |  Disk queue HW: {}  |  Disk wait/write: {:.1} / {:.1} ms",
+                            s.preview_packet_drops,
+                            s.preview_frame_drops,
+                            s.preview_packet_queue_high_water,
+                            s.preview_frame_queue_high_water,
+                            s.disk_queue_high_water,
+                            s.disk_send_wait_us as f64 / 1_000.0,
+                            s.disk_write_us as f64 / 1_000.0,
+                        ));
                     }
                     if let Some(frame) = &self.latest_frame {
                         let total = frame.on_count + frame.off_count;
@@ -2695,6 +2923,17 @@ impl eframe::App for CameraApp {
 
                     if let Some(notice) = &self.analysis_notice {
                         ui.label(notice);
+                    }
+
+                    if self.replay_open_task.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                self.replay_notice
+                                    .as_deref()
+                                    .unwrap_or("Opening replay..."),
+                            );
+                        });
                     }
 
                     if let Some(err) = &self.last_error {
@@ -2805,10 +3044,13 @@ impl eframe::App for CameraApp {
 
         self.sync_active_pipeline_requirements();
 
-        if self.host_view_window_open.values().any(|open| *open)
-            || (self.mode != AppMode::Idle && self.controller.is_some())
-        {
-            ctx.request_repaint();
+        let stream_active = matches!(self.mode, AppMode::Previewing | AppMode::Recording)
+            || (self.mode == AppMode::Replaying && !self.replay_paused && !self.replay_finished);
+        let process_interval = self.active_preview_process_interval();
+        if self.replay_open_task.is_some() {
+            ctx.request_repaint_after(PREVIEW_PROCESS_INTERVAL);
+        } else if stream_active && self.controller.is_some() {
+            ctx.request_repaint_after(process_interval);
         }
     }
 }

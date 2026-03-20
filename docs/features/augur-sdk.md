@@ -33,7 +33,8 @@ Additional guarantees:
 - Throughput stats use a 1-second sliding window (Mev/s, MB/s)
 - Worker errors surface through a dedicated error channel
 - USB timeouts are non-fatal (low-event scenes are valid)
-- Preview analysis runs on the GUI thread against the latest decoded frame
+- Recording output is opened and header-initialized before streaming starts
+- Preview analysis still runs on the GUI thread, but only against the latest processed preview frame and at a capped UI cadence
 
 ## Recording Output
 

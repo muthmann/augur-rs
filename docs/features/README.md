@@ -15,6 +15,8 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 ## Index
 
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
+- [Performance Safeguards](./performance-safeguards.md) — capture-path fail-fast setup, stop-time drain behavior, preview throttling, and UI-side load shedding
+- [Performance Overhaul](./performance-overhaul.md) — split pipeline telemetry, direct `Color32` preview rendering, async decoded replay opening, and generation-aware host caching
 - [Release Distribution](./release-distribution.md) — cross-platform tagged artifacts, macOS signing/notarization, and cargo-release workflow
 - [HDF5 File Support](./hdf5-file-support.md) — native HDF5 build requirements, ECF plugin installation, runtime environment setup
 - [Replay](./raw-replay.md) — `.raw` plus decoded-event replay, seekable transport controls, persisted EOF state
@@ -23,6 +25,7 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
 - [Plugin API v0.2](./plugin-api-v0-2.md) — flat runtime ABI, EventStore history, persistent plugin context, and repo split cleanup
+- [Plugin API v0.3 Migration](./plugin-api-v0-3-migration.md) — segmented EventStore access, host-view dataset generations, raw context publishing, and rebuild requirements
 - [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables and density views
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection

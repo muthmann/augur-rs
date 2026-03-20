@@ -18,6 +18,15 @@ pub struct PointCloudMetrics {
     pub rendered_points: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleHistoryWindow {
+    lo: usize,
+    hi: usize,
+    start_ts: u64,
+    end_ts: u64,
+    step: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PointCloudState {
     history: VecDeque<CdEvent>,
@@ -145,17 +154,12 @@ impl PointCloudState {
         }
     }
 
-    fn paint_points(
-        &self,
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        roi: RoiConfig,
-    ) -> PointCloudMetrics {
-        let Some(latest) = self.history.back() else {
-            return PointCloudMetrics::default();
-        };
+    fn downsample_step(&self, slice_len: usize) -> usize {
+        slice_len.div_ceil(self.point_limit.max(1)).max(1)
+    }
 
-        let roi = sanitize_roi(roi);
+    fn visible_history_window(&self) -> Option<VisibleHistoryWindow> {
+        let latest = self.history.back()?;
         let end_ts = latest.timestamp;
         let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
 
@@ -163,16 +167,30 @@ impl PointCloudState {
         // This avoids iterating the full (up to 400 K) history on every frame.
         let lo = self.history.partition_point(|e| e.timestamp < start_ts);
         let hi = self.history.partition_point(|e| e.timestamp <= end_ts);
-        let slice_len = hi - lo;
-        if slice_len == 0 {
-            return PointCloudMetrics::default();
+        if lo >= hi {
+            return None;
         }
 
-        // Use the full slice length to compute a downsample step, avoiding a
-        // separate counting pass over the ROI-filtered iterator. This is
-        // conservative (step may be slightly larger than needed) but halves the
-        // per-frame iteration cost.
-        let step = slice_len.div_ceil(self.point_limit).max(1);
+        Some(VisibleHistoryWindow {
+            lo,
+            hi,
+            start_ts,
+            end_ts,
+            step: self.downsample_step(hi - lo),
+        })
+    }
+
+    fn paint_points(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        roi: RoiConfig,
+    ) -> PointCloudMetrics {
+        let Some(window) = self.visible_history_window() else {
+            return PointCloudMetrics::default();
+        };
+
+        let roi = sanitize_roi(roi);
 
         // Precompute the camera transform once — avoids sin/cos per point.
         let cam = CameraView::new(self.azimuth, self.elevation, self.distance, rect);
@@ -180,15 +198,16 @@ impl PointCloudState {
 
         let mut visible_points = 0usize;
         let mut rendered_points = 0usize;
-        for (idx, event) in self.history.range(lo..hi).enumerate() {
+        for (idx, event) in self.history.range(window.lo..window.hi).enumerate() {
             if !roi_contains(event, &roi) {
                 continue;
             }
             visible_points += 1;
-            if idx % step != 0 {
+            if idx % window.step != 0 {
                 continue;
             }
-            let Some(projected) = project_event(event, &roi, start_ts, end_ts, cam) else {
+            let Some(projected) = project_event(event, &roi, window.start_ts, window.end_ts, cam)
+            else {
                 continue;
             };
 
@@ -369,6 +388,31 @@ mod tests {
         state.push_events(&events);
 
         assert!(state.point_limit >= 1_000);
+    }
+
+    #[test]
+    fn visible_window_uses_latest_time_slice_and_downsamples() {
+        let mut state = PointCloudState {
+            time_window_ms: 1_000.0,
+            point_limit: 2,
+            ..Default::default()
+        };
+
+        let events: Vec<CdEvent> = (0..6)
+            .map(|idx| CdEvent {
+                x: 10,
+                y: 10,
+                timestamp: idx as u64 * 10,
+                polarity: idx % 2 == 0,
+            })
+            .collect();
+        state.push_events(&events);
+
+        let window = state.visible_history_window().expect("window should exist");
+        assert_eq!((window.lo, window.hi), (0, 6));
+        assert_eq!(window.start_ts, 0);
+        assert_eq!(window.end_ts, 50);
+        assert_eq!(window.step, 3);
     }
 
     #[test]

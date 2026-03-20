@@ -357,6 +357,22 @@ macro_rules! export_plugin {
                 })
             }
 
+            unsafe extern "C" fn __host_view_dataset_generation(
+                instance: *const ::std::ffi::c_void,
+                dataset_id: $crate::FfiString,
+            ) -> u64 {
+                ::std::panic::catch_unwind(|| {
+                    let Some(plugin) = __instance_ref(instance) else {
+                        return 0;
+                    };
+                    let Ok(dataset_id) = dataset_id.as_str() else {
+                        return 0;
+                    };
+                    plugin.plugin.host_view_dataset_generation(dataset_id)
+                })
+                .unwrap_or(0)
+            }
+
             static __AUGUR_PLUGIN_VTABLE: $crate::PluginVTable = $crate::PluginVTable {
                 vtable_size: ::std::mem::size_of::<$crate::PluginVTable>(),
                 create: __create,
@@ -376,6 +392,7 @@ macro_rules! export_plugin {
                 status_entries: __status_entries,
                 host_views: __host_views,
                 host_view_dataset: __host_view_dataset,
+                host_view_dataset_generation: __host_view_dataset_generation,
             };
 
             #[no_mangle]
@@ -384,4 +401,57 @@ macro_rules! export_plugin {
             }
         };
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame, PluginInput};
+
+    #[derive(Default)]
+    struct GenerationPlugin;
+
+    impl Plugin for GenerationPlugin {
+        fn name(&self) -> &'static str {
+            "generation-plugin"
+        }
+
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn set_enabled(&mut self, _enabled: bool) {}
+
+        fn reset(&mut self) {}
+
+        fn input_kind(&self) -> PluginInput {
+            PluginInput::FrameOnly
+        }
+
+        fn process_frame(
+            &mut self,
+            _frame: &PluginFrame<'_>,
+            _output: &mut HostOutput<'_>,
+            _context: &mut HostContext<'_>,
+            _event_store: &EventStoreHandle<'_>,
+        ) {
+        }
+
+        fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+            match dataset_id {
+                "table.a" => 41,
+                "table.b" => 42,
+                _ => 0,
+            }
+        }
+    }
+
+    crate::export_plugin!(GenerationPlugin);
+
+    #[test]
+    fn host_view_dataset_generation_defaults_and_overrides_are_preserved() {
+        let plugin = GenerationPlugin;
+        assert_eq!(plugin.host_view_dataset_generation("table.a"), 41);
+        assert_eq!(plugin.host_view_dataset_generation("table.b"), 42);
+        assert_eq!(plugin.host_view_dataset_generation("missing"), 0);
+    }
 }

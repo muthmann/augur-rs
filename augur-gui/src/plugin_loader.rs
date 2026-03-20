@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use augur_core::{
@@ -14,7 +15,7 @@ use augur_core::{
     pipeline::PreviewFrame,
 };
 use augur_plugin_api::{
-    AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventStoreHandle,
+    AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
     FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
     FfiSubpixelMarker, HostViewRegistry, PluginEntry, PluginInput, PluginVTable, SettingsSchema,
     StatusEntry, PLUGIN_ENTRY_SYMBOL,
@@ -22,6 +23,20 @@ use augur_plugin_api::{
 use libloading::Library;
 use serde::Deserialize;
 use serde_json::Value;
+
+pub const PLUGIN_UI_CACHE_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone)]
+struct CachedSettingValue {
+    fetched_at: Instant,
+    value: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedStatusEntries {
+    fetched_at: Instant,
+    entries: Vec<StatusEntry>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
@@ -57,6 +72,8 @@ pub struct DynPlugin {
     cached_schema: SettingsSchema,
     cached_dependencies: Vec<String>,
     input_kind: PluginInput,
+    cached_setting_values: HashMap<String, CachedSettingValue>,
+    cached_status_entries: Option<CachedStatusEntries>,
 }
 
 impl DynPlugin {
@@ -96,6 +113,8 @@ impl DynPlugin {
             cached_schema: SettingsSchema::default(),
             cached_dependencies: Vec::new(),
             input_kind: PluginInput::FrameOnly,
+            cached_setting_values: HashMap::new(),
+            cached_status_entries: None,
         };
         if let Err(err) = plugin.refresh_cached_metadata() {
             unsafe {
@@ -130,6 +149,7 @@ impl DynPlugin {
         self.cached_schema = schema;
         self.cached_dependencies = dependencies;
         self.input_kind = input_kind;
+        self.invalidate_ui_cache();
         Ok(())
     }
 
@@ -191,12 +211,14 @@ impl DynPlugin {
         unsafe {
             (self.vtable.set_enabled)(self.instance, enabled);
         }
+        self.invalidate_ui_cache();
     }
 
     pub fn reset(&mut self) {
         unsafe {
             (self.vtable.reset)(self.instance);
         }
+        self.invalidate_ui_cache();
     }
 
     pub fn get_setting_value(&self, key: &str) -> Result<Option<Value>, String> {
@@ -219,20 +241,59 @@ impl DynPlugin {
             .map_err(|err| format!("plugin setting {key} is not valid JSON: {err}"))
     }
 
+    pub fn get_setting_value_cached(&mut self, key: &str) -> Result<Option<Value>, String> {
+        let now = Instant::now();
+        if let Some(cached) = self.cached_setting_values.get(key) {
+            if now.duration_since(cached.fetched_at) < PLUGIN_UI_CACHE_INTERVAL {
+                return Ok(cached.value.clone());
+            }
+        }
+
+        let value = self.get_setting_value(key)?;
+        self.cached_setting_values.insert(
+            key.to_owned(),
+            CachedSettingValue {
+                fetched_at: now,
+                value: value.clone(),
+            },
+        );
+        Ok(value)
+    }
+
     pub fn set_setting_value(&mut self, key: &str, value: &Value) -> Result<bool, String> {
         let json = serde_json::to_vec(value)
             .map_err(|err| format!("serializing setting failed: {err}"))?;
-        Ok(unsafe {
+        let updated = unsafe {
             (self.vtable.set_setting)(
                 self.instance,
                 FfiString::from(key),
                 FfiSlice::from_slice(&json),
             )
-        })
+        };
+        if updated {
+            self.invalidate_ui_cache();
+        }
+        Ok(updated)
     }
 
     pub fn status_entries(&self) -> Result<Vec<StatusEntry>, String> {
         self.read_json(self.vtable.status_entries)
+    }
+
+    pub fn status_entries_cached(&mut self) -> Result<Vec<StatusEntry>, String> {
+        let now = Instant::now();
+        if let Some(cached) = &self.cached_status_entries {
+            if now.duration_since(cached.fetched_at) < PLUGIN_UI_CACHE_INTERVAL {
+                return Ok(cached.entries.clone());
+            }
+        }
+
+        let entries = self.status_entries()?;
+        self.cached_status_entries = Some(CachedStatusEntries {
+            fetched_at: now,
+            entries: entries.clone(),
+        });
+        Ok(entries)
     }
 
     pub fn host_views(&self) -> Result<HostViewRegistry, String> {
@@ -244,6 +305,17 @@ impl DynPlugin {
             (self.vtable.host_view_dataset)(inst, FfiString::from(dataset_id), ptr, len)
         });
         Ok(bytes.map(|b| b.to_vec()))
+    }
+
+    pub fn host_view_dataset_generation(&self, dataset_id: &str) -> u64 {
+        unsafe {
+            (self.vtable.host_view_dataset_generation)(self.instance, FfiString::from(dataset_id))
+        }
+    }
+
+    pub fn invalidate_ui_cache(&mut self) {
+        self.cached_setting_values.clear();
+        self.cached_status_entries = None;
     }
 
     fn call_optional_bytes(
@@ -300,10 +372,10 @@ impl DynPlugin {
         };
         let ffi_event_store = FfiEventStoreHandle {
             ctx: (&store_bridge as *const EventStoreBridge).cast(),
-            all_events: all_events_callback,
-            events_in_range: events_in_range_callback,
-            oldest_timestamp_us: oldest_timestamp_callback,
             frame_count: frame_count_callback,
+            frame_at: frame_at_callback,
+            frame_range_for_timestamps: frame_range_for_timestamps_callback,
+            oldest_timestamp_us: oldest_timestamp_callback,
         };
 
         unsafe {
@@ -642,32 +714,58 @@ unsafe extern "C" fn get_persistent_context_value(
     }
 }
 
-unsafe extern "C" fn all_events_callback(
+unsafe extern "C" fn frame_at_callback(
     ctx: *const c_void,
-    out_ptr: *mut *const FfiCdEvent,
-    out_len: *mut usize,
-) {
-    let events = ctx
+    index: usize,
+    out_frame: *mut FfiEventFrame,
+) -> bool {
+    let Some(slot) = out_frame.as_mut() else {
+        return false;
+    };
+    let frame = ctx
         .cast::<EventStoreBridge>()
         .as_ref()
-        .map(|bridge| bridge.store.all_events())
-        .unwrap_or(&[]);
-    write_event_slice(events, out_ptr, out_len);
+        .and_then(|bridge| bridge.store.frame(index));
+    match frame {
+        Some(frame) => {
+            *slot = frame;
+            true
+        }
+        None => {
+            *slot = FfiEventFrame::empty();
+            false
+        }
+    }
 }
 
-unsafe extern "C" fn events_in_range_callback(
+unsafe extern "C" fn frame_range_for_timestamps_callback(
     ctx: *const c_void,
     start_us: u64,
     end_us: u64,
-    out_ptr: *mut *const FfiCdEvent,
-    out_len: *mut usize,
-) {
-    let events = ctx
+    out_start: *mut usize,
+    out_end: *mut usize,
+) -> bool {
+    if out_start.is_null() || out_end.is_null() {
+        return false;
+    }
+
+    let range = ctx
         .cast::<EventStoreBridge>()
         .as_ref()
-        .map(|bridge| bridge.store.events_in_range(start_us, end_us))
-        .unwrap_or(&[]);
-    write_event_slice(events, out_ptr, out_len);
+        .and_then(|bridge| bridge.store.frame_range_for_timestamps(start_us, end_us));
+
+    match range {
+        Some((start, end)) => {
+            *out_start = start;
+            *out_end = end;
+            true
+        }
+        None => {
+            *out_start = 0;
+            *out_end = 0;
+            false
+        }
+    }
 }
 
 unsafe extern "C" fn oldest_timestamp_callback(ctx: *const c_void) -> u64 {
@@ -682,25 +780,6 @@ unsafe extern "C" fn frame_count_callback(ctx: *const c_void) -> usize {
         .as_ref()
         .map(|bridge| bridge.store.frame_count())
         .unwrap_or(0)
-}
-
-unsafe fn write_event_slice(
-    events: &[FfiCdEvent],
-    out_ptr: *mut *const FfiCdEvent,
-    out_len: *mut usize,
-) {
-    if out_ptr.is_null() || out_len.is_null() {
-        return;
-    }
-
-    if events.is_empty() {
-        *out_ptr = std::ptr::null();
-        *out_len = 0;
-        return;
-    }
-
-    *out_ptr = events.as_ptr();
-    *out_len = events.len();
 }
 
 fn ffi_string_to_option(ffi: FfiString, context: &str) -> Result<Option<String>, String> {
@@ -902,19 +981,14 @@ mod tests {
         store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
         store.push_frame(&[event(30, 3)], 30, 30);
         let bridge = EventStoreBridge { store: &store };
-        let mut out_ptr = std::ptr::null();
-        let mut out_len = 0usize;
+        let mut out = FfiEventFrame::empty();
 
         unsafe {
-            all_events_callback(
-                (&bridge as *const EventStoreBridge).cast(),
-                &mut out_ptr,
-                &mut out_len,
-            );
+            frame_at_callback((&bridge as *const EventStoreBridge).cast(), 0, &mut out);
         }
 
-        let slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
-        assert_eq!(slice, store.all_events());
+        let slice = unsafe { out.as_slice() };
+        assert_eq!(slice, &[event(10, 1), event(20, 2)]);
         assert_eq!(
             unsafe { oldest_timestamp_callback((&bridge as *const EventStoreBridge).cast()) },
             10
@@ -931,21 +1005,20 @@ mod tests {
         store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
         store.push_frame(&[event(30, 3), event(40, 4)], 30, 40);
         let bridge = EventStoreBridge { store: &store };
-        let mut out_ptr = std::ptr::null();
-        let mut out_len = 0usize;
+        let mut out_start = usize::MAX;
+        let mut out_end = usize::MAX;
 
         unsafe {
-            events_in_range_callback(
+            frame_range_for_timestamps_callback(
                 (&bridge as *const EventStoreBridge).cast(),
                 15,
                 35,
-                &mut out_ptr,
-                &mut out_len,
+                &mut out_start,
+                &mut out_end,
             );
         }
 
-        let slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
-        assert_eq!(slice, &[event(20, 2), event(30, 3)]);
+        assert_eq!((out_start, out_end), (0, 2));
     }
 
     #[test]

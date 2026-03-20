@@ -21,3 +21,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 005: Shared Preview Workspace State for 2D/3D GUI Views](./005-shared-preview-workspace.md)
 - [ADR 006: Host-Owned Dataset/View Registry for Plugin Outputs](./006-host-view-registry.md)
 - [ADR 007: Host-Owned EventStore for Plugin History](./007-event-store-history.md)
+- [ADR 008: Segmented EventStore and Generation-Aware Host View Caching](./008-segmented-event-store-and-host-view-generations.md)

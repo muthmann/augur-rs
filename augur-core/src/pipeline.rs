@@ -5,21 +5,27 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use crossbeam_channel::{
-    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError,
+    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
 };
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{camera::PacketStreamCamera, config::CameraConfig, CameraError, Result};
 
 pub const BUF_SIZE: usize = 65_536;
-pub const N_BUFFERS: usize = 8;
+pub const RAW_BUFFER_POOL_CAPACITY: usize = 8;
+pub const DISK_QUEUE_CAPACITY: usize = 8;
+pub const PREVIEW_PACKET_POOL_CAPACITY: usize = 4;
+pub const PREVIEW_PACKET_QUEUE_CAPACITY: usize = 4;
+pub const PREVIEW_FRAME_QUEUE_CAPACITY: usize = 4;
+const PREVIEW_FRAME_POOL_CAPACITY: usize = PREVIEW_FRAME_QUEUE_CAPACITY * 2;
+pub const N_BUFFERS: usize = RAW_BUFFER_POOL_CAPACITY;
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -97,6 +103,16 @@ pub struct PreviewFrame {
     pub window_end_us: u64,
 }
 
+impl Drop for PreviewFrame {
+    fn drop(&mut self) {
+        recycle_preview_frame_buffers(PreviewFrameBuffers {
+            pixels: std::mem::take(&mut self.pixels),
+            pixels_on: std::mem::take(&mut self.pixels_on),
+            pixels_off: std::mem::take(&mut self.pixels_off),
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
     pub output_path: Option<PathBuf>,
@@ -132,6 +148,13 @@ pub struct PipelineStatsSnapshot {
     pub events_total: u64,
     pub mb_per_s: f64,
     pub mev_per_s: f64,
+    pub preview_packet_drops: u64,
+    pub preview_packet_queue_high_water: usize,
+    pub preview_frame_drops: u64,
+    pub preview_frame_queue_high_water: usize,
+    pub disk_queue_high_water: usize,
+    pub disk_send_wait_us: u64,
+    pub disk_write_us: u64,
 }
 
 #[derive(Debug)]
@@ -139,6 +162,13 @@ struct PipelineStatsInner {
     started: Instant,
     bytes_total: u64,
     events_total: u64,
+    preview_packet_drops: u64,
+    preview_packet_queue_high_water: usize,
+    preview_frame_drops: u64,
+    preview_frame_queue_high_water: usize,
+    disk_queue_high_water: usize,
+    disk_send_wait_us: u64,
+    disk_write_us: u64,
     recent_samples: VecDeque<PipelineStatsSample>,
 }
 
@@ -155,6 +185,13 @@ impl PipelineStatsInner {
             started: Instant::now(),
             bytes_total: 0,
             events_total: 0,
+            preview_packet_drops: 0,
+            preview_packet_queue_high_water: 0,
+            preview_frame_drops: 0,
+            preview_frame_queue_high_water: 0,
+            disk_queue_high_water: 0,
+            disk_send_wait_us: 0,
+            disk_write_us: 0,
             recent_samples: VecDeque::new(),
         }
     }
@@ -191,6 +228,13 @@ impl PipelineStatsInner {
             events_total: self.events_total,
             mb_per_s: recent_bytes as f64 / current_window_s / (1024.0 * 1024.0),
             mev_per_s: recent_events as f64 / current_window_s / 1_000_000.0,
+            preview_packet_drops: self.preview_packet_drops,
+            preview_packet_queue_high_water: self.preview_packet_queue_high_water,
+            preview_frame_drops: self.preview_frame_drops,
+            preview_frame_queue_high_water: self.preview_frame_queue_high_water,
+            disk_queue_high_water: self.disk_queue_high_water,
+            disk_send_wait_us: self.disk_send_wait_us,
+            disk_write_us: self.disk_write_us,
         }
     }
 
@@ -200,11 +244,109 @@ impl PipelineStatsInner {
             self.recent_samples.pop_front();
         }
     }
+
+    fn record_preview_packet_drop(&mut self) {
+        self.preview_packet_drops = self.preview_packet_drops.saturating_add(1);
+    }
+
+    fn record_preview_packet_queue_depth(&mut self, queue_depth: usize) {
+        self.preview_packet_queue_high_water =
+            self.preview_packet_queue_high_water.max(queue_depth);
+    }
+
+    fn record_preview_frame_drop(&mut self) {
+        self.preview_frame_drops = self.preview_frame_drops.saturating_add(1);
+    }
+
+    fn record_preview_frame_queue_depth(&mut self, queue_depth: usize) {
+        self.preview_frame_queue_high_water = self.preview_frame_queue_high_water.max(queue_depth);
+    }
+
+    fn record_disk_queue_depth(&mut self, queue_depth: usize) {
+        self.disk_queue_high_water = self.disk_queue_high_water.max(queue_depth);
+    }
+
+    fn record_disk_send_wait(&mut self, wait: Duration) {
+        self.disk_send_wait_us = self
+            .disk_send_wait_us
+            .saturating_add(wait.as_micros() as u64);
+    }
+
+    fn record_disk_write_time(&mut self, write_time: Duration) {
+        self.disk_write_us = self
+            .disk_write_us
+            .saturating_add(write_time.as_micros() as u64);
+    }
 }
 
 type UsbBuffer = Box<[u8; BUF_SIZE]>;
 
+#[derive(Debug)]
+struct PreviewFrameBuffers {
+    pixels: Vec<u16>,
+    pixels_on: Vec<u16>,
+    pixels_off: Vec<u16>,
+}
+
+static PREVIEW_FRAME_BUFFER_POOL: OnceLock<Mutex<Vec<PreviewFrameBuffers>>> = OnceLock::new();
+
+fn preview_frame_buffer_pool() -> &'static Mutex<Vec<PreviewFrameBuffers>> {
+    PREVIEW_FRAME_BUFFER_POOL
+        .get_or_init(|| Mutex::new(Vec::with_capacity(PREVIEW_FRAME_POOL_CAPACITY)))
+}
+
+fn take_preview_frame_buffers(pixel_count: usize) -> PreviewFrameBuffers {
+    let mut buffers = preview_frame_buffer_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mut frame_buffers) = buffers.pop() {
+        frame_buffers.pixels.clear();
+        frame_buffers.pixels.resize(pixel_count, 0);
+        frame_buffers.pixels_on.clear();
+        frame_buffers.pixels_on.resize(pixel_count, 0);
+        frame_buffers.pixels_off.clear();
+        frame_buffers.pixels_off.resize(pixel_count, 0);
+        frame_buffers
+    } else {
+        PreviewFrameBuffers {
+            pixels: vec![0_u16; pixel_count],
+            pixels_on: vec![0_u16; pixel_count],
+            pixels_off: vec![0_u16; pixel_count],
+        }
+    }
+}
+
+fn recycle_preview_frame_buffers(buffers: PreviewFrameBuffers) {
+    let mut pool = preview_frame_buffer_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pool.len() < PREVIEW_FRAME_POOL_CAPACITY {
+        pool.push(buffers);
+    }
+}
+
+#[cfg(test)]
+fn preview_frame_pool_len() -> usize {
+    preview_frame_buffer_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+}
+
+#[cfg(test)]
+fn clear_preview_frame_pool() {
+    preview_frame_buffer_pool()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 struct DiskChunk {
+    buf: UsbBuffer,
+    len: usize,
+}
+
+struct PreviewChunk {
     buf: UsbBuffer,
     len: usize,
 }
@@ -277,21 +419,38 @@ where
         }
     }
 
-    let (pool_tx, pool_rx) = bounded::<UsbBuffer>(N_BUFFERS);
-    for _ in 0..N_BUFFERS {
+    let disk_writer = if let Some(ref output_path) = options.output_path {
+        Some(prepare_output_writer(
+            output_path,
+            options.write_evt3_header,
+            options.sensor_width,
+            options.sensor_height,
+        )?)
+    } else {
+        None
+    };
+
+    let (pool_tx, pool_rx) = bounded::<UsbBuffer>(RAW_BUFFER_POOL_CAPACITY);
+    for _ in 0..RAW_BUFFER_POOL_CAPACITY {
         pool_tx
             .send(Box::new([0_u8; BUF_SIZE]))
             .map_err(|e| CameraError::Channel(format!("buffer pool init failed: {e}")))?;
     }
+    let (preview_pool_tx, preview_pool_rx) = bounded::<UsbBuffer>(PREVIEW_PACKET_POOL_CAPACITY);
+    for _ in 0..PREVIEW_PACKET_POOL_CAPACITY {
+        preview_pool_tx
+            .send(Box::new([0_u8; BUF_SIZE]))
+            .map_err(|e| CameraError::Channel(format!("preview pool init failed: {e}")))?;
+    }
 
     let (disk_tx, disk_rx) = if recording {
-        let (tx, rx) = bounded::<DiskChunk>(N_BUFFERS);
+        let (tx, rx) = bounded::<DiskChunk>(DISK_QUEUE_CAPACITY);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
-    let (preview_tx, preview_rx) = bounded::<Vec<u8>>(N_BUFFERS);
-    let (frame_tx, frame_rx) = bounded::<PreviewFrame>(2);
+    let (preview_tx, preview_rx) = bounded::<PreviewChunk>(PREVIEW_PACKET_QUEUE_CAPACITY);
+    let (frame_tx, frame_rx) = bounded::<PreviewFrame>(PREVIEW_FRAME_QUEUE_CAPACITY);
     let (settings_tx, settings_rx) = bounded::<CameraConfig>(8);
     let (error_tx, error_rx) = bounded::<String>(32);
 
@@ -309,6 +468,8 @@ where
     let error_preview = error_tx.clone();
 
     let usb_pool_tx = pool_tx.clone();
+    let preview_pool_tx_usb = preview_pool_tx.clone();
+    let stats_preview = Arc::clone(&stats);
 
     let usb_thread = thread::spawn(move || {
         let mut camera = camera;
@@ -383,33 +544,76 @@ where
 
             if let Ok(mut s) = stats_usb.lock() {
                 let now = Instant::now();
-                s.record_packet(now, len as u64, D::estimate_event_count(&buf[..len]));
+                s.record_packet(now, len as u64, 0);
             }
+            // PacketStreamCamera does not currently expose upstream overflow counters.
+            // Surface them here once the transport API makes them available.
 
-            let preview_copy = buf[..len].to_vec();
-
-            if let Some(ref disk_tx) = disk_tx {
-                match disk_tx.send_timeout(DiskChunk { buf, len }, Duration::from_millis(50)) {
-                    Ok(_) => {}
-                    Err(SendTimeoutError::Timeout(chunk)) => {
-                        if stop_usb.load(Ordering::Relaxed) {
-                            let _ = usb_pool_tx.send(chunk.buf);
-                            break;
-                        }
-                        match disk_tx.send(chunk) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                report_pipeline_error(
-                                    &error_usb,
-                                    &stop_usb,
-                                    "usb",
-                                    format!("disk channel send failed: {e}"),
-                                );
-                                break;
+            if !preview_tx.is_full() {
+                match preview_pool_rx.try_recv() {
+                    Ok(mut preview_buf) => {
+                        preview_buf[..len].copy_from_slice(&buf[..len]);
+                        match preview_tx.try_send(PreviewChunk {
+                            buf: preview_buf,
+                            len,
+                        }) {
+                            Ok(()) => {
+                                if let Ok(mut s) = stats_usb.lock() {
+                                    s.record_preview_packet_queue_depth(preview_tx.len());
+                                }
+                            }
+                            Err(TrySendError::Full(chunk))
+                            | Err(TrySendError::Disconnected(chunk)) => {
+                                if let Ok(mut s) = stats_usb.lock() {
+                                    s.record_preview_packet_drop();
+                                }
+                                let _ = preview_pool_tx_usb.try_send(chunk.buf);
                             }
                         }
                     }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                        if let Ok(mut s) = stats_usb.lock() {
+                            s.record_preview_packet_drop();
+                        }
+                    }
+                }
+            } else if let Ok(mut s) = stats_usb.lock() {
+                s.record_preview_packet_drop();
+            }
+
+            if let Some(ref disk_tx) = disk_tx {
+                let disk_send_started = Instant::now();
+                match disk_tx.send_timeout(DiskChunk { buf, len }, Duration::from_millis(50)) {
+                    Ok(_) => {
+                        if let Ok(mut s) = stats_usb.lock() {
+                            s.record_disk_send_wait(disk_send_started.elapsed());
+                            s.record_disk_queue_depth(disk_tx.len());
+                        }
+                    }
+                    Err(SendTimeoutError::Timeout(chunk)) => match disk_tx.send(chunk) {
+                        Ok(_) => {
+                            if let Ok(mut s) = stats_usb.lock() {
+                                s.record_disk_send_wait(disk_send_started.elapsed());
+                                s.record_disk_queue_depth(disk_tx.len());
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut s) = stats_usb.lock() {
+                                s.record_disk_send_wait(disk_send_started.elapsed());
+                            }
+                            report_pipeline_error(
+                                &error_usb,
+                                &stop_usb,
+                                "usb",
+                                format!("disk channel send failed: {e}"),
+                            );
+                            break;
+                        }
+                    },
                     Err(SendTimeoutError::Disconnected(chunk)) => {
+                        if let Ok(mut s) = stats_usb.lock() {
+                            s.record_disk_send_wait(disk_send_started.elapsed());
+                        }
                         let _ = usb_pool_tx.send(chunk.buf);
                         report_pipeline_error(
                             &error_usb,
@@ -423,8 +627,6 @@ where
             } else {
                 let _ = usb_pool_tx.send(buf);
             }
-
-            let _ = preview_tx.try_send(preview_copy);
         }
 
         if let Err(e) = camera.stop_streaming() {
@@ -439,48 +641,22 @@ where
 
     let mut threads = vec![usb_thread];
 
-    if let (Some(disk_rx), Some(output_path)) = (disk_rx, options.output_path) {
+    if let (Some(disk_rx), Some(mut writer)) = (disk_rx, disk_writer) {
         let stop_disk = Arc::clone(&stop);
         let error_disk = error_tx.clone();
         let disk_pool_tx = pool_tx.clone();
-        let write_evt3_header = options.write_evt3_header;
-        let header_width = options.sensor_width;
-        let header_height = options.sensor_height;
+        let stats_disk = Arc::clone(&stats);
 
         let disk_thread = thread::spawn(move || {
-            let file = match File::create(&output_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    report_pipeline_error(
-                        &error_disk,
-                        &stop_disk,
-                        "disk",
-                        format!(
-                            "failed to create output file {}: {e}",
-                            output_path.display()
-                        ),
-                    );
-                    return;
-                }
-            };
-            let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-
-            if write_evt3_header {
-                if let Err(e) = write_evt3_header_lines(&mut writer, header_width, header_height) {
-                    report_pipeline_error(
-                        &error_disk,
-                        &stop_disk,
-                        "disk",
-                        format!("failed to write EVT3 header: {e}"),
-                    );
-                    return;
-                }
-            }
-
             loop {
                 match disk_rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(chunk) => {
-                        if let Err(e) = writer.write_all(&chunk.buf[..chunk.len]) {
+                        let write_started = Instant::now();
+                        let write_result = writer.write_all(&chunk.buf[..chunk.len]);
+                        if let Ok(mut s) = stats_disk.lock() {
+                            s.record_disk_write_time(write_started.elapsed());
+                        }
+                        if let Err(e) = write_result {
                             report_pipeline_error(
                                 &error_disk,
                                 &stop_disk,
@@ -500,7 +676,12 @@ where
                 }
             }
 
-            if let Err(e) = writer.flush() {
+            let flush_started = Instant::now();
+            let flush_result = writer.flush();
+            if let Ok(mut s) = stats_disk.lock() {
+                s.record_disk_write_time(flush_started.elapsed());
+            }
+            if let Err(e) = flush_result {
                 report_pipeline_error(
                     &error_disk,
                     &stop_disk,
@@ -515,20 +696,23 @@ where
 
     let width = options.sensor_width;
     let height = options.sensor_height;
+    let pixel_count = width as usize * height as usize;
+    let preview_pool_tx_preview = preview_pool_tx.clone();
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
-        let mut frame_buf = vec![0_u16; width as usize * height as usize];
-        let mut frame_buf_on = vec![0_u16; width as usize * height as usize];
-        let mut frame_buf_off = vec![0_u16; width as usize * height as usize];
+        let mut frame_buffers = take_preview_frame_buffers(pixel_count);
         let mut on_count = 0_u64;
         let mut off_count = 0_u64;
         let mut frame_start_ts: Option<u64> = None;
 
         loop {
             match preview_rx.recv_timeout(Duration::from_millis(2)) {
-                Ok(bytes) => {
-                    if let Err(e) = decoder.decode_bytes(&bytes, &mut events) {
+                Ok(chunk) => {
+                    let decode_result = decoder.decode_bytes(&chunk.buf[..chunk.len], &mut events);
+                    let _ = preview_pool_tx_preview.try_send(chunk.buf);
+
+                    if let Err(e) = decode_result {
                         report_pipeline_error(
                             &error_preview,
                             &stop_preview,
@@ -537,17 +721,22 @@ where
                         );
                         break;
                     }
+                    if let Ok(mut s) = stats_preview.lock() {
+                        s.record_packet(Instant::now(), 0, events.len() as u64);
+                    }
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
                             continue;
                         }
                         let idx = ev.y as usize * width as usize + ev.x as usize;
-                        frame_buf[idx] = frame_buf[idx].saturating_add(1);
+                        frame_buffers.pixels[idx] = frame_buffers.pixels[idx].saturating_add(1);
                         if ev.polarity {
-                            frame_buf_on[idx] = frame_buf_on[idx].saturating_add(1);
+                            frame_buffers.pixels_on[idx] =
+                                frame_buffers.pixels_on[idx].saturating_add(1);
                             on_count += 1;
                         } else {
-                            frame_buf_off[idx] = frame_buf_off[idx].saturating_add(1);
+                            frame_buffers.pixels_off[idx] =
+                                frame_buffers.pixels_off[idx].saturating_add(1);
                             off_count += 1;
                         }
                         frame_start_ts.get_or_insert(ev.timestamp);
@@ -572,22 +761,35 @@ where
                                 frame_events.clear();
                                 None
                             };
+                            let frame_buffers = std::mem::replace(
+                                &mut frame_buffers,
+                                take_preview_frame_buffers(pixel_count),
+                            );
                             let frame = PreviewFrame {
                                 width,
                                 height,
-                                pixels: frame_buf.clone(),
-                                pixels_on: frame_buf_on.clone(),
-                                pixels_off: frame_buf_off.clone(),
+                                pixels: frame_buffers.pixels,
+                                pixels_on: frame_buffers.pixels_on,
+                                pixels_off: frame_buffers.pixels_off,
                                 on_count,
                                 off_count,
                                 events: raw_events,
                                 window_start_us: t0,
                                 window_end_us: last_ts,
                             };
-                            let _ = frame_tx.try_send(frame);
-                            frame_buf.fill(0);
-                            frame_buf_on.fill(0);
-                            frame_buf_off.fill(0);
+                            match frame_tx.try_send(frame) {
+                                Ok(()) => {
+                                    if let Ok(mut s) = stats_preview.lock() {
+                                        s.record_preview_frame_queue_depth(frame_tx.len());
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Ok(mut s) = stats_preview.lock() {
+                                        s.record_preview_frame_drop();
+                                    }
+                                    drop(err);
+                                }
+                            }
                             on_count = 0;
                             off_count = 0;
                             frame_start_ts = None;
@@ -635,6 +837,20 @@ fn write_evt3_header_lines(mut writer: impl Write, width: u16, height: u16) -> R
     Ok(())
 }
 
+fn prepare_output_writer(
+    output_path: &Path,
+    write_evt3_header: bool,
+    width: u16,
+    height: u16,
+) -> Result<BufWriter<File>> {
+    let file = File::create(output_path)?;
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    if write_evt3_header {
+        write_evt3_header_lines(&mut writer, width, height)?;
+    }
+    Ok(writer)
+}
+
 fn recording_config_path(raw_path: &Path) -> Option<PathBuf> {
     let stem = raw_path.file_stem()?.to_string_lossy();
     let parent = raw_path.parent().unwrap_or_else(|| Path::new("."));
@@ -675,6 +891,22 @@ mod tests {
             out.extend_from_slice(&w.to_le_bytes());
         }
         out
+    }
+
+    fn test_stats(start: Instant) -> PipelineStatsInner {
+        PipelineStatsInner {
+            started: start,
+            bytes_total: 0,
+            events_total: 0,
+            preview_packet_drops: 0,
+            preview_packet_queue_high_water: 0,
+            preview_frame_drops: 0,
+            preview_frame_queue_high_water: 0,
+            disk_queue_high_water: 0,
+            disk_send_wait_us: 0,
+            disk_write_us: 0,
+            recent_samples: VecDeque::new(),
+        }
     }
 
     #[test]
@@ -796,12 +1028,7 @@ mod tests {
     #[test]
     fn snapshot_uses_recent_window_rate() {
         let start = Instant::now();
-        let mut stats = PipelineStatsInner {
-            started: start,
-            bytes_total: 0,
-            events_total: 0,
-            recent_samples: VecDeque::new(),
-        };
+        let mut stats = test_stats(start);
 
         stats.record_packet(start, 1_048_576, 1_000_000);
         stats.record_packet(start + Duration::from_millis(250), 1_048_576, 1_000_000);
@@ -817,12 +1044,7 @@ mod tests {
     #[test]
     fn snapshot_drops_stale_samples_from_current_rate() {
         let start = Instant::now();
-        let mut stats = PipelineStatsInner {
-            started: start,
-            bytes_total: 0,
-            events_total: 0,
-            recent_samples: VecDeque::new(),
-        };
+        let mut stats = test_stats(start);
 
         stats.record_packet(start, 1_048_576, 1_000_000);
         stats.record_packet(start + Duration::from_millis(1_100), 524_288, 500_000);
@@ -833,5 +1055,61 @@ mod tests {
         assert_eq!(snapshot.events_total, 1_500_000);
         assert!((snapshot.mb_per_s - 0.5).abs() < 0.05);
         assert!((snapshot.mev_per_s - 0.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn snapshot_includes_preview_and_disk_telemetry() {
+        let start = Instant::now();
+        let mut stats = test_stats(start);
+
+        stats.record_preview_packet_drop();
+        stats.record_preview_packet_drop();
+        stats.record_preview_packet_queue_depth(3);
+        stats.record_preview_packet_queue_depth(2);
+        stats.record_preview_frame_drop();
+        stats.record_preview_frame_queue_depth(4);
+        stats.record_disk_queue_depth(5);
+        stats.record_disk_queue_depth(4);
+        stats.record_disk_send_wait(Duration::from_micros(120));
+        stats.record_disk_write_time(Duration::from_micros(340));
+
+        let snapshot = stats.snapshot_at(start + Duration::from_millis(10));
+
+        assert_eq!(snapshot.preview_packet_drops, 2);
+        assert_eq!(snapshot.preview_packet_queue_high_water, 3);
+        assert_eq!(snapshot.preview_frame_drops, 1);
+        assert_eq!(snapshot.preview_frame_queue_high_water, 4);
+        assert_eq!(snapshot.disk_queue_high_water, 5);
+        assert_eq!(snapshot.disk_send_wait_us, 120);
+        assert_eq!(snapshot.disk_write_us, 340);
+    }
+
+    #[test]
+    fn dropped_preview_frames_recycle_buffers() {
+        clear_preview_frame_pool();
+        assert_eq!(preview_frame_pool_len(), 0);
+
+        let frame = PreviewFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![1, 2, 3, 4],
+            pixels_on: vec![5, 6, 7, 8],
+            pixels_off: vec![9, 10, 11, 12],
+            on_count: 2,
+            off_count: 2,
+            events: None,
+            window_start_us: 10,
+            window_end_us: 20,
+        };
+
+        drop(frame);
+
+        assert_eq!(preview_frame_pool_len(), 1);
+
+        let buffers = take_preview_frame_buffers(4);
+        assert_eq!(buffers.pixels.len(), 4);
+        assert_eq!(buffers.pixels_on.len(), 4);
+        assert_eq!(buffers.pixels_off.len(), 4);
+        assert_eq!(preview_frame_pool_len(), 0);
     }
 }

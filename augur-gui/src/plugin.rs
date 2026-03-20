@@ -34,5 +34,9 @@ pub trait AnalysisPlugin {
         None
     }
 
+    fn host_view_dataset_generation(&self, _dataset_id: &str) -> u64 {
+        0
+    }
+
     fn reset(&mut self);
 }
