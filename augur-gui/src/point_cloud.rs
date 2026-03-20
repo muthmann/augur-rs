@@ -392,9 +392,11 @@ mod tests {
 
     #[test]
     fn visible_window_uses_latest_time_slice_and_downsamples() {
-        let mut state = PointCloudState::default();
-        state.time_window_ms = 1_000.0;
-        state.point_limit = 2;
+        let mut state = PointCloudState {
+            time_window_ms: 1_000.0,
+            point_limit: 2,
+            ..Default::default()
+        };
 
         let events: Vec<CdEvent> = (0..6)
             .map(|idx| CdEvent {

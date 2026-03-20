@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn host_view_dataset_generation_defaults_and_overrides_are_preserved() {
-        let plugin = GenerationPlugin::default();
+        let plugin = GenerationPlugin;
         assert_eq!(plugin.host_view_dataset_generation("table.a"), 41);
         assert_eq!(plugin.host_view_dataset_generation("table.b"), 42);
         assert_eq!(plugin.host_view_dataset_generation("missing"), 0);
