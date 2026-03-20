@@ -118,6 +118,7 @@ fn render_setting_item(
                 .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_f64())
                 .unwrap_or(*default);
+            let old_value = value;
             let response = ui.horizontal(|ui| {
                 ui.label(&item.label);
                 ui.add(
@@ -127,7 +128,7 @@ fn render_setting_item(
                 )
             });
             maybe_add_tooltip(&response.response, item.tooltip.as_deref());
-            if response.response.changed() {
+            if value != old_value {
                 return plugin.set_setting_value(&item.key, &json!(value));
             }
         }
@@ -136,12 +137,13 @@ fn render_setting_item(
                 .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_i64())
                 .unwrap_or(*default);
+            let old_value = value;
             let response = ui.horizontal(|ui| {
                 ui.label(&item.label);
                 ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max))
             });
             maybe_add_tooltip(&response.response, item.tooltip.as_deref());
-            if response.response.changed() {
+            if value != old_value {
                 return plugin.set_setting_value(&item.key, &json!(value));
             }
         }
@@ -151,6 +153,7 @@ fn render_setting_item(
                 .and_then(|value| value.as_u64())
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(*default);
+            let old_value = value;
             let response = ui.horizontal_wrapped(|ui| {
                 ui.label(&item.label);
                 for (index, variant) in variants.iter().enumerate() {
@@ -158,7 +161,7 @@ fn render_setting_item(
                 }
             });
             maybe_add_tooltip(&response.response, item.tooltip.as_deref());
-            if response.response.changed() {
+            if value != old_value {
                 return plugin.set_setting_value(&item.key, &json!(value));
             }
         }
