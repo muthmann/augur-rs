@@ -37,8 +37,10 @@ Stop recording with `Ctrl+C` or `--duration-s`.
 
 The recording path is designed to stay bounded under load:
 
+- output files and EVT3 headers are prepared before streaming starts
 - disk writes use bounded backpressure instead of unbounded buffering
+- already-read packets are still drained into the disk queue during shutdown
 - preview delivery is lossy so it does not block USB streaming
 - worker errors are surfaced back to the CLI or GUI session
 
-That split keeps capture stability ahead of preview smoothness when the host is under pressure.
+That split keeps capture stability ahead of preview smoothness when the host is under pressure. `MB/s` remains the authoritative throughput indicator; `Mev/s` is now derived from the decoded preview side so the USB reader does not spend capture time scanning every packet.

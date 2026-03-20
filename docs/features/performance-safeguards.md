@@ -1,0 +1,24 @@
+# Performance Safeguards
+
+## Why This Exists
+
+The live GUI and replay preview are intentionally allowed to be lossy so the recording path can stay bounded and predictable. This note captures the runtime safeguards that were added after severe lag reports in live and replay mode.
+
+## Recording-Safety Changes
+
+- The output file and EVT3 header are prepared before the camera starts streaming. If file creation or header writing fails, the pipeline now fails fast instead of starting capture and erroring asynchronously later.
+- Once the USB reader has accepted a packet, shutdown now keeps trying to enqueue that packet to the disk writer instead of discarding it when stop and backpressure overlap.
+- The USB reader no longer scans every packet to estimate event counts for GUI/CLI stats. Ingress bytes remain authoritative on the capture path, while decoded-event stats are now measured on the lossy preview side.
+
+## Preview / GUI Changes
+
+- Preview packet fan-out now uses a reusable buffer pool instead of allocating a fresh `Vec<u8>` for every packet on the USB thread.
+- The GUI only processes preview work at a capped cadence of roughly 30 Hz. This keeps egui from spending all of its time on texture uploads, overlay generation, and plugin work when frames arrive faster than the UI can present them.
+- Paused replay no longer forces a continuous repaint loop.
+- When 3D point-cloud view is the only raw-event consumer, the GUI skips runtime-plugin FFI event marshaling and `EventStore` updates.
+
+## Operational Implications
+
+- Recording correctness takes priority over preview smoothness and preview completeness.
+- `MB/s` remains the best throughput indicator for capture health because it is measured directly on the ingress path.
+- `Mev/s` now reflects decoded preview traffic. Under extreme preview backpressure it can under-report relative to the true ingress event rate, which is an intentional tradeoff to keep the USB reader lightweight.

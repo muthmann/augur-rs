@@ -12,7 +12,7 @@ use std::{
 };
 
 use crossbeam_channel::{
-    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError,
+    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
 };
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
@@ -209,6 +209,11 @@ struct DiskChunk {
     len: usize,
 }
 
+struct PreviewChunk {
+    buf: UsbBuffer,
+    len: usize,
+}
+
 pub struct PipelineController {
     pub frame_rx: Receiver<PreviewFrame>,
     pub settings_tx: Sender<CameraConfig>,
@@ -277,11 +282,28 @@ where
         }
     }
 
+    let disk_writer = if let Some(ref output_path) = options.output_path {
+        Some(prepare_output_writer(
+            output_path,
+            options.write_evt3_header,
+            options.sensor_width,
+            options.sensor_height,
+        )?)
+    } else {
+        None
+    };
+
     let (pool_tx, pool_rx) = bounded::<UsbBuffer>(N_BUFFERS);
     for _ in 0..N_BUFFERS {
         pool_tx
             .send(Box::new([0_u8; BUF_SIZE]))
             .map_err(|e| CameraError::Channel(format!("buffer pool init failed: {e}")))?;
+    }
+    let (preview_pool_tx, preview_pool_rx) = bounded::<UsbBuffer>(N_BUFFERS);
+    for _ in 0..N_BUFFERS {
+        preview_pool_tx
+            .send(Box::new([0_u8; BUF_SIZE]))
+            .map_err(|e| CameraError::Channel(format!("preview pool init failed: {e}")))?;
     }
 
     let (disk_tx, disk_rx) = if recording {
@@ -290,7 +312,7 @@ where
     } else {
         (None, None)
     };
-    let (preview_tx, preview_rx) = bounded::<Vec<u8>>(N_BUFFERS);
+    let (preview_tx, preview_rx) = bounded::<PreviewChunk>(N_BUFFERS);
     let (frame_tx, frame_rx) = bounded::<PreviewFrame>(2);
     let (settings_tx, settings_rx) = bounded::<CameraConfig>(8);
     let (error_tx, error_rx) = bounded::<String>(32);
@@ -309,6 +331,8 @@ where
     let error_preview = error_tx.clone();
 
     let usb_pool_tx = pool_tx.clone();
+    let preview_pool_tx_usb = preview_pool_tx.clone();
+    let stats_preview = Arc::clone(&stats);
 
     let usb_thread = thread::spawn(move || {
         let mut camera = camera;
@@ -383,32 +407,37 @@ where
 
             if let Ok(mut s) = stats_usb.lock() {
                 let now = Instant::now();
-                s.record_packet(now, len as u64, D::estimate_event_count(&buf[..len]));
+                s.record_packet(now, len as u64, 0);
             }
 
-            let preview_copy = buf[..len].to_vec();
+            if let Ok(mut preview_buf) = preview_pool_rx.try_recv() {
+                preview_buf[..len].copy_from_slice(&buf[..len]);
+                match preview_tx.try_send(PreviewChunk {
+                    buf: preview_buf,
+                    len,
+                }) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(chunk)) | Err(TrySendError::Disconnected(chunk)) => {
+                        let _ = preview_pool_tx_usb.try_send(chunk.buf);
+                    }
+                }
+            }
 
             if let Some(ref disk_tx) = disk_tx {
                 match disk_tx.send_timeout(DiskChunk { buf, len }, Duration::from_millis(50)) {
                     Ok(_) => {}
-                    Err(SendTimeoutError::Timeout(chunk)) => {
-                        if stop_usb.load(Ordering::Relaxed) {
-                            let _ = usb_pool_tx.send(chunk.buf);
+                    Err(SendTimeoutError::Timeout(chunk)) => match disk_tx.send(chunk) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            report_pipeline_error(
+                                &error_usb,
+                                &stop_usb,
+                                "usb",
+                                format!("disk channel send failed: {e}"),
+                            );
                             break;
                         }
-                        match disk_tx.send(chunk) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                report_pipeline_error(
-                                    &error_usb,
-                                    &stop_usb,
-                                    "usb",
-                                    format!("disk channel send failed: {e}"),
-                                );
-                                break;
-                            }
-                        }
-                    }
+                    },
                     Err(SendTimeoutError::Disconnected(chunk)) => {
                         let _ = usb_pool_tx.send(chunk.buf);
                         report_pipeline_error(
@@ -423,8 +452,6 @@ where
             } else {
                 let _ = usb_pool_tx.send(buf);
             }
-
-            let _ = preview_tx.try_send(preview_copy);
         }
 
         if let Err(e) = camera.stop_streaming() {
@@ -439,44 +466,12 @@ where
 
     let mut threads = vec![usb_thread];
 
-    if let (Some(disk_rx), Some(output_path)) = (disk_rx, options.output_path) {
+    if let (Some(disk_rx), Some(mut writer)) = (disk_rx, disk_writer) {
         let stop_disk = Arc::clone(&stop);
         let error_disk = error_tx.clone();
         let disk_pool_tx = pool_tx.clone();
-        let write_evt3_header = options.write_evt3_header;
-        let header_width = options.sensor_width;
-        let header_height = options.sensor_height;
 
         let disk_thread = thread::spawn(move || {
-            let file = match File::create(&output_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    report_pipeline_error(
-                        &error_disk,
-                        &stop_disk,
-                        "disk",
-                        format!(
-                            "failed to create output file {}: {e}",
-                            output_path.display()
-                        ),
-                    );
-                    return;
-                }
-            };
-            let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-
-            if write_evt3_header {
-                if let Err(e) = write_evt3_header_lines(&mut writer, header_width, header_height) {
-                    report_pipeline_error(
-                        &error_disk,
-                        &stop_disk,
-                        "disk",
-                        format!("failed to write EVT3 header: {e}"),
-                    );
-                    return;
-                }
-            }
-
             loop {
                 match disk_rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(chunk) => {
@@ -515,6 +510,7 @@ where
 
     let width = options.sensor_width;
     let height = options.sensor_height;
+    let preview_pool_tx_preview = preview_pool_tx.clone();
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
@@ -527,8 +523,11 @@ where
 
         loop {
             match preview_rx.recv_timeout(Duration::from_millis(2)) {
-                Ok(bytes) => {
-                    if let Err(e) = decoder.decode_bytes(&bytes, &mut events) {
+                Ok(chunk) => {
+                    let decode_result = decoder.decode_bytes(&chunk.buf[..chunk.len], &mut events);
+                    let _ = preview_pool_tx_preview.try_send(chunk.buf);
+
+                    if let Err(e) = decode_result {
                         report_pipeline_error(
                             &error_preview,
                             &stop_preview,
@@ -536,6 +535,9 @@ where
                             format!("EVT3 decode failed: {e}"),
                         );
                         break;
+                    }
+                    if let Ok(mut s) = stats_preview.lock() {
+                        s.record_packet(Instant::now(), 0, events.len() as u64);
                     }
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
@@ -633,6 +635,20 @@ fn write_evt3_header_lines(mut writer: impl Write, width: u16, height: u16) -> R
     writeln!(writer, "% evt 3.0")?;
     writeln!(writer, "% end")?;
     Ok(())
+}
+
+fn prepare_output_writer(
+    output_path: &Path,
+    write_evt3_header: bool,
+    width: u16,
+    height: u16,
+) -> Result<BufWriter<File>> {
+    let file = File::create(output_path)?;
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    if write_evt3_header {
+        write_evt3_header_lines(&mut writer, width, height)?;
+    }
+    Ok(writer)
 }
 
 fn recording_config_path(raw_path: &Path) -> Option<PathBuf> {

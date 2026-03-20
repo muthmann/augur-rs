@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use augur_core::{
@@ -51,6 +51,7 @@ const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
+const PREVIEW_PROCESS_INTERVAL: Duration = Duration::from_millis(33);
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
@@ -257,6 +258,7 @@ pub struct CameraApp {
     controller: Option<PipelineController>,
     texture: Option<egui::TextureHandle>,
     latest_frame: Option<PreviewFrame>,
+    last_preview_process_at: Option<Instant>,
     replay_controls: Option<ReplayControls>,
     replay_file_info: Option<ReplayFileInfo>,
     replay_decoded_events: Option<Arc<Vec<CdEvent>>>,
@@ -312,6 +314,7 @@ impl CameraApp {
             controller: None,
             texture: None,
             latest_frame: None,
+            last_preview_process_at: None,
             replay_controls: None,
             replay_file_info: None,
             replay_decoded_events: None,
@@ -1042,6 +1045,7 @@ impl CameraApp {
             Ok(controller) => {
                 self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
+                self.last_preview_process_at = None;
                 self.mode = AppMode::Previewing;
                 self.preview_workspace.clear_session_state();
                 self.reset_analysis();
@@ -1065,6 +1069,7 @@ impl CameraApp {
             Ok(controller) => {
                 self.sync_pipeline_requirements(&controller);
                 self.controller = Some(controller);
+                self.last_preview_process_at = None;
                 self.mode = AppMode::Recording;
                 self.preview_workspace.clear_session_state();
                 self.reset_analysis();
@@ -1151,6 +1156,7 @@ impl CameraApp {
         self.set_replay_speed_internal(&controls, 1.0);
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
+        self.last_preview_process_at = None;
         self.mode = AppMode::Replaying;
         self.preview_workspace.clear_session_state();
         self.camera_info = Some(replay_info);
@@ -1358,6 +1364,7 @@ impl CameraApp {
         self.set_replay_speed_internal(&controls, self.replay_speed);
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
+        self.last_preview_process_at = None;
         self.replay_controls = Some(controls);
         self.replay_file_info = Some(info);
         self.replay_paused = desired_paused;
@@ -1414,6 +1421,7 @@ impl CameraApp {
         }
         self.texture = None;
         self.latest_frame = None;
+        self.last_preview_process_at = None;
         self.preview_workspace.clear_session_state();
         self.reset_analysis();
         self.mode = AppMode::Idle;
@@ -1495,20 +1503,31 @@ impl CameraApp {
     fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
-        let ffi_events: Vec<FfiCdEvent> = frame
-            .events
-            .as_deref()
-            .unwrap_or(&[])
+        let runtime_plugins_enabled = self
+            .plugin_manager
+            .records()
             .iter()
-            .map(|event| FfiCdEvent {
-                timestamp: event.timestamp,
-                x: event.x,
-                y: event.y,
-                polarity: u8::from(event.polarity),
-            })
-            .collect();
-        self.event_store
-            .push_frame(&ffi_events, frame.window_start_us, frame.window_end_us);
+            .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()));
+        let ffi_events = if runtime_plugins_enabled {
+            let ffi_events: Vec<FfiCdEvent> = frame
+                .events
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|event| FfiCdEvent {
+                    timestamp: event.timestamp,
+                    x: event.x,
+                    y: event.y,
+                    polarity: u8::from(event.polarity),
+                })
+                .collect();
+            self.event_store
+                .push_frame(&ffi_events, frame.window_start_us, frame.window_end_us);
+            ffi_events
+        } else {
+            self.event_store.clear();
+            Vec::new()
+        };
 
         for phase in [
             PluginInput::FrameOnly,
@@ -1555,6 +1574,18 @@ impl CameraApp {
             return;
         };
 
+        let needs_texture = self.preview_workspace.view_mode == ViewMode::Preview2d
+            || self.preview_workspace.popup_open;
+        let force_process =
+            (needs_texture && self.texture.is_none()) || self.replay_pause_after_seek_frame;
+        if !force_process
+            && self
+                .last_preview_process_at
+                .is_some_and(|at| at.elapsed() < PREVIEW_PROCESS_INTERVAL)
+        {
+            return;
+        }
+
         if self.mode == AppMode::Replaying && self.replay_pause_after_seek_frame {
             if let Some(controls) = &self.replay_controls {
                 self.set_replay_paused_internal(controls, true);
@@ -1565,20 +1596,24 @@ impl CameraApp {
 
         self.run_analysis_plugins(&frame);
 
-        let image = frame_to_color_image(
-            &frame,
-            &self.analysis_output.overlays,
-            self.contrast_percentile,
-        );
+        if needs_texture {
+            let image = frame_to_color_image(
+                &frame,
+                &self.analysis_output.overlays,
+                self.contrast_percentile,
+            );
+            if let Some(texture) = &mut self.texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.texture =
+                    Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
+            }
+        }
         if let Some(events) = frame.events.as_deref() {
             self.preview_workspace.point_cloud.push_events(events);
         }
         self.latest_frame = Some(frame);
-        if let Some(texture) = &mut self.texture {
-            texture.set(image, egui::TextureOptions::LINEAR);
-        } else {
-            self.texture = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
-        }
+        self.last_preview_process_at = Some(Instant::now());
     }
 
     fn settings_are_locked(&self) -> bool {
@@ -2805,10 +2840,10 @@ impl eframe::App for CameraApp {
 
         self.sync_active_pipeline_requirements();
 
-        if self.host_view_window_open.values().any(|open| *open)
-            || (self.mode != AppMode::Idle && self.controller.is_some())
-        {
-            ctx.request_repaint();
+        let stream_active = matches!(self.mode, AppMode::Previewing | AppMode::Recording)
+            || (self.mode == AppMode::Replaying && !self.replay_paused && !self.replay_finished);
+        if stream_active && self.controller.is_some() {
+            ctx.request_repaint_after(PREVIEW_PROCESS_INTERVAL);
         }
     }
 }
