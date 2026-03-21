@@ -6,10 +6,10 @@ mod macros;
 mod settings;
 
 pub use context::{
-    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind, HostViewPlacement,
-    HostViewRegistry, Localization, LocalizationResults, LocalizationRow, LocalizationTable,
-    TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
-    TableSchema, TableValueType, CTX_LOCALIZATION_RESULTS,
+    GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
+    HostViewPlacement, HostViewRegistry, Localization, LocalizationResults, LocalizationRow,
+    LocalizationTable, TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d,
+    TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_LOCALIZATION_RESULTS,
 };
 pub use event_store::EventStore;
 pub use ffi::{
@@ -66,11 +66,11 @@ pub mod __private {
 mod tests {
     use super::{
         context::{
-            HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
-            HostViewPlacement, HostViewRegistry, Localization, LocalizationResults,
+            GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor,
+            HostViewKind, HostViewPlacement, HostViewRegistry, Localization, LocalizationResults,
             LocalizationRow, LocalizationTable, TableColumn, TableColumnData, TableColumnValues,
             TableCoordinateSpace2d, TableDatasetV1, TableSchema, TableValueType,
-            CTX_LOCALIZATION_RESULTS,
+            CTX_GLOBAL_SETTINGS, CTX_LOCALIZATION_RESULTS,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
@@ -152,6 +152,23 @@ mod tests {
             serde_json::from_slice(&json).expect("results must deserialize");
         assert_eq!(decoded, results);
         assert_eq!(CTX_LOCALIZATION_RESULTS, "augur.localization.results");
+    }
+
+    #[test]
+    fn global_settings_round_trip_through_json() {
+        let settings = GlobalSettings {
+            nm_per_pixel: 65.0,
+            sensor_width: 1280,
+            sensor_height: 720,
+            acq_time_ms: 50,
+            event_store_budget_bytes: 100 * 1024 * 1024,
+        };
+
+        let json = serde_json::to_vec(&settings).expect("settings must serialize");
+        let decoded: GlobalSettings =
+            serde_json::from_slice(&json).expect("settings must deserialize");
+        assert_eq!(decoded, settings);
+        assert_eq!(CTX_GLOBAL_SETTINGS, "augur.global_settings");
     }
 
     #[test]

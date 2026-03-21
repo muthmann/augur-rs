@@ -35,6 +35,7 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 - **Reproducible sessions** — every `.raw` file gets a `.toml` config sidecar written automatically
 - **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
 - **Interactive preview workspace** — edge-collapsible side panels, hover `x/y`, drag-to-select ROI, zoom/crop controls, enlarged popup preview, and a toggleable 3D point-cloud view
+- **Global settings menu** — top-bar control over pixel scale, sensor geometry, acquisition time, retained event history, and advanced preview/disk tuning
 - **Live preview stats** — 1-second sliding window for Mev/s and MB/s, plus per-frame ON/OFF polarity percentages in the GUI
 
 ### Sensor Control
@@ -145,7 +146,7 @@ Each capture produces two files:
 
 ```
 captures/
-  run.raw     ← EVT3 stream  (header: format EVT3;width=1280;height=720)
+  run.raw     ← EVT3 stream  (header reflects configured geometry; defaults to 1280x720)
   run.toml    ← effective configuration snapshot for exact replay
 ```
 
@@ -165,6 +166,7 @@ The plugin system is a first-class extension point, not an afterthought. Plugins
 - declare their input kind (decoded frame, raw events, or upstream plugin results)
 - run in ordered phases so one plugin can feed the next within the same frame
 - can query retained decoded-event history through the host-owned EventStore
+- can read host-published global experiment settings through the shared context bus
 - expose settings and status through a declarative JSON schema instead of direct `egui` access
 
 Anyone can write a plugin. The API is documented in [Plugin Architecture](./docs/features/analysis-plugins.md).

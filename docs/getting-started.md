@@ -80,9 +80,10 @@ Suggested first run:
 
 1. Click `Probe` to detect the EVK4 and populate device information.
 2. Click `Preview` to start live display.
-3. Adjust ROI, pixel mask, or digital filters in the left settings panel.
-4. Click `Apply Settings` to push runtime changes while previewing.
-5. Click `Record` when you are ready to capture to disk.
+3. Adjust pixel scale, acquisition time, or retained history budget from the top-bar `Settings` menu.
+4. Adjust ROI, pixel mask, or digital filters in the left settings panel.
+5. Click `Apply Settings` to push live camera changes while previewing.
+6. Click `Record` when you are ready to capture to disk.
 
 ## Next Steps
 

@@ -25,6 +25,7 @@ pub const PREVIEW_PACKET_POOL_CAPACITY: usize = 4;
 pub const PREVIEW_PACKET_QUEUE_CAPACITY: usize = 4;
 pub const PREVIEW_FRAME_QUEUE_CAPACITY: usize = 4;
 const PREVIEW_FRAME_POOL_CAPACITY: usize = PREVIEW_FRAME_QUEUE_CAPACITY * 2;
+const DEFAULT_DISK_WRITER_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 pub const N_BUFFERS: usize = RAW_BUFFER_POOL_CAPACITY;
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -119,6 +120,7 @@ pub struct PipelineOptions {
     pub sensor_width: u16,
     pub sensor_height: u16,
     pub write_evt3_header: bool,
+    pub disk_writer_buffer_bytes: usize,
 }
 
 impl PipelineOptions {
@@ -128,6 +130,7 @@ impl PipelineOptions {
             sensor_width: 1280,
             sensor_height: 720,
             write_evt3_header: true,
+            disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
         }
     }
 
@@ -137,6 +140,7 @@ impl PipelineOptions {
             sensor_width: width,
             sensor_height: height,
             write_evt3_header: false,
+            disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
         }
     }
 }
@@ -425,6 +429,7 @@ where
             options.write_evt3_header,
             options.sensor_width,
             options.sensor_height,
+            options.disk_writer_buffer_bytes,
         )?)
     } else {
         None
@@ -842,9 +847,10 @@ fn prepare_output_writer(
     write_evt3_header: bool,
     width: u16,
     height: u16,
+    disk_writer_buffer_bytes: usize,
 ) -> Result<BufWriter<File>> {
     let file = File::create(output_path)?;
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    let mut writer = BufWriter::with_capacity(disk_writer_buffer_bytes.max(1), file);
     if write_evt3_header {
         write_evt3_header_lines(&mut writer, width, height)?;
     }

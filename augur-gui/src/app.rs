@@ -10,7 +10,7 @@ use std::{
 use augur_core::{
     analysis::{AnalysisOutput, AnalysisSeverity, Overlay},
     camera::{DeviceInfo, EventCamera},
-    config::{CameraConfig, RoiConfig},
+    config::{CameraConfig, GlobalSettingsConfig, RoiConfig},
     pipeline::{
         spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
         PreviewFrame,
@@ -18,7 +18,10 @@ use augur_core::{
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
-use augur_plugin_api::{EventStore, FfiCdEvent, HostViewKind, PluginInput, TableDatasetV1};
+use augur_plugin_api::{
+    EventStore, FfiCdEvent, GlobalSettings, HostViewKind, PluginInput, TableDatasetV1,
+    CTX_GLOBAL_SETTINGS,
+};
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
@@ -52,10 +55,13 @@ const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
-const PREVIEW_PROCESS_INTERVAL: Duration = Duration::from_millis(33);
-const POINT_CLOUD_PROCESS_INTERVAL: Duration = Duration::from_millis(67);
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
+
+fn mib_to_bytes(mib: u64) -> usize {
+    mib.saturating_mul(EVENT_STORE_MEBIBYTE as u64)
+        .min(usize::MAX as u64) as usize
+}
 
 #[derive(Debug, Clone)]
 struct HostDatasetCacheEntry {
@@ -305,9 +311,15 @@ pub struct CameraApp {
     plugin_context_data: HashMap<String, Vec<u8>>,
     persistent_context_data: HashMap<String, Vec<u8>>,
     event_store: EventStore,
+    nm_per_pixel: f64,
+    sensor_width: u16,
+    sensor_height: u16,
     analysis_output: AnalysisOutput,
     analysis_notice: Option<String>,
     acq_time_ms: u64,
+    preview_interval_ms: u64,
+    point_cloud_interval_ms: u64,
+    disk_writer_buffer_mib: u64,
     acq_dirty: bool,
     config_dirty: bool,
     contrast_percentile: f32,
@@ -335,6 +347,7 @@ impl CameraApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
+        let global_defaults = GlobalSettingsConfig::default();
 
         let mut app = Self {
             config: CameraConfig::default(),
@@ -362,9 +375,15 @@ impl CameraApp {
             plugin_context_data: HashMap::new(),
             persistent_context_data: HashMap::new(),
             event_store: EventStore::default(),
+            nm_per_pixel: global_defaults.nm_per_pixel,
+            sensor_width: global_defaults.sensor_width,
+            sensor_height: global_defaults.sensor_height,
             analysis_output: AnalysisOutput::default(),
             analysis_notice: None,
-            acq_time_ms: 50,
+            acq_time_ms: global_defaults.acq_time_ms,
+            preview_interval_ms: global_defaults.preview_interval_ms,
+            point_cloud_interval_ms: global_defaults.point_cloud_interval_ms,
+            disk_writer_buffer_mib: global_defaults.disk_writer_buffer_mib,
             acq_dirty: false,
             config_dirty: false,
             contrast_percentile: 99.5,
@@ -387,8 +406,52 @@ impl CameraApp {
             host_view_dataset_cache: HashMap::new(),
             host_view_resolution_warnings: Vec::new(),
         };
+        app.event_store
+            .set_memory_budget(mib_to_bytes(global_defaults.event_store_budget_mib));
+        app.sync_config_global_from_runtime();
         app.refresh_host_view_registry();
         app
+    }
+
+    fn event_store_budget_mib(&self) -> u64 {
+        (self.event_store.memory_budget_bytes() / EVENT_STORE_MEBIBYTE).max(1) as u64
+    }
+
+    fn sync_config_global_from_runtime(&mut self) {
+        self.config.global = GlobalSettingsConfig {
+            nm_per_pixel: self.nm_per_pixel,
+            sensor_width: self.sensor_width,
+            sensor_height: self.sensor_height,
+            acq_time_ms: self.acq_time_ms,
+            event_store_budget_mib: self.event_store_budget_mib(),
+            preview_interval_ms: self.preview_interval_ms,
+            point_cloud_interval_ms: self.point_cloud_interval_ms,
+            disk_writer_buffer_mib: self.disk_writer_buffer_mib,
+        };
+    }
+
+    fn published_acq_time_ms(&self) -> u64 {
+        if matches!(self.mode, AppMode::Previewing | AppMode::Recording) {
+            self.controller
+                .as_ref()
+                .map(|controller| controller.acq_time_us.load(Ordering::Relaxed) / 1_000)
+                .unwrap_or(self.acq_time_ms)
+        } else {
+            self.acq_time_ms
+        }
+    }
+
+    fn apply_global_config(&mut self, global: &GlobalSettingsConfig) {
+        self.nm_per_pixel = global.nm_per_pixel.max(1.0);
+        self.sensor_width = global.sensor_width.max(1);
+        self.sensor_height = global.sensor_height.max(1);
+        self.acq_time_ms = global.acq_time_ms.max(1);
+        self.preview_interval_ms = global.preview_interval_ms.max(10);
+        self.point_cloud_interval_ms = global.point_cloud_interval_ms.max(20);
+        self.disk_writer_buffer_mib = global.disk_writer_buffer_mib.max(1);
+        self.event_store
+            .set_memory_budget(mib_to_bytes(global.event_store_budget_mib.max(1)));
+        self.sync_config_global_from_runtime();
     }
 
     fn reset_analysis(&mut self) {
@@ -1193,6 +1256,8 @@ impl CameraApp {
             return;
         }
 
+        self.sync_config_global_from_runtime();
+
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Replay Files", &["raw", "csv", "bin", "npy", "h5", "hdf5"])
             .pick_file()
@@ -1307,6 +1372,8 @@ impl CameraApp {
         self.preview_workspace.clear_session_state();
         self.camera_info = Some(replay_info);
         self.config = display_config;
+        let global = self.config.global.clone();
+        self.apply_global_config(&global);
         self.mask_file = display_mask_file;
         self.replay_notice = replay_notice;
         self.replay_path = Some(path.display().to_string());
@@ -1369,6 +1436,8 @@ impl CameraApp {
         let mut default_config = CameraConfig::default();
         default_config.roi.width = width;
         default_config.roi.height = height;
+        default_config.global.sensor_width = width;
+        default_config.global.sensor_height = height;
 
         let Some(config_path) = replay_config_path(raw_path) else {
             return (
@@ -1387,7 +1456,11 @@ impl CameraApp {
         }
 
         match CameraConfig::load_from_path(&config_path) {
-            Ok(config) => {
+            Ok(mut config) => {
+                if config.global == GlobalSettingsConfig::default() {
+                    config.global.sensor_width = width;
+                    config.global.sensor_height = height;
+                }
                 let mask_file = config
                     .pixel_mask
                     .mask_file
@@ -1408,8 +1481,10 @@ impl CameraApp {
     }
 
     fn start_pipeline_inner(&mut self, preview_only: bool) -> Result<PipelineController, String> {
+        self.sync_config_global_from_runtime();
+
         let options = if preview_only {
-            PipelineOptions::preview_only(1280, 720)
+            PipelineOptions::preview_only(self.sensor_width, self.sensor_height)
         } else {
             let output_path = self.validated_output_path()?;
             if let Some(parent) = output_path.parent() {
@@ -1418,8 +1493,9 @@ impl CameraApp {
                 })?;
             }
             let mut opts = PipelineOptions::new(output_path);
-            opts.sensor_width = 1280;
-            opts.sensor_height = 720;
+            opts.sensor_width = self.sensor_width;
+            opts.sensor_height = self.sensor_height;
+            opts.disk_writer_buffer_bytes = mib_to_bytes(self.disk_writer_buffer_mib);
             opts
         };
 
@@ -1444,9 +1520,11 @@ impl CameraApp {
     }
 
     fn set_replay_speed_internal(&self, controls: &ReplayControls, speed: f32) {
-        controls
-            .speed_bits
-            .store(speed.to_bits(), Ordering::Relaxed);
+        let speed_bits = speed.to_bits();
+        let previous = controls.speed_bits.swap(speed_bits, Ordering::Relaxed);
+        if previous != speed_bits {
+            controls.speed_epoch.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn set_replay_paused(&mut self, paused: bool) {
@@ -1567,6 +1645,8 @@ impl CameraApp {
             self.config = saved.config;
             self.mask_file = saved.mask_file;
             self.camera_info = saved.camera_info;
+            let global = self.config.global.clone();
+            self.apply_global_config(&global);
         }
     }
 
@@ -1650,12 +1730,14 @@ impl CameraApp {
     }
 
     fn apply_runtime_changes(&mut self) {
+        self.sync_config_global_from_runtime();
+
         let Some(ctrl) = &self.controller else {
             return;
         };
 
         if self.config_dirty {
-            if let Err(e) = self.config.validate(1280, 720) {
+            if let Err(e) = self.config.validate(self.sensor_width, self.sensor_height) {
                 self.last_error = Some(format!("settings invalid: {e}"));
                 return;
             }
@@ -1678,6 +1760,17 @@ impl CameraApp {
     fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
+        let global_settings = GlobalSettings {
+            nm_per_pixel: self.nm_per_pixel,
+            sensor_width: self.sensor_width,
+            sensor_height: self.sensor_height,
+            acq_time_ms: self.published_acq_time_ms(),
+            event_store_budget_bytes: self.event_store.memory_budget_bytes(),
+        };
+        if let Ok(json) = serde_json::to_vec(&global_settings) {
+            self.plugin_context_data
+                .insert(CTX_GLOBAL_SETTINGS.to_owned(), json);
+        }
         let runtime_plugins_enabled = self
             .plugin_manager
             .records()
@@ -1838,9 +1931,9 @@ impl CameraApp {
 
     fn active_preview_process_interval(&self) -> Duration {
         if self.preview_workspace.view_mode == ViewMode::PointCloud3d {
-            POINT_CLOUD_PROCESS_INTERVAL
+            Duration::from_millis(self.point_cloud_interval_ms)
         } else {
-            PREVIEW_PROCESS_INTERVAL
+            Duration::from_millis(self.preview_interval_ms)
         }
     }
 
@@ -2084,6 +2177,7 @@ impl eframe::App for CameraApp {
                         )
                         .clicked()
                     {
+                        self.sync_config_global_from_runtime();
                         if let Some(path) = rfd::FileDialog::new()
                             .set_file_name("augur.toml")
                             .add_filter("TOML", &["toml"])
@@ -2108,14 +2202,18 @@ impl eframe::App for CameraApp {
                         {
                             match CameraConfig::load_from_path(&path) {
                                 Ok(cfg) => {
-                                    self.mask_file = cfg
+                                    let mask_file = cfg
                                         .pixel_mask
                                         .mask_file
                                         .as_ref()
                                         .map(|p| p.display().to_string())
                                         .unwrap_or_default();
                                     self.config = cfg;
-                                    self.config_dirty = self.controller.is_some();
+                                    let global = self.config.global.clone();
+                                    self.apply_global_config(&global);
+                                    self.mask_file = mask_file;
+                                    self.config_dirty = false;
+                                    self.acq_dirty = false;
                                     self.last_error = None;
                                 }
                                 Err(e) => {
@@ -2202,20 +2300,128 @@ impl eframe::App for CameraApp {
                                 self.set_replay_speed(speed);
                             }
                         }
-                    } else {
-                        ui.separator();
+                    }
+                });
+
+                // ── Settings ────────────────────────────────────────────────
+                ui.menu_button("Settings", |ui| {
+                    let mut global_settings_changed = false;
+
+                    ui.horizontal(|ui| {
+                        ui.label("Pixel scale [nm/px]");
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.nm_per_pixel)
+                                    .speed(1.0)
+                                    .clamp_range(1.0..=10_000.0),
+                            )
+                            .changed()
+                        {
+                            global_settings_changed = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Sensor");
+                        if ui
+                            .add_enabled(
+                                mode == AppMode::Idle,
+                                egui::DragValue::new(&mut self.sensor_width)
+                                    .prefix("w ")
+                                    .clamp_range(1..=u16::MAX),
+                            )
+                            .changed()
+                        {
+                            global_settings_changed = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                mode == AppMode::Idle,
+                                egui::DragValue::new(&mut self.sensor_height)
+                                    .prefix("h ")
+                                    .clamp_range(1..=u16::MAX),
+                            )
+                            .changed()
+                        {
+                            global_settings_changed = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Acq time [ms]");
+                        if ui
+                            .add_enabled(
+                                mode != AppMode::Replaying && !settings_locked,
+                                egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
+                            )
+                            .changed()
+                        {
+                            self.acq_dirty = true;
+                            global_settings_changed = true;
+                        }
+                    });
+
+                    let mut event_store_budget_mb = self.event_store_budget_mib();
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut event_store_budget_mb, 1..=1024)
+                                .text("Event history budget (MB)"),
+                        )
+                        .changed()
+                    {
+                        self.event_store
+                            .set_memory_budget(mib_to_bytes(event_store_budget_mb));
+                        global_settings_changed = true;
+                    }
+                    ui.small(format!(
+                        "Retained {:.1} MiB across {} frame(s).",
+                        self.event_store.memory_usage_bytes() as f32 / EVENT_STORE_MEBIBYTE as f32,
+                        self.event_store.frame_count()
+                    ));
+
+                    ui.separator();
+                    egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Acq time [ms]");
+                            ui.label("Preview update [ms]");
                             if ui
-                                .add_enabled(
-                                    !settings_locked,
-                                    egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
+                                .add(
+                                    egui::DragValue::new(&mut self.preview_interval_ms)
+                                        .clamp_range(10..=200),
                                 )
                                 .changed()
                             {
-                                self.acq_dirty = true;
+                                global_settings_changed = true;
                             }
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Point cloud update [ms]");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.point_cloud_interval_ms)
+                                        .clamp_range(20..=500),
+                                )
+                                .changed()
+                            {
+                                global_settings_changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Disk writer buffer [MB]");
+                            if ui
+                                .add_enabled(
+                                    mode == AppMode::Idle,
+                                    egui::DragValue::new(&mut self.disk_writer_buffer_mib)
+                                        .clamp_range(1..=64),
+                                )
+                                .changed()
+                            {
+                                global_settings_changed = true;
+                            }
+                        });
+                    });
+
+                    if global_settings_changed {
+                        self.sync_config_global_from_runtime();
                     }
                 });
 
@@ -2406,28 +2612,6 @@ impl eframe::App for CameraApp {
                             }
 
                             ui.separator();
-                            ui.label("Analysis runtime");
-                            let mut event_store_budget_mb =
-                                (self.event_store.memory_budget_bytes() / EVENT_STORE_MEBIBYTE)
-                                    .max(1);
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut event_store_budget_mb, 1..=1024)
-                                        .text("Event history budget (MB)"),
-                                )
-                                .changed()
-                            {
-                                self.event_store
-                                    .set_memory_budget(event_store_budget_mb * EVENT_STORE_MEBIBYTE);
-                            }
-                            ui.small(format!(
-                                "Retained {:.1} MiB across {} frame(s).",
-                                self.event_store.memory_usage_bytes() as f32
-                                    / EVENT_STORE_MEBIBYTE as f32,
-                                self.event_store.frame_count()
-                            ));
-
-                            ui.separator();
                             ui.add_enabled_ui(!settings_locked, |ui| {
                                 let changed = draw_settings(
                                     ui,
@@ -2435,6 +2619,8 @@ impl eframe::App for CameraApp {
                                     &mut self.mask_x,
                                     &mut self.mask_y,
                                     &mut self.mask_file,
+                                    self.sensor_width,
+                                    self.sensor_height,
                                 );
                                 if changed {
                                     self.config_dirty = true;
@@ -2520,7 +2706,12 @@ impl eframe::App for CameraApp {
                                         );
                                     }
 
-                                    if plugin.ui_settings(ui, &mut self.config) {
+                                    if plugin.ui_settings(
+                                        ui,
+                                        &mut self.config,
+                                        self.sensor_width,
+                                        self.sensor_height,
+                                    ) {
                                         builtin_plugin_config_changed = true;
                                     }
                                     true
@@ -3048,7 +3239,7 @@ impl eframe::App for CameraApp {
             || (self.mode == AppMode::Replaying && !self.replay_paused && !self.replay_finished);
         let process_interval = self.active_preview_process_interval();
         if self.replay_open_task.is_some() {
-            ctx.request_repaint_after(PREVIEW_PROCESS_INTERVAL);
+            ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);
         }
@@ -3622,6 +3813,8 @@ fn replay_pipeline_config(info: &ReplayFileInfo) -> CameraConfig {
     let mut config = CameraConfig::default();
     config.roi.width = info.width;
     config.roi.height = info.height;
+    config.global.sensor_width = info.width;
+    config.global.sensor_height = info.height;
     config
 }
 

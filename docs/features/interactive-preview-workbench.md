@@ -38,9 +38,10 @@ The 3D mode:
 
 A single menu bar row replaces the former two-row layout:
 
-- **Left**: `File | Camera | View | Plugins | Analysis` menus
+- **Left**: `File | Camera | Settings | View | Plugins | Analysis` menus
   - `File` — output path/browse, Open Replay, Save/Load config
-  - `Camera` — probe, preview, record, stop, apply settings, acq time slider; in replay mode also Play/Pause, Restart, and Speed selection
+  - `Camera` — probe, preview, record, stop, apply settings; in replay mode also Play/Pause, Restart, and Speed selection
+  - `Settings` — pixel scale, sensor geometry, acquisition time, retained event-history budget, and advanced preview / point-cloud / disk-buffer tuning
   - `View` — toggle side panels, switch 2D/3D
   - `Plugins` — plugin manager, scan, open folder
   - `Analysis` — per-plugin enable/disable checkboxes (shown only when plugins exist)

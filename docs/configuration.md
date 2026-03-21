@@ -1,11 +1,12 @@
 # Configuration Reference
 
-AugurRS uses a TOML camera configuration with four top-level sections:
+AugurRS uses a TOML camera configuration with five top-level sections:
 
 - `biases`
 - `roi`
 - `pixel_mask`
 - `digital_filter`
+- `global`
 
 An example file is available at [examples/augur.toml](../examples/augur.toml).
 
@@ -39,6 +40,16 @@ masked_pixels = []
 stc_enabled = false
 stc_threshold_us = 1000
 trail_enabled = false
+
+[global]
+nm_per_pixel = 65.0
+sensor_width = 1280
+sensor_height = 720
+acq_time_ms = 50
+event_store_budget_mib = 100
+preview_interval_ms = 33
+point_cloud_interval_ms = 67
+disk_writer_buffer_mib = 4
 ```
 
 ## `biases`
@@ -100,3 +111,17 @@ Rules:
 - For IMX636 runtime programming, `stc_threshold_us` should stay within `1000..=100000`
 
 Use STC to suppress isolated noise bursts. Use Trail to keep the first event after a polarity transition and suppress redundant trailing events.
+
+## `global`
+
+The `global` section persists host-owned GUI/runtime settings.
+
+- `nm_per_pixel`: shared pixel scale for plugins and downstream analysis
+- `sensor_width`, `sensor_height`: configured sensor geometry reference used by the GUI and RAW header metadata
+- `acq_time_ms`: acquisition window used for live preview/recording
+- `event_store_budget_mib`: retained decoded-event history budget for runtime plugins
+- `preview_interval_ms`: 2D preview repaint/update cadence
+- `point_cloud_interval_ms`: 3D point-cloud repaint/update cadence
+- `disk_writer_buffer_mib`: recording buffer size for the disk writer thread
+
+Older TOML files without `[global]` still load with defaults.

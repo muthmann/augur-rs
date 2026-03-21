@@ -46,6 +46,7 @@ pub struct DecodedEventFileCamera {
     controls: ReplayControls,
     nominal_bytes_per_sec: Option<f64>,
     session_start_idx: usize,
+    last_speed_epoch: u32,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
     total_paused: Duration,
@@ -118,6 +119,7 @@ impl DecodedEventFileCamera {
                 controls: controls.clone(),
                 nominal_bytes_per_sec: info.nominal_bytes_per_sec,
                 session_start_idx: start_event_idx,
+                last_speed_epoch: controls.speed_epoch.load(Ordering::Relaxed),
                 playback_started_at: None,
                 paused_at: None,
                 total_paused: Duration::ZERO,
@@ -143,7 +145,22 @@ impl DecodedEventFileCamera {
         f32::from_bits(self.controls.speed_bits.load(Ordering::Relaxed))
     }
 
+    fn reset_throttle_baseline_if_needed(&mut self) {
+        let epoch = self.controls.speed_epoch.load(Ordering::Relaxed);
+        if epoch == self.last_speed_epoch {
+            return;
+        }
+
+        self.last_speed_epoch = epoch;
+        self.session_start_idx = self.event_idx;
+        self.playback_started_at = Some(Instant::now());
+        self.total_paused = Duration::ZERO;
+        self.paused_at = None;
+    }
+
     fn throttle_to_current_progress(&mut self) -> Result<()> {
+        self.reset_throttle_baseline_if_needed();
+
         let Some(base_rate) = self.nominal_bytes_per_sec else {
             return Ok(());
         };
@@ -1056,6 +1073,41 @@ mod tests {
         assert_eq!(info.width, 1280);
         assert_eq!(info.height, 720);
         assert_eq!(&*shared_events, &events);
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn speed_epoch_reset_restarts_decoded_replay_baseline() {
+        let path = temp_path("csv");
+        let events = sample_events();
+        write_csv(&path, 640, 480, &events);
+
+        let (mut camera, controls, _info, _shared_events) =
+            DecodedEventFileCamera::open(&path).expect("csv replay must open");
+        camera.nominal_bytes_per_sec = Some(1_000_000.0);
+        camera.event_idx = 2;
+        camera.session_start_idx = 0;
+        camera.playback_started_at = Some(Instant::now() - Duration::from_secs(2));
+        camera.paused_at = Some(Instant::now());
+        camera.total_paused = Duration::from_millis(250);
+
+        controls.speed_epoch.fetch_add(1, Ordering::Relaxed);
+        camera
+            .throttle_to_current_progress()
+            .expect("speed-change throttle reset must succeed");
+
+        assert_eq!(camera.session_start_idx, camera.event_idx);
+        assert_eq!(camera.last_speed_epoch, 1);
+        assert_eq!(camera.total_paused, Duration::ZERO);
+        assert!(camera.paused_at.is_none());
+        assert!(
+            camera
+                .playback_started_at
+                .expect("baseline must be reset")
+                .elapsed()
+                < Duration::from_secs(1)
+        );
 
         fs::remove_file(path).expect("temp file must be removed");
     }

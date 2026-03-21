@@ -22,7 +22,7 @@ and per-frame plus persistent JSON context storage.
 ## Operational Notes
 
 - Event history retention is host-owned and memory-budgeted, with a default budget of `100 MiB`.
-- The settings panel exposes the EventStore memory budget so users can trade retention depth
+- The top-bar `Settings` menu exposes the EventStore memory budget so users can trade retention depth
   against RAM use without recompiling.
 - Any plugin built against the pre-v0.2 host-view / ABI-v2 transition layer must be rebuilt before
   it can load into this host.

@@ -47,6 +47,7 @@ impl ReplayFileInfo {
 pub struct ReplayControls {
     pub paused: Arc<AtomicBool>,
     pub speed_bits: Arc<AtomicU32>,
+    pub speed_epoch: Arc<AtomicU32>,
     pub bytes_read: Arc<AtomicU64>,
     pub file_size: u64,
     pub data_offset: u64,
@@ -61,6 +62,7 @@ impl ReplayControls {
         Self {
             paused: Arc::new(AtomicBool::new(false)),
             speed_bits: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
+            speed_epoch: Arc::new(AtomicU32::new(0)),
             bytes_read: Arc::new(AtomicU64::new(bytes_read)),
             file_size: info.file_size,
             data_offset: info.data_offset,
@@ -80,6 +82,7 @@ pub struct RawFileCamera {
     nominal_bytes_per_sec: Option<f64>,
     bytes_read: u64,
     session_start_bytes: u64,
+    last_speed_epoch: u32,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
     total_paused: Duration,
@@ -141,6 +144,7 @@ impl RawFileCamera {
                 nominal_bytes_per_sec: info.nominal_bytes_per_sec,
                 bytes_read: start_data_bytes,
                 session_start_bytes: start_data_bytes,
+                last_speed_epoch: controls.speed_epoch.load(Ordering::Relaxed),
                 playback_started_at: None,
                 paused_at: None,
                 total_paused: Duration::ZERO,
@@ -166,7 +170,22 @@ impl RawFileCamera {
         f32::from_bits(self.controls.speed_bits.load(Ordering::Relaxed))
     }
 
+    fn reset_throttle_baseline_if_needed(&mut self) {
+        let epoch = self.controls.speed_epoch.load(Ordering::Relaxed);
+        if epoch == self.last_speed_epoch {
+            return;
+        }
+
+        self.last_speed_epoch = epoch;
+        self.session_start_bytes = self.bytes_read;
+        self.playback_started_at = Some(Instant::now());
+        self.total_paused = Duration::ZERO;
+        self.paused_at = None;
+    }
+
     fn throttle_to_current_progress(&mut self) -> Result<()> {
+        self.reset_throttle_baseline_if_needed();
+
         let Some(base_rate) = self.nominal_bytes_per_sec else {
             return Ok(());
         };
@@ -610,6 +629,39 @@ mod tests {
             .read_packet(&mut [0_u8; 16])
             .expect_err("paused replay must time out");
         assert!(matches!(err, CameraError::Timeout(_)));
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn speed_epoch_reset_restarts_throttle_baseline() {
+        let path = temp_path("speed");
+        write_sample_raw(&path);
+
+        let (mut camera, controls, _info) = RawFileCamera::open(&path).expect("raw file must open");
+        camera.nominal_bytes_per_sec = Some(1_000_000.0);
+        camera.bytes_read = 8;
+        camera.session_start_bytes = 2;
+        camera.playback_started_at = Some(Instant::now() - Duration::from_secs(2));
+        camera.paused_at = Some(Instant::now());
+        camera.total_paused = Duration::from_millis(250);
+
+        controls.speed_epoch.fetch_add(1, Ordering::Relaxed);
+        camera
+            .throttle_to_current_progress()
+            .expect("speed-change throttle reset must succeed");
+
+        assert_eq!(camera.session_start_bytes, camera.bytes_read);
+        assert_eq!(camera.last_speed_epoch, 1);
+        assert_eq!(camera.total_paused, Duration::ZERO);
+        assert!(camera.paused_at.is_none());
+        assert!(
+            camera
+                .playback_started_at
+                .expect("baseline must be reset")
+                .elapsed()
+                < Duration::from_secs(1)
+        );
 
         fs::remove_file(path).expect("temp file must be removed");
     }

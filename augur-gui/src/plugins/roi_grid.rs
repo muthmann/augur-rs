@@ -11,9 +11,6 @@ use augur_core::{
 
 use crate::plugin::AnalysisPlugin;
 
-const SENSOR_WIDTH: u16 = 1280;
-const SENSOR_HEIGHT: u16 = 720;
-
 pub struct RoiGridPlugin {
     enabled: bool,
     roi_grid: Option<Arc<RoiGrid>>,
@@ -35,24 +32,29 @@ impl Default for RoiGridPlugin {
 }
 
 impl RoiGridPlugin {
-    fn recompute_roi_grid(&mut self, config: &CameraConfig) {
+    fn recompute_roi_grid(&mut self, config: &CameraConfig, sensor_width: u16, sensor_height: u16) {
         let grid = roi_grid::compute_roi_grid(
             &config.pixel_mask.masked_pixels,
-            SENSOR_WIDTH,
-            SENSOR_HEIGHT,
+            sensor_width,
+            sensor_height,
             self.roi_grid_top_n.max(1),
         );
         self.last_mask_snapshot = config.pixel_mask.masked_pixels.clone();
         self.roi_grid = Some(Arc::new(grid));
     }
 
-    fn maybe_auto_recompute_roi_grid(&mut self, config: &CameraConfig) {
+    fn maybe_auto_recompute_roi_grid(
+        &mut self,
+        config: &CameraConfig,
+        sensor_width: u16,
+        sensor_height: u16,
+    ) {
         if config.pixel_mask.masked_pixels == self.last_mask_snapshot {
             return;
         }
 
         if self.roi_grid.is_some() || self.show_roi_grid {
-            self.recompute_roi_grid(config);
+            self.recompute_roi_grid(config, sensor_width, sensor_height);
         } else {
             self.last_mask_snapshot = config.pixel_mask.masked_pixels.clone();
         }
@@ -76,8 +78,14 @@ impl AnalysisPlugin for RoiGridPlugin {
         self.enabled = enabled;
     }
 
-    fn ui_settings(&mut self, ui: &mut egui::Ui, config: &mut CameraConfig) -> bool {
-        self.maybe_auto_recompute_roi_grid(config);
+    fn ui_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &mut CameraConfig,
+        sensor_width: u16,
+        sensor_height: u16,
+    ) -> bool {
+        self.maybe_auto_recompute_roi_grid(config, sensor_width, sensor_height);
 
         let mut config_changed = false;
 
@@ -86,7 +94,7 @@ impl AnalysisPlugin for RoiGridPlugin {
             .show(ui, |ui| {
                 ui.weak(self.description());
                 if ui.button("Compute ROI Grid").clicked() {
-                    self.recompute_roi_grid(config);
+                    self.recompute_roi_grid(config, sensor_width, sensor_height);
                     self.show_roi_grid = true;
                 }
 
@@ -101,7 +109,7 @@ impl AnalysisPlugin for RoiGridPlugin {
                         .changed()
                         && self.roi_grid.is_some()
                     {
-                        self.recompute_roi_grid(config);
+                        self.recompute_roi_grid(config, sensor_width, sensor_height);
                     }
                 });
 

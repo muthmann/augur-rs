@@ -45,10 +45,12 @@ The standalone `augur-plugin-api` crate defines the cross-library boundary:
 
 Shared science-facing context types live in `augur-plugin-api/src/context.rs`, including:
 
+- `GlobalSettings`
 - `Localization`
 - `LocalizationResults`
 - `HostViewRegistry`
 - `TableDatasetV1`
+- `CTX_GLOBAL_SETTINGS`
 - `CTX_LOCALIZATION_RESULTS`
 
 ## Host Views
@@ -161,6 +163,10 @@ for per-frame data, plus a second persistent `HashMap<String, Vec<u8>>` that sur
 frames until analysis state resets. Plugins can keep using JSON-serialized values under
 well-known keys, or they can call the raw publish helpers when they already own a serialized byte
 buffer and want to avoid repeated `serde_json::to_vec` work.
+
+The host now publishes `CTX_GLOBAL_SETTINGS` (`augur.global_settings`) before each plugin frame so
+runtime plugins can read the current pixel scale, configured sensor geometry, acquisition time, and
+EventStore budget through `HostContext::get::<GlobalSettings>()`.
 
 ## Settings and Status
 
