@@ -44,6 +44,18 @@ The GUI synchronizes those values when it:
 - loads replay sidecars
 - restores live state after replay closes
 
+## Parameter Reference
+
+| Parameter | Guidance |
+|---|---|
+| `nm_per_pixel` | Physical size of one sensor pixel in nanometers. Shared with plugins for coordinate conversion, such as reporting localization results in nm. Typical values: `15` for high-mag TIRF, `65` for standard SMLM, `100+` for wide-field imaging. |
+| `sensor_width`, `sensor_height` | Sensor pixel dimensions. They must match the connected camera, default to IMX636 (`1280x720`), and are used for ROI validation plus plugin coordinate systems. These are idle-time settings because they describe the pipeline shape. |
+| `acq_time_ms` | Duration of each preview frame's accumulation window. Lower values give finer temporal resolution but fewer events per frame; higher values integrate more events for a brighter preview while reducing temporal detail. |
+| `event_store_budget_mib` | Maximum memory for retained decoded-event history. Runtime plugins can access past frames from this buffer, so increase it for longer analysis windows or reduce it to save RAM. |
+| `preview_interval_ms` | Maximum redraw interval for the 2D preview. Lower values look smoother but cost more CPU/GPU work. This does not affect recording or replay timing. The default `33` ms is about `30` fps. |
+| `point_cloud_interval_ms` | Maximum redraw interval for the 3D point-cloud view. Lower values are smoother but more GPU-intensive. The default `67` ms is about `15` fps. |
+| `disk_writer_buffer_mib` | Write buffer size for the recording output file. Larger buffers reduce disk I/O pressure during high-bandwidth recordings but use more memory. This stays idle-only because the recording pipeline allocates it at startup. |
+
 ## Plugin Context Contract
 
 Runtime plugins can now read host-owned experiment settings from the normal per-frame context bus:

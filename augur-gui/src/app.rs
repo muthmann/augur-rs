@@ -2305,70 +2305,78 @@ impl eframe::App for CameraApp {
 
                 // ── Settings ────────────────────────────────────────────────
                 ui.menu_button("Settings", |ui| {
+                    const PIXEL_SCALE_TOOLTIP: &str = "Physical size of one sensor pixel in nanometers. Shared with plugins for coordinate conversion (for example localization in nm). Typical values: 15 nm (high-mag TIRF), 65 nm (standard SMLM), 100+ nm (wide-field).";
+                    const SENSOR_DIMENSIONS_TOOLTIP: &str = "Sensor pixel dimensions. Must match the connected camera. Defaults to IMX636 (1280x720). Used for ROI validation and plugin coordinate systems. Only editable when idle.";
+                    const ACQ_TIME_TOOLTIP: &str = "Duration of each preview frame's accumulation window. Lower values give finer temporal resolution but fewer events per frame. Higher values integrate more events for a brighter preview but reduce temporal detail.";
+                    const EVENT_HISTORY_TOOLTIP: &str = "Maximum memory for retained decoded event history. Plugins can access past frames from this buffer. Increase for longer analysis windows; decrease to save RAM.";
+                    const PREVIEW_UPDATE_TOOLTIP: &str = "Maximum redraw interval for the 2D preview. Lower values give a smoother display but higher CPU/GPU load. Does not affect recording or replay timing. Default 33 ms is about 30 fps.";
+                    const POINT_CLOUD_UPDATE_TOOLTIP: &str = "Maximum redraw interval for the 3D point cloud view. Lower values are smoother but more GPU-intensive. Default 67 ms is about 15 fps.";
+                    const DISK_WRITER_BUFFER_TOOLTIP: &str = "Write buffer size for the recording output file. Larger buffers reduce disk I/O pressure during high-bandwidth recordings. Only editable when idle.";
                     let mut global_settings_changed = false;
 
                     ui.horizontal(|ui| {
-                        ui.label("Pixel scale [nm/px]");
-                        if ui
+                        ui.label("Pixel scale [nm/px]")
+                            .on_hover_text(PIXEL_SCALE_TOOLTIP);
+                        let response = ui
                             .add(
                                 egui::DragValue::new(&mut self.nm_per_pixel)
                                     .speed(1.0)
                                     .clamp_range(1.0..=10_000.0),
                             )
-                            .changed()
-                        {
+                            .on_hover_text(PIXEL_SCALE_TOOLTIP);
+                        if response.changed() {
                             global_settings_changed = true;
                         }
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Sensor");
-                        if ui
+                        ui.label("Sensor").on_hover_text(SENSOR_DIMENSIONS_TOOLTIP);
+                        let width_response = ui
                             .add_enabled(
                                 mode == AppMode::Idle,
                                 egui::DragValue::new(&mut self.sensor_width)
                                     .prefix("w ")
                                     .clamp_range(1..=u16::MAX),
                             )
-                            .changed()
-                        {
+                            .on_hover_text(SENSOR_DIMENSIONS_TOOLTIP);
+                        if width_response.changed() {
                             global_settings_changed = true;
                         }
-                        if ui
+                        let height_response = ui
                             .add_enabled(
                                 mode == AppMode::Idle,
                                 egui::DragValue::new(&mut self.sensor_height)
                                     .prefix("h ")
                                     .clamp_range(1..=u16::MAX),
                             )
-                            .changed()
-                        {
+                            .on_hover_text(SENSOR_DIMENSIONS_TOOLTIP);
+                        if height_response.changed() {
                             global_settings_changed = true;
                         }
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Acq time [ms]");
-                        if ui
+                        ui.label("Acq time [ms]").on_hover_text(ACQ_TIME_TOOLTIP);
+                        let response = ui
                             .add_enabled(
                                 mode != AppMode::Replaying && !settings_locked,
                                 egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
                             )
-                            .changed()
-                        {
+                            .on_hover_text(ACQ_TIME_TOOLTIP);
+                        if response.changed() {
                             self.acq_dirty = true;
                             global_settings_changed = true;
                         }
                     });
 
                     let mut event_store_budget_mb = self.event_store_budget_mib();
-                    if ui
+                    let event_store_response = ui
                         .add(
                             egui::Slider::new(&mut event_store_budget_mb, 1..=1024)
                                 .text("Event history budget (MB)"),
                         )
-                        .changed()
-                    {
+                        .on_hover_text(EVENT_HISTORY_TOOLTIP);
+                    if event_store_response.changed() {
                         self.event_store
                             .set_memory_budget(mib_to_bytes(event_store_budget_mb));
                         global_settings_changed = true;
@@ -2382,39 +2390,42 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Preview update [ms]");
-                            if ui
+                            ui.label("Preview update [ms]")
+                                .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
+                            let response = ui
                                 .add(
                                     egui::DragValue::new(&mut self.preview_interval_ms)
                                         .clamp_range(10..=200),
                                 )
-                                .changed()
-                            {
+                                .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
+                            if response.changed() {
                                 global_settings_changed = true;
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Point cloud update [ms]");
-                            if ui
+                            ui.label("Point cloud update [ms]")
+                                .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
+                            let response = ui
                                 .add(
                                     egui::DragValue::new(&mut self.point_cloud_interval_ms)
                                         .clamp_range(20..=500),
                                 )
-                                .changed()
-                            {
+                                .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
+                            if response.changed() {
                                 global_settings_changed = true;
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Disk writer buffer [MB]");
-                            if ui
+                            ui.label("Disk writer buffer [MB]")
+                                .on_hover_text(DISK_WRITER_BUFFER_TOOLTIP);
+                            let response = ui
                                 .add_enabled(
                                     mode == AppMode::Idle,
                                     egui::DragValue::new(&mut self.disk_writer_buffer_mib)
                                         .clamp_range(1..=64),
                                 )
-                                .changed()
-                            {
+                                .on_hover_text(DISK_WRITER_BUFFER_TOOLTIP);
+                            if response.changed() {
                                 global_settings_changed = true;
                             }
                         });

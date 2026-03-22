@@ -116,12 +116,12 @@ Use STC to suppress isolated noise bursts. Use Trail to keep the first event aft
 
 The `global` section persists host-owned GUI/runtime settings.
 
-- `nm_per_pixel`: shared pixel scale for plugins and downstream analysis
-- `sensor_width`, `sensor_height`: configured sensor geometry reference used by the GUI and RAW header metadata
-- `acq_time_ms`: acquisition window used for live preview/recording
-- `event_store_budget_mib`: retained decoded-event history budget for runtime plugins
-- `preview_interval_ms`: 2D preview repaint/update cadence
-- `point_cloud_interval_ms`: 3D point-cloud repaint/update cadence
-- `disk_writer_buffer_mib`: recording buffer size for the disk writer thread
+- `nm_per_pixel`: physical size of one sensor pixel in nanometers. This value is shared with plugins for coordinate conversion, such as reporting localization results in nm instead of pixels. Typical values are around `15` for high-magnification TIRF, `65` for standard SMLM setups, and `100+` for wider-field imaging.
+- `sensor_width`, `sensor_height`: sensor pixel dimensions used by the GUI, ROI validation, plugin coordinate systems, and RAW header metadata. They must match the connected camera and default to the IMX636's `1280 x 720`. These are effectively hardware-shape settings, so changing them only makes sense while idle or when switching camera models.
+- `acq_time_ms`: accumulation window for each preview frame. Lower values preserve finer temporal detail but produce dimmer frames with fewer events; higher values integrate more events into a brighter preview at the cost of temporal resolution.
+- `event_store_budget_mib`: maximum retained decoded-event history budget for runtime plugins. Increase it for longer look-back windows and multi-frame analysis; decrease it when you want to reduce RAM usage.
+- `preview_interval_ms`: maximum redraw/update cadence for the 2D preview. Lower values make the display feel smoother but increase CPU/GPU work. This only affects presentation cadence, not recording correctness or replay timing. The default `33` ms is about `30` fps.
+- `point_cloud_interval_ms`: maximum redraw/update cadence for the 3D point-cloud view. Lower values make the 3D view smoother but cost more GPU time. The default `67` ms is about `15` fps and is intentionally looser than the 2D preview cadence.
+- `disk_writer_buffer_mib`: recording buffer size for the disk-writer thread. Larger buffers absorb burstier high-bandwidth recordings and reduce disk I/O pressure, but reserve more memory. Because it shapes pipeline resources at startup, it should be treated as an idle-time setting.
 
 Older TOML files without `[global]` still load with defaults.
