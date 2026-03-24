@@ -6,18 +6,38 @@ use augur_core::{
 };
 use egui::{Color32, ColorImage};
 
+use crate::colormap::Colormap;
+
 thread_local! {
     static PREVIEW_SCRATCH: RefCell<PreviewRenderScratch> = RefCell::new(PreviewRenderScratch::default());
 }
 
 #[derive(Default)]
 struct PreviewRenderScratch {
-    hist: Vec<u32>,
     grid_col_map: Vec<usize>,
     grid_row_map: Vec<usize>,
     grid_x_line: Vec<bool>,
     grid_y_line: Vec<bool>,
     grid_cell_highlight: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewDisplaySettings {
+    pub display_min: u16,
+    pub display_max: u16,
+    pub gamma: f32,
+    pub colormap: Colormap,
+}
+
+impl Default for PreviewDisplaySettings {
+    fn default() -> Self {
+        Self {
+            display_min: 0,
+            display_max: 1,
+            gamma: 0.5,
+            colormap: Colormap::EventPolarity,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -31,11 +51,10 @@ struct PixelRect {
 pub fn frame_to_color_image(
     frame: &PreviewFrame,
     overlays: &[Overlay],
-    contrast_percentile: f32,
+    settings: PreviewDisplaySettings,
 ) -> ColorImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    let max = percentile_value_two(&frame.pixels_on, &frame.pixels_off, contrast_percentile) as f32;
     let mut image = ColorImage::new([w, h], Color32::TRANSPARENT);
 
     // Look for a ROI grid overlay to merge into the base rendering pass.
@@ -54,15 +73,14 @@ pub fn frame_to_color_image(
                 frame,
                 grid,
                 top_n,
-                max,
-                w,
-                h,
-                &mut image.pixels,
+                settings,
+                [w, h],
+                &mut image.pixels[..],
                 &mut scratch,
             );
         });
     } else {
-        render_base(frame, max, &mut image.pixels);
+        render_base(frame, settings, &mut image.pixels);
     }
 
     render_overlays(frame, overlays, &mut image.pixels, w, h);
@@ -70,76 +88,38 @@ pub fn frame_to_color_image(
     image
 }
 
-#[cfg(test)]
-fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
-    percentile_value_from_slices(&[pixels], percentile)
-}
-
-fn percentile_value_two(on: &[u16], off: &[u16], percentile: f32) -> u16 {
-    percentile_value_from_slices(&[on, off], percentile)
-}
-
-fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
-    PREVIEW_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
-        percentile_value_from_slices_with_hist(channels, percentile, &mut scratch.hist)
-    })
-}
-
-fn percentile_value_from_slices_with_hist(
-    channels: &[&[u16]],
-    percentile: f32,
-    hist_scratch: &mut Vec<u32>,
-) -> u16 {
-    let max_val = channels
-        .iter()
-        .flat_map(|channel| channel.iter())
-        .copied()
-        .max()
-        .unwrap_or(0) as usize;
-    if max_val == 0 {
-        return 1;
+pub fn compute_frame_histogram(frame: &PreviewFrame) -> Vec<u64> {
+    let max_value = frame.pixels.iter().copied().max().unwrap_or(0) as usize;
+    if max_value == 0 {
+        return vec![frame.pixels.len() as u64];
     }
 
-    // Cap histogram at 4096 entries (16 KB). Values above the cap are clamped
-    // into the last bin, so a single hot pixel at 65535 does not force a
-    // 256 KB allocation every frame.
-    const MAX_BINS: usize = 4096;
-    let hist_size = max_val.min(MAX_BINS - 1) + 1;
-    hist_scratch.resize(hist_size, 0);
-    hist_scratch.fill(0);
-    for channel in channels {
-        for &value in *channel {
-            hist_scratch[(value as usize).min(hist_size - 1)] += 1;
-        }
+    let mut histogram = vec![0u64; max_value + 1];
+    for &value in &frame.pixels {
+        histogram[value as usize] += 1;
     }
-
-    let percentile = percentile.clamp(0.0, 100.0);
-    let len = channels.iter().map(|channel| channel.len()).sum::<usize>();
-    let target =
-        ((len as f64 * percentile as f64 / 100.0).ceil() as u64).clamp(1, len.max(1) as u64);
-    let mut cumulative = 0u64;
-    for (value, &count) in hist_scratch.iter().enumerate() {
-        cumulative += u64::from(count);
-        if cumulative >= target {
-            return value.max(1) as u16;
-        }
-    }
-
-    hist_size.max(1) as u16
+    histogram
 }
 
-fn render_base(frame: &PreviewFrame, max: f32, pixels: &mut [Color32]) {
+fn render_base(frame: &PreviewFrame, settings: PreviewDisplaySettings, pixels: &mut [Color32]) {
     for (i, pixel) in pixels.iter_mut().enumerate() {
-        let r = normalized_channel(frame.pixels_off[i], max);
-        let g = normalized_channel(frame.pixels_on[i], max);
-        *pixel = Color32::from_rgb(r.max(8), g.max(8), 8);
+        *pixel = settings.colormap.map(
+            normalized_value(frame.pixels_on[i], settings),
+            normalized_value(frame.pixels_off[i], settings),
+        );
     }
 }
 
-fn normalized_channel(value: u16, max: f32) -> u8 {
-    let clamped = (value as f32).min(max);
-    ((clamped / max).sqrt() * 255.0) as u8
+fn normalized_value(value: u16, settings: PreviewDisplaySettings) -> f32 {
+    let display_min = settings
+        .display_min
+        .min(settings.display_max.saturating_sub(1));
+    let display_max = settings.display_max.max(display_min.saturating_add(1));
+    let numerator = (f32::from(value) - f32::from(display_min)).max(0.0);
+    let denominator = (f32::from(display_max) - f32::from(display_min)).max(1.0);
+    (numerator / denominator)
+        .clamp(0.0, 1.0)
+        .powf(settings.gamma.max(0.01))
 }
 
 /// Single-pass base frame + ROI grid overlay rendering.
@@ -153,12 +133,12 @@ fn render_base_with_grid(
     frame: &PreviewFrame,
     grid: &RoiGrid,
     top_n: usize,
-    max: f32,
-    w: usize,
-    h: usize,
+    settings: PreviewDisplaySettings,
+    size: [usize; 2],
     pixels: &mut [Color32],
     scratch: &mut PreviewRenderScratch,
 ) {
+    let [w, h] = size;
     let grid_cols = grid.cols();
     let grid_rows = grid.rows();
 
@@ -217,8 +197,16 @@ fn render_base_with_grid(
         for px in 0..w {
             let on_v = frame.pixels_on[row_off + px];
             let off_v = frame.pixels_off[row_off + px];
-            let base_g = u32::from(normalized_channel(on_v, max).max(8));
-            let base_r = u32::from(normalized_channel(off_v, max).max(8));
+            let [base_r, base_g, base_b, _] = settings
+                .colormap
+                .map(
+                    normalized_value(on_v, settings),
+                    normalized_value(off_v, settings),
+                )
+                .to_array();
+            let base_r = u32::from(base_r);
+            let base_g = u32::from(base_g);
+            let base_b = u32::from(base_b);
 
             let gc = scratch.grid_col_map[px];
             let cell = gr * grid_cols + gc;
@@ -237,7 +225,7 @@ fn render_base_with_grid(
             let inv = 255 - a;
             let r = ((base_r * inv + tint[0] * a) / 255) as u8;
             let g = ((base_g * inv + tint[1] * a) / 255) as u8;
-            let b = ((8 * inv + tint[2] * a) / 255) as u8;
+            let b = ((base_b * inv + tint[2] * a) / 255) as u8;
             pixels[row_off + px] = Color32::from_rgb(r, g, b);
         }
     }
@@ -422,7 +410,7 @@ fn render_overlays(
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_to_color_image, percentile_value, percentile_value_two};
+    use super::{compute_frame_histogram, frame_to_color_image, PreviewDisplaySettings};
     use augur_core::{
         analysis::{roi_grid::compute_roi_grid, Overlay, Pixel, SubpixelMarker},
         pipeline::PreviewFrame,
@@ -430,22 +418,21 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn percentile_ignores_single_hotpixel_outlier() {
-        let pixels = [1, 2, 2, 3, 10_000];
-        assert_eq!(percentile_value(&pixels, 80.0), 3);
-    }
-
-    #[test]
-    fn percentile_returns_one_for_empty_or_all_zero() {
-        assert_eq!(percentile_value(&[], 99.5), 1);
-        assert_eq!(percentile_value(&[0, 0, 0], 99.5), 1);
-    }
-
-    #[test]
-    fn combined_percentile_uses_both_polarity_channels() {
-        let on = [0, 3];
-        let off = [0, 6];
-        assert_eq!(percentile_value_two(&on, &off, 75.0), 3);
+    fn histogram_counts_combined_pixels() {
+        let frame = PreviewFrame {
+            width: 3,
+            height: 1,
+            pixels: vec![0, 2, 2],
+            pixels_on: vec![0, 1, 2],
+            pixels_off: vec![0, 1, 0],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+        let histogram = compute_frame_histogram(&frame);
+        assert_eq!(histogram, vec![1, 0, 2]);
     }
 
     #[test]
@@ -474,7 +461,7 @@ mod tests {
             },
         ];
 
-        let image = frame_to_color_image(&frame, &overlays, 80.0);
+        let image = frame_to_color_image(&frame, &overlays, PreviewDisplaySettings::default());
 
         assert_eq!(image.size, [2, 1]);
         assert_eq!(image.pixels.len(), 2);
@@ -502,7 +489,7 @@ mod tests {
             highlight_top_n: 1,
         }];
 
-        let image = frame_to_color_image(&frame, &overlays, 50.0);
+        let image = frame_to_color_image(&frame, &overlays, PreviewDisplaySettings::default());
 
         assert_eq!(image.size, [2, 2]);
         assert_eq!(image.pixels.len(), 4);

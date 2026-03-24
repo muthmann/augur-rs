@@ -1,4 +1,6 @@
 mod app;
+mod colormap;
+mod external_tools;
 mod host_views;
 mod plugin;
 mod plugin_loader;
@@ -7,6 +9,7 @@ mod plugins;
 mod point_cloud;
 mod preview;
 mod settings;
+mod viewer_tools;
 
 use app::CameraApp;
 

@@ -19,11 +19,12 @@ A single menu bar row at the top of the window:
 | `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay |
 | `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection |
 | `Settings` | Pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls |
-| `View` | Toggle Settings/Analysis panels, switch 2D/3D view mode |
+| `View` | Toggle Settings/Analysis panels, show/hide the scale bar, switch 2D/3D view mode |
+| `Tools` | Connect or disconnect the ImageJ/Fiji bridge |
 | `Plugins` | Plugin Manager, Scan for New Plugins, Open Plugins Folder |
 | `Analysis` | Per-plugin enable/disable checkboxes (shown only when plugins exist) |
 
-The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), and the current camera/session status label.
+The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), the ImageJ bridge status when connected, and the current camera/session status label.
 
 ---
 
@@ -95,11 +96,19 @@ The center panel is now an interactive preview workspace shared by the embedded 
 
 ### 2D preview tools
 
-- hover the preview to read the current sensor-space `x, y` cursor position
-- `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`
-- `+`, `-`, and `Fit` control zoom
+- hover the preview to read the current sensor-space `x, y` position together with ON / OFF / combined pixel values
+- the preview toolbar uses compact icon buttons with hover tooltips for ROI, line profile, ruler, annotation, histogram, zoom, and popup actions, and it stays on one row instead of wrapping the hover readout below the preview
+- `Histogram` opens a combined histogram plus brightness/contrast window with labeled intensity/count axes, hover readouts, Auto percentile, manual min/max, gamma controls, draggable marker handles, and a display-ramp preview
+- the scroll area below the preview includes a `Colormap` selector for polarity, fire, grayscale, viridis, magma, and inferno rendering
+- `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`; during replay the disabled tooltip points users to rectangle annotations instead
+- `Line Profile` samples ON and OFF intensity along a dragged line, opens after the drag completes, and includes labeled axes plus an optional ON+OFF sum trace
+- `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
+- `Rect` and `Ellipse` add host-side software annotations; selecting one shows ROI statistics for ON, OFF, and combined channels
+- `Esc` clears the active ROI/line/ruler/annotation draft, while `Delete` / `Backspace` removes the selected annotation
+- zoom-out, zoom-in, and fit-to-window icon buttons control zoom
 - when zoomed in, dragging the image pans the viewport
-- `Crop to ROI` switches between full-frame and ROI-only rendering
+- `Crop to ROI` switches between full-frame and ROI-only rendering without changing the allocated canvas size
+- a scale-bar overlay can be toggled from `View` or from the preview controls and positioned in any corner
 - `Enlarge` opens a larger resizable popup that reuses the same zoom/crop/ROI state as the main preview
 
 If a ROI is configured, the full-frame preview shows its outline. While dragging a new ROI, the pending selection rectangle is drawn live on top of the image.
@@ -135,7 +144,7 @@ HDF5 replay is optional at build time. Build or run `augur-gui` with `--features
 
 The center panel switches to a `Replay` heading and shows a transport bar between the canvas and the scrollable controls area:
 
-- `▶` / `⏸` Play/Pause, `⏮` Restart, `⏹` Stop buttons
+- play/pause, restart, and stop icon buttons
 - a Speed combo box (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
 - a full-width timeline slider for seeking within the recording
 - current / total replay time
@@ -146,16 +155,32 @@ At EOF, replay shuts down its controller threads but stays in replay mode so the
 
 ---
 
-## Preview Contrast
+## Preview Contrast And Colormaps
 
-A `Contrast` slider below the preview is available in 2D mode only (live and replay). In 3D mode, point cloud metrics are shown instead.
+The 2D preview uses a shared display model for the base image and ROI-grid overlay:
 
-- the slider controls percentile-based normalization (`90.0` to `100.0`)
-- this prevents a single hotpixel from dominating the entire frame
-- lower percentiles reveal dimmer activity at the cost of earlier saturation
-- ON events render in green, OFF events render in red, and mixed pixels appear yellow/orange
+- `Auto` mode updates the display max from a combined histogram percentile (`90.0` to `100.0`)
+- `Manual` mode lets you pin display min/max from the histogram window for repeatable inspection
+- `Gamma` defaults to `0.5`, which keeps the previous square-root-like look while allowing flatter or steeper contrast curves
+- `Event polarity` preserves the original ON=green / OFF=red rendering
+- the other colormaps combine ON+OFF into one intensity channel for grayscale or false-color inspection
+- fire / viridis / magma / inferno now use exact canonical LUT tables rather than coarse stop interpolation
+- ruler, line-profile, and scale-bar overlays use outline/shadow rendering so they remain readable on bright colormaps
 
-The same contrast setting is used for the base preview image and ROI-grid rendering, with one shared normalization range across both polarity channels so relative ON/OFF strength remains visible.
+In 3D mode, the scroll area still switches over to point-cloud metrics instead of 2D display controls.
+
+---
+
+## External Tools
+
+`Tools -> Stream to ImageJ...` opens a small connection dialog for a running ImageJ/Fiji socket listener.
+
+- the dialog includes the socket-listener setup steps, inline bridge status, and inline connection errors
+- while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and forwards the newest frame to ImageJ on a lossy background channel
+- `Return to augur` disconnects the bridge and restores the in-app preview surface
+- the connection is best-effort today: use it for live inspection, and verify the exact Fiji-side workflow manually on your machine
+
+Histogram and line-profile tools also use deferred OS windows when the backend supports them, with embedded `egui::Window` fallbacks on backends that do not.
 
 ---
 

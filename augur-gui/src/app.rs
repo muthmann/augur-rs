@@ -23,8 +23,11 @@ use augur_plugin_api::{
     CTX_GLOBAL_SETTINGS,
 };
 use augur_prophesee::evk4::Evk4Camera;
+use egui_phosphor::regular as phosphor;
 
 use crate::{
+    colormap::Colormap,
+    external_tools::{ExternalTool, ExternalToolStatus, ImageJBridge},
     host_views::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
         render_compact_table, render_density2d_view, render_density_window_viewport,
@@ -38,8 +41,13 @@ use crate::{
     plugin_settings_ui::render_plugin_settings,
     plugins::create_all_plugins,
     point_cloud::{PointCloudMetrics, PointCloudState},
-    preview::frame_to_color_image,
+    preview::{compute_frame_histogram, frame_to_color_image, PreviewDisplaySettings},
     settings::draw_settings,
+    viewer_tools::{
+        compute_scale_bar, AnnotationManager, AnnotationShape, AnnotationShapeKind, ContrastMode,
+        ContrastSettings, HistogramWindow, LineProfileTool, RulerTool, ScaleBarPosition,
+        ScaleBarSettings,
+    },
 };
 
 const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
@@ -98,6 +106,10 @@ enum ViewMode {
 enum PreviewTool {
     None,
     SelectRoi,
+    LineProfile,
+    Ruler,
+    AnnotateRect,
+    AnnotateEllipse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +257,25 @@ impl Default for PopupSharedData {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ImageJDialogState {
+    open: bool,
+    host: String,
+    port: u16,
+    error: Option<String>,
+}
+
+impl Default for ImageJDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            host: "127.0.0.1".into(),
+            port: 8010,
+            error: None,
+        }
+    }
+}
+
 fn format_timestamp_now() -> String {
     let dur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -322,7 +353,13 @@ pub struct CameraApp {
     disk_writer_buffer_mib: u64,
     acq_dirty: bool,
     config_dirty: bool,
-    contrast_percentile: f32,
+    colormap: Colormap,
+    contrast_settings: ContrastSettings,
+    histogram_window: HistogramWindow,
+    line_profile_tool: LineProfileTool,
+    ruler_tool: RulerTool,
+    scale_bar_settings: ScaleBarSettings,
+    annotation_manager: AnnotationManager,
     preview_workspace: PreviewWorkspaceState,
     lock_settings_while_recording: bool,
     settings_panel_open: bool,
@@ -335,6 +372,8 @@ pub struct CameraApp {
     camera_info: Option<DeviceInfo>,
     camera_status: String,
     popup_shared: Arc<Mutex<PopupSharedData>>,
+    imagej_dialog: ImageJDialogState,
+    external_tool: Option<Box<dyn ExternalTool>>,
     host_view_registry: ResolvedHostViewRegistry,
     host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
@@ -344,7 +383,11 @@ pub struct CameraApp {
 }
 
 impl CameraApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
+
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
         let global_defaults = GlobalSettingsConfig::default();
@@ -386,7 +429,13 @@ impl CameraApp {
             disk_writer_buffer_mib: global_defaults.disk_writer_buffer_mib,
             acq_dirty: false,
             config_dirty: false,
-            contrast_percentile: 99.5,
+            colormap: Colormap::default(),
+            contrast_settings: ContrastSettings::default(),
+            histogram_window: HistogramWindow::default(),
+            line_profile_tool: LineProfileTool::default(),
+            ruler_tool: RulerTool::default(),
+            scale_bar_settings: ScaleBarSettings::default(),
+            annotation_manager: AnnotationManager::default(),
             preview_workspace: PreviewWorkspaceState::default(),
             lock_settings_while_recording: true,
             settings_panel_open: true,
@@ -399,6 +448,8 @@ impl CameraApp {
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
             popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
+            imagej_dialog: ImageJDialogState::default(),
+            external_tool: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
             host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
@@ -452,6 +503,122 @@ impl CameraApp {
         self.event_store
             .set_memory_budget(mib_to_bytes(global.event_store_budget_mib.max(1)));
         self.sync_config_global_from_runtime();
+    }
+
+    fn external_tool_status(&self) -> ExternalToolStatus {
+        self.external_tool
+            .as_ref()
+            .map(|tool| tool.status())
+            .unwrap_or(ExternalToolStatus::Disconnected)
+    }
+
+    fn disconnect_external_tool(&mut self) {
+        if let Some(mut tool) = self.external_tool.take() {
+            tool.disconnect();
+        }
+    }
+
+    fn show_imagej_dialog(&mut self, ctx: &egui::Context) {
+        if !self.imagej_dialog.open {
+            return;
+        }
+
+        let mut open = self.imagej_dialog.open;
+        let mut connect_requested = false;
+        let mut disconnect_requested = false;
+        let external_status = self.external_tool_status();
+        egui::Window::new("Stream to ImageJ")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let (status_label, status_color) = match &external_status {
+                    ExternalToolStatus::Disconnected => (
+                        "Disconnected",
+                        ui.visuals().widgets.inactive.fg_stroke.color,
+                    ),
+                    ExternalToolStatus::Connecting => ("Connecting...", analysis_info_color()),
+                    ExternalToolStatus::Streaming => ("Connected", status_success_color()),
+                    ExternalToolStatus::Error(_) => ("Error", ui.visuals().error_fg_color),
+                };
+
+                ui.label("Connect to a running ImageJ/Fiji socket listener.");
+                ui.horizontal(|ui| {
+                    ui.label("Status:");
+                    ui.colored_label(status_color, status_label);
+                });
+                ui.separator();
+                ui.small("To enable ImageJ's socket listener:");
+                ui.small("1. Open ImageJ/Fiji");
+                ui.small("2. Edit -> Options -> Misc... -> check 'Run socket listener'");
+                ui.small("3. Restart ImageJ/Fiji");
+                ui.small("4. The default listener port is 8010");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Host");
+                    ui.text_edit_singleline(&mut self.imagej_dialog.host);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Port");
+                    ui.add(
+                        egui::DragValue::new(&mut self.imagej_dialog.port)
+                            .clamp_range(1..=u16::MAX),
+                    );
+                });
+                if let Some(error) =
+                    self.imagej_dialog
+                        .error
+                        .as_deref()
+                        .or(match &external_status {
+                            ExternalToolStatus::Error(error) => Some(error.as_str()),
+                            _ => None,
+                        })
+                {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                ui.horizontal(|ui| {
+                    let connect_enabled = self.external_tool.is_none();
+                    if ui
+                        .add_enabled(connect_enabled, egui::Button::new("Connect"))
+                        .clicked()
+                    {
+                        connect_requested = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.external_tool.is_some(),
+                            egui::Button::new("Disconnect"),
+                        )
+                        .clicked()
+                    {
+                        disconnect_requested = true;
+                    }
+                });
+            });
+
+        if disconnect_requested {
+            self.disconnect_external_tool();
+            self.imagej_dialog.error = None;
+        }
+
+        if connect_requested {
+            self.imagej_dialog.error = None;
+            if self.external_tool.is_some() {
+                self.disconnect_external_tool();
+            }
+
+            let mut bridge =
+                ImageJBridge::new(self.imagej_dialog.host.clone(), self.imagej_dialog.port);
+            match bridge.connect() {
+                Ok(()) => {
+                    self.external_tool = Some(Box::new(bridge));
+                }
+                Err(err) => {
+                    self.imagej_dialog.error = Some(err);
+                }
+            }
+        }
+
+        self.imagej_dialog.open = open;
     }
 
     fn reset_analysis(&mut self) {
@@ -1666,6 +1833,7 @@ impl CameraApp {
 
     fn stop_pipeline(&mut self) {
         let was_replaying = self.mode == AppMode::Replaying;
+        self.disconnect_external_tool();
         if let Some(controller) = self.controller.take() {
             if let Err(e) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {e}"));
@@ -1678,6 +1846,9 @@ impl CameraApp {
         self.latest_frame = None;
         self.last_preview_process_at = None;
         self.preview_workspace.clear_session_state();
+        self.line_profile_tool.clear();
+        self.ruler_tool.clear();
+        self.annotation_manager = AnnotationManager::default();
         self.reset_analysis();
         self.mode = AppMode::Idle;
         self.camera_status =
@@ -1840,7 +2011,9 @@ impl CameraApp {
             return;
         };
 
-        let needs_texture = self.preview_workspace.view_mode == ViewMode::Preview2d
+        let external_streaming = self.external_tool_status().is_streaming();
+        let needs_texture = (!external_streaming
+            && self.preview_workspace.view_mode == ViewMode::Preview2d)
             || self.preview_workspace.popup_open;
         let force_process =
             (needs_texture && self.texture.is_none()) || self.replay_pause_after_seek_frame;
@@ -1863,11 +2036,49 @@ impl CameraApp {
 
         self.run_analysis_plugins(&frame);
 
+        let histogram = compute_frame_histogram(&frame);
+        if self.contrast_settings.mode == ContrastMode::Auto {
+            self.contrast_settings.update_auto_range(&histogram);
+        }
+        let histogram_max = histogram.len().saturating_sub(1).min(u16::MAX as usize) as u16;
+        let clamped_min = self
+            .contrast_settings
+            .display_min
+            .min(histogram_max.saturating_sub(1));
+        let clamped_max = self
+            .contrast_settings
+            .display_max
+            .clamp(clamped_min.saturating_add(1), histogram_max.max(1));
+        self.contrast_settings.display_min = clamped_min;
+        self.contrast_settings.display_max = clamped_max;
+        self.histogram_window.set_histogram(histogram);
+
+        if self.line_profile_tool.has_line() {
+            self.line_profile_tool.recompute(&frame);
+        }
+
+        let external_tool_error = if let Some(tool) = &mut self.external_tool {
+            tool.send_frame(&frame, self.nm_per_pixel)
+                .err()
+                .map(|err| format!("{} bridge failed: {err}", tool.name()))
+        } else {
+            None
+        };
+        if let Some(err) = external_tool_error {
+            self.last_error = Some(err);
+            self.disconnect_external_tool();
+        }
+
         if needs_texture {
             let image = frame_to_color_image(
                 &frame,
                 &self.analysis_output.overlays,
-                self.contrast_percentile,
+                PreviewDisplaySettings {
+                    display_min: self.contrast_settings.display_min,
+                    display_max: self.contrast_settings.display_max,
+                    gamma: self.contrast_settings.gamma,
+                    colormap: self.colormap,
+                },
             );
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
@@ -2105,6 +2316,7 @@ impl eframe::App for CameraApp {
         let mut view_mode_changed = false;
         let mut plugin_scan_requested = false;
         let mut open_plugins_dir_requested = false;
+        let mut disconnect_external_tool_requested = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 // ── File ──────────────────────────────────────────────────────
@@ -2440,6 +2652,7 @@ impl eframe::App for CameraApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
                     ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
+                    ui.checkbox(&mut self.scale_bar_settings.show, "Show Scale Bar");
                     let window_views: Vec<ResolvedHostView> =
                         self.host_view_registry.window_views().cloned().collect();
                     for view in window_views {
@@ -2457,6 +2670,24 @@ impl eframe::App for CameraApp {
                     if r2d.changed() || r3d.changed() {
                         view_mode_changed = true;
                         self.preview_workspace.set_view_mode(view_mode);
+                    }
+                });
+
+                // ── Tools ─────────────────────────────────────────────────────
+                ui.menu_button("Tools", |ui| {
+                    match self.external_tool_status() {
+                        ExternalToolStatus::Streaming | ExternalToolStatus::Connecting => {
+                            if ui.button("Disconnect ImageJ").clicked() {
+                                disconnect_external_tool_requested = true;
+                                ui.close_menu();
+                            }
+                        }
+                        _ => {
+                            if ui.button("Stream to ImageJ...").clicked() {
+                                self.imagej_dialog.open = true;
+                                ui.close_menu();
+                            }
+                        }
                     }
                 });
 
@@ -2516,6 +2747,11 @@ impl eframe::App for CameraApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.camera_status);
                     ui.separator();
+                    let external_status = self.external_tool_status();
+                    if !matches!(external_status, ExternalToolStatus::Disconnected) {
+                        ui.label(format!("ImageJ: {}", external_status.label()));
+                        ui.separator();
+                    }
                     let mut view_mode = self.preview_workspace.view_mode;
                     let r3d = ui.selectable_value(&mut view_mode, ViewMode::PointCloud3d, "3D");
                     let r2d = ui.selectable_value(&mut view_mode, ViewMode::Preview2d, "2D");
@@ -2552,11 +2788,21 @@ impl eframe::App for CameraApp {
             }
         }
 
+        if disconnect_external_tool_requested {
+            self.disconnect_external_tool();
+        }
+
         if plugin_toggle_changed {
             self.reset_analysis();
         }
 
-        if settings_locked {
+        if ctx.input(|input| {
+            input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+        }) {
+            self.annotation_manager.delete_selected();
+        }
+
+        if settings_locked && self.preview_workspace.tool == PreviewTool::SelectRoi {
             self.preview_workspace.clear_selection();
         }
 
@@ -2935,6 +3181,9 @@ impl eframe::App for CameraApp {
             self.host_view_registry_dirty = true;
         }
 
+        let external_status = self.external_tool_status();
+        let external_streaming = external_status.is_streaming();
+        let mut return_from_external_tool = false;
         let mut pc_metrics: Option<PointCloudMetrics> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(preview_heading(mode, self.preview_workspace.view_mode));
@@ -2952,37 +3201,65 @@ impl eframe::App for CameraApp {
             // Reserve space for controls below so the canvas never crowds them out.
             let controls_reserve = 190.0;
 
-            if self.preview_workspace.popup_open {
-                // When the popup is open, show a placeholder in the main window.
-                draw_preview_toolbar(ui, &mut self.preview_workspace, settings_locked, "Enlarge");
+            if external_streaming {
+                draw_preview_toolbar(
+                    ui,
+                    PreviewToolbarState {
+                        workspace: &mut self.preview_workspace,
+                        latest_frame: self.latest_frame.as_ref(),
+                        line_profile_tool: &mut self.line_profile_tool,
+                        ruler_tool: &mut self.ruler_tool,
+                        nm_per_pixel: self.nm_per_pixel,
+                        settings_locked,
+                        histogram_open: &mut self.histogram_window.open,
+                        popup_button_tooltip: "Open in separate window",
+                    },
+                );
                 let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
-                let placeholder_height = max_image_height;
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), placeholder_height),
-                    egui::Sense::hover(),
+                draw_text_placeholder(
+                    ui,
+                    max_image_height,
+                    &format!(
+                        "Streaming to ImageJ ({}:{})",
+                        self.imagej_dialog.host, self.imagej_dialog.port
+                    ),
                 );
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
-                painter.rect_stroke(
-                    rect,
-                    PANEL_ROUNDING,
-                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                ui.add_space(8.0);
+                if ui.button("Return to augur").clicked() {
+                    return_from_external_tool = true;
+                }
+            } else if self.preview_workspace.popup_open {
+                // When the popup is open, show a placeholder in the main window.
+                draw_preview_toolbar(
+                    ui,
+                    PreviewToolbarState {
+                        workspace: &mut self.preview_workspace,
+                        latest_frame: self.latest_frame.as_ref(),
+                        line_profile_tool: &mut self.line_profile_tool,
+                        ruler_tool: &mut self.ruler_tool,
+                        nm_per_pixel: self.nm_per_pixel,
+                        settings_locked,
+                        histogram_open: &mut self.histogram_window.open,
+                        popup_button_tooltip: "Open in separate window",
+                    },
                 );
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Preview open in separate window",
-                    egui::FontId::proportional(16.0),
-                    ui.visuals().weak_text_color(),
-                );
+                let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
+                draw_text_placeholder(ui, max_image_height, "Preview open in separate window");
             } else {
                 match self.preview_workspace.view_mode {
                     ViewMode::Preview2d => {
                         draw_preview_toolbar(
                             ui,
-                            &mut self.preview_workspace,
-                            settings_locked,
-                            "Enlarge",
+                            PreviewToolbarState {
+                                workspace: &mut self.preview_workspace,
+                                latest_frame: self.latest_frame.as_ref(),
+                                line_profile_tool: &mut self.line_profile_tool,
+                                ruler_tool: &mut self.ruler_tool,
+                                nm_per_pixel: self.nm_per_pixel,
+                                settings_locked,
+                                histogram_open: &mut self.histogram_window.open,
+                                popup_button_tooltip: "Open in separate window",
+                            },
                         );
                         let max_image_height =
                             (ui.available_size().y - controls_reserve).max(180.0);
@@ -2993,10 +3270,19 @@ impl eframe::App for CameraApp {
                                 ui,
                                 texture,
                                 frame,
-                                &mut self.config,
-                                &mut self.preview_workspace,
-                                settings_locked,
-                                max_image_height,
+                                PreviewCanvasState {
+                                    config: &mut self.config,
+                                    workspace: &mut self.preview_workspace,
+                                    line_profile_tool: &mut self.line_profile_tool,
+                                    ruler_tool: &mut self.ruler_tool,
+                                    annotation_manager: &mut self.annotation_manager,
+                                },
+                                PreviewCanvasOptions {
+                                    scale_bar_settings: &self.scale_bar_settings,
+                                    nm_per_pixel: self.nm_per_pixel,
+                                    settings_locked,
+                                    max_height: max_image_height,
+                                },
                             ) && mode != AppMode::Replaying
                             {
                                 self.config_dirty = true;
@@ -3038,13 +3324,91 @@ impl eframe::App for CameraApp {
                     match self.preview_workspace.view_mode {
                         ViewMode::Preview2d => {
                             ui.horizontal(|ui| {
-                                ui.label("Contrast");
-                                ui.add(egui::Slider::new(
-                                    &mut self.contrast_percentile,
-                                    90.0..=100.0,
-                                ));
-                                ui.label(format!("{:.1}th percentile", self.contrast_percentile));
+                                ui.label("Colormap");
+                                egui::ComboBox::from_id_source("preview_colormap")
+                                    .selected_text(self.colormap.label())
+                                    .show_ui(ui, |ui| {
+                                        for colormap in Colormap::ALL {
+                                            ui.selectable_value(
+                                                &mut self.colormap,
+                                                colormap,
+                                                colormap.label(),
+                                            );
+                                        }
+                                    });
+                                ui.checkbox(
+                                    &mut self.scale_bar_settings.show,
+                                    "Scale bar",
+                                );
+                                if self.scale_bar_settings.show {
+                                    egui::ComboBox::from_id_source("scale_bar_position")
+                                        .selected_text(match self.scale_bar_settings.position {
+                                            ScaleBarPosition::TopLeft => "Top left",
+                                            ScaleBarPosition::TopRight => "Top right",
+                                            ScaleBarPosition::BottomLeft => "Bottom left",
+                                            ScaleBarPosition::BottomRight => "Bottom right",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.scale_bar_settings.position,
+                                                ScaleBarPosition::TopLeft,
+                                                "Top left",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.scale_bar_settings.position,
+                                                ScaleBarPosition::TopRight,
+                                                "Top right",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.scale_bar_settings.position,
+                                                ScaleBarPosition::BottomLeft,
+                                                "Bottom left",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.scale_bar_settings.position,
+                                                ScaleBarPosition::BottomRight,
+                                                "Bottom right",
+                                            );
+                                        });
+                                }
                             });
+                            if let Some(stats) = self
+                                .latest_frame
+                                .as_ref()
+                                .and_then(|frame| self.annotation_manager.statistics_for_selected(frame))
+                            {
+                                ui.small(format!(
+                                    "{} | {} px | ON {:.2}±{:.2} | OFF {:.2}±{:.2} | Total {:.2}±{:.2}",
+                                    stats.label,
+                                    stats.pixel_count,
+                                    stats.on.mean,
+                                    stats.on.stddev,
+                                    stats.off.mean,
+                                    stats.off.stddev,
+                                    stats.combined.mean,
+                                    stats.combined.stddev,
+                                ));
+                            }
+                            if !self.annotation_manager.annotations().is_empty() {
+                                egui::CollapsingHeader::new("Annotations")
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for annotation in self.annotation_manager.annotations() {
+                                            let selected = self.annotation_manager.selected_id()
+                                                == Some(annotation.id);
+                                            let _ = ui.selectable_label(selected, &annotation.label);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.annotation_manager.selected_id().is_some(),
+                                                egui::Button::new("Delete selected"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.annotation_manager.delete_selected();
+                                        }
+                                    });
+                            }
                         }
                         ViewMode::PointCloud3d => {
                             if let Some(metrics) = pc_metrics {
@@ -3144,6 +3508,15 @@ impl eframe::App for CameraApp {
                     }
                 });
         });
+
+        if return_from_external_tool {
+            self.disconnect_external_tool();
+        }
+
+        self.histogram_window
+            .show(ctx, &mut self.contrast_settings, self.colormap);
+        self.line_profile_tool.show_window(ctx);
+        self.show_imagej_dialog(ctx);
 
         if self.preview_workspace.popup_open {
             // Update shared data for the popup viewport.
@@ -3345,21 +3718,55 @@ fn empty_preview_message(mode: AppMode, view_mode: ViewMode) -> &'static str {
     }
 }
 
-fn draw_preview_toolbar(
-    ui: &mut egui::Ui,
-    workspace: &mut PreviewWorkspaceState,
+struct PreviewToolbarState<'a> {
+    workspace: &'a mut PreviewWorkspaceState,
+    latest_frame: Option<&'a PreviewFrame>,
+    line_profile_tool: &'a mut LineProfileTool,
+    ruler_tool: &'a mut RulerTool,
+    nm_per_pixel: f64,
     settings_locked: bool,
-    popup_button_label: &str,
-) {
-    ui.horizontal_wrapped(|ui| {
+    histogram_open: &'a mut bool,
+    popup_button_tooltip: &'a str,
+}
+
+fn draw_preview_toolbar(ui: &mut egui::Ui, state: PreviewToolbarState<'_>) {
+    let PreviewToolbarState {
+        workspace,
+        latest_frame,
+        line_profile_tool,
+        ruler_tool,
+        nm_per_pixel,
+        settings_locked,
+        histogram_open,
+        popup_button_tooltip,
+    } = state;
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::SelectableLabel::new(
+                workspace.tool == PreviewTool::None,
+                toolbar_icon(phosphor::CURSOR),
+            ))
+            .on_hover_text("Pointer")
+            .clicked()
+        {
+            workspace.tool = PreviewTool::None;
+            workspace.selection_anchor = None;
+            workspace.pending_roi = None;
+        }
+
         let mut select_roi_button = ui.add_enabled(
             !settings_locked,
-            egui::SelectableLabel::new(workspace.tool == PreviewTool::SelectRoi, "Select ROI"),
+            egui::SelectableLabel::new(
+                workspace.tool == PreviewTool::SelectRoi,
+                toolbar_icon(phosphor::SELECTION),
+            ),
         );
         if settings_locked {
             select_roi_button = select_roi_button.on_hover_text(
-                "ROI editing is disabled while replay is active or settings are locked.",
+                "Hardware ROI editing is disabled during replay. Use the rectangle annotation tool instead.",
             );
+        } else {
+            select_roi_button = select_roi_button.on_hover_text("Select hardware ROI");
         }
         if select_roi_button.clicked() {
             if workspace.tool == PreviewTool::SelectRoi {
@@ -3371,32 +3778,155 @@ fn draw_preview_toolbar(
             }
         }
 
-        if ui.button("-").clicked() {
+        if preview_tool_button(
+            ui,
+            workspace,
+            PreviewTool::LineProfile,
+            phosphor::LINE_SEGMENT,
+            "Line profile",
+        ) {
+            line_profile_tool.clear();
+        }
+        if preview_tool_button(
+            ui,
+            workspace,
+            PreviewTool::Ruler,
+            phosphor::RULER,
+            "Measure distance",
+        ) {
+            ruler_tool.clear();
+        }
+        preview_tool_button(
+            ui,
+            workspace,
+            PreviewTool::AnnotateRect,
+            phosphor::RECTANGLE,
+            "Rectangle annotation",
+        );
+        preview_tool_button(
+            ui,
+            workspace,
+            PreviewTool::AnnotateEllipse,
+            phosphor::CIRCLE,
+            "Ellipse annotation",
+        );
+
+        ui.separator();
+        if ui
+            .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_MINUS))
+            .on_hover_text("Zoom out")
+            .clicked()
+        {
             workspace.zoom = (workspace.zoom / 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
             if (workspace.zoom - PREVIEW_ZOOM_MIN).abs() < f32::EPSILON {
                 workspace.pan = egui::Vec2::ZERO;
             }
         }
-        if ui.button("+").clicked() {
+        if ui
+            .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_PLUS))
+            .on_hover_text("Zoom in")
+            .clicked()
+        {
             workspace.zoom = (workspace.zoom * 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
         }
-        if ui.button("Fit").clicked() {
+        if ui
+            .small_button(toolbar_icon(phosphor::FRAME_CORNERS))
+            .on_hover_text("Fit to window")
+            .clicked()
+        {
             workspace.reset_zoom();
         }
 
-        ui.checkbox(&mut workspace.crop_to_roi, "Crop to ROI");
+        if ui
+            .add(egui::SelectableLabel::new(
+                workspace.crop_to_roi,
+                toolbar_icon(phosphor::CROP),
+            ))
+            .on_hover_text("Crop to ROI")
+            .clicked()
+        {
+            workspace.crop_to_roi = !workspace.crop_to_roi;
+        }
 
-        if ui.button(popup_button_label).clicked() {
+        ui.separator();
+        if ui
+            .add(egui::SelectableLabel::new(
+                *histogram_open,
+                toolbar_icon(phosphor::CHART_BAR),
+            ))
+            .on_hover_text("Histogram & Brightness/Contrast")
+            .clicked()
+        {
+            *histogram_open = !*histogram_open;
+        }
+
+        if ui
+            .add(egui::SelectableLabel::new(
+                workspace.popup_open,
+                toolbar_icon(phosphor::ARROW_SQUARE_OUT),
+            ))
+            .on_hover_text(popup_button_tooltip)
+            .clicked()
+        {
             workspace.popup_open = !workspace.popup_open;
         }
 
         ui.separator();
-        if let Some((x, y)) = workspace.hover_sensor {
-            ui.monospace(format!("x {x}, y {y}"));
+        if let (Some((x, y)), Some(frame)) = (workspace.hover_sensor, latest_frame) {
+            let width = usize::from(frame.width.max(1));
+            let idx = usize::from(y) * width + usize::from(x);
+            if idx < frame.pixels.len() {
+                ui.monospace(format!(
+                    "x {x}, y {y} | ON: {} OFF: {} Total: {}",
+                    frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
+                ));
+            } else {
+                ui.weak("Hover preview for pixel values");
+            }
         } else {
-            ui.weak("Hover preview for x/y");
+            ui.weak("Hover preview for pixel values");
+        }
+        if workspace.tool == PreviewTool::Ruler {
+            if let Some(measurement) = ruler_tool.measurement(nm_per_pixel) {
+                ui.separator();
+                ui.small(format!(
+                    "{:.1} px | {:.2} µm",
+                    measurement.pixel_distance, measurement.micrometers
+                ));
+            }
         }
     });
+}
+
+fn preview_tool_button(
+    ui: &mut egui::Ui,
+    workspace: &mut PreviewWorkspaceState,
+    tool: PreviewTool,
+    icon: &str,
+    tooltip: &str,
+) -> bool {
+    if ui
+        .add(egui::SelectableLabel::new(
+            workspace.tool == tool,
+            toolbar_icon(icon),
+        ))
+        .on_hover_text(tooltip)
+        .clicked()
+    {
+        if workspace.tool == tool {
+            workspace.tool = PreviewTool::None;
+            return true;
+        } else {
+            workspace.tool = tool;
+            workspace.selection_anchor = None;
+            workspace.pending_roi = None;
+        }
+    }
+    false
+}
+
+fn toolbar_icon(symbol: &str) -> egui::RichText {
+    egui::RichText::new(symbol).size(18.0)
 }
 
 fn draw_point_cloud_toolbar(
@@ -3459,6 +3989,10 @@ fn draw_empty_preview_placeholder(
     mode: AppMode,
     view_mode: ViewMode,
 ) {
+    draw_text_placeholder(ui, max_image_height, empty_preview_message(mode, view_mode));
+}
+
+fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, message: &str) {
     let placeholder_height = max_image_height;
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), placeholder_height),
@@ -3474,7 +4008,7 @@ fn draw_empty_preview_placeholder(
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        empty_preview_message(mode, view_mode),
+        message,
         egui::FontId::proportional(16.0),
         ui.visuals().weak_text_color(),
     );
@@ -3581,35 +4115,82 @@ fn render_popup_content(ui: &mut egui::Ui, shared: &Arc<Mutex<PopupSharedData>>)
     }
 }
 
+struct PreviewCanvasState<'a> {
+    config: &'a mut CameraConfig,
+    workspace: &'a mut PreviewWorkspaceState,
+    line_profile_tool: &'a mut LineProfileTool,
+    ruler_tool: &'a mut RulerTool,
+    annotation_manager: &'a mut AnnotationManager,
+}
+
+struct PreviewCanvasOptions<'a> {
+    scale_bar_settings: &'a ScaleBarSettings,
+    nm_per_pixel: f64,
+    settings_locked: bool,
+    max_height: f32,
+}
+
 fn draw_preview_canvas(
     ui: &mut egui::Ui,
     texture: &egui::TextureHandle,
     frame: &PreviewFrame,
-    config: &mut CameraConfig,
-    workspace: &mut PreviewWorkspaceState,
-    settings_locked: bool,
-    max_height: f32,
+    state: PreviewCanvasState<'_>,
+    options: PreviewCanvasOptions<'_>,
 ) -> bool {
+    let PreviewCanvasState {
+        config,
+        workspace,
+        line_profile_tool,
+        ruler_tool,
+        annotation_manager,
+    } = state;
+    let PreviewCanvasOptions {
+        scale_bar_settings,
+        nm_per_pixel,
+        settings_locked,
+        max_height,
+    } = options;
     let viewport = build_preview_viewport(frame, config, workspace);
-    let available = ui.available_size_before_wrap();
-    let display_size = viewport.display_size(egui::vec2(available.x, available.y.min(max_height)));
-    let response = ui.add(
-        egui::Image::new(texture)
-            .uv(viewport.uv_rect(frame))
-            .fit_to_exact_size(display_size)
-            .sense(egui::Sense::click_and_drag()),
-    );
+    let canvas_size = egui::vec2(ui.available_width().max(1.0), max_height.max(1.0));
+    let (canvas_rect, response) =
+        ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+    let display_size = viewport.display_size(canvas_rect.size());
+    let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(display_size, canvas_rect);
+    ui.painter()
+        .rect_filled(canvas_rect, 4.0, ui.visuals().faint_bg_color);
+    egui::Image::new(texture)
+        .uv(viewport.uv_rect(frame))
+        .paint_at(ui, image_rect);
 
     workspace.hover_sensor = response
         .hover_pos()
-        .and_then(|pos| viewport.screen_to_sensor(response.rect, pos));
+        .and_then(|pos| viewport.screen_to_sensor(image_rect, pos));
+    let pointer_sensor = response
+        .interact_pointer_pos()
+        .and_then(|pos| viewport.screen_to_sensor(image_rect, pos));
+
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        match workspace.tool {
+            PreviewTool::SelectRoi => {
+                workspace.selection_anchor = None;
+                workspace.pending_roi = None;
+            }
+            PreviewTool::LineProfile => line_profile_tool.clear(),
+            PreviewTool::Ruler => ruler_tool.clear(),
+            PreviewTool::AnnotateRect | PreviewTool::AnnotateEllipse => {
+                annotation_manager.cancel_drawing();
+            }
+            PreviewTool::None => {}
+        }
+        workspace.tool = PreviewTool::None;
+    }
 
     let mut roi_committed = false;
     if workspace.tool == PreviewTool::SelectRoi && !settings_locked {
         if response.drag_started() {
             if let Some(pointer_pos) = response
                 .interact_pointer_pos()
-                .and_then(|pos| viewport.screen_to_sensor(response.rect, pos))
+                .and_then(|pos| viewport.screen_to_sensor(image_rect, pos))
             {
                 let anchor = egui::pos2(pointer_pos.0 as f32, pointer_pos.1 as f32);
                 workspace.selection_anchor = Some(anchor);
@@ -3622,7 +4203,7 @@ fn draw_preview_canvas(
                 workspace.selection_anchor,
                 response
                     .interact_pointer_pos()
-                    .and_then(|pos| viewport.screen_to_sensor(response.rect, pos)),
+                    .and_then(|pos| viewport.screen_to_sensor(image_rect, pos)),
             ) {
                 workspace.pending_roi = Some(sensor_rect_from_points(
                     anchor,
@@ -3644,20 +4225,89 @@ fn draw_preview_canvas(
             }
             workspace.selection_anchor = None;
         }
+    } else if workspace.tool == PreviewTool::LineProfile {
+        if response.drag_started() {
+            if let Some(pointer_pos) = pointer_sensor {
+                line_profile_tool.start = Some(pointer_pos);
+                line_profile_tool.end = Some(pointer_pos);
+                line_profile_tool.recompute(frame);
+            }
+        }
+        if response.dragged() {
+            if let Some(start) = line_profile_tool.start {
+                if let Some(pointer_pos) = pointer_sensor {
+                    line_profile_tool.set_line(start, pointer_pos, frame);
+                }
+            }
+        }
+        if response.drag_stopped() {
+            if let (Some(start), Some(end)) = (
+                line_profile_tool.start,
+                pointer_sensor.or(line_profile_tool.end),
+            ) {
+                line_profile_tool.set_line(start, end, frame);
+                line_profile_tool.open_window();
+            }
+        }
+    } else if workspace.tool == PreviewTool::Ruler {
+        if response.drag_started() {
+            if let Some(pointer_pos) = pointer_sensor {
+                ruler_tool.start = Some(pointer_pos);
+                ruler_tool.end = Some(pointer_pos);
+            }
+        }
+        if response.dragged() {
+            if let Some(start) = ruler_tool.start {
+                if let Some(pointer_pos) = pointer_sensor {
+                    ruler_tool.set_line(start, pointer_pos);
+                }
+            }
+        }
+        if response.drag_stopped() {
+            if let (Some(start), Some(pointer_pos)) = (ruler_tool.start, pointer_sensor) {
+                ruler_tool.set_line(start, pointer_pos);
+            }
+        }
+    } else if matches!(
+        workspace.tool,
+        PreviewTool::AnnotateRect | PreviewTool::AnnotateEllipse
+    ) {
+        let kind = if workspace.tool == PreviewTool::AnnotateRect {
+            AnnotationShapeKind::Rectangle
+        } else {
+            AnnotationShapeKind::Ellipse
+        };
+        if response.drag_started() {
+            if let Some(pointer_pos) = pointer_sensor {
+                annotation_manager.start_drawing(kind, pointer_pos);
+            }
+        }
+        if response.dragged() {
+            if let Some(pointer_pos) = pointer_sensor {
+                annotation_manager.update_drawing(pointer_pos);
+            }
+        }
+        if response.drag_stopped() {
+            annotation_manager.finish_drawing();
+        }
     } else if response.dragged() && workspace.zoom > PREVIEW_ZOOM_MIN {
         let delta = ui.ctx().input(|input| input.pointer.delta());
         workspace.pan += egui::vec2(
-            -delta.x * viewport.visible_sensor_rect.width() / response.rect.width().max(1.0),
-            -delta.y * viewport.visible_sensor_rect.height() / response.rect.height().max(1.0),
+            -delta.x * viewport.visible_sensor_rect.width() / image_rect.width().max(1.0),
+            -delta.y * viewport.visible_sensor_rect.height() / image_rect.height().max(1.0),
         );
+    } else if response.clicked() {
+        if let Some(pointer_pos) = pointer_sensor {
+            annotation_manager.select_at(pointer_pos);
+        }
     }
 
-    let painter = ui.painter().with_clip_rect(response.rect);
+    let painter = ui.painter().with_clip_rect(image_rect);
     if let Some(current_roi) = viewport.roi_rect {
         if !workspace.crop_to_roi {
             paint_sensor_rect(
                 &painter,
-                response.rect,
+                image_rect,
                 viewport,
                 current_roi,
                 egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 196, 64)),
@@ -3667,10 +4317,71 @@ fn draw_preview_canvas(
     if let Some(pending_roi) = workspace.pending_roi {
         paint_sensor_rect(
             &painter,
-            response.rect,
+            image_rect,
             viewport,
             pending_roi,
             egui::Stroke::new(2.0, egui::Color32::WHITE),
+        );
+    }
+    if let (Some(start), Some(end)) = (line_profile_tool.start, line_profile_tool.end) {
+        paint_sensor_line_with_shadow(
+            &painter,
+            image_rect,
+            viewport,
+            start,
+            end,
+            egui::Color32::YELLOW,
+            2.0,
+        );
+    }
+    if let (Some(start), Some(end), Some(measurement)) = (
+        ruler_tool.start,
+        ruler_tool.end,
+        ruler_tool.measurement(nm_per_pixel),
+    ) {
+        paint_sensor_line_with_shadow(
+            &painter,
+            image_rect,
+            viewport,
+            start,
+            end,
+            egui::Color32::from_rgb(64, 220, 255),
+            2.0,
+        );
+        let midpoint = viewport.sensor_to_screen(
+            image_rect,
+            egui::pos2(measurement.midpoint.0, measurement.midpoint.1),
+        );
+        paint_outlined_text(
+            &painter,
+            midpoint,
+            egui::Align2::CENTER_BOTTOM,
+            &format!(
+                "{:.1} px | {:.2} µm",
+                measurement.pixel_distance, measurement.micrometers
+            ),
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        );
+    }
+    paint_annotations(&painter, image_rect, viewport, annotation_manager);
+    if let Some(shape) = annotation_manager.pending_shape() {
+        paint_annotation_shape(
+            &painter,
+            image_rect,
+            viewport,
+            &shape,
+            egui::Color32::WHITE,
+            false,
+        );
+    }
+    if scale_bar_settings.show {
+        paint_scale_bar(
+            &painter,
+            image_rect,
+            viewport,
+            scale_bar_settings,
+            nm_per_pixel,
         );
     }
 
@@ -3802,6 +4513,188 @@ fn paint_sensor_rect(
         viewport.sensor_to_screen(image_rect, sensor_rect.max),
     );
     painter.rect_stroke(screen_rect, 0.0, stroke);
+}
+
+fn paint_sensor_line(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    start: (u16, u16),
+    end: (u16, u16),
+    stroke: egui::Stroke,
+) {
+    painter.line_segment(
+        [
+            viewport.sensor_to_screen(
+                image_rect,
+                egui::pos2(f32::from(start.0), f32::from(start.1)),
+            ),
+            viewport.sensor_to_screen(image_rect, egui::pos2(f32::from(end.0), f32::from(end.1))),
+        ],
+        stroke,
+    );
+}
+
+fn paint_sensor_line_with_shadow(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    start: (u16, u16),
+    end: (u16, u16),
+    color: egui::Color32,
+    width: f32,
+) {
+    paint_sensor_line(
+        painter,
+        image_rect,
+        viewport,
+        start,
+        end,
+        egui::Stroke::new(
+            width + 2.0,
+            egui::Color32::from_rgba_premultiplied(0, 0, 0, 160),
+        ),
+    );
+    paint_sensor_line(
+        painter,
+        image_rect,
+        viewport,
+        start,
+        end,
+        egui::Stroke::new(width, color),
+    );
+}
+
+fn paint_outlined_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    let outline = egui::Color32::from_rgba_premultiplied(0, 0, 0, 200);
+    for offset in [
+        egui::vec2(-1.0, -1.0),
+        egui::vec2(1.0, -1.0),
+        egui::vec2(-1.0, 1.0),
+        egui::vec2(1.0, 1.0),
+    ] {
+        painter.text(pos + offset, anchor, text, font.clone(), outline);
+    }
+    painter.text(pos, anchor, text, font, color);
+}
+
+fn paint_annotations(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    annotation_manager: &AnnotationManager,
+) {
+    for annotation in annotation_manager.annotations() {
+        let selected = annotation_manager.selected_id() == Some(annotation.id);
+        paint_annotation_shape(
+            painter,
+            image_rect,
+            viewport,
+            &annotation.shape,
+            annotation.color,
+            selected,
+        );
+    }
+}
+
+fn paint_annotation_shape(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    shape: &AnnotationShape,
+    color: egui::Color32,
+    selected: bool,
+) {
+    let stroke = egui::Stroke::new(if selected { 2.5 } else { 1.5 }, color);
+    match shape {
+        AnnotationShape::Rectangle { min, max } => {
+            let rect = egui::Rect::from_min_max(
+                viewport
+                    .sensor_to_screen(image_rect, egui::pos2(f32::from(min.0), f32::from(min.1))),
+                viewport
+                    .sensor_to_screen(image_rect, egui::pos2(f32::from(max.0), f32::from(max.1))),
+            );
+            painter.rect_stroke(rect, 0.0, stroke);
+        }
+        AnnotationShape::Ellipse {
+            center,
+            radius_x,
+            radius_y,
+        } => {
+            let screen_center = viewport.sensor_to_screen(
+                image_rect,
+                egui::pos2(f32::from(center.0), f32::from(center.1)),
+            );
+            let radius_screen = viewport.sensor_to_screen(
+                image_rect,
+                egui::pos2(
+                    f32::from(center.0.saturating_add(*radius_x)),
+                    f32::from(center.1.saturating_add(*radius_y)),
+                ),
+            );
+            let radii = egui::vec2(
+                (radius_screen.x - screen_center.x).abs(),
+                (radius_screen.y - screen_center.y).abs(),
+            );
+            let points: Vec<egui::Pos2> = (0..=48)
+                .map(|step| {
+                    let angle = std::f32::consts::TAU * step as f32 / 48.0;
+                    egui::pos2(
+                        screen_center.x + radii.x * angle.cos(),
+                        screen_center.y + radii.y * angle.sin(),
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
+}
+
+fn paint_scale_bar(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    settings: &ScaleBarSettings,
+    nm_per_pixel: f64,
+) {
+    let pixels_per_sensor_pixel =
+        image_rect.width() / viewport.visible_sensor_rect.width().max(1.0);
+    let Some(spec) = compute_scale_bar(nm_per_pixel, pixels_per_sensor_pixel) else {
+        return;
+    };
+
+    let margin = 18.0;
+    let bar_height = 6.0;
+    let y = match settings.position {
+        ScaleBarPosition::TopLeft | ScaleBarPosition::TopRight => image_rect.top() + margin,
+        ScaleBarPosition::BottomLeft | ScaleBarPosition::BottomRight => {
+            image_rect.bottom() - margin
+        }
+    };
+    let x = match settings.position {
+        ScaleBarPosition::TopLeft | ScaleBarPosition::BottomLeft => image_rect.left() + margin,
+        ScaleBarPosition::TopRight | ScaleBarPosition::BottomRight => {
+            image_rect.right() - margin - spec.screen_width
+        }
+    };
+    let rect =
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(spec.screen_width, bar_height));
+    painter.rect_filled(rect, 1.5, settings.color);
+    paint_outlined_text(
+        painter,
+        egui::pos2(rect.center().x, rect.top() - 4.0),
+        egui::Align2::CENTER_BOTTOM,
+        &spec.label,
+        egui::FontId::proportional(13.0),
+        settings.color,
+    );
 }
 
 fn status_success_color() -> egui::Color32 {

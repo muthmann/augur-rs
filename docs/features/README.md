@@ -24,6 +24,7 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [Theme-Aware GUI Status Colors](./theme-aware-gui-status-colors.md) — theme-adaptive warning/error labels plus contrast-safe success/info colors
 - [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, ROI drag tool, zoom/crop, popup enlarge, point cloud
+- [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the external ImageJ/Fiji handoff path
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
 - [Plugin API v0.2](./plugin-api-v0-2.md) — flat runtime ABI, EventStore history, persistent plugin context, and repo split cleanup
 - [Plugin API v0.3 Migration](./plugin-api-v0-3-migration.md) — segmented EventStore access, host-view dataset generations, raw context publishing, and rebuild requirements
