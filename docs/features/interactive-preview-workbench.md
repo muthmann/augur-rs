@@ -77,6 +77,11 @@ resizing the window.
 parameter; the popup passes `ui.available_size().y` (unconstrained) while the main
 panel passes `max_image_height`.
 
+Preview placeholders, 2D overlay painters, and the 3D point-cloud painter now
+intersect their canvas rects with the current `egui` clip rect. That keeps
+hover overlays and background fills confined to the central panel when the
+analysis side panel is present or resizing.
+
 ## Files
 
 | File | Role |

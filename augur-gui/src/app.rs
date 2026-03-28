@@ -3029,6 +3029,7 @@ impl eframe::App for CameraApp {
         if self.analysis_panel_open && !enabled_plugin_names.is_empty() {
             egui::SidePanel::right("analysis")
                 .min_width(360.0)
+                .show_separator_line(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -3155,6 +3156,7 @@ impl eframe::App for CameraApp {
             egui::SidePanel::right("analysis-collapsed")
                 .exact_width(COLLAPSED_PANEL_WIDTH)
                 .resizable(false)
+                .show_separator_line(true)
                 .show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
                         if ui
@@ -4114,7 +4116,7 @@ fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, message: &str
         egui::vec2(ui.available_width(), placeholder_height),
         egui::Sense::hover(),
     );
-    let painter = ui.painter_at(rect);
+    let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
     painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
     painter.rect_stroke(
         rect,
@@ -4418,7 +4420,9 @@ fn draw_preview_canvas(
         }
     }
 
-    let painter = ui.painter().with_clip_rect(image_rect);
+    let painter = ui
+        .painter()
+        .with_clip_rect(image_rect.intersect(ui.clip_rect()));
     if let Some(current_roi) = viewport.roi_rect {
         if !workspace.crop_to_roi {
             paint_sensor_rect(
