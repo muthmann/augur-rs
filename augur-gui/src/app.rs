@@ -557,10 +557,7 @@ impl CameraApp {
                 };
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("Status:")
-                            .size(body_size),
-                    );
+                    ui.label(egui::RichText::new("Status:").size(body_size));
                     ui.label(
                         egui::RichText::new(status_label)
                             .size(body_size)
@@ -585,17 +582,13 @@ impl CameraApp {
                     "Start the bridge: Plugins > Augur > Start Bridge.",
                 ];
                 for (i, step) in steps.iter().enumerate() {
-                    ui.label(
-                        egui::RichText::new(format!("{}. {step}", i + 1))
-                            .size(small_size),
-                    );
+                    ui.label(egui::RichText::new(format!("{}. {step}", i + 1)).size(small_size));
                 }
 
                 ui.add_space(6.0 * scale);
                 if ui
                     .add(egui::Button::new(
-                        egui::RichText::new("Save AugurBridge.jar...")
-                            .size(body_size),
+                        egui::RichText::new("Save AugurBridge.jar...").size(body_size),
                     ))
                     .clicked()
                 {
@@ -663,9 +656,7 @@ impl CameraApp {
                     if ui
                         .add_enabled(
                             connect_enabled,
-                            egui::Button::new(
-                                egui::RichText::new("Connect").size(body_size),
-                            ),
+                            egui::Button::new(egui::RichText::new("Connect").size(body_size)),
                         )
                         .clicked()
                     {
@@ -674,9 +665,7 @@ impl CameraApp {
                     if ui
                         .add_enabled(
                             self.external_tool.is_some(),
-                            egui::Button::new(
-                                egui::RichText::new("Disconnect").size(body_size),
-                            ),
+                            egui::Button::new(egui::RichText::new("Disconnect").size(body_size)),
                         )
                         .clicked()
                     {
