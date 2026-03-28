@@ -3893,7 +3893,7 @@ fn draw_preview_toolbar(ui: &mut egui::Ui, state: PreviewToolbarState<'_>) {
         histogram_open,
         popup_button_tooltip,
     } = state;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add(egui::SelectableLabel::new(
                 workspace.tool == PreviewTool::None,
