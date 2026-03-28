@@ -536,7 +536,8 @@ impl CameraApp {
         egui::Window::new("Stream to ImageJ")
             .open(&mut open)
             .collapsible(false)
-            .default_size([380.0, 0.0])
+            .default_width(380.0)
+            .resizable(true)
             .show(ctx, |ui| {
                 // Scale font sizes based on the available width so the dialog
                 // becomes more readable when the user drags the resize handle.
@@ -550,7 +551,7 @@ impl CameraApp {
                         "Disconnected",
                         ui.visuals().widgets.inactive.fg_stroke.color,
                     ),
-                    ExternalToolStatus::Connecting => ("Connecting\u{2026}", analysis_info_color()),
+                    ExternalToolStatus::Connecting => ("Connecting...", analysis_info_color()),
                     ExternalToolStatus::Streaming => ("Connected", status_success_color()),
                     ExternalToolStatus::Error(_) => ("Error", ui.visuals().error_fg_color),
                 };
@@ -577,11 +578,11 @@ impl CameraApp {
 
                 let steps = [
                     "Export the plugin with the button below.",
-                    "Install it in ImageJ/Fiji via Plugins \u{2192} Install\u{2026}",
-                    "You can also drag it onto ImageJ/Fiji or copy it into the main plugins/ folder.",
-                    "Do not place it in plugins/Tools; that folder is reserved for toolbar tools.",
-                    "Restart ImageJ/Fiji (or Help \u{2192} Refresh Menus).",
-                    "Start the bridge: Plugins \u{2192} Augur \u{2192} Start Bridge.",
+                    "Install it in ImageJ/Fiji via Plugins > Install...",
+                    "Or drag it onto ImageJ/Fiji or copy it into the main plugins/ folder.",
+                    "Do not place it in plugins/Tools (reserved for toolbar tools).",
+                    "Restart ImageJ/Fiji (or Help > Refresh Menus).",
+                    "Start the bridge: Plugins > Augur > Start Bridge.",
                 ];
                 for (i, step) in steps.iter().enumerate() {
                     ui.label(
@@ -593,7 +594,7 @@ impl CameraApp {
                 ui.add_space(6.0 * scale);
                 if ui
                     .add(egui::Button::new(
-                        egui::RichText::new("\u{1F4E6} Save AugurBridge.jar\u{2026}")
+                        egui::RichText::new("Save AugurBridge.jar...")
                             .size(body_size),
                     ))
                     .clicked()
