@@ -7,7 +7,7 @@
 brightness/contrast tuning, line profiles, ruler measurements, software ROI annotations, ROI
 statistics, colormap switching, and a scale-bar overlay. When a user wants a richer downstream
 analysis surface, Augur can also hand the newest preview frames off to ImageJ/Fiji through a small
-external-tool bridge backed by a bundled `AugurBridge_.jar` plugin.
+external-tool bridge backed by a bundled `AugurBridge.jar` plugin.
 
 ## Viewer Tools
 
@@ -46,10 +46,11 @@ Modern ImageJ no longer exposes the old built-in socket listener, so this reposi
 tiny ImageJ plugin under `augur-gui/imagej-plugin/` that restores the simple local TCP `eval`
 workflow Augur already uses.
 
-- the dialog can export the bundled `AugurBridge_.jar` directly, so users do not need to hunt for
+- the dialog can export the bundled `AugurBridge.jar` directly, so users do not need to hunt for
   the file in the repository first
 - in ImageJ/Fiji, install the jar with `Plugins -> Install PlugIn...`, or drag it onto the
-  ImageJ/Fiji window, or copy it into the `plugins/` folder
+  ImageJ/Fiji window, or copy it into the main `plugins/` folder
+- do not place it in `plugins/Tools`, which ImageJ reserves for toolbar tools
 - if menus do not refresh automatically, restart ImageJ/Fiji or run `Help -> Refresh Menus`
 - then run `Plugins -> Augur -> Start Bridge`
 - the bridge connects to a configurable `host:port` and now defaults to `127.0.0.1:57294`
@@ -73,7 +74,7 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 - histogram and line-profile windows use the same deferred-viewport pattern as the existing popup and
   host-view windows, so they can live outside the main OS window when supported
 - because ImageJ replaced its historic socket listener with a Java-RMI single-instance mechanism,
-  `augur-gui/imagej-plugin/AugurBridge_.jar` restores a tiny loopback-only TCP listener instead of
+  `augur-gui/imagej-plugin/AugurBridge.jar` restores a tiny loopback-only TCP listener instead of
   teaching the Rust bridge Java serialization/RMI
 - the ImageJ bridge lives under `augur-gui/src/external_tools/` and uses a bounded background
   sender to avoid backpressuring capture or preview work
@@ -99,4 +100,4 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 - manual GUI pass still recommended for:
   - dragging each viewer tool in live and replay mode
   - checking histogram/manual contrast interaction feel
-  - validating ImageJ/Fiji connectivity on a machine with the bundled `AugurBridge_.jar` workflow
+  - validating ImageJ/Fiji connectivity on a machine with the bundled `AugurBridge.jar` workflow

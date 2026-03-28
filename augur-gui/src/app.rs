@@ -536,57 +536,102 @@ impl CameraApp {
         egui::Window::new("Stream to ImageJ")
             .open(&mut open)
             .collapsible(false)
+            .default_size([380.0, 0.0])
             .show(ctx, |ui| {
+                // Scale font sizes based on the available width so the dialog
+                // becomes more readable when the user drags the resize handle.
+                let base_width = 380.0_f32;
+                let scale = (ui.available_width() / base_width).clamp(1.0, 2.0);
+                let body_size = 14.0 * scale;
+                let small_size = 12.0 * scale;
+
                 let (status_label, status_color) = match &external_status {
                     ExternalToolStatus::Disconnected => (
                         "Disconnected",
                         ui.visuals().widgets.inactive.fg_stroke.color,
                     ),
-                    ExternalToolStatus::Connecting => ("Connecting...", analysis_info_color()),
+                    ExternalToolStatus::Connecting => ("Connecting\u{2026}", analysis_info_color()),
                     ExternalToolStatus::Streaming => ("Connected", status_success_color()),
                     ExternalToolStatus::Error(_) => ("Error", ui.visuals().error_fg_color),
                 };
 
-                ui.label("Connect to the Augur Bridge plugin running inside ImageJ/Fiji.");
-                ui.horizontal(|ui| {
-                    ui.label("Status:");
-                    ui.colored_label(status_color, status_label);
-                });
-                ui.separator();
-                ui.small("How to install the bridge plugin:");
-                ui.small(
-                    "1. Click 'Save bundled plugin jar...' below to export AugurBridge_.jar.",
-                );
-                ui.small(
-                    "2. In ImageJ/Fiji, use Plugins -> Install PlugIn... and choose that jar.",
-                );
-                ui.small(
-                    "3. You can also drag the jar onto the ImageJ/Fiji window or copy it into the plugins/ folder.",
-                );
-                ui.small(
-                    "4. If menus do not refresh automatically, restart ImageJ/Fiji or run Help -> Refresh Menus.",
-                );
-                ui.small("5. Run Plugins -> Augur -> Start Bridge.");
-                ui.small(format!(
-                    "6. Back in Augur, connect to 127.0.0.1:{DEFAULT_IMAGEJ_BRIDGE_PORT}."
-                ));
-                ui.add_space(4.0);
-                if ui.button("Save bundled plugin jar...").clicked() {
-                    export_plugin_requested = true;
-                }
-                ui.small("The exported file name should stay AugurBridge_.jar.");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Host");
-                    ui.text_edit_singleline(&mut self.imagej_dialog.host);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Port");
-                    ui.add(
-                        egui::DragValue::new(&mut self.imagej_dialog.port)
-                            .clamp_range(1..=u16::MAX),
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Status:")
+                            .size(body_size),
+                    );
+                    ui.label(
+                        egui::RichText::new(status_label)
+                            .size(body_size)
+                            .color(status_color),
                     );
                 });
+                ui.add_space(4.0 * scale);
+
+                ui.separator();
+
+                // --- Setup instructions ---
+                ui.add_space(2.0 * scale);
+                ui.label(egui::RichText::new("Plugin Setup").size(body_size).strong());
+                ui.add_space(2.0 * scale);
+
+                let steps = [
+                    "Export the plugin with the button below.",
+                    "Install it in ImageJ/Fiji via Plugins \u{2192} Install\u{2026}",
+                    "You can also drag it onto ImageJ/Fiji or copy it into the main plugins/ folder.",
+                    "Do not place it in plugins/Tools; that folder is reserved for toolbar tools.",
+                    "Restart ImageJ/Fiji (or Help \u{2192} Refresh Menus).",
+                    "Start the bridge: Plugins \u{2192} Augur \u{2192} Start Bridge.",
+                ];
+                for (i, step) in steps.iter().enumerate() {
+                    ui.label(
+                        egui::RichText::new(format!("{}. {step}", i + 1))
+                            .size(small_size),
+                    );
+                }
+
+                ui.add_space(6.0 * scale);
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("\u{1F4E6} Save AugurBridge.jar\u{2026}")
+                            .size(body_size),
+                    ))
+                    .clicked()
+                {
+                    export_plugin_requested = true;
+                }
+                ui.add_space(2.0 * scale);
+
+                ui.separator();
+
+                // --- Connection settings ---
+                ui.add_space(2.0 * scale);
+                ui.label(egui::RichText::new("Connection").size(body_size).strong());
+                ui.add_space(2.0 * scale);
+
+                egui::Grid::new("imagej_conn_grid")
+                    .num_columns(2)
+                    .spacing([8.0 * scale, 4.0 * scale])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Host").size(small_size));
+                        ui.add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::TextEdit::singleline(&mut self.imagej_dialog.host)
+                                .font(egui::TextStyle::Body),
+                        );
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("Port").size(small_size));
+                        ui.add(
+                            egui::DragValue::new(&mut self.imagej_dialog.port)
+                                .clamp_range(1..=u16::MAX),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0 * scale);
+
+                // --- Feedback messages ---
                 if let Some(error) =
                     self.imagej_dialog
                         .error
@@ -596,15 +641,31 @@ impl CameraApp {
                             _ => None,
                         })
                 {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    ui.label(
+                        egui::RichText::new(error)
+                            .size(small_size)
+                            .color(ui.visuals().error_fg_color),
+                    );
                 }
                 if let Some(info) = self.imagej_dialog.info.as_deref() {
-                    ui.colored_label(analysis_info_color(), info);
+                    ui.label(
+                        egui::RichText::new(info)
+                            .size(small_size)
+                            .color(analysis_info_color()),
+                    );
                 }
+
+                // --- Action buttons ---
+                ui.add_space(4.0 * scale);
                 ui.horizontal(|ui| {
                     let connect_enabled = self.external_tool.is_none();
                     if ui
-                        .add_enabled(connect_enabled, egui::Button::new("Connect"))
+                        .add_enabled(
+                            connect_enabled,
+                            egui::Button::new(
+                                egui::RichText::new("Connect").size(body_size),
+                            ),
+                        )
                         .clicked()
                     {
                         connect_requested = true;
@@ -612,7 +673,9 @@ impl CameraApp {
                     if ui
                         .add_enabled(
                             self.external_tool.is_some(),
-                            egui::Button::new("Disconnect"),
+                            egui::Button::new(
+                                egui::RichText::new("Disconnect").size(body_size),
+                            ),
                         )
                         .clicked()
                     {

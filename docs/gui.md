@@ -176,9 +176,10 @@ In 3D mode, the scroll area still switches over to point-cloud metrics instead o
 `Tools -> Stream to ImageJ...` opens a small connection dialog for the bundled Augur Bridge plugin
 running inside ImageJ/Fiji.
 
-- use `Save bundled plugin jar...` in the dialog to export `AugurBridge_.jar`
+- use `Save bundled plugin jar...` in the dialog to export `AugurBridge.jar`
 - in ImageJ/Fiji, install that jar with `Plugins -> Install PlugIn...`, drag it onto the
-  ImageJ/Fiji window, or copy it into the `plugins/` folder
+  ImageJ/Fiji window, or copy it into the main `plugins/` folder
+- do not place it in `plugins/Tools`, which is reserved for toolbar tools
 - if ImageJ/Fiji does not refresh automatically, restart it or run `Help -> Refresh Menus`
 - then run `Plugins -> Augur -> Start Bridge`
 - the dialog includes the plugin-install/start steps, inline bridge status, and inline connection

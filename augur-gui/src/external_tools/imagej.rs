@@ -14,8 +14,8 @@ use image::{ImageBuffer, ImageFormat, Luma};
 use super::{ExternalTool, ExternalToolStatus};
 
 const IMAGEJ_FRAME_TITLE: &str = "augur_live";
-pub const BUNDLED_IMAGEJ_PLUGIN_JAR: &[u8] = include_bytes!("../../imagej-plugin/AugurBridge_.jar");
-pub const BUNDLED_IMAGEJ_PLUGIN_JAR_NAME: &str = "AugurBridge_.jar";
+pub const BUNDLED_IMAGEJ_PLUGIN_JAR: &[u8] = include_bytes!("../../imagej-plugin/AugurBridge.jar");
+pub const BUNDLED_IMAGEJ_PLUGIN_JAR_NAME: &str = "AugurBridge.jar";
 pub const DEFAULT_IMAGEJ_BRIDGE_PORT: u16 = 57_294;
 
 #[derive(Debug)]

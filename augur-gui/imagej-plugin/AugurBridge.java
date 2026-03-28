@@ -14,14 +14,14 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 
-public class AugurBridge_ implements PlugIn {
+public class AugurBridge implements PlugIn {
     private static final String PREF_PORT_KEY = "augur.bridge.port";
     private static final int DEFAULT_PORT = 57294;
     private static BridgeServer bridgeServer;
 
     @Override
     public void run(String arg) {
-        synchronized (AugurBridge_.class) {
+        synchronized (AugurBridge.class) {
             if (bridgeServer != null && bridgeServer.isRunning()) {
                 IJ.showStatus("Augur Bridge already listening on 127.0.0.1:" + bridgeServer.getPort());
                 return;
@@ -63,7 +63,7 @@ public class AugurBridge_ implements PlugIn {
     }
 
     private static void clearServer(BridgeServer server) {
-        synchronized (AugurBridge_.class) {
+        synchronized (AugurBridge.class) {
             if (bridgeServer == server) {
                 bridgeServer = null;
             }
