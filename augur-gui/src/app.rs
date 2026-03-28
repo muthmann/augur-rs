@@ -434,7 +434,7 @@ impl CameraApp {
             disk_writer_buffer_mib: global_defaults.disk_writer_buffer_mib,
             acq_dirty: false,
             config_dirty: false,
-            preview_colormap: None,
+            preview_colormap: Some(Colormap::Grays),
             contrast_settings: ContrastSettings::default(),
             histogram_window: HistogramWindow::default(),
             line_profile_tool: LineProfileTool::default(),
