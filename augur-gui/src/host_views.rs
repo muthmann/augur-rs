@@ -13,6 +13,8 @@ use augur_plugin_api::{
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use image::{ImageFormat, RgbaImage};
 
+use crate::colormap::Colormap;
+
 pub const COMPACT_TABLE_PREVIEW_ROWS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -210,21 +212,6 @@ pub fn decode_dataset_snapshot(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostViewColormap {
-    Hot,
-    Gray,
-}
-
-impl HostViewColormap {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Hot => "Hot",
-            Self::Gray => "Gray",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostViewImageFormat {
     Png,
     Tiff,
@@ -243,7 +230,7 @@ impl HostViewImageFormat {
 pub struct Density2dRenderSettings {
     pub pixel_size: f64,
     pub contrast_percentile: f32,
-    pub colormap: HostViewColormap,
+    pub colormap: Colormap,
     pub zoom: f32,
 }
 
@@ -252,7 +239,7 @@ impl Default for Density2dRenderSettings {
         Self {
             pixel_size: 10.0,
             contrast_percentile: 99.5,
-            colormap: HostViewColormap::Hot,
+            colormap: Colormap::Fire,
             zoom: 1.0,
         }
     }
@@ -509,8 +496,9 @@ pub fn render_density2d_view(
         egui::ComboBox::from_id_source(format!("{view_id}_colormap"))
             .selected_text(settings.colormap.label())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut settings.colormap, HostViewColormap::Hot, "Hot");
-                ui.selectable_value(&mut settings.colormap, HostViewColormap::Gray, "Gray");
+                for colormap in Colormap::ALL {
+                    ui.selectable_value(&mut settings.colormap, colormap, colormap.label());
+                }
             });
         ui.label("Zoom");
         ui.add(egui::Slider::new(&mut settings.zoom, 0.5..=8.0).logarithmic(true));
@@ -660,12 +648,13 @@ pub fn render_density_window_viewport(
             egui::ComboBox::from_id_source(format!("{view_id}_viewport_colormap"))
                 .selected_text(data.settings.colormap.label())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut data.settings.colormap, HostViewColormap::Hot, "Hot");
-                    ui.selectable_value(
-                        &mut data.settings.colormap,
-                        HostViewColormap::Gray,
-                        "Gray",
-                    );
+                    for colormap in Colormap::ALL {
+                        ui.selectable_value(
+                            &mut data.settings.colormap,
+                            colormap,
+                            colormap.label(),
+                        );
+                    }
                 });
             ui.label("Zoom");
             ui.add(egui::Slider::new(&mut data.settings.zoom, 0.5..=8.0).logarithmic(true));
@@ -819,7 +808,7 @@ fn render_density_image(
     y_column: &str,
     pixel_size: f64,
     contrast_percentile: f32,
-    colormap: HostViewColormap,
+    colormap: Colormap,
 ) -> Result<RenderedDensityImage, String> {
     let x_values = dataset
         .column(x_column)
@@ -875,7 +864,7 @@ fn render_density_image(
         .iter()
         .map(|&count| {
             let normalized = ((count as f32 / max_value).clamp(0.0, 1.0)).sqrt();
-            colormap_color(colormap, normalized)
+            colormap.lookup(normalized)
         })
         .collect();
 
@@ -923,31 +912,6 @@ fn percentile_nonzero(values: &[u32], percentile: f32) -> f32 {
     let last = values.len().saturating_sub(1);
     let index = ((last as f32) * percentile.clamp(0.0, 100.0) / 100.0).round() as usize;
     values[index.min(last)] as f32
-}
-
-fn colormap_color(colormap: HostViewColormap, value: f32) -> Color32 {
-    let value = value.clamp(0.0, 1.0);
-    match colormap {
-        HostViewColormap::Gray => {
-            let channel = (value * 255.0).round() as u8;
-            Color32::from_rgba_premultiplied(channel, channel, channel, 255)
-        }
-        HostViewColormap::Hot => {
-            let (r, g, b) = if value < (1.0 / 3.0) {
-                (value * 3.0, 0.0, 0.0)
-            } else if value < (2.0 / 3.0) {
-                (1.0, (value - 1.0 / 3.0) * 3.0, 0.0)
-            } else {
-                (1.0, 1.0, (value - 2.0 / 3.0) * 3.0)
-            };
-            Color32::from_rgba_premultiplied(
-                (r.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (g.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (b.clamp(0.0, 1.0) * 255.0).round() as u8,
-                255,
-            )
-        }
-    }
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@ impl Default for HistogramWindow {
 struct HistogramViewportData {
     histogram: Vec<u64>,
     contrast: ContrastSettings,
-    colormap: Colormap,
+    colormap: Option<Colormap>,
     log_scale: bool,
     drag_target: Option<MarkerDragTarget>,
     close_requested: bool,
@@ -92,7 +92,7 @@ impl HistogramWindow {
         &mut self,
         ctx: &egui::Context,
         contrast: &mut ContrastSettings,
-        colormap: Colormap,
+        colormap: Option<Colormap>,
     ) {
         {
             let mut data = self.shared.lock().unwrap();
@@ -377,7 +377,11 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         1.0,
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
-    ui.small(format!("{} display ramp", data.colormap.label()));
+    if let Some(colormap) = data.colormap {
+        ui.small(format!("{} display ramp", colormap.label()));
+    } else {
+        ui.small("Preview display ramp");
+    }
 
     let mut display_min = data.contrast.display_min;
     let mut display_max = data.contrast.display_max.max(display_min.saturating_add(1));
@@ -418,10 +422,13 @@ fn nearest_marker(value: u16, display_min: u16, display_max: u16) -> MarkerDragT
     }
 }
 
-fn gradient_color(colormap: Colormap, value: f32) -> Color32 {
+fn gradient_color(colormap: Option<Colormap>, value: f32) -> Color32 {
     match colormap {
-        Colormap::EventPolarity => colormap.map(value, value),
-        _ => colormap.map(value, 0.0),
+        Some(colormap) => colormap.lookup(value),
+        None => {
+            let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            Color32::from_gray(channel)
+        }
     }
 }
 

@@ -358,7 +358,7 @@ pub struct CameraApp {
     disk_writer_buffer_mib: u64,
     acq_dirty: bool,
     config_dirty: bool,
-    colormap: Colormap,
+    preview_colormap: Option<Colormap>,
     contrast_settings: ContrastSettings,
     histogram_window: HistogramWindow,
     line_profile_tool: LineProfileTool,
@@ -434,7 +434,7 @@ impl CameraApp {
             disk_writer_buffer_mib: global_defaults.disk_writer_buffer_mib,
             acq_dirty: false,
             config_dirty: false,
-            colormap: Colormap::default(),
+            preview_colormap: None,
             contrast_settings: ContrastSettings::default(),
             histogram_window: HistogramWindow::default(),
             line_profile_tool: LineProfileTool::default(),
@@ -1821,6 +1821,44 @@ impl CameraApp {
         }
     }
 
+    fn preview_display_settings(&self) -> PreviewDisplaySettings {
+        PreviewDisplaySettings {
+            display_min: self.contrast_settings.display_min,
+            display_max: self.contrast_settings.display_max,
+            gamma: self.contrast_settings.gamma,
+        }
+    }
+
+    fn render_preview_image(&self, frame: &PreviewFrame) -> egui::ColorImage {
+        frame_to_color_image(
+            frame,
+            &self.analysis_output.overlays,
+            self.preview_display_settings(),
+            self.preview_colormap,
+        )
+    }
+
+    fn refresh_preview_texture_from_latest_frame(&mut self, ctx: &egui::Context) {
+        let Some(frame) = self.latest_frame.as_ref() else {
+            return;
+        };
+        let image = self.render_preview_image(frame);
+        if let Some(texture) = &mut self.texture {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.texture = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
+        }
+    }
+
+    fn refresh_paused_preview_if_needed(&mut self, ctx: &egui::Context, settings_changed: bool) {
+        if !settings_changed || self.preview_workspace.view_mode != ViewMode::Preview2d {
+            return;
+        }
+        if self.mode == AppMode::Replaying && (self.replay_paused || self.replay_finished) {
+            self.refresh_preview_texture_from_latest_frame(ctx);
+        }
+    }
+
     fn set_replay_speed(&mut self, speed: f32) {
         let Some(controls) = &self.replay_controls else {
             return;
@@ -2186,16 +2224,7 @@ impl CameraApp {
         }
 
         if needs_texture {
-            let image = frame_to_color_image(
-                &frame,
-                &self.analysis_output.overlays,
-                PreviewDisplaySettings {
-                    display_min: self.contrast_settings.display_min,
-                    display_max: self.contrast_settings.display_max,
-                    gamma: self.contrast_settings.gamma,
-                    colormap: self.colormap,
-                },
-            );
+            let image = self.render_preview_image(&frame);
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -3301,6 +3330,7 @@ impl eframe::App for CameraApp {
         let external_streaming = external_status.is_streaming();
         let mut return_from_external_tool = false;
         let mut pc_metrics: Option<PointCloudMetrics> = None;
+        let mut preview_colormap_changed = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(preview_heading(mode, self.preview_workspace.view_mode));
             ui.separator();
@@ -3440,18 +3470,30 @@ impl eframe::App for CameraApp {
                     match self.preview_workspace.view_mode {
                         ViewMode::Preview2d => {
                             ui.horizontal(|ui| {
+                                let previous_preview_colormap = self.preview_colormap;
                                 ui.label("Colormap");
                                 egui::ComboBox::from_id_source("preview_colormap")
-                                    .selected_text(self.colormap.label())
+                                    .selected_text(
+                                        self.preview_colormap
+                                            .map(Colormap::label)
+                                            .unwrap_or("Polarity (R/G)"),
+                                    )
                                     .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.preview_colormap,
+                                            None,
+                                            "Polarity (R/G)",
+                                        );
                                         for colormap in Colormap::ALL {
                                             ui.selectable_value(
-                                                &mut self.colormap,
-                                                colormap,
+                                                &mut self.preview_colormap,
+                                                Some(colormap),
                                                 colormap.label(),
                                             );
                                         }
                                     });
+                                preview_colormap_changed |=
+                                    self.preview_colormap != previous_preview_colormap;
                                 ui.checkbox(
                                     &mut self.scale_bar_settings.show,
                                     "Scale bar",
@@ -3629,8 +3671,11 @@ impl eframe::App for CameraApp {
             self.disconnect_external_tool();
         }
 
+        let previous_contrast_settings = self.contrast_settings.clone();
         self.histogram_window
-            .show(ctx, &mut self.contrast_settings, self.colormap);
+            .show(ctx, &mut self.contrast_settings, self.preview_colormap);
+        let contrast_changed = self.contrast_settings != previous_contrast_settings;
+        self.refresh_paused_preview_if_needed(ctx, preview_colormap_changed || contrast_changed);
         self.line_profile_tool.show_window(ctx);
         self.show_imagej_dialog(ctx);
 
