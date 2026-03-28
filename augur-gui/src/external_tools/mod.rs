@@ -2,7 +2,10 @@ mod imagej;
 
 use augur_core::pipeline::PreviewFrame;
 
-pub use imagej::ImageJBridge;
+pub use imagej::{
+    ImageJBridge, BUNDLED_IMAGEJ_PLUGIN_JAR, BUNDLED_IMAGEJ_PLUGIN_JAR_NAME,
+    DEFAULT_IMAGEJ_BRIDGE_PORT,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalToolStatus {

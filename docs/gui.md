@@ -173,12 +173,24 @@ In 3D mode, the scroll area still switches over to point-cloud metrics instead o
 
 ## External Tools
 
-`Tools -> Stream to ImageJ...` opens a small connection dialog for a running ImageJ/Fiji socket listener.
+`Tools -> Stream to ImageJ...` opens a small connection dialog for the bundled Augur Bridge plugin
+running inside ImageJ/Fiji.
 
-- the dialog includes the socket-listener setup steps, inline bridge status, and inline connection errors
+- use `Save bundled plugin jar...` in the dialog to export `AugurBridge_.jar`
+- in ImageJ/Fiji, install that jar with `Plugins -> Install PlugIn...`, drag it onto the
+  ImageJ/Fiji window, or copy it into the `plugins/` folder
+- if ImageJ/Fiji does not refresh automatically, restart it or run `Help -> Refresh Menus`
+- then run `Plugins -> Augur -> Start Bridge`
+- the dialog includes the plugin-install/start steps, inline bridge status, and inline connection
+  errors
+- the default connection target is `127.0.0.1:57294`
 - while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and forwards the newest frame to ImageJ on a lossy background channel
 - `Return to augur` disconnects the bridge and restores the in-app preview surface
-- the connection is best-effort today: use it for live inspection, and verify the exact Fiji-side workflow manually on your machine
+- the connection is best-effort today: use it for live inspection, and verify the exact Fiji-side
+  workflow manually on your machine
+
+The repository includes both the installable jar and its source/build files under
+`augur-gui/imagej-plugin/` in case you need to rebuild the plugin against a local `ij.jar`.
 
 Histogram and line-profile tools also use deferred OS windows when the backend supports them, with embedded `egui::Window` fallbacks on backends that do not.
 

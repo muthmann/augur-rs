@@ -19,6 +19,10 @@ measurements, and annotations are user-interaction features, not frame-processin
 an external viewer bridge needs lossy background delivery and connection state, not a new
 `augur-core` contract.
 
+The initial ImageJ/Fiji implementation also hit an upstream compatibility limit: modern ImageJ no
+longer ships the historic raw TCP `SocketListener`, so a direct Rust socket client cannot talk to a
+stock ImageJ/Fiji install without an additional compatibility layer.
+
 ## Decision
 
 Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
@@ -31,6 +35,9 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
 - external viewers implement a small `ExternalTool` trait under `external_tools/`
 - the first bridge, ImageJ/Fiji, uses a bounded background sender so external streaming stays
   lossy/latest-oriented and cannot backpressure capture or preview processing
+- the ImageJ/Fiji bridge is paired with a tiny bundled `AugurBridge_.jar` plugin that restores a
+  loopback-only TCP `eval` listener on port `57294`, letting Augur keep the simple write-only
+  protocol instead of implementing Java RMI/serialization in Rust
 
 ## Consequences
 
@@ -40,14 +47,16 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
 - plugin overlays stay focused on analysis output rather than ad hoc GUI interaction state
 - the external-viewer handoff has a clear host-owned extension point for future backends
 - ImageJ/Fiji streaming can be enabled or disconnected without changing the capture pipeline split
+- the ImageJ/Fiji workaround stays small and isolated to one auxiliary plugin artifact rather than
+  pulling Java-specific remoting code into the Rust bridge
 
 ### Negative
 
 - `augur-gui` owns more UI state and canvas interaction logic than before
 - the embedded preview and popup still do not share every interactive overlay path perfectly, so
   future polish may further reduce divergence there
-- the ImageJ bridge is intentionally best-effort and still needs manual validation against local
-  Fiji socket-listener setups
+- the ImageJ bridge is intentionally best-effort and now requires a one-time plugin install inside
+  ImageJ/Fiji, plus manual validation against local Fiji bridge setups
 
 ## Alternatives Considered
 

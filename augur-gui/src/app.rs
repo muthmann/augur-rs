@@ -27,7 +27,10 @@ use egui_phosphor::regular as phosphor;
 
 use crate::{
     colormap::Colormap,
-    external_tools::{ExternalTool, ExternalToolStatus, ImageJBridge},
+    external_tools::{
+        ExternalTool, ExternalToolStatus, ImageJBridge, BUNDLED_IMAGEJ_PLUGIN_JAR,
+        BUNDLED_IMAGEJ_PLUGIN_JAR_NAME, DEFAULT_IMAGEJ_BRIDGE_PORT,
+    },
     host_views::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
         render_compact_table, render_density2d_view, render_density_window_viewport,
@@ -263,6 +266,7 @@ struct ImageJDialogState {
     host: String,
     port: u16,
     error: Option<String>,
+    info: Option<String>,
 }
 
 impl Default for ImageJDialogState {
@@ -270,8 +274,9 @@ impl Default for ImageJDialogState {
         Self {
             open: false,
             host: "127.0.0.1".into(),
-            port: 8010,
+            port: DEFAULT_IMAGEJ_BRIDGE_PORT,
             error: None,
+            info: None,
         }
     }
 }
@@ -526,6 +531,7 @@ impl CameraApp {
         let mut open = self.imagej_dialog.open;
         let mut connect_requested = false;
         let mut disconnect_requested = false;
+        let mut export_plugin_requested = false;
         let external_status = self.external_tool_status();
         egui::Window::new("Stream to ImageJ")
             .open(&mut open)
@@ -541,17 +547,34 @@ impl CameraApp {
                     ExternalToolStatus::Error(_) => ("Error", ui.visuals().error_fg_color),
                 };
 
-                ui.label("Connect to a running ImageJ/Fiji socket listener.");
+                ui.label("Connect to the Augur Bridge plugin running inside ImageJ/Fiji.");
                 ui.horizontal(|ui| {
                     ui.label("Status:");
                     ui.colored_label(status_color, status_label);
                 });
                 ui.separator();
-                ui.small("To enable ImageJ's socket listener:");
-                ui.small("1. Open ImageJ/Fiji");
-                ui.small("2. Edit -> Options -> Misc... -> check 'Run socket listener'");
-                ui.small("3. Restart ImageJ/Fiji");
-                ui.small("4. The default listener port is 8010");
+                ui.small("How to install the bridge plugin:");
+                ui.small(
+                    "1. Click 'Save bundled plugin jar...' below to export AugurBridge_.jar.",
+                );
+                ui.small(
+                    "2. In ImageJ/Fiji, use Plugins -> Install PlugIn... and choose that jar.",
+                );
+                ui.small(
+                    "3. You can also drag the jar onto the ImageJ/Fiji window or copy it into the plugins/ folder.",
+                );
+                ui.small(
+                    "4. If menus do not refresh automatically, restart ImageJ/Fiji or run Help -> Refresh Menus.",
+                );
+                ui.small("5. Run Plugins -> Augur -> Start Bridge.");
+                ui.small(format!(
+                    "6. Back in Augur, connect to 127.0.0.1:{DEFAULT_IMAGEJ_BRIDGE_PORT}."
+                ));
+                ui.add_space(4.0);
+                if ui.button("Save bundled plugin jar...").clicked() {
+                    export_plugin_requested = true;
+                }
+                ui.small("The exported file name should stay AugurBridge_.jar.");
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Host");
@@ -574,6 +597,9 @@ impl CameraApp {
                         })
                 {
                     ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if let Some(info) = self.imagej_dialog.info.as_deref() {
+                    ui.colored_label(analysis_info_color(), info);
                 }
                 ui.horizontal(|ui| {
                     let connect_enabled = self.external_tool.is_none();
@@ -598,10 +624,37 @@ impl CameraApp {
         if disconnect_requested {
             self.disconnect_external_tool();
             self.imagej_dialog.error = None;
+            self.imagej_dialog.info = None;
+        }
+
+        if export_plugin_requested {
+            self.imagej_dialog.error = None;
+            self.imagej_dialog.info = None;
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(BUNDLED_IMAGEJ_PLUGIN_JAR_NAME)
+                .save_file()
+            {
+                match fs::write(&path, BUNDLED_IMAGEJ_PLUGIN_JAR) {
+                    Ok(()) => {
+                        self.imagej_dialog.info = Some(format!(
+                            "Saved {} to {}",
+                            BUNDLED_IMAGEJ_PLUGIN_JAR_NAME,
+                            path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        self.imagej_dialog.error = Some(format!(
+                            "failed to save {}: {err}",
+                            BUNDLED_IMAGEJ_PLUGIN_JAR_NAME
+                        ));
+                    }
+                }
+            }
         }
 
         if connect_requested {
             self.imagej_dialog.error = None;
+            self.imagej_dialog.info = None;
             if self.external_tool.is_some() {
                 self.disconnect_external_tool();
             }
