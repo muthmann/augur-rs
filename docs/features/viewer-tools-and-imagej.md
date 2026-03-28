@@ -23,11 +23,15 @@ external-tool bridge backed by a bundled `AugurBridge.jar` plugin.
 - `Colormap` switches the 2D preview between:
   - polarity rendering (ON green / OFF red)
   - fire
-  - grayscale
-  - viridis
-  - magma
-  - inferno
-- the scientific false-color LUTs now use exact canonical tables from matplotlib/ImageJ instead of coarse stop interpolation
+  - red hot
+  - grays
+  - green
+  - cyan hot
+  - magenta hot
+  - ice
+- host density views now use the same shared ImageJ LUT set as the 2D preview, minus the special polarity mode
+- paused replay now re-renders the current frame immediately after preview colormap or histogram contrast changes
+- the shared false-color LUTs now use the requested official ImageJ ramps instead of the earlier preview-only matplotlib/ImageJ mix
 - `Line Profile` samples ON and OFF values along a dragged line, opens its separate window after the drag completes, and can optionally overlay the ON+OFF sum trace
 - `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
 - `Rect` and `Ellipse` create host-side software annotations with live ROI statistics
@@ -66,9 +70,10 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 ## Architecture Notes
 
 - viewer tools live under `augur-gui/src/viewer_tools/`
-- preview rendering now uses explicit display settings (`min`, `max`, `gamma`, `colormap`) instead
-  of a single percentile slider
-- canonical LUT tables are embedded directly in `colormap.rs` for fire / viridis / magma / inferno
+- preview rendering now uses explicit display settings (`min`, `max`, `gamma`) plus an optional
+  shared ImageJ colormap mode instead of a single percentile slider
+- the shared `colormap.rs` module now owns the ImageJ LUT tables for grays / fire / red hot /
+  green / cyan hot / magenta hot / ice
 - interactive viewer-tool overlays are painted with `egui::Painter`, keeping the plugin
   `Overlay` enum reserved for analysis outputs
 - histogram and line-profile windows use the same deferred-viewport pattern as the existing popup and
@@ -84,7 +89,7 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 | File | Role |
 |---|---|
 | `augur-gui/imagej-plugin/` | bundled ImageJ plugin source, menu config, build script, and installable jar |
-| `augur-gui/src/colormap.rs` | built-in preview colormaps and LUT generation |
+| `augur-gui/src/colormap.rs` | shared ImageJ colormaps and LUT generation for preview + host views |
 | `augur-gui/src/preview.rs` | display-range-aware preview rendering plus combined histogram helper |
 | `augur-gui/src/viewer_tools/` | histogram, line profile, ruler, annotations, and scale-bar state/helpers |
 | `augur-gui/src/external_tools/` | generic external-tool trait plus ImageJ bridge |

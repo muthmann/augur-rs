@@ -99,7 +99,7 @@ The center panel is now an interactive preview workspace shared by the embedded 
 - hover the preview to read the current sensor-space `x, y` position together with ON / OFF / combined pixel values
 - the preview toolbar uses compact icon buttons with hover tooltips for ROI, line profile, ruler, annotation, histogram, zoom, and popup actions, and it stays on one row instead of wrapping the hover readout below the preview
 - `Histogram` opens a combined histogram plus brightness/contrast window with labeled intensity/count axes, hover readouts, Auto percentile, manual min/max, gamma controls, draggable marker handles, and a display-ramp preview
-- the scroll area below the preview includes a `Colormap` selector for polarity, fire, grayscale, viridis, magma, and inferno rendering
+- the scroll area below the preview includes a `Colormap` selector for polarity, fire, red hot, grays, green, cyan hot, magenta hot, and ice rendering
 - `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`; during replay the disabled tooltip points users to rectangle annotations instead
 - `Line Profile` samples ON and OFF intensity along a dragged line, opens after the drag completes, and includes labeled axes plus an optional ON+OFF sum trace
 - `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
@@ -162,9 +162,10 @@ The 2D preview uses a shared display model for the base image and ROI-grid overl
 - `Auto` mode updates the display max from a combined histogram percentile (`90.0` to `100.0`)
 - `Manual` mode lets you pin display min/max from the histogram window for repeatable inspection
 - `Gamma` defaults to `0.5`, which keeps the previous square-root-like look while allowing flatter or steeper contrast curves
-- `Event polarity` preserves the original ON=green / OFF=red rendering
-- the other colormaps combine ON+OFF into one intensity channel for grayscale or false-color inspection
-- fire / viridis / magma / inferno now use exact canonical LUT tables rather than coarse stop interpolation
+- `Polarity (R/G)` preserves the original ON=green / OFF=red rendering
+- the ImageJ colormaps combine ON+OFF into one intensity channel for grayscale or false-color inspection
+- fire / red hot / grays / green / cyan hot / magenta hot / ice use the shared official ImageJ LUT set
+- while replay is paused or finished, changing either the preview colormap or the histogram contrast controls immediately re-renders the current frame instead of waiting for another decoded frame
 - ruler, line-profile, and scale-bar overlays use outline/shadow rendering so they remain readable on bright colormaps
 
 In 3D mode, the scroll area still switches over to point-cloud metrics instead of 2D display controls.

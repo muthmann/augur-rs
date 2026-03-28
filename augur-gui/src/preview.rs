@@ -26,7 +26,6 @@ pub struct PreviewDisplaySettings {
     pub display_min: u16,
     pub display_max: u16,
     pub gamma: f32,
-    pub colormap: Colormap,
 }
 
 impl Default for PreviewDisplaySettings {
@@ -35,7 +34,6 @@ impl Default for PreviewDisplaySettings {
             display_min: 0,
             display_max: 1,
             gamma: 0.5,
-            colormap: Colormap::EventPolarity,
         }
     }
 }
@@ -52,6 +50,7 @@ pub fn frame_to_color_image(
     frame: &PreviewFrame,
     overlays: &[Overlay],
     settings: PreviewDisplaySettings,
+    colormap: Option<Colormap>,
 ) -> ColorImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
@@ -74,13 +73,14 @@ pub fn frame_to_color_image(
                 grid,
                 top_n,
                 settings,
+                colormap,
                 [w, h],
                 &mut image.pixels[..],
                 &mut scratch,
             );
         });
     } else {
-        render_base(frame, settings, &mut image.pixels);
+        render_base(frame, settings, colormap, &mut image.pixels);
     }
 
     render_overlays(frame, overlays, &mut image.pixels, w, h);
@@ -101,12 +101,14 @@ pub fn compute_frame_histogram(frame: &PreviewFrame) -> Vec<u64> {
     histogram
 }
 
-fn render_base(frame: &PreviewFrame, settings: PreviewDisplaySettings, pixels: &mut [Color32]) {
+fn render_base(
+    frame: &PreviewFrame,
+    settings: PreviewDisplaySettings,
+    colormap: Option<Colormap>,
+    pixels: &mut [Color32],
+) {
     for (i, pixel) in pixels.iter_mut().enumerate() {
-        *pixel = settings.colormap.map(
-            normalized_value(frame.pixels_on[i], settings),
-            normalized_value(frame.pixels_off[i], settings),
-        );
+        *pixel = preview_pixel_color(frame, i, settings, colormap);
     }
 }
 
@@ -134,6 +136,7 @@ fn render_base_with_grid(
     grid: &RoiGrid,
     top_n: usize,
     settings: PreviewDisplaySettings,
+    colormap: Option<Colormap>,
     size: [usize; 2],
     pixels: &mut [Color32],
     scratch: &mut PreviewRenderScratch,
@@ -195,15 +198,8 @@ fn render_base_with_grid(
         let row_off = py * w;
 
         for px in 0..w {
-            let on_v = frame.pixels_on[row_off + px];
-            let off_v = frame.pixels_off[row_off + px];
-            let [base_r, base_g, base_b, _] = settings
-                .colormap
-                .map(
-                    normalized_value(on_v, settings),
-                    normalized_value(off_v, settings),
-                )
-                .to_array();
+            let [base_r, base_g, base_b, _] =
+                preview_pixel_color(frame, row_off + px, settings, colormap).to_array();
             let base_r = u32::from(base_r);
             let base_g = u32::from(base_g);
             let base_b = u32::from(base_b);
@@ -246,6 +242,33 @@ fn render_base_with_grid(
             border_color,
         );
     }
+}
+
+fn preview_pixel_color(
+    frame: &PreviewFrame,
+    index: usize,
+    settings: PreviewDisplaySettings,
+    colormap: Option<Colormap>,
+) -> Color32 {
+    match colormap {
+        Some(colormap) => colormap.lookup(normalized_value(frame.pixels[index], settings)),
+        None => polarity_color(
+            normalized_value(frame.pixels_on[index], settings),
+            normalized_value(frame.pixels_off[index], settings),
+        ),
+    }
+}
+
+fn polarity_color(on_value: f32, off_value: f32) -> Color32 {
+    Color32::from_rgb(
+        channel_to_u8(off_value).max(8),
+        channel_to_u8(on_value).max(8),
+        8,
+    )
+}
+
+fn channel_to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// Linear sweep mapping each pixel coordinate to its grid cell index.
@@ -411,6 +434,7 @@ fn render_overlays(
 #[cfg(test)]
 mod tests {
     use super::{compute_frame_histogram, frame_to_color_image, PreviewDisplaySettings};
+    use crate::colormap::Colormap;
     use augur_core::{
         analysis::{roi_grid::compute_roi_grid, Overlay, Pixel, SubpixelMarker},
         pipeline::PreviewFrame,
@@ -461,7 +485,8 @@ mod tests {
             },
         ];
 
-        let image = frame_to_color_image(&frame, &overlays, PreviewDisplaySettings::default());
+        let image =
+            frame_to_color_image(&frame, &overlays, PreviewDisplaySettings::default(), None);
 
         assert_eq!(image.size, [2, 1]);
         assert_eq!(image.pixels.len(), 2);
@@ -489,9 +514,35 @@ mod tests {
             highlight_top_n: 1,
         }];
 
-        let image = frame_to_color_image(&frame, &overlays, PreviewDisplaySettings::default());
+        let image =
+            frame_to_color_image(&frame, &overlays, PreviewDisplaySettings::default(), None);
 
         assert_eq!(image.size, [2, 2]);
         assert_eq!(image.pixels.len(), 4);
+    }
+
+    #[test]
+    fn false_color_preview_uses_shared_lookup_tables() {
+        let frame = PreviewFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![1],
+            pixels_on: vec![0],
+            pixels_off: vec![0],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+
+        let image = frame_to_color_image(
+            &frame,
+            &[],
+            PreviewDisplaySettings::default(),
+            Some(Colormap::Green),
+        );
+
+        assert_eq!(image.pixels[0], Colormap::Green.lookup(1.0));
     }
 }
