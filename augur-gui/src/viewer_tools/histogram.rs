@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::colormap::Colormap;
+use crate::{colormap::Colormap, preview::PreviewMode};
 use egui::{Align2, Color32, Sense};
 use egui_plot::{Bar, BarChart, LineStyle, MarkerShape, Plot, PlotPoint, Points, Text, VLine};
 
@@ -28,7 +28,7 @@ impl Default for ContrastSettings {
             mode: ContrastMode::Auto,
             auto_percentile: 99.5,
             display_min: 0,
-            display_max: 1,
+            display_max: 255,
             gamma: 0.5,
         }
     }
@@ -69,7 +69,7 @@ impl Default for HistogramWindow {
 struct HistogramViewportData {
     histogram: Vec<u64>,
     contrast: ContrastSettings,
-    colormap: Option<Colormap>,
+    mode: PreviewMode,
     log_scale: bool,
     drag_target: Option<MarkerDragTarget>,
     close_requested: bool,
@@ -92,12 +92,12 @@ impl HistogramWindow {
         &mut self,
         ctx: &egui::Context,
         contrast: &mut ContrastSettings,
-        colormap: Option<Colormap>,
+        mode: PreviewMode,
     ) {
         {
             let mut data = self.shared.lock().unwrap();
             data.contrast = contrast.clone();
-            data.colormap = colormap;
+            data.mode = mode;
         }
 
         if !self.open {
@@ -153,6 +153,15 @@ impl HistogramWindow {
         self.open = !close_requested;
         *contrast = updated_contrast;
     }
+}
+
+fn update_auto_contrast_from_histogram(data: &mut HistogramViewportData) {
+    if data.contrast.mode != ContrastMode::Auto {
+        return;
+    }
+    let auto_percentile = data.contrast.auto_percentile;
+    data.contrast.display_min = 0;
+    data.contrast.display_max = percentile_bin(&data.histogram, auto_percentile).max(1);
 }
 
 fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramViewportData>>) {
@@ -331,8 +340,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
     ui.horizontal(|ui| {
         if ui.button("Auto").clicked() {
             data.contrast.mode = ContrastMode::Auto;
-            let histogram = data.histogram.clone();
-            data.contrast.update_auto_range(&histogram);
+            update_auto_contrast_from_histogram(&mut data);
         }
         if ui.button("Reset").clicked() {
             data.contrast.gamma = 0.5;
@@ -351,8 +359,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
             egui::Slider::new(&mut data.contrast.auto_percentile, 90.0..=100.0)
                 .text("Auto percentile"),
         );
-        let histogram = data.histogram.clone();
-        data.contrast.update_auto_range(&histogram);
+        update_auto_contrast_from_histogram(&mut data);
     }
 
     let gradient_size = egui::vec2(ui.available_width().max(120.0), 12.0);
@@ -369,7 +376,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
                 egui::pos2(x1, gradient_rect.bottom()),
             ),
             0.0,
-            gradient_color(data.colormap, (t0 + t1) * 0.5),
+            gradient_color(data.mode, (t0 + t1) * 0.5),
         );
     }
     gradient_painter.rect_stroke(
@@ -377,11 +384,10 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         1.0,
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
-    if let Some(colormap) = data.colormap {
-        ui.small(format!("{} display ramp", colormap.label()));
-    } else {
-        ui.small("Preview display ramp");
-    }
+    ui.small(match data.mode {
+        PreviewMode::Intensity(colormap) => format!("{} display ramp", colormap.label()),
+        mode => mode.ramp_label().to_owned(),
+    });
 
     let mut display_min = data.contrast.display_min;
     let mut display_max = data.contrast.display_max.max(display_min.saturating_add(1));
@@ -422,10 +428,20 @@ fn nearest_marker(value: u16, display_min: u16, display_max: u16) -> MarkerDragT
     }
 }
 
-fn gradient_color(colormap: Option<Colormap>, value: f32) -> Color32 {
-    match colormap {
-        Some(colormap) => colormap.lookup(value),
-        None => {
+fn gradient_color(mode: PreviewMode, value: f32) -> Color32 {
+    match mode {
+        PreviewMode::RedBlue => {
+            if value < 0.5 {
+                let channel = ((value * 2.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                Color32::from_rgb(0, 0, channel)
+            } else {
+                let channel = (((value - 0.5) * 2.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                Color32::from_rgb(channel, 0, channel)
+            }
+        }
+        PreviewMode::SignedCount => Colormap::BlueWhiteRed.lookup(value),
+        PreviewMode::Intensity(colormap) => colormap.lookup(value),
+        PreviewMode::TimeSurface => {
             let channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
             Color32::from_gray(channel)
         }

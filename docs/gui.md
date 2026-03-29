@@ -98,8 +98,9 @@ The center panel is now an interactive preview workspace shared by the embedded 
 
 - hover the preview to read the current sensor-space `x, y` position together with ON / OFF / combined pixel values
 - the preview toolbar uses compact icon buttons with hover tooltips for ROI, line profile, ruler, annotation, histogram, zoom, and popup actions, and it stays on one row instead of wrapping the hover readout below the preview
-- `Histogram` opens a combined histogram plus brightness/contrast window with labeled intensity/count axes, hover readouts, Auto percentile, manual min/max, gamma controls, draggable marker handles, and a display-ramp preview
-- the scroll area below the preview includes a `Colormap` selector for polarity, fire, red hot, grays, green, cyan hot, magenta hot, and ice rendering
+- `Histogram` opens a mode-aware histogram plus brightness/contrast window with labeled intensity/count axes, hover readouts, Auto percentile, manual min/max, gamma controls, draggable marker handles, and a display-ramp preview
+- the scroll area below the preview includes a `Mode` selector for red-blue polarity, signed count, time surface, and summed-intensity colormap rendering
+- when `Time Surface` is active, a logarithmic `Decay τ [ms]` slider controls the temporal decay constant and Augur automatically requests raw preview events
 - `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`; during replay the disabled tooltip points users to rectangle annotations instead
 - `Line Profile` samples ON and OFF intensity along a dragged line, opens after the drag completes, and includes labeled axes plus an optional ON+OFF sum trace
 - `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
@@ -159,13 +160,15 @@ At EOF, replay shuts down its controller threads but stays in replay mode so the
 
 The 2D preview uses a shared display model for the base image and ROI-grid overlay:
 
-- `Auto` mode updates the display max from a combined histogram percentile (`90.0` to `100.0`)
+- `Auto` mode updates the display max from the active mode's histogram percentile (`90.0` to `100.0`)
 - `Manual` mode lets you pin display min/max from the histogram window for repeatable inspection
 - `Gamma` defaults to `0.5`, which keeps the previous square-root-like look while allowing flatter or steeper contrast curves
-- `Polarity (R/G)` preserves the original ON=green / OFF=red rendering
-- the ImageJ colormaps combine ON+OFF into one intensity channel for grayscale or false-color inspection
-- fire / red hot / grays / green / cyan hot / magenta hot / ice use the shared official ImageJ LUT set
-- while replay is paused or finished, changing either the preview colormap or the histogram contrast controls immediately re-renders the current frame instead of waiting for another decoded frame
+- `Red-Blue Polarity` uses red for ON-dominant pixels, blue for OFF-dominant pixels, and magenta when both polarities balance at the same pixel
+- `Signed Count` maps the net polarity (`ON - OFF`) through a blue-white-red diverging ramp while preserving a black background for pixels with no events
+- `Time Surface` renders `exp(-(t_now - t_last) / τ)` in grayscale; if the current frame does not yet carry raw events, Augur falls back to grayscale summed intensity until a raw-event frame arrives
+- the intensity modes combine ON+OFF into one channel for grayscale or false-color inspection
+- fire / red hot / grays / green / cyan hot / magenta hot / ice / blue white red use the shared official LUT set
+- changing the preview mode, time-surface decay, or histogram contrast controls immediately re-renders the current frame, including paused replay frames
 - ruler, line-profile, and scale-bar overlays use outline/shadow rendering so they remain readable on bright colormaps
 
 In 3D mode, the scroll area still switches over to point-cloud metrics instead of 2D display controls.
@@ -186,7 +189,7 @@ running inside ImageJ/Fiji.
 - the dialog includes the plugin-install/start steps, inline bridge status, and inline connection
   errors
 - the default connection target is `127.0.0.1:57294`
-- while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and forwards the newest frame to ImageJ on a lossy background channel
+- while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and forwards only the newest frame to ImageJ on a lossy background channel, so stale frames are dropped instead of queued
 - `Return to augur` disconnects the bridge and restores the in-app preview surface
 - the connection is best-effort today: use it for live inspection, and verify the exact Fiji-side
   workflow manually on your machine
@@ -212,7 +215,9 @@ Status, warning, and error labels adapt to the active GUI theme.
 
 - Acquisition time is only adjustable for live preview and recording
 - sensor geometry and disk-writer buffer are start-time controls, so they are only editable while idle
-- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu
+- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu, which now shows those cadences in Hz instead of milliseconds
+- preview histogram work stays bounded even when a frame contains very large per-pixel counts, and
+  time-surface mode reuses one cached decay pass for both the image and histogram views
 - output path editing is disabled during active recording and replay
 - the camera/replay status line below the toolbar shows the current session state
 - the stats area also shows per-frame `ON % | OFF %` plus the event count for the latest preview frame
