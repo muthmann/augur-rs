@@ -3893,7 +3893,7 @@ fn draw_preview_toolbar(ui: &mut egui::Ui, state: PreviewToolbarState<'_>) {
         histogram_open,
         popup_button_tooltip,
     } = state;
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         if ui
             .add(egui::SelectableLabel::new(
                 workspace.tool == PreviewTool::None,
@@ -4029,10 +4029,27 @@ fn draw_preview_toolbar(ui: &mut egui::Ui, state: PreviewToolbarState<'_>) {
             let width = usize::from(frame.width.max(1));
             let idx = usize::from(y) * width + usize::from(x);
             if idx < frame.pixels.len() {
-                ui.monospace(format!(
+                let full = format!(
                     "x {x}, y {y} | ON: {} OFF: {} Total: {}",
                     frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
-                ));
+                );
+                let short = format!("x {x}, y {y}");
+                let avail = ui.available_width();
+                let full_w = ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        full.clone(),
+                        egui::FontId::monospace(ui.style().text_styles[&egui::TextStyle::Monospace].size),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+                });
+                if full_w <= avail {
+                    ui.monospace(&full);
+                } else {
+                    ui.monospace(format!("{short}\u{2026}"))
+                        .on_hover_text(full);
+                }
             } else {
                 ui.weak("Hover preview for pixel values");
             }
