@@ -47,8 +47,8 @@ The new `Tools -> Stream to ImageJ...` flow adds a small external-tool abstracti
 `augur-gui` and ships an initial ImageJ/Fiji implementation.
 
 Modern ImageJ no longer exposes the old built-in socket listener, so this repository now includes a
-tiny ImageJ plugin under `augur-gui/imagej-plugin/` that restores the simple local TCP `eval`
-workflow Augur already uses.
+tiny ImageJ plugin under `augur-gui/imagej-plugin/` that provides a loopback TCP bridge with both a
+text command protocol and a binary frame protocol for live streaming.
 
 - the dialog can export the bundled `AugurBridge.jar` directly, so users do not need to hunt for
   the file in the repository first
@@ -59,8 +59,9 @@ workflow Augur already uses.
 - then run `Plugins -> Augur -> Start Bridge`
 - the bridge connects to a configurable `host:port` and now defaults to `127.0.0.1:57294`
 - the dialog includes the plugin-install/start steps, inline status, and inline connection errors
-- preview frames are written to a temporary TIFF path and forwarded to ImageJ on a lossy background
-  channel so the GUI never blocks on the external consumer
+- preview frames are sent as raw 16-bit pixel data over the binary `frame` protocol; the plugin
+  updates a single persistent `ImagePlus` window in-place via `setPixels()` + `updateAndDraw()`,
+  so there is no close/reopen flicker and no TIFF file I/O per frame
 - while streaming is active, the center panel shows a placeholder plus a `Return to augur` button
 - the top bar exposes the current ImageJ bridge status
 
@@ -79,8 +80,9 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 - histogram and line-profile windows use the same deferred-viewport pattern as the existing popup and
   host-view windows, so they can live outside the main OS window when supported
 - because ImageJ replaced its historic socket listener with a Java-RMI single-instance mechanism,
-  `augur-gui/imagej-plugin/AugurBridge.jar` restores a tiny loopback-only TCP listener instead of
-  teaching the Rust bridge Java serialization/RMI
+  `augur-gui/imagej-plugin/AugurBridge.jar` restores a loopback-only TCP listener with a binary
+  frame protocol (`frame <w> <h> <scale>\n` + raw u16 LE pixels) that updates a persistent
+  `ImagePlus` in-place, avoiding TIFF file I/O and window close/reopen per frame
 - the ImageJ bridge lives under `augur-gui/src/external_tools/` and uses a bounded background
   sender to avoid backpressuring capture or preview work
 

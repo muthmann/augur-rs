@@ -35,9 +35,10 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
 - external viewers implement a small `ExternalTool` trait under `external_tools/`
 - the first bridge, ImageJ/Fiji, uses a bounded background sender so external streaming stays
   lossy/latest-oriented and cannot backpressure capture or preview processing
-- the ImageJ/Fiji bridge is paired with a tiny bundled `AugurBridge.jar` plugin that restores a
-  loopback-only TCP `eval` listener on port `57294`, letting Augur keep the simple write-only
-  protocol instead of implementing Java RMI/serialization in Rust
+- the ImageJ/Fiji bridge is paired with a tiny bundled `AugurBridge.jar` plugin that provides a
+  loopback-only TCP listener on port `57294` with a binary frame protocol (`frame <w> <h> <scale>\n`
+  + raw u16 LE pixels) that updates a persistent `ImagePlus` in-place via `setPixels()` +
+  `updateAndDraw()`, avoiding TIFF file I/O and window flicker
 
 ## Consequences
 

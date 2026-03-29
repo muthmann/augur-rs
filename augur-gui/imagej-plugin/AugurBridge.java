@@ -1,22 +1,28 @@
 import ij.IJ;
+import ij.ImagePlus;
 import ij.Prefs;
 import ij.gui.GenericDialog;
 import ij.io.OpenDialog;
+import ij.measure.Calibration;
 import ij.plugin.Macro_Runner;
 import ij.plugin.PlugIn;
+import ij.process.ShortProcessor;
 
 import java.awt.EventQueue;
-import java.io.BufferedReader;
+import java.io.DataInputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 public class AugurBridge implements PlugIn {
     private static final String PREF_PORT_KEY = "augur.bridge.port";
     private static final int DEFAULT_PORT = 57294;
+    private static final String LIVE_TITLE = "augur_live";
     private static BridgeServer bridgeServer;
 
     @Override
@@ -74,6 +80,7 @@ public class AugurBridge implements PlugIn {
         private final int port;
         private final ServerSocket serverSocket;
         private final Thread thread;
+        private ImagePlus liveImage;
 
         BridgeServer(int port) throws IOException {
             this.port = port;
@@ -111,57 +118,144 @@ public class AugurBridge implements PlugIn {
                 try {
                     serverSocket.close();
                 } catch (IOException ignored) {
-                    // Nothing else to do while shutting down.
                 }
                 clearServer(this);
             }
         }
 
         private void handleClient(Socket socket) throws IOException {
-            BufferedReader reader =
-                new BufferedReader(
-                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8)
-                );
-            String line;
-            while ((line = reader.readLine()) != null) {
-                handleCommand(line);
+            InputStream rawIn = socket.getInputStream();
+            DataInputStream dataIn = new DataInputStream(rawIn);
+
+            // Read lines byte-by-byte so we can switch to binary reads for frame data.
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                int b = dataIn.read();
+                if (b == -1) {
+                    break;
+                }
+                if (b == '\n') {
+                    String line = sb.toString().trim();
+                    sb.setLength(0);
+                    if (!line.isEmpty()) {
+                        handleLine(line, dataIn);
+                    }
+                } else {
+                    sb.append((char) b);
+                }
             }
         }
 
-        private void handleCommand(String line) {
-            String commandLine = line.trim();
-            if (commandLine.isEmpty()) {
+        private void handleLine(String line, DataInputStream dataIn) {
+            int split = line.indexOf(' ');
+            String command = split >= 0 ? line.substring(0, split) : line;
+            String argument = split >= 0 ? line.substring(split + 1) : "";
+
+            if ("frame".equals(command)) {
+                handleFrameCommand(argument, dataIn);
                 return;
             }
 
-            int split = commandLine.indexOf(' ');
-            String command = split >= 0 ? commandLine.substring(0, split) : commandLine;
-            String argument = split >= 0 ? commandLine.substring(split + 1) : "";
-
             try {
-                runOnEventThread(command, argument);
+                final String cmd = command;
+                final String arg = argument;
+                invokeOnEDT(new Runnable() {
+                    @Override
+                    public void run() {
+                        executeTextCommand(cmd, arg);
+                    }
+                });
             } catch (Exception e) {
                 IJ.log("Augur Bridge command failed: " + e.getMessage());
             }
         }
 
-        private void runOnEventThread(final String command, final String argument) throws Exception {
-            Runnable action = new Runnable() {
-                @Override
-                public void run() {
-                    executeCommand(command, argument);
-                }
-            };
-
-            if (EventQueue.isDispatchThread()) {
-                action.run();
+        private void handleFrameCommand(String header, DataInputStream dataIn) {
+            // Header format: "<width> <height> <nm_per_pixel>"
+            String[] parts = header.split(" ");
+            if (parts.length < 3) {
+                IJ.log("Augur Bridge: malformed frame header: " + header);
                 return;
             }
 
-            EventQueue.invokeAndWait(action);
+            final int width;
+            final int height;
+            final double nmPerPixel;
+            try {
+                width = Integer.parseInt(parts[0]);
+                height = Integer.parseInt(parts[1]);
+                nmPerPixel = Double.parseDouble(parts[2]);
+            } catch (NumberFormatException e) {
+                IJ.log("Augur Bridge: bad frame header numbers: " + header);
+                return;
+            }
+
+            int numPixels = width * height;
+            byte[] rawBytes = new byte[numPixels * 2];
+            try {
+                dataIn.readFully(rawBytes);
+            } catch (IOException e) {
+                IJ.log("Augur Bridge: failed to read frame pixels: " + e.getMessage());
+                return;
+            }
+
+            // Convert little-endian bytes to short array.
+            final short[] pixels = new short[numPixels];
+            ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(pixels);
+
+            try {
+                invokeOnEDT(new Runnable() {
+                    @Override
+                    public void run() {
+                        updateLiveImage(width, height, nmPerPixel, pixels);
+                    }
+                });
+            } catch (Exception e) {
+                IJ.log("Augur Bridge: display update failed: " + e.getMessage());
+            }
         }
 
-        private void executeCommand(String command, String argument) {
+        private void updateLiveImage(int width, int height, double nmPerPixel, short[] pixels) {
+            boolean needNewImage = liveImage == null
+                || liveImage.getWindow() == null
+                || liveImage.getWindow().isClosed()
+                || liveImage.getWidth() != width
+                || liveImage.getHeight() != height;
+
+            if (needNewImage) {
+                if (liveImage != null && liveImage.getWindow() != null
+                        && !liveImage.getWindow().isClosed()) {
+                    liveImage.close();
+                }
+                ShortProcessor sp = new ShortProcessor(width, height, pixels, null);
+                liveImage = new ImagePlus(LIVE_TITLE, sp);
+                Calibration cal = liveImage.getCalibration();
+                cal.pixelWidth = nmPerPixel;
+                cal.pixelHeight = nmPerPixel;
+                cal.setUnit("nm");
+                liveImage.show();
+            } else {
+                liveImage.getProcessor().setPixels(pixels);
+                Calibration cal = liveImage.getCalibration();
+                if (cal.pixelWidth != nmPerPixel) {
+                    cal.pixelWidth = nmPerPixel;
+                    cal.pixelHeight = nmPerPixel;
+                    cal.setUnit("nm");
+                }
+                liveImage.updateAndDraw();
+            }
+        }
+
+        private void invokeOnEDT(Runnable action)
+                throws InterruptedException, InvocationTargetException {
+            if (EventQueue.isDispatchThread()) {
+                action.run();
+            } else {
+                EventQueue.invokeAndWait(action);
+            }
+        }
+
+        private void executeTextCommand(String command, String argument) {
             if ("eval".equals(command)) {
                 new Macro_Runner().runMacro(argument, null);
                 return;
