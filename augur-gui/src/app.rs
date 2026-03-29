@@ -44,7 +44,10 @@ use crate::{
     plugin_settings_ui::render_plugin_settings,
     plugins::create_all_plugins,
     point_cloud::{PointCloudMetrics, PointCloudState},
-    preview::{compute_frame_histogram, frame_to_color_image, PreviewDisplaySettings},
+    preview::{
+        compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
+        PreviewDisplaySettings, PreviewMode,
+    },
     settings::draw_settings,
     viewer_tools::{
         compute_scale_bar, AnnotationManager, AnnotationShape, AnnotationShapeKind, ContrastMode,
@@ -66,12 +69,22 @@ const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 const PREVIEW_ZOOM_MAX: f32 = 16.0;
+const DEFAULT_TIME_SURFACE_TAU_US: u64 = 30_000;
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
 fn mib_to_bytes(mib: u64) -> usize {
     mib.saturating_mul(EVENT_STORE_MEBIBYTE as u64)
         .min(usize::MAX as u64) as usize
+}
+
+fn interval_ms_to_hz(interval_ms: u64) -> f64 {
+    1000.0 / interval_ms.max(1) as f64
+}
+
+fn hz_to_interval_ms(hz: f64, hz_range: std::ops::RangeInclusive<f64>) -> u64 {
+    let hz = hz.clamp(*hz_range.start(), *hz_range.end());
+    (1000.0 / hz).round().max(1.0) as u64
 }
 
 #[derive(Debug, Clone)]
@@ -358,7 +371,8 @@ pub struct CameraApp {
     disk_writer_buffer_mib: u64,
     acq_dirty: bool,
     config_dirty: bool,
-    preview_colormap: Option<Colormap>,
+    preview_mode: PreviewMode,
+    time_surface_tau_us: u64,
     contrast_settings: ContrastSettings,
     histogram_window: HistogramWindow,
     line_profile_tool: LineProfileTool,
@@ -434,7 +448,8 @@ impl CameraApp {
             disk_writer_buffer_mib: global_defaults.disk_writer_buffer_mib,
             acq_dirty: false,
             config_dirty: false,
-            preview_colormap: Some(Colormap::Grays),
+            preview_mode: PreviewMode::default(),
+            time_surface_tau_us: DEFAULT_TIME_SURFACE_TAU_US,
             contrast_settings: ContrastSettings::default(),
             histogram_window: HistogramWindow::default(),
             line_profile_tool: LineProfileTool::default(),
@@ -1403,7 +1418,9 @@ impl CameraApp {
     }
 
     fn raw_events_required(&self) -> bool {
-        self.preview_workspace.view_mode == ViewMode::PointCloud3d || self.plugins_need_raw_events()
+        self.preview_workspace.view_mode == ViewMode::PointCloud3d
+            || self.preview_mode.requires_raw_events()
+            || self.plugins_need_raw_events()
     }
 
     fn sync_pipeline_requirements(&self, controller: &PipelineController) {
@@ -1824,7 +1841,8 @@ impl CameraApp {
             frame,
             &self.analysis_output.overlays,
             self.preview_display_settings(),
-            self.preview_colormap,
+            self.preview_mode,
+            self.time_surface_tau_us,
         )
     }
 
@@ -1840,11 +1858,34 @@ impl CameraApp {
         }
     }
 
-    fn refresh_paused_preview_if_needed(&mut self, ctx: &egui::Context, settings_changed: bool) {
+    fn apply_preview_histogram(&mut self, histogram: Vec<u64>) {
+        if self.contrast_settings.mode == ContrastMode::Auto {
+            self.contrast_settings.update_auto_range(&histogram);
+        }
+        let histogram_max = histogram.len().saturating_sub(1).min(u16::MAX as usize) as u16;
+        let clamped_min = self
+            .contrast_settings
+            .display_min
+            .min(histogram_max.saturating_sub(1));
+        let clamped_max = self
+            .contrast_settings
+            .display_max
+            .clamp(clamped_min.saturating_add(1), histogram_max.max(1));
+        self.contrast_settings.display_min = clamped_min;
+        self.contrast_settings.display_max = clamped_max;
+        self.histogram_window.set_histogram(histogram);
+    }
+
+    fn refresh_preview_if_needed(&mut self, ctx: &egui::Context, settings_changed: bool) {
         if !settings_changed || self.preview_workspace.view_mode != ViewMode::Preview2d {
             return;
         }
-        if self.mode == AppMode::Replaying && (self.replay_paused || self.replay_finished) {
+        let Some(frame) = self.latest_frame.as_ref() else {
+            return;
+        };
+        let histogram = compute_frame_histogram(frame, self.preview_mode, self.time_surface_tau_us);
+        self.apply_preview_histogram(histogram);
+        if self.mode != AppMode::Idle {
             self.refresh_preview_texture_from_latest_frame(ctx);
         }
     }
@@ -1944,6 +1985,7 @@ impl CameraApp {
                 .unwrap_or_else(|| path.display().to_string())
         );
         self.latest_frame = None;
+        reset_preview_render_cache();
         self.reset_analysis();
     }
 
@@ -1988,6 +2030,7 @@ impl CameraApp {
         }
         self.texture = None;
         self.latest_frame = None;
+        reset_preview_render_cache();
         self.last_preview_process_at = None;
         self.preview_workspace.clear_session_state();
         self.line_profile_tool.clear();
@@ -2180,22 +2223,9 @@ impl CameraApp {
 
         self.run_analysis_plugins(&frame);
 
-        let histogram = compute_frame_histogram(&frame);
-        if self.contrast_settings.mode == ContrastMode::Auto {
-            self.contrast_settings.update_auto_range(&histogram);
-        }
-        let histogram_max = histogram.len().saturating_sub(1).min(u16::MAX as usize) as u16;
-        let clamped_min = self
-            .contrast_settings
-            .display_min
-            .min(histogram_max.saturating_sub(1));
-        let clamped_max = self
-            .contrast_settings
-            .display_max
-            .clamp(clamped_min.saturating_add(1), histogram_max.max(1));
-        self.contrast_settings.display_min = clamped_min;
-        self.contrast_settings.display_max = clamped_max;
-        self.histogram_window.set_histogram(histogram);
+        let histogram =
+            compute_frame_histogram(&frame, self.preview_mode, self.time_surface_tau_us);
+        self.apply_preview_histogram(histogram);
 
         if self.line_profile_tool.has_line() {
             self.line_profile_tool.recompute(&frame);
@@ -2737,28 +2767,36 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Preview update [ms]")
+                            let mut preview_hz = interval_ms_to_hz(self.preview_interval_ms);
+                            ui.label("Preview update [Hz]")
                                 .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
                             let response = ui
                                 .add(
-                                    egui::DragValue::new(&mut self.preview_interval_ms)
-                                        .clamp_range(10..=200),
+                                    egui::DragValue::new(&mut preview_hz)
+                                        .clamp_range(5.0..=100.0)
+                                        .speed(0.5),
                                 )
                                 .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
                             if response.changed() {
+                                self.preview_interval_ms =
+                                    hz_to_interval_ms(preview_hz, 5.0..=100.0);
                                 global_settings_changed = true;
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Point cloud update [ms]")
+                            let mut point_cloud_hz = interval_ms_to_hz(self.point_cloud_interval_ms);
+                            ui.label("Point cloud update [Hz]")
                                 .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
                             let response = ui
                                 .add(
-                                    egui::DragValue::new(&mut self.point_cloud_interval_ms)
-                                        .clamp_range(20..=500),
+                                    egui::DragValue::new(&mut point_cloud_hz)
+                                        .clamp_range(2.0..=50.0)
+                                        .speed(0.5),
                                 )
                                 .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
                             if response.changed() {
+                                self.point_cloud_interval_ms =
+                                    hz_to_interval_ms(point_cloud_hz, 2.0..=50.0);
                                 global_settings_changed = true;
                             }
                         });
@@ -3322,7 +3360,8 @@ impl eframe::App for CameraApp {
         let external_streaming = external_status.is_streaming();
         let mut return_from_external_tool = false;
         let mut pc_metrics: Option<PointCloudMetrics> = None;
-        let mut preview_colormap_changed = false;
+        let mut preview_mode_changed = false;
+        let mut time_surface_tau_changed = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(preview_heading(mode, self.preview_workspace.view_mode));
             ui.separator();
@@ -3462,30 +3501,44 @@ impl eframe::App for CameraApp {
                     match self.preview_workspace.view_mode {
                         ViewMode::Preview2d => {
                             ui.horizontal(|ui| {
-                                let previous_preview_colormap = self.preview_colormap;
-                                ui.label("Colormap");
-                                egui::ComboBox::from_id_source("preview_colormap")
-                                    .selected_text(
-                                        self.preview_colormap
-                                            .map(Colormap::label)
-                                            .unwrap_or("Polarity (R/G)"),
-                                    )
+                                let previous_preview_mode = self.preview_mode;
+                                ui.label("Mode");
+                                egui::ComboBox::from_id_source("preview_mode")
+                                    .selected_text(match self.preview_mode {
+                                        PreviewMode::Intensity(colormap) => {
+                                            format!("Intensity / {}", colormap.label())
+                                        }
+                                        mode => mode.label().to_owned(),
+                                    })
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
-                                            &mut self.preview_colormap,
-                                            None,
-                                            "Polarity (R/G)",
+                                            &mut self.preview_mode,
+                                            PreviewMode::RedBlue,
+                                            PreviewMode::RedBlue.label(),
                                         );
+                                        ui.selectable_value(
+                                            &mut self.preview_mode,
+                                            PreviewMode::SignedCount,
+                                            PreviewMode::SignedCount.label(),
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.preview_mode,
+                                            PreviewMode::TimeSurface,
+                                            PreviewMode::TimeSurface.label(),
+                                        );
+                                        ui.separator();
                                         for colormap in Colormap::ALL {
                                             ui.selectable_value(
-                                                &mut self.preview_colormap,
-                                                Some(colormap),
-                                                colormap.label(),
+                                                &mut self.preview_mode,
+                                                PreviewMode::Intensity(colormap),
+                                                format!("Intensity / {}", colormap.label()),
                                             );
                                         }
                                     });
-                                preview_colormap_changed |=
-                                    self.preview_colormap != previous_preview_colormap;
+                                preview_mode_changed |= self.preview_mode != previous_preview_mode;
+                                if preview_mode_changed {
+                                    reset_preview_render_cache();
+                                }
                                 ui.checkbox(
                                     &mut self.scale_bar_settings.show,
                                     "Scale bar",
@@ -3522,6 +3575,30 @@ impl eframe::App for CameraApp {
                                         });
                                 }
                             });
+                            if matches!(self.preview_mode, PreviewMode::TimeSurface) {
+                                ui.horizontal(|ui| {
+                                    let mut tau_ms = self.time_surface_tau_us as f64 / 1_000.0;
+                                    let response = ui.add(
+                                        egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
+                                            .text("Decay τ [ms]")
+                                            .logarithmic(true),
+                                    );
+                                    if response.changed() {
+                                        self.time_surface_tau_us =
+                                            (tau_ms * 1_000.0).round().max(1.0) as u64;
+                                        time_surface_tau_changed = true;
+                                    }
+                                });
+                                if self
+                                    .latest_frame
+                                    .as_ref()
+                                    .is_some_and(|frame| frame.events.is_none())
+                                {
+                                    ui.small(
+                                        "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
+                                    );
+                                }
+                            }
                             if let Some(stats) = self
                                 .latest_frame
                                 .as_ref()
@@ -3665,9 +3742,12 @@ impl eframe::App for CameraApp {
 
         let previous_contrast_settings = self.contrast_settings.clone();
         self.histogram_window
-            .show(ctx, &mut self.contrast_settings, self.preview_colormap);
+            .show(ctx, &mut self.contrast_settings, self.preview_mode);
         let contrast_changed = self.contrast_settings != previous_contrast_settings;
-        self.refresh_paused_preview_if_needed(ctx, preview_colormap_changed || contrast_changed);
+        self.refresh_preview_if_needed(
+            ctx,
+            preview_mode_changed || time_surface_tau_changed || contrast_changed,
+        );
         self.line_profile_tool.show_window(ctx);
         self.show_imagej_dialog(ctx);
 

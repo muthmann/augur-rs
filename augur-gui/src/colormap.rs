@@ -11,10 +11,11 @@ pub enum Colormap {
     CyanHot,
     MagentaHot,
     Ice,
+    BlueWhiteRed,
 }
 
 impl Colormap {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Grays,
         Self::Fire,
         Self::RedHot,
@@ -22,6 +23,7 @@ impl Colormap {
         Self::CyanHot,
         Self::MagentaHot,
         Self::Ice,
+        Self::BlueWhiteRed,
     ];
 
     pub fn label(self) -> &'static str {
@@ -33,6 +35,7 @@ impl Colormap {
             Self::CyanHot => "Cyan Hot",
             Self::MagentaHot => "Magenta Hot",
             Self::Ice => "Ice",
+            Self::BlueWhiteRed => "Blue White Red",
         }
     }
 
@@ -49,6 +52,7 @@ impl Colormap {
             Self::CyanHot => &CYAN_HOT_LUT,
             Self::MagentaHot => &MAGENTA_HOT_LUT,
             Self::Ice => &ICE_LUT,
+            Self::BlueWhiteRed => &BLUE_WHITE_RED_LUT,
         }
     }
 }
@@ -98,6 +102,18 @@ static MAGENTA_HOT_LUT: LazyLock<[Color32; 256]> = LazyLock::new(|| {
 
 static ICE_LUT: LazyLock<[Color32; 256]> =
     LazyLock::new(|| interpolated_lut(ICE_RED, ICE_GREEN, ICE_BLUE));
+
+static BLUE_WHITE_RED_LUT: LazyLock<[Color32; 256]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        if index < 128 {
+            let t = index as f32 / 127.0;
+            Color32::from_rgb(lerp_u8(0, 255, t), lerp_u8(0, 255, t), 255)
+        } else {
+            let t = (index - 128) as f32 / 127.0;
+            Color32::from_rgb(255, lerp_u8(255, 0, t), lerp_u8(255, 0, t))
+        }
+    })
+});
 
 const FIRE_RED: [u8; 32] = [
     0, 0, 1, 25, 49, 73, 98, 122, 146, 162, 173, 184, 195, 207, 217, 229, 240, 252, 255, 255, 255,
@@ -166,7 +182,7 @@ fn ramp(index: u8, start: u8, end: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Colormap, FIRE_LUT, ICE_LUT, MAGENTA_HOT_LUT, RED_HOT_LUT};
+    use super::{Colormap, BLUE_WHITE_RED_LUT, FIRE_LUT, ICE_LUT, MAGENTA_HOT_LUT, RED_HOT_LUT};
     use egui::Color32;
 
     #[test]
@@ -200,5 +216,12 @@ mod tests {
         assert_eq!(MAGENTA_HOT_LUT[0], Color32::from_rgb(0, 0, 0));
         assert_eq!(MAGENTA_HOT_LUT[127], Color32::from_rgb(255, 0, 255));
         assert_eq!(MAGENTA_HOT_LUT[255], Color32::from_rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn blue_white_red_matches_diverging_endpoints() {
+        assert_eq!(BLUE_WHITE_RED_LUT[0], Color32::from_rgb(0, 0, 255));
+        assert_eq!(BLUE_WHITE_RED_LUT[127], Color32::from_rgb(255, 255, 255));
+        assert_eq!(BLUE_WHITE_RED_LUT[255], Color32::from_rgb(255, 0, 0));
     }
 }

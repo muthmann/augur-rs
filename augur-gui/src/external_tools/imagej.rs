@@ -168,9 +168,9 @@ fn take_latest_pending_frame(
 /// Protocol: `frame <width> <height> <nm_per_pixel>\n` followed by
 /// `width * height * 2` bytes of raw 16-bit little-endian pixel data.
 fn write_frame_packet<W: Write>(writer: &mut W, frame: &FrameEnvelope) -> Result<(), String> {
-    write!(
+    writeln!(
         writer,
-        "frame {} {} {}\n",
+        "frame {} {} {}",
         frame.width, frame.height, frame.nm_per_pixel
     )
     .map_err(|err| format!("header write failed: {err}"))?;
