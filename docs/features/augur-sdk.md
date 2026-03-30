@@ -39,9 +39,18 @@ Additional guarantees:
 ## Recording Output
 
 Each capture produces:
-- `<name>.raw` — EVT3 stream with standard header (`format EVT3;width=1280;height=720`)
+- `<name>.raw` — EVT3 stream with a header that reflects the configured sensor geometry (default `1280x720`)
 - `<name>.toml` — effective configuration sidecar for reproducibility
 
 ## Configuration
 
-TOML-based with four sections: `biases`, `roi`, `pixel_mask`, `digital_filter`. The GUI and CLI share the same config types. Runtime validation covers ROI bounds, mask coordinates, and filter conflicts.
+TOML-based with five sections: `biases`, `roi`, `pixel_mask`, `digital_filter`, and `global`.
+
+- `biases`, `roi`, `pixel_mask`, and `digital_filter` capture live camera programming state
+- `global` persists host-owned settings such as pixel scale, configured sensor geometry,
+  acquisition time, EventStore budget, preview cadence, point-cloud cadence, and disk-writer
+  buffer size
+
+The GUI and CLI share the same config types. Runtime validation still covers ROI bounds, mask
+coordinates, and filter conflicts, and older TOML files without `[global]` continue to load via
+defaults.

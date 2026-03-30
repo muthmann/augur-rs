@@ -2,7 +2,7 @@
 
 ## Summary
 
-AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, and now finalizes older `.raw` files without suppressing genuine preview errors.
+AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, resets its pacing baseline cleanly when speed changes, and finalizes older `.raw` files without suppressing genuine preview errors.
 
 ## Core Design
 
@@ -18,6 +18,7 @@ Replay lives in `augur-core` as two file-backed camera adapters, so the rest of 
 
 - `paused`
 - `speed_bits`
+- `speed_epoch`
 - `bytes_read`
 - `file_size`
 - `data_offset`
@@ -26,7 +27,7 @@ Replay lives in `augur-core` as two file-backed camera adapters, so the rest of 
 - `total_duration_us`
 - `first_timestamp_us`
 
-The current replay pacing remains approximate: it uses a byte-rate model derived from the file's timestamp span, not per-event scheduling.
+The current replay pacing remains approximate: it uses a byte-rate model derived from the file's timestamp span, not per-event scheduling. When replay speed changes, the replay backends now reset their local pacing baseline from the current byte/event position so approximate throttling stays responsive instead of racing ahead or freezing.
 
 ## Decoded File Formats
 
@@ -52,7 +53,7 @@ HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `aug
    - MB progress as secondary info
 4. Enabled analysis plugins continue to run on replayed frames exactly as they do on live preview frames.
 
-If a `<capture>.toml` sidecar exists next to the selected replay file, the settings panel shows it as read-only reference data during replay.
+If a `<capture>.toml` sidecar exists next to the selected replay file, the replay session uses it as read-only reference data for both the left camera settings panel and the top-bar global `Settings` menu.
 
 ## EOF Behavior
 

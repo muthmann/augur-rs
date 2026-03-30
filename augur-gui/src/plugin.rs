@@ -13,7 +13,13 @@ pub trait AnalysisPlugin {
     fn set_enabled(&mut self, enabled: bool);
 
     /// Draw plugin settings. Returns true if `CameraConfig` was mutated.
-    fn ui_settings(&mut self, ui: &mut egui::Ui, config: &mut CameraConfig) -> bool;
+    fn ui_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &mut CameraConfig,
+        sensor_width: u16,
+        sensor_height: u16,
+    ) -> bool;
 
     /// Process a new preview frame. Called only when plugin is enabled.
     fn process_frame(&mut self, frame: &PreviewFrame, output: &mut AnalysisOutput);

@@ -13,7 +13,8 @@ cargo run --bin augur-gui
 A single menu bar row at the top of the window:
 
 - `File` — output path/browse, Open Replay, Save/Load Config, Close Replay
-- `Camera` — Probe Camera, Preview, Record, Stop, Apply Settings, Acq time slider; replay mode adds Play/Pause, Restart, and Speed selection
+- `Camera` — Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection
+- `Settings` — pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls
 - `View` — toggle Settings/Analysis panels, switch 2D/3D view mode
 - `Plugins` — Plugin Manager, Scan for New Plugins, Open Plugins Folder
 - `Analysis` — per-plugin enable/disable checkboxes (shown only when plugins exist)
@@ -38,7 +39,7 @@ The left panel groups camera-only controls into focused sections:
 ### Replay sessions
 
 - the panel becomes read-only
-- a companion `<capture>.toml` sidecar is shown when available
+- a companion `<capture>.toml` sidecar is shown when available and also seeds the top-bar `Settings` menu
 - otherwise the GUI falls back to a geometry-matched default reference config
 - collapse and expand happen from the panel edge, and the panel body is scrollable
 
@@ -112,6 +113,8 @@ Status, warning, and error labels adapt to the active GUI theme.
 ## Runtime Notes
 
 - acquisition time is only adjustable for live preview and recording
+- sensor geometry and disk-writer buffer are idle-only controls because they shape pipeline startup
+- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu
 - output path editing is disabled during active recording and replay
 - collapsing either side panel gives more space back to the preview
 - the same embedded/popup preview controls work in both live and replay sessions

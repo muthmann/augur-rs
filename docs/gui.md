@@ -17,7 +17,8 @@ A single menu bar row at the top of the window:
 | Menu | Contents |
 |---|---|
 | `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay |
-| `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings, Acq time slider; replay mode adds Play/Pause, Restart, and Speed selection |
+| `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection |
+| `Settings` | Pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls |
 | `View` | Toggle Settings/Analysis panels, switch 2D/3D view mode |
 | `Plugins` | Plugin Manager, Scan for New Plugins, Open Plugins Folder |
 | `Analysis` | Per-plugin enable/disable checkboxes (shown only when plugins exist) |
@@ -41,8 +42,8 @@ Camera-only controls are shown in the left panel.
 
 ### Replay sessions
 
-- the panel becomes read-only
-- if a companion `<capture>.toml` sidecar exists, it is shown as reference data
+- the left camera settings panel becomes read-only
+- if a companion `<capture>.toml` sidecar exists, both the panel and the top-bar `Settings` menu use it as replay reference data
 - if no sidecar exists, the GUI shows a default geometry-matched reference config instead
 
 ### Camera sections
@@ -171,6 +172,8 @@ Status, warning, and error labels adapt to the active GUI theme.
 ## Runtime Notes
 
 - Acquisition time is only adjustable for live preview and recording
+- sensor geometry and disk-writer buffer are start-time controls, so they are only editable while idle
+- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu
 - output path editing is disabled during active recording and replay
 - the camera/replay status line below the toolbar shows the current session state
 - the stats area also shows per-frame `ON % | OFF %` plus the event count for the latest preview frame

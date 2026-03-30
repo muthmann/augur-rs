@@ -1,7 +1,5 @@
 use augur_core::config::CameraConfig;
 
-const SENSOR_WIDTH: u16 = 1280;
-const SENSOR_HEIGHT: u16 = 720;
 pub(crate) const IMX636_DEM_SLOTS: usize = 64;
 
 pub fn draw_settings(
@@ -10,6 +8,8 @@ pub fn draw_settings(
     mask_x: &mut u16,
     mask_y: &mut u16,
     mask_file: &mut String,
+    sensor_width: u16,
+    sensor_height: u16,
 ) -> bool {
     let mut changed = false;
 
@@ -46,14 +46,14 @@ pub fn draw_settings(
                 .add(
                     egui::DragValue::new(&mut cfg.roi.x)
                         .prefix("x ")
-                        .clamp_range(0..=SENSOR_WIDTH - 1),
+                        .clamp_range(0..=sensor_width.saturating_sub(1)),
                 )
                 .changed();
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut cfg.roi.y)
                         .prefix("y ")
-                        .clamp_range(0..=SENSOR_HEIGHT - 1),
+                        .clamp_range(0..=sensor_height.saturating_sub(1)),
                 )
                 .changed();
         });
@@ -62,14 +62,14 @@ pub fn draw_settings(
                 .add(
                     egui::DragValue::new(&mut cfg.roi.width)
                         .prefix("w ")
-                        .clamp_range(1..=SENSOR_WIDTH),
+                        .clamp_range(1..=sensor_width.max(1)),
                 )
                 .changed();
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut cfg.roi.height)
                         .prefix("h ")
-                        .clamp_range(1..=SENSOR_HEIGHT),
+                        .clamp_range(1..=sensor_height.max(1)),
                 )
                 .changed();
         });
@@ -82,12 +82,12 @@ pub fn draw_settings(
             ui.add(
                 egui::DragValue::new(mask_x)
                     .prefix("x ")
-                    .clamp_range(0..=SENSOR_WIDTH - 1),
+                    .clamp_range(0..=sensor_width.saturating_sub(1)),
             );
             ui.add(
                 egui::DragValue::new(mask_y)
                     .prefix("y ")
-                    .clamp_range(0..=SENSOR_HEIGHT - 1),
+                    .clamp_range(0..=sensor_height.saturating_sub(1)),
             );
             let can_add = cfg.pixel_mask.masked_pixels.len() < IMX636_DEM_SLOTS;
             if ui

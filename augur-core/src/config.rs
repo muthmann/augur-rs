@@ -13,6 +13,8 @@ pub struct CameraConfig {
     pub roi: RoiConfig,
     pub pixel_mask: PixelMaskConfig,
     pub digital_filter: DigitalFilterConfig,
+    #[serde(default)]
+    pub global: GlobalSettingsConfig,
 }
 
 impl Default for CameraConfig {
@@ -22,6 +24,7 @@ impl Default for CameraConfig {
             roi: RoiConfig::full_frame(),
             pixel_mask: PixelMaskConfig::default(),
             digital_filter: DigitalFilterConfig::default(),
+            global: GlobalSettingsConfig::default(),
         }
     }
 }
@@ -53,6 +56,33 @@ impl CameraConfig {
             .map_err(|e| CameraError::Other(format!("failed to encode TOML: {e}")))?;
         fs::write(path, encoded)?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GlobalSettingsConfig {
+    pub nm_per_pixel: f64,
+    pub sensor_width: u16,
+    pub sensor_height: u16,
+    pub acq_time_ms: u64,
+    pub event_store_budget_mib: u64,
+    pub preview_interval_ms: u64,
+    pub point_cloud_interval_ms: u64,
+    pub disk_writer_buffer_mib: u64,
+}
+
+impl Default for GlobalSettingsConfig {
+    fn default() -> Self {
+        Self {
+            nm_per_pixel: 65.0,
+            sensor_width: 1280,
+            sensor_height: 720,
+            acq_time_ms: 50,
+            event_store_budget_mib: 100,
+            preview_interval_ms: 33,
+            point_cloud_interval_ms: 67,
+            disk_writer_buffer_mib: 4,
+        }
     }
 }
 
@@ -186,6 +216,7 @@ mod tests {
         .expect("valid toml");
 
         assert_eq!(cfg.pixel_mask.masked_pixels, vec![(10, 20), (30, 40)]);
+        assert_eq!(cfg.global, GlobalSettingsConfig::default());
     }
 
     #[test]
@@ -201,5 +232,58 @@ mod tests {
 
         let err = cfg.validate(1280, 720).expect_err("must reject");
         assert!(err.to_string().contains("cannot both be enabled"));
+    }
+
+    #[test]
+    fn global_settings_round_trip_through_toml() {
+        let cfg = CameraConfig {
+            global: GlobalSettingsConfig {
+                nm_per_pixel: 42.5,
+                sensor_width: 640,
+                sensor_height: 480,
+                acq_time_ms: 75,
+                event_store_budget_mib: 256,
+                preview_interval_ms: 40,
+                point_cloud_interval_ms: 90,
+                disk_writer_buffer_mib: 8,
+            },
+            ..CameraConfig::default()
+        };
+
+        let encoded = toml::to_string_pretty(&cfg).expect("camera config must serialize");
+        let decoded: CameraConfig = toml::from_str(&encoded).expect("camera config must parse");
+
+        assert_eq!(decoded.global, cfg.global);
+    }
+
+    #[test]
+    fn old_toml_without_global_uses_defaults() {
+        let cfg: CameraConfig = toml::from_str(
+            r#"
+            [biases]
+            diff_on = 1
+            diff_off = 2
+            fo = 3
+            hpf = 4
+            refr = 5
+
+            [roi]
+            x = 0
+            y = 0
+            width = 1280
+            height = 720
+
+            [pixel_mask]
+            masked_pixels = []
+
+            [digital_filter]
+            stc_enabled = false
+            stc_threshold_us = 1000
+            trail_enabled = false
+            "#,
+        )
+        .expect("legacy toml without global must load");
+
+        assert_eq!(cfg.global, GlobalSettingsConfig::default());
     }
 }

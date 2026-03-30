@@ -10,17 +10,21 @@ Recording `captures/run.raw` produces:
 - `captures/run.toml`
 
 The `.toml` sidecar stores the configuration used for that capture so recordings remain reproducible.
+That includes the host-owned `[global]` settings block that records pixel scale, configured sensor
+geometry, acquisition time, retained history budget, and advanced GUI/runtime tuning.
 
 ## RAW Header
 
-Each `.raw` file starts with EVT3 metadata lines for the IMX636 sensor geometry:
+Each `.raw` file starts with EVT3 metadata lines for the configured sensor geometry:
 
 ```text
-% format EVT3;width=1280;height=720
-% geometry 1280x720
+% format EVT3;width=<sensor_width>;height=<sensor_height>
+% geometry <sensor_width>x<sensor_height>
 % evt 3.0
 % end
 ```
+
+If the user leaves the geometry untouched, those values default to `1280x720`.
 
 ## CLI Behavior
 

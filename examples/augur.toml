@@ -18,3 +18,13 @@ masked_pixels = []
 stc_enabled = false
 stc_threshold_us = 1000
 trail_enabled = false
+
+[global]
+nm_per_pixel = 65.0
+sensor_width = 1280
+sensor_height = 720
+acq_time_ms = 50
+event_store_budget_mib = 100
+preview_interval_ms = 33
+point_cloud_interval_ms = 67
+disk_writer_buffer_mib = 4

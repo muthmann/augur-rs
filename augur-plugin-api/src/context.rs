@@ -1,6 +1,16 @@
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
+pub const CTX_GLOBAL_SETTINGS: &str = "augur.global_settings";
 pub const CTX_LOCALIZATION_RESULTS: &str = "augur.localization.results";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GlobalSettings {
+    pub nm_per_pixel: f64,
+    pub sensor_width: u16,
+    pub sensor_height: u16,
+    pub acq_time_ms: u64,
+    pub event_store_budget_bytes: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Localization {
