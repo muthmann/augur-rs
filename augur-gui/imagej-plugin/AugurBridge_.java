@@ -19,7 +19,7 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
-public class AugurBridge implements PlugIn {
+public class AugurBridge_ implements PlugIn {
     private static final String PREF_PORT_KEY = "augur.bridge.port";
     private static final int DEFAULT_PORT = 57294;
     private static final String LIVE_TITLE = "augur_live";
@@ -27,7 +27,7 @@ public class AugurBridge implements PlugIn {
 
     @Override
     public void run(String arg) {
-        synchronized (AugurBridge.class) {
+        synchronized (AugurBridge_.class) {
             if (bridgeServer != null && bridgeServer.isRunning()) {
                 IJ.showStatus("Augur Bridge already listening on 127.0.0.1:" + bridgeServer.getPort());
                 return;
@@ -69,7 +69,7 @@ public class AugurBridge implements PlugIn {
     }
 
     private static void clearServer(BridgeServer server) {
-        synchronized (AugurBridge.class) {
+        synchronized (AugurBridge_.class) {
             if (bridgeServer == server) {
                 bridgeServer = null;
             }

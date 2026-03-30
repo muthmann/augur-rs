@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_JAR="$SCRIPT_DIR/AugurBridge.jar"
+OUTPUT_JAR="$SCRIPT_DIR/AugurBridge_.jar"
 
 find_imagej_jar() {
   if [[ -n "${IMAGEJ_JAR:-}" ]]; then
@@ -48,7 +48,7 @@ mkdir -p "$TMP_DIR/classes"
 javac --release 8 \
   -cp "$IMAGEJ_JAR_PATH" \
   -d "$TMP_DIR/classes" \
-  "$SCRIPT_DIR/AugurBridge.java"
+  "$SCRIPT_DIR/AugurBridge_.java"
 
 jar cf "$OUTPUT_JAR" \
   -C "$TMP_DIR/classes" . \

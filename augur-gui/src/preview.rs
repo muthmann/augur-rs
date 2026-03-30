@@ -53,6 +53,34 @@ impl Default for PreviewDisplaySettings {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DisplayNormalizer {
+    display_min: f32,
+    inverse_range: f32,
+    gamma: f32,
+}
+
+impl DisplayNormalizer {
+    fn new(settings: PreviewDisplaySettings) -> Self {
+        let display_min = settings
+            .display_min
+            .min(settings.display_max.saturating_sub(1));
+        let display_max = settings.display_max.max(display_min.saturating_add(1));
+        let range = (f32::from(display_max) - f32::from(display_min)).max(1.0);
+        Self {
+            display_min: f32::from(display_min),
+            inverse_range: 1.0 / range,
+            gamma: settings.gamma.max(0.01),
+        }
+    }
+
+    fn normalize(self, value: u16) -> f32 {
+        ((f32::from(value) - self.display_min).max(0.0) * self.inverse_range)
+            .clamp(0.0, 1.0)
+            .powf(self.gamma)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewMode {
     RedBlue,
@@ -114,6 +142,7 @@ pub fn frame_to_color_image(
 ) -> ColorImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
+    let normalizer = DisplayNormalizer::new(settings);
     let mut image = ColorImage::new([w, h], Color32::TRANSPARENT);
 
     // Look for a ROI grid overlay to merge into the base rendering pass.
@@ -132,7 +161,7 @@ pub fn frame_to_color_image(
                 frame,
                 grid,
                 top_n,
-                settings,
+                normalizer,
                 mode,
                 time_surface_tau_us,
                 [w, h],
@@ -142,7 +171,7 @@ pub fn frame_to_color_image(
         } else {
             render_base(
                 frame,
-                settings,
+                normalizer,
                 mode,
                 time_surface_tau_us,
                 &mut image.pixels,
@@ -184,7 +213,7 @@ pub fn compute_frame_histogram(
 
 fn render_base(
     frame: &PreviewFrame,
-    settings: PreviewDisplaySettings,
+    normalizer: DisplayNormalizer,
     mode: PreviewMode,
     time_surface_tau_us: u64,
     pixels: &mut [Color32],
@@ -192,20 +221,8 @@ fn render_base(
 ) {
     prepare_time_surface(frame, mode, time_surface_tau_us, scratch);
     for (index, pixel) in pixels.iter_mut().enumerate() {
-        *pixel = preview_pixel_color(frame, index, settings, mode, time_surface_tau_us, scratch);
+        *pixel = preview_pixel_color(frame, index, normalizer, mode, time_surface_tau_us, scratch);
     }
-}
-
-fn normalized_value(value: u16, settings: PreviewDisplaySettings) -> f32 {
-    let display_min = settings
-        .display_min
-        .min(settings.display_max.saturating_sub(1));
-    let display_max = settings.display_max.max(display_min.saturating_add(1));
-    let numerator = (f32::from(value) - f32::from(display_min)).max(0.0);
-    let denominator = (f32::from(display_max) - f32::from(display_min)).max(1.0);
-    (numerator / denominator)
-        .clamp(0.0, 1.0)
-        .powf(settings.gamma.max(0.01))
 }
 
 /// Single-pass base frame + ROI grid overlay rendering.
@@ -219,7 +236,7 @@ fn render_base_with_grid(
     frame: &PreviewFrame,
     grid: &RoiGrid,
     top_n: usize,
-    settings: PreviewDisplaySettings,
+    normalizer: DisplayNormalizer,
     mode: PreviewMode,
     time_surface_tau_us: u64,
     size: [usize; 2],
@@ -288,7 +305,7 @@ fn render_base_with_grid(
             let [base_r, base_g, base_b, _] = preview_pixel_color(
                 frame,
                 row_offset + px,
-                settings,
+                normalizer,
                 mode,
                 time_surface_tau_us,
                 scratch,
@@ -341,21 +358,22 @@ fn render_base_with_grid(
 fn preview_pixel_color(
     frame: &PreviewFrame,
     index: usize,
-    settings: PreviewDisplaySettings,
+    normalizer: DisplayNormalizer,
     mode: PreviewMode,
     time_surface_tau_us: u64,
     scratch: &PreviewRenderScratch,
 ) -> Color32 {
     match mode {
-        PreviewMode::RedBlue => polarity_red_blue(frame, index, settings),
-        PreviewMode::SignedCount => signed_count_color(frame, index, settings),
+        PreviewMode::RedBlue => polarity_red_blue(frame, index, normalizer),
+        PreviewMode::SignedCount => signed_count_color(frame, index, normalizer),
         PreviewMode::Intensity(colormap) => {
-            colormap.lookup(normalized_value(frame.pixels[index], settings))
+            colormap.lookup(normalizer.normalize(frame.pixels[index]))
         }
         PreviewMode::TimeSurface => {
-            time_surface_color(frame, index, settings, time_surface_tau_us, scratch).unwrap_or_else(
-                || Colormap::Grays.lookup(normalized_value(frame.pixels[index], settings)),
-            )
+            time_surface_color(frame, index, normalizer, time_surface_tau_us, scratch)
+                .unwrap_or_else(|| {
+                    Colormap::Grays.lookup(normalizer.normalize(frame.pixels[index]))
+                })
         }
     }
 }
@@ -448,11 +466,7 @@ fn update_time_surface(events: &[CdEvent], width: u16, height: u16, time_surface
     }
 }
 
-fn polarity_red_blue(
-    frame: &PreviewFrame,
-    index: usize,
-    settings: PreviewDisplaySettings,
-) -> Color32 {
+fn polarity_red_blue(frame: &PreviewFrame, index: usize, normalizer: DisplayNormalizer) -> Color32 {
     let total = frame.pixels[index];
     if total == 0 {
         return Color32::BLACK;
@@ -460,7 +474,7 @@ fn polarity_red_blue(
 
     let on = frame.pixels_on[index];
     let off = frame.pixels_off[index];
-    let brightness = channel_to_u8(normalized_value(total, settings));
+    let brightness = channel_to_u8(normalizer.normalize(total));
     match on.cmp(&off) {
         std::cmp::Ordering::Greater => Color32::from_rgb(brightness, 0, 0),
         std::cmp::Ordering::Less => Color32::from_rgb(0, 0, brightness),
@@ -471,7 +485,7 @@ fn polarity_red_blue(
 fn signed_count_color(
     frame: &PreviewFrame,
     index: usize,
-    settings: PreviewDisplaySettings,
+    normalizer: DisplayNormalizer,
 ) -> Color32 {
     if frame.pixels[index] == 0 {
         return Color32::BLACK;
@@ -479,7 +493,7 @@ fn signed_count_color(
 
     let on = frame.pixels_on[index];
     let off = frame.pixels_off[index];
-    let magnitude = normalized_value(on.abs_diff(off), settings);
+    let magnitude = normalizer.normalize(on.abs_diff(off));
     let signed_t = match on.cmp(&off) {
         std::cmp::Ordering::Greater => 0.5 + 0.5 * magnitude,
         std::cmp::Ordering::Less => 0.5 - 0.5 * magnitude,
@@ -491,7 +505,7 @@ fn signed_count_color(
 fn time_surface_color(
     frame: &PreviewFrame,
     index: usize,
-    settings: PreviewDisplaySettings,
+    normalizer: DisplayNormalizer,
     time_surface_tau_us: u64,
     scratch: &PreviewRenderScratch,
 ) -> Option<Color32> {
@@ -504,10 +518,9 @@ fn time_surface_color(
         return None;
     }
 
-    Some(Colormap::Grays.lookup(normalized_value(
-        u16::from(scratch.time_surface_values[index]),
-        settings,
-    )))
+    Some(
+        Colormap::Grays.lookup(normalizer.normalize(u16::from(scratch.time_surface_values[index]))),
+    )
 }
 
 fn time_surface_value_u8(timestamp: u64, reference_us: u64, tau_us: u64) -> u8 {

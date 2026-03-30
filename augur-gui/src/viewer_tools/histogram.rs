@@ -67,7 +67,7 @@ impl Default for HistogramWindow {
 
 #[derive(Debug, Clone, Default)]
 struct HistogramViewportData {
-    histogram: Vec<u64>,
+    histogram: Arc<Vec<u64>>,
     contrast: ContrastSettings,
     mode: PreviewMode,
     log_scale: bool,
@@ -84,7 +84,7 @@ enum MarkerDragTarget {
 impl HistogramWindow {
     pub fn set_histogram(&mut self, histogram: Vec<u64>) {
         if let Ok(mut data) = self.shared.lock() {
-            data.histogram = histogram;
+            data.histogram = Arc::new(histogram);
         }
     }
 
@@ -155,27 +155,19 @@ impl HistogramWindow {
     }
 }
 
-fn update_auto_contrast_from_histogram(data: &mut HistogramViewportData) {
-    if data.contrast.mode != ContrastMode::Auto {
-        return;
-    }
-    let auto_percentile = data.contrast.auto_percentile;
-    data.contrast.display_min = 0;
-    data.contrast.display_max = percentile_bin(&data.histogram, auto_percentile).max(1);
-}
-
 fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramViewportData>>) {
     let mut data = shared.lock().unwrap();
-    if data.histogram.is_empty() {
+    let histogram = Arc::clone(&data.histogram);
+    if histogram.is_empty() {
         ui.weak("No preview frame histogram available yet.");
         return;
     }
 
     ui.small("Drag the blue/yellow markers to adjust brightness & contrast.");
 
-    let max_bin = data.histogram.len().saturating_sub(1);
+    let max_bin = histogram.len().saturating_sub(1);
     let plot_max = if data.log_scale {
-        data.histogram
+        histogram
             .iter()
             .copied()
             .max()
@@ -183,10 +175,9 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
             .unwrap_or(1.0)
             .max(1.0)
     } else {
-        data.histogram.iter().copied().max().unwrap_or(1) as f64
+        histogram.iter().copied().max().unwrap_or(1) as f64
     };
-    let bars: Vec<Bar> = data
-        .histogram
+    let bars: Vec<Bar> = histogram
         .iter()
         .enumerate()
         .map(|(index, value)| {
@@ -203,7 +194,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
     } else {
         "Count"
     };
-    let histogram_for_hover = data.histogram.clone();
+    let histogram_for_hover = Arc::clone(&histogram);
 
     let mut pointer_x = None;
     let plot_response = Plot::new("preview_histogram_plot")
@@ -340,7 +331,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
     ui.horizontal(|ui| {
         if ui.button("Auto").clicked() {
             data.contrast.mode = ContrastMode::Auto;
-            update_auto_contrast_from_histogram(&mut data);
+            data.contrast.update_auto_range(histogram.as_slice());
         }
         if ui.button("Reset").clicked() {
             data.contrast.gamma = 0.5;
@@ -359,7 +350,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
             egui::Slider::new(&mut data.contrast.auto_percentile, 90.0..=100.0)
                 .text("Auto percentile"),
         );
-        update_auto_contrast_from_histogram(&mut data);
+        data.contrast.update_auto_range(histogram.as_slice());
     }
 
     let gradient_size = egui::vec2(ui.available_width().max(120.0), 12.0);

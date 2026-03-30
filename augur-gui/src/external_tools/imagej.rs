@@ -10,8 +10,8 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use super::{ExternalTool, ExternalToolStatus};
 
-pub const BUNDLED_IMAGEJ_PLUGIN_JAR: &[u8] = include_bytes!("../../imagej-plugin/AugurBridge.jar");
-pub const BUNDLED_IMAGEJ_PLUGIN_JAR_NAME: &str = "AugurBridge.jar";
+pub const BUNDLED_IMAGEJ_PLUGIN_JAR: &[u8] = include_bytes!("../../imagej-plugin/AugurBridge_.jar");
+pub const BUNDLED_IMAGEJ_PLUGIN_JAR_NAME: &str = "AugurBridge_.jar";
 pub const DEFAULT_IMAGEJ_BRIDGE_PORT: u16 = 57_294;
 
 #[derive(Debug)]

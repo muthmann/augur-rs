@@ -603,7 +603,8 @@ impl CameraApp {
                 ui.add_space(6.0 * scale);
                 if ui
                     .add(egui::Button::new(
-                        egui::RichText::new("Save AugurBridge.jar...").size(body_size),
+                        egui::RichText::new(format!("Save {BUNDLED_IMAGEJ_PLUGIN_JAR_NAME}..."))
+                            .size(body_size),
                     ))
                     .clicked()
                 {
