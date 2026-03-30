@@ -1,7 +1,10 @@
 use std::{
     io::Write,
     net::TcpStream,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle},
 };
 
@@ -13,6 +16,7 @@ use super::{ExternalTool, ExternalToolStatus};
 pub const BUNDLED_IMAGEJ_PLUGIN_JAR: &[u8] = include_bytes!("../../imagej-plugin/AugurBridge_.jar");
 pub const BUNDLED_IMAGEJ_PLUGIN_JAR_NAME: &str = "AugurBridge_.jar";
 pub const DEFAULT_IMAGEJ_BRIDGE_PORT: u16 = 57_294;
+const FRAME_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug)]
 struct FrameEnvelope {
@@ -20,15 +24,19 @@ struct FrameEnvelope {
     height: u16,
     pixels: Vec<u16>,
     nm_per_pixel: f64,
+    seq: u64,
+    timestamp_us: u64,
 }
 
 impl FrameEnvelope {
-    fn from_preview_frame(frame: &PreviewFrame, nm_per_pixel: f64) -> Self {
+    fn from_preview_frame(frame: &PreviewFrame, nm_per_pixel: f64, seq: u64) -> Self {
         Self {
             width: frame.width,
             height: frame.height,
             pixels: frame.pixels.clone(),
             nm_per_pixel,
+            seq,
+            timestamp_us: frame.window_end_us,
         }
     }
 }
@@ -37,8 +45,8 @@ pub struct ImageJBridge {
     host: String,
     port: u16,
     status: Arc<Mutex<ExternalToolStatus>>,
-    wake_tx: Option<Sender<()>>,
-    pending_frame: Arc<Mutex<Option<FrameEnvelope>>>,
+    frame_tx: Option<Sender<FrameEnvelope>>,
+    frame_seq: AtomicU64,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -48,8 +56,8 @@ impl ImageJBridge {
             host: host.into(),
             port,
             status: Arc::new(Mutex::new(ExternalToolStatus::Disconnected)),
-            wake_tx: None,
-            pending_frame: Arc::new(Mutex::new(None)),
+            frame_tx: None,
+            frame_seq: AtomicU64::new(0),
             handle: None,
         }
     }
@@ -65,31 +73,28 @@ impl ExternalTool for ImageJBridge {
     }
 
     fn connect(&mut self) -> Result<(), String> {
-        if self.wake_tx.is_some() {
+        if self.frame_tx.is_some() {
             return Ok(());
         }
 
         *self.status.lock().unwrap() = ExternalToolStatus::Connecting;
+        self.frame_seq.store(0, Ordering::Relaxed);
 
-        *self.pending_frame.lock().unwrap() = None;
-
-        let (tx, rx) = bounded::<()>(1);
+        let (tx, rx) = bounded::<FrameEnvelope>(FRAME_QUEUE_CAPACITY);
         let host = self.host.clone();
         let port = self.port;
         let status = Arc::clone(&self.status);
-        let pending_frame = Arc::clone(&self.pending_frame);
         let handle = thread::spawn(move || {
-            run_bridge_worker(host, port, status, pending_frame, rx);
+            run_bridge_worker(host, port, status, rx);
         });
 
-        self.wake_tx = Some(tx);
+        self.frame_tx = Some(tx);
         self.handle = Some(handle);
         Ok(())
     }
 
     fn disconnect(&mut self) {
-        self.wake_tx.take();
-        *self.pending_frame.lock().unwrap() = None;
+        self.frame_tx.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -97,15 +102,14 @@ impl ExternalTool for ImageJBridge {
     }
 
     fn send_frame(&mut self, frame: &PreviewFrame, nm_per_pixel: f64) -> Result<(), String> {
-        let Some(tx) = &self.wake_tx else {
+        let Some(tx) = &self.frame_tx else {
             return Err("ImageJ bridge is not connected".into());
         };
 
-        *self.pending_frame.lock().unwrap() =
-            Some(FrameEnvelope::from_preview_frame(frame, nm_per_pixel));
-        match tx.try_send(()) {
-            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
-            Err(TrySendError::Disconnected(())) => Err("ImageJ bridge is not connected".into()),
+        let seq = self.frame_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        match tx.try_send(FrameEnvelope::from_preview_frame(frame, nm_per_pixel, seq)) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err("ImageJ bridge is not connected".into()),
         }
     }
 }
@@ -114,8 +118,7 @@ fn run_bridge_worker(
     host: String,
     port: u16,
     status: Arc<Mutex<ExternalToolStatus>>,
-    pending_frame: Arc<Mutex<Option<FrameEnvelope>>>,
-    wake_rx: Receiver<()>,
+    frame_rx: Receiver<FrameEnvelope>,
 ) {
     let stream = TcpStream::connect((host.as_str(), port));
     let mut stream = match stream {
@@ -134,11 +137,7 @@ fn run_bridge_worker(
         return;
     }
 
-    while wake_rx.recv().is_ok() {
-        let Some(envelope) = take_latest_pending_frame(&pending_frame, &wake_rx) else {
-            continue;
-        };
-
+    while let Ok(envelope) = frame_rx.recv() {
         if let Err(err) = write_frame_packet(&mut stream, &envelope) {
             *status.lock().unwrap() =
                 ExternalToolStatus::Error(format!("send frame failed: {err}"));
@@ -149,29 +148,15 @@ fn run_bridge_worker(
     *status.lock().unwrap() = ExternalToolStatus::Disconnected;
 }
 
-fn take_latest_pending_frame(
-    pending_frame: &Arc<Mutex<Option<FrameEnvelope>>>,
-    wake_rx: &Receiver<()>,
-) -> Option<FrameEnvelope> {
-    let mut latest = pending_frame.lock().unwrap().take();
-    while wake_rx.try_recv().is_ok() {
-        let next = pending_frame.lock().unwrap().take();
-        if next.is_some() {
-            latest = next;
-        }
-    }
-    latest
-}
-
 /// Send a binary frame to the AugurBridge plugin.
 ///
-/// Protocol: `frame <width> <height> <nm_per_pixel>\n` followed by
-/// `width * height * 2` bytes of raw 16-bit little-endian pixel data.
+/// Protocol: `frame <width> <height> <nm_per_pixel> <seq> <timestamp_us>\n`
+/// followed by `width * height * 2` bytes of raw 16-bit little-endian pixel data.
 fn write_frame_packet<W: Write>(writer: &mut W, frame: &FrameEnvelope) -> Result<(), String> {
     writeln!(
         writer,
-        "frame {} {} {}",
-        frame.width, frame.height, frame.nm_per_pixel
+        "frame {} {} {} {} {}",
+        frame.width, frame.height, frame.nm_per_pixel, frame.seq, frame.timestamp_us
     )
     .map_err(|err| format!("header write failed: {err}"))?;
     write_pixels(writer, &frame.pixels)?;
@@ -226,12 +211,14 @@ mod tests {
             height: 1,
             pixels: vec![1, 0x0203],
             nm_per_pixel: 42.5,
+            seq: 7,
+            timestamp_us: 99,
         };
         let mut out = Vec::new();
 
         write_frame_packet(&mut out, &frame).expect("frame packet should encode");
 
-        let expected_prefix = b"frame 2 1 42.5\n";
+        let expected_prefix = b"frame 2 1 42.5 7 99\n";
         assert_eq!(&out[..expected_prefix.len()], expected_prefix);
         assert_eq!(&out[expected_prefix.len()..], &[1, 0, 3, 2]);
     }

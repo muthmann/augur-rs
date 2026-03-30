@@ -6,8 +6,10 @@
 2D preview can stay inside Augur for routine inspection work such as pixel probing, histogram-based
 brightness/contrast tuning, line profiles, ruler measurements, software ROI annotations, ROI
 statistics, colormap switching, and a scale-bar overlay. When a user wants a richer downstream
-analysis surface, Augur can also hand the newest preview frames off to ImageJ/Fiji through a small
-external-tool bridge backed by a bundled `AugurBridge_.jar` plugin.
+analysis surface, Augur can also hand preview frames off to ImageJ/Fiji through a small
+external-tool bridge backed by a bundled `AugurBridge_.jar` plugin. That bridge now supports both a
+bounded timeline stack for frame-history analysis and a live-only compatibility mode for the older
+single-window overwrite workflow.
 
 ## Viewer Tools
 
@@ -55,13 +57,25 @@ text command protocol and a binary frame protocol for live streaming.
 - do not place it in `plugins/Tools`, which ImageJ reserves for toolbar tools
 - if menus do not refresh automatically, restart ImageJ/Fiji or run `Help -> Refresh Menus`
 - then run `Plugins -> Augur -> Start Bridge`
+- the bridge startup dialog now lets the user choose `Timeline (stack)` or `Live only (single frame)`
+  and configure a persisted `Max frames` cap (default `500`) for timeline mode
 - the bridge connects to a configurable `host:port` and now defaults to `127.0.0.1:57294`
 - the dialog includes the plugin-install/start steps, inline status, and inline connection errors
-- preview frames are sent as raw 16-bit pixel data over the binary `frame` protocol; the plugin
-  updates a single persistent `ImagePlus` window in-place via `setPixels()` + `updateAndDraw()`,
-  so there is no close/reopen flicker and no TIFF file I/O per frame
-- the bridge now keeps only the newest pending frame and streams it from a small background worker,
-  so a slow ImageJ/Fiji update loop does not build up stale preview backlog inside Augur
+- preview frames are sent as raw 16-bit pixel data over the binary `frame` protocol; the Rust side
+  now tags each frame with a sequence number and frame-end timestamp so the ImageJ plugin can label
+  stack slices consistently
+- in `Timeline (stack)` mode, the plugin accumulates frames into a bounded `ImageStack`, exposes the
+  normal ImageJ slice slider for history navigation, follows the newest slice only while the user is
+  already on the live tail, and archives the current stack into a separate window if frame
+  dimensions change mid-stream
+- when the stack cap is reached, the oldest slices are dropped from the front so long runs stay
+  bounded in memory
+- in `Live only (single frame)` mode, the plugin preserves the previous behavior and keeps one
+  persistent `ImagePlus` window updated in place via `setPixels()` + `updateAndDraw()`
+- the Rust bridge now uses a bounded background frame queue (`32` envelopes) so brief ImageJ/Fiji
+  stalls can absorb short bursts without backpressuring Augur's preview/capture path
+- the ImageJ plugin drains pending frames onto the EDT in batches instead of blocking the socket
+  thread with one `invokeAndWait` call per frame
 - while streaming is active, the center panel shows a placeholder plus a `Return to augur` button
 - the top bar exposes the current ImageJ bridge status
 
@@ -88,11 +102,15 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
   host-view windows, so they can live outside the main OS window when supported
 - because ImageJ replaced its historic socket listener with a Java-RMI single-instance mechanism,
   `augur-gui/imagej-plugin/AugurBridge_.jar` restores a loopback-only TCP listener with a binary
-  frame protocol (`frame <w> <h> <scale>\n` + raw u16 LE pixels) that updates a persistent
-  `ImagePlus` in-place, avoiding TIFF file I/O and window close/reopen per frame
-- the ImageJ bridge lives under `augur-gui/src/external_tools/` and uses a bounded background
-  latest-frame sender plus fixed-size chunked pixel writes to avoid backpressuring capture or
-  preview work with unnecessary whole-frame copies or per-frame serialization buffers
+  frame protocol (`frame <w> <h> <scale> <seq> <timestamp_us>\n` + raw u16 LE pixels)
+- the Java bridge keeps its own EDT-side frame queue so multiple incoming frames can be folded into
+  one stack/display update, which keeps the ImageJ UI responsive under bursty traffic
+- the ImageJ bridge lives under `augur-gui/src/external_tools/` and now uses a bounded background
+  frame queue plus fixed-size chunked pixel writes so Augur can deliver short bursts of frame
+  history without blocking capture or preview work
+- the default ImageJ presentation is now a capped in-memory `ImageStack` instead of a single
+  overwritten image window, but the plugin still exposes a live-only fallback for users who only
+  need a remote preview
 
 ## Files
 
@@ -109,6 +127,7 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 ## Verification
 
 - `./augur-gui/imagej-plugin/build.sh`
+- `jar tf augur-gui/imagej-plugin/AugurBridge_.jar`
 - `cargo check -p augur-gui`
 - `cargo test -p augur-gui`
 - `cargo fmt --all -- --check`
@@ -116,3 +135,4 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
   - checking red/blue polarity, signed-count, intensity, and time-surface preview modes in live and replay mode
   - checking histogram/manual contrast interaction feel, including paused replay refreshes
   - validating ImageJ/Fiji connectivity on a machine with the bundled `AugurBridge_.jar` workflow
+  - checking timeline-stack scrubbing, auto-follow pause/resume, cap trimming, dimension-change archiving, and the live-only fallback mode

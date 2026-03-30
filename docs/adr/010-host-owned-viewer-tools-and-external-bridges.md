@@ -33,12 +33,17 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
 - preview display state is promoted from one percentile slider to explicit display settings
   (`min`, `max`, `gamma`, `colormap`)
 - external viewers implement a small `ExternalTool` trait under `external_tools/`
-- the first bridge, ImageJ/Fiji, uses a bounded background sender so external streaming stays
-  lossy/latest-oriented and cannot backpressure capture or preview processing
+- the first bridge, ImageJ/Fiji, uses a bounded background sender on the Rust side so external
+  streaming cannot backpressure capture or preview processing, while still preserving short bursts
+  of frame history for downstream tools
 - the ImageJ/Fiji bridge is paired with a tiny bundled `AugurBridge_.jar` plugin that provides a
-  loopback-only TCP listener on port `57294` with a binary frame protocol (`frame <w> <h> <scale>\n`
-  + raw u16 LE pixels) that updates a persistent `ImagePlus` in-place via `setPixels()` +
-  `updateAndDraw()`, avoiding TIFF file I/O and window flicker
+  loopback-only TCP listener on port `57294` with a binary frame protocol
+  (`frame <w> <h> <scale> <seq> <timestamp_us>\n` + raw u16 LE pixels)
+- the default ImageJ/Fiji presentation is a capped in-memory `ImageStack` with auto-follow on the
+  newest slice, bounded history trimming, and archived-stack rollover on dimension changes; the
+  plugin also keeps a live-only fallback mode for users who only want the old single-frame preview
+- ImageJ-side frame display updates are batched onto the EDT so the bridge can absorb bursty input
+  without one blocking EDT round-trip per frame
 
 ## Consequences
 
@@ -50,6 +55,8 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
 - ImageJ/Fiji streaming can be enabled or disconnected without changing the capture pipeline split
 - the ImageJ/Fiji workaround stays small and isolated to one auxiliary plugin artifact rather than
   pulling Java-specific remoting code into the Rust bridge
+- researchers can now use native ImageJ stack tools such as scrubbing, temporal measurements, and
+  stack projections on recent preview history without writing intermediary TIFF files
 
 ### Negative
 
@@ -58,6 +65,9 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
   future polish may further reduce divergence there
 - the ImageJ bridge is intentionally best-effort and now requires a one-time plugin install inside
   ImageJ/Fiji, plus manual validation against local Fiji bridge setups
+- the new timeline mode moves bounded frame-history memory pressure into ImageJ/Fiji itself, so the
+  plugin must keep an explicit frame cap and users still need to size it sensibly for their image
+  dimensions
 
 ## Alternatives Considered
 

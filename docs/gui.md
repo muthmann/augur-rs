@@ -186,10 +186,20 @@ running inside ImageJ/Fiji.
 - do not place it in `plugins/Tools`, which is reserved for toolbar tools
 - if ImageJ/Fiji does not refresh automatically, restart it or run `Help -> Refresh Menus`
 - then run `Plugins -> Augur -> Start Bridge`
+- the plugin startup dialog lets you pick `Timeline (stack)` or `Live only (single frame)` and set a
+  persisted `Max frames` cap for timeline mode
 - the dialog includes the plugin-install/start steps, inline bridge status, and inline connection
   errors
 - the default connection target is `127.0.0.1:57294`
-- while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and forwards only the newest frame to ImageJ on a lossy background channel, so stale frames are dropped instead of queued
+- while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and
+  forwards frames to ImageJ on a bounded background queue, so short EDT stalls can absorb a brief
+  burst without backpressuring the native preview/capture path
+- in `Timeline (stack)` mode, ImageJ builds a bounded `ImageStack` with the normal slice slider,
+  follows the newest frame while you stay on the live tail, stops auto-follow when you scrub away,
+  resumes when you return to the last slice, and archives the current stack if the incoming frame
+  dimensions change
+- in `Live only (single frame)` mode, the plugin preserves the earlier single-window overwrite
+  behavior
 - `Return to augur` disconnects the bridge and restores the in-app preview surface
 - the connection is best-effort today: use it for live inspection, and verify the exact Fiji-side
   workflow manually on your machine
