@@ -9,6 +9,14 @@
 The reconstruction window now reads the host-view dataset exposed by the active reconstruction
 provider. It does not probe optional plugin hooks or manifest capabilities anymore.
 
+The external reconstruction viewport owns its own repaint cadence while preview or replay is
+active, and reconstruction-side actions wake the root viewport immediately. This keeps the image
+refreshing even when the main window is unfocused and prevents play/pause, clear, and export
+actions from waiting on incidental root-window input.
+
+To avoid UI stalls, `augur-gui` only refreshes the accumulated reconstruction table after analysis
+work or reconstruction-setting changes instead of re-polling the full table on every GUI repaint.
+
 ## Expected Producer
 
 The intended table producer is the external `Localization Reconstruction` runtime plugin from [augur-plugins](https://github.com/muthmann/augur-plugins). That plugin accumulates `augur.localization.results` from upstream localization/fitting plugins and exposes the full table through the dynamic-plugin API.

@@ -151,6 +151,8 @@ pub struct ReconstructionSharedData {
     pub export_csv_requested: bool,
     pub export_image_requested: Option<ReconstructionImageFormat>,
     pub clear_requested: bool,
+    pub stream_active: bool,
+    pub refresh_interval_ms: u64,
 }
 
 impl Default for ReconstructionSharedData {
@@ -168,8 +170,15 @@ impl Default for ReconstructionSharedData {
             export_csv_requested: false,
             export_image_requested: None,
             clear_requested: false,
+            stream_active: false,
+            refresh_interval_ms: 33,
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconstructionViewportOutput {
+    pub root_repaint_requested: bool,
 }
 
 struct RenderedReconstruction {
@@ -249,53 +258,18 @@ pub fn export_image_to_path(path: &Path, image: &ColorImage) -> Result<(), Strin
 pub fn render_reconstruction_viewport(
     ui: &mut egui::Ui,
     shared: &Arc<Mutex<ReconstructionSharedData>>,
-) {
+) -> ReconstructionViewportOutput {
     let (
         texture,
         total_localizations,
         rendered_width,
         rendered_height,
-        zoom,
-        pixel_size_nm,
-        contrast_percentile,
-        colormap,
+        initial_zoom,
+        initial_pixel_size_nm,
+        initial_contrast_percentile,
+        initial_colormap,
     ) = {
-        let mut data = shared.lock().unwrap();
-
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Export CSV").clicked() {
-                data.export_csv_requested = true;
-            }
-            ui.menu_button("Export Image", |ui| {
-                if ui.button("PNG").clicked() {
-                    data.export_image_requested = Some(ReconstructionImageFormat::Png);
-                    ui.close_menu();
-                }
-                if ui.button("TIFF").clicked() {
-                    data.export_image_requested = Some(ReconstructionImageFormat::Tiff);
-                    ui.close_menu();
-                }
-            });
-            if ui.button("Clear").clicked() {
-                data.clear_requested = true;
-            }
-            ui.separator();
-            ui.label("Pixel size [nm]");
-            ui.add(egui::Slider::new(&mut data.pixel_size_nm, 5.0..=100.0));
-            ui.label("Contrast");
-            ui.add(egui::Slider::new(
-                &mut data.contrast_percentile,
-                90.0..=100.0,
-            ));
-            egui::ComboBox::from_id_source("reconstruction_colormap")
-                .selected_text(data.colormap.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut data.colormap, ReconstructionColormap::Hot, "Hot");
-                    ui.selectable_value(&mut data.colormap, ReconstructionColormap::Gray, "Gray");
-                });
-            ui.label("Zoom");
-            ui.add(egui::Slider::new(&mut data.zoom, 0.5..=8.0).logarithmic(true));
-        });
+        let data = shared.lock().unwrap();
 
         (
             data.texture.clone(),
@@ -308,6 +282,101 @@ pub fn render_reconstruction_viewport(
             data.colormap,
         )
     };
+
+    let mut zoom = initial_zoom;
+    let mut pixel_size_nm = initial_pixel_size_nm;
+    let mut contrast_percentile = initial_contrast_percentile;
+    let mut colormap = initial_colormap;
+    let mut export_csv_requested = false;
+    let mut export_image_requested = None;
+    let mut clear_requested = false;
+    let mut output = ReconstructionViewportOutput::default();
+
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Export CSV").clicked() {
+            export_csv_requested = true;
+            output.root_repaint_requested = true;
+        }
+        ui.menu_button("Export Image", |ui| {
+            if ui.button("PNG").clicked() {
+                export_image_requested = Some(ReconstructionImageFormat::Png);
+                output.root_repaint_requested = true;
+                ui.close_menu();
+            }
+            if ui.button("TIFF").clicked() {
+                export_image_requested = Some(ReconstructionImageFormat::Tiff);
+                output.root_repaint_requested = true;
+                ui.close_menu();
+            }
+        });
+        if ui.button("Clear").clicked() {
+            clear_requested = true;
+            output.root_repaint_requested = true;
+        }
+        ui.separator();
+        ui.label("Pixel size [nm]");
+        if ui
+            .add(egui::Slider::new(&mut pixel_size_nm, 5.0..=100.0))
+            .changed()
+        {
+            output.root_repaint_requested = true;
+        }
+        ui.label("Contrast");
+        if ui
+            .add(egui::Slider::new(&mut contrast_percentile, 90.0..=100.0))
+            .changed()
+        {
+            output.root_repaint_requested = true;
+        }
+        egui::ComboBox::from_id_source("reconstruction_colormap")
+            .selected_text(colormap.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut colormap, ReconstructionColormap::Hot, "Hot");
+                ui.selectable_value(&mut colormap, ReconstructionColormap::Gray, "Gray");
+            });
+        if colormap != initial_colormap {
+            output.root_repaint_requested = true;
+        }
+        ui.label("Zoom");
+        ui.add(egui::Slider::new(&mut zoom, 0.5..=8.0).logarithmic(true));
+    });
+
+    let pixel_size_changed = (pixel_size_nm - initial_pixel_size_nm).abs() > f64::EPSILON;
+    let contrast_changed = (contrast_percentile - initial_contrast_percentile).abs() > f32::EPSILON;
+    let zoom_changed = (zoom - initial_zoom).abs() > f32::EPSILON;
+    let colormap_changed = colormap != initial_colormap;
+
+    if export_csv_requested
+        || export_image_requested.is_some()
+        || clear_requested
+        || pixel_size_changed
+        || contrast_changed
+        || colormap_changed
+        || zoom_changed
+    {
+        let mut data = shared.lock().unwrap();
+        if export_csv_requested {
+            data.export_csv_requested = true;
+        }
+        if let Some(format) = export_image_requested {
+            data.export_image_requested = Some(format);
+        }
+        if clear_requested {
+            data.clear_requested = true;
+        }
+        if pixel_size_changed {
+            data.pixel_size_nm = pixel_size_nm;
+        }
+        if contrast_changed {
+            data.contrast_percentile = contrast_percentile;
+        }
+        if colormap_changed {
+            data.colormap = colormap;
+        }
+        if zoom_changed {
+            data.zoom = zoom;
+        }
+    }
 
     ui.separator();
 
@@ -336,6 +405,8 @@ pub fn render_reconstruction_viewport(
         ui.separator();
         ui.label(format!("Colormap: {}", colormap.label()));
     });
+
+    output
 }
 
 fn write_csv(mut writer: impl Write, table: &LocalizationTable) -> std::io::Result<()> {

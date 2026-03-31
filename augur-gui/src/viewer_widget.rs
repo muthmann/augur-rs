@@ -123,6 +123,19 @@ impl ViewerOutput {
         self.preview_mode_changed || self.contrast_changed || self.time_surface_tau_changed
     }
 
+    pub(crate) fn requests_root_update(&self) -> bool {
+        self.popup_toggled
+            || self.return_from_external
+            || self.mask_hotpixels_clicked
+            || self.replay_toggle_pause
+            || self.replay_restart
+            || self.replay_stop
+            || self.replay_seek_to.is_some()
+            || self.replay_set_speed.is_some()
+            || self.new_roi.is_some()
+            || self.needs_preview_refresh()
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         self.roi_committed |= other.roi_committed;
         if other.new_roi.is_some() {

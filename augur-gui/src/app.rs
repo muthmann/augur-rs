@@ -72,6 +72,45 @@ const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
+fn process_interval_for_view_mode(
+    view_mode: ViewMode,
+    preview_interval_ms: u64,
+    point_cloud_interval_ms: u64,
+) -> Duration {
+    if view_mode == ViewMode::PointCloud3d {
+        Duration::from_millis(point_cloud_interval_ms)
+    } else {
+        Duration::from_millis(preview_interval_ms)
+    }
+}
+
+fn viewport_stream_active(mode: AppMode, replay: ViewerReplayState) -> bool {
+    matches!(mode, AppMode::Previewing | AppMode::Recording)
+        || (mode == AppMode::Replaying && replay.active && !replay.paused && !replay.finished)
+}
+
+fn child_viewport_repaint_after(
+    stream_active: bool,
+    replay_open_task_active: bool,
+    process_interval: Duration,
+    preview_interval_ms: u64,
+) -> Option<Duration> {
+    let mut repaint_after =
+        replay_open_task_active.then_some(Duration::from_millis(preview_interval_ms));
+    if stream_active {
+        repaint_after = Some(
+            repaint_after
+                .map(|existing| existing.min(process_interval))
+                .unwrap_or(process_interval),
+        );
+    }
+    repaint_after
+}
+
+fn request_root_repaint(ctx: &egui::Context) {
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
 fn mib_to_bytes(mib: u64) -> usize {
     mib.saturating_mul(EVENT_STORE_MEBIBYTE as u64)
         .min(usize::MAX as u64) as usize
@@ -154,12 +193,15 @@ struct PopupSharedData {
     last_error: Option<String>,
     external_streaming: bool,
     external_streaming_label: String,
+    preview_interval_ms: u64,
+    point_cloud_interval_ms: u64,
     close_requested: bool,
     output: Option<ViewerOutput>,
 }
 
 impl Default for PopupSharedData {
     fn default() -> Self {
+        let global_defaults = GlobalSettingsConfig::default();
         Self {
             viewer: ViewerState::default(),
             texture: None,
@@ -182,6 +224,8 @@ impl Default for PopupSharedData {
             last_error: None,
             external_streaming: false,
             external_streaming_label: String::new(),
+            preview_interval_ms: global_defaults.preview_interval_ms,
+            point_cloud_interval_ms: global_defaults.point_cloud_interval_ms,
             close_requested: false,
             output: None,
         }
@@ -302,6 +346,7 @@ pub struct CameraApp {
     reconstruction_settings: ReconstructionRenderSettings,
     reconstruction_state: ReconstructionState,
     reconstruction_shared: Arc<Mutex<ReconstructionSharedData>>,
+    reconstruction_source_dirty: bool,
     imagej_dialog: ImageJDialogState,
     external_tool: Option<Box<dyn ExternalTool>>,
     host_view_registry: ResolvedHostViewRegistry,
@@ -375,6 +420,7 @@ impl CameraApp {
             reconstruction_settings: ReconstructionRenderSettings::default(),
             reconstruction_state: ReconstructionState::default(),
             reconstruction_shared: Arc::new(Mutex::new(ReconstructionSharedData::default())),
+            reconstruction_source_dirty: true,
             imagej_dialog: ImageJDialogState::default(),
             external_tool: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
@@ -503,6 +549,8 @@ impl CameraApp {
     }
 
     fn sync_reconstruction_shared(&self) {
+        let replay = self.viewer_replay_state();
+        let refresh_interval_ms = self.active_preview_process_interval().as_millis() as u64;
         let mut data = self.reconstruction_shared.lock().unwrap();
         data.texture = self.reconstruction_state.texture().cloned();
         data.total_localizations = self
@@ -516,6 +564,8 @@ impl CameraApp {
         data.pixel_size_nm = self.reconstruction_settings.pixel_size_nm;
         data.contrast_percentile = self.reconstruction_settings.contrast_percentile;
         data.colormap = self.reconstruction_settings.colormap;
+        data.stream_active = self.controller.is_some() && viewport_stream_active(self.mode, replay);
+        data.refresh_interval_ms = refresh_interval_ms.max(1);
     }
 
     fn collect_reconstruction_table(&self) -> Result<Option<LocalizationTable>, String> {
@@ -553,6 +603,7 @@ impl CameraApp {
             }
         }
         self.reconstruction_state.clear();
+        self.reconstruction_source_dirty = false;
         self.sync_reconstruction_shared();
     }
 
@@ -597,12 +648,15 @@ impl CameraApp {
     }
 
     fn update_reconstruction_window(&mut self, ctx: &egui::Context) {
-        match self.collect_reconstruction_table() {
-            Ok(table) => self.reconstruction_state.set_table(table),
-            Err(err) => {
-                self.last_error = Some(err);
-                self.reconstruction_state.clear();
+        if self.reconstruction_source_dirty {
+            match self.collect_reconstruction_table() {
+                Ok(table) => self.reconstruction_state.set_table(table),
+                Err(err) => {
+                    self.last_error = Some(err);
+                    self.reconstruction_state.clear();
+                }
             }
+            self.reconstruction_source_dirty = false;
         }
 
         {
@@ -637,13 +691,26 @@ impl CameraApp {
                 .with_inner_size([1200.0, 860.0]),
             move |ctx, class| match class {
                 egui::viewport::ViewportClass::Deferred => {
+                    let mut root_repaint_requested = false;
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        render_reconstruction_viewport(ui, &shared);
+                        root_repaint_requested =
+                            render_reconstruction_viewport(ui, &shared).root_repaint_requested;
                     });
+                    let repaint_after = shared.lock().ok().and_then(|data| {
+                        data.stream_active
+                            .then_some(Duration::from_millis(data.refresh_interval_ms.max(1)))
+                    });
+                    if let Some(duration) = repaint_after {
+                        ctx.request_repaint_after(duration);
+                    }
+                    if root_repaint_requested {
+                        request_root_repaint(ctx);
+                    }
                     if ctx.input(|i| i.viewport().close_requested()) {
                         if let Ok(mut data) = shared.lock() {
                             data.close_requested = true;
                         }
+                        request_root_repaint(ctx);
                     }
                 }
                 egui::viewport::ViewportClass::Embedded => {
@@ -652,12 +719,15 @@ impl CameraApp {
                         .open(&mut open)
                         .default_size([1100.0, 760.0])
                         .show(ctx, |ui| {
-                            render_reconstruction_viewport(ui, &shared);
+                            if render_reconstruction_viewport(ui, &shared).root_repaint_requested {
+                                request_root_repaint(ctx);
+                            }
                         });
                     if !open {
                         if let Ok(mut data) = shared.lock() {
                             data.close_requested = true;
                         }
+                        request_root_repaint(ctx);
                     }
                 }
                 _ => {}
@@ -726,6 +796,8 @@ impl CameraApp {
         data.last_error = self.last_error.clone();
         data.external_streaming = external_streaming;
         data.external_streaming_label = external_streaming_label.to_owned();
+        data.preview_interval_ms = self.preview_interval_ms;
+        data.point_cloud_interval_ms = self.point_cloud_interval_ms;
     }
 
     fn handle_viewer_output(
@@ -1009,6 +1081,7 @@ impl CameraApp {
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
         self.reconstruction_state.clear();
+        self.reconstruction_source_dirty = false;
         self.sync_reconstruction_shared();
         self.mark_host_view_datasets_stale();
         self.refresh_host_view_registry();
@@ -2419,6 +2492,8 @@ impl CameraApp {
                 }
             }
         }
+
+        self.reconstruction_source_dirty = true;
     }
 
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
@@ -2540,11 +2615,11 @@ impl CameraApp {
     }
 
     fn active_preview_process_interval(&self) -> Duration {
-        if self.active_view_mode() == ViewMode::PointCloud3d {
-            Duration::from_millis(self.point_cloud_interval_ms)
-        } else {
-            Duration::from_millis(self.preview_interval_ms)
-        }
+        process_interval_for_view_mode(
+            self.active_view_mode(),
+            self.preview_interval_ms,
+            self.point_cloud_interval_ms,
+        )
     }
 
     fn latest_detected_hotpixels(&self) -> Vec<(u16, u16)> {
@@ -3504,6 +3579,7 @@ impl eframe::App for CameraApp {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
             self.host_view_registry_dirty = true;
+            self.reconstruction_source_dirty = true;
         }
 
         let external_status = self.external_tool_status();
@@ -3590,6 +3666,8 @@ impl eframe::App for CameraApp {
                     .with_inner_size([1280.0, 820.0]),
                 move |ctx, class| match class {
                     egui::viewport::ViewportClass::Deferred => {
+                        let mut root_repaint_requested = false;
+                        let mut repaint_after = None;
                         if let Ok(mut data) = shared.lock() {
                             egui::CentralPanel::default().show(ctx, |ui| {
                                 let PopupSharedData {
@@ -3614,6 +3692,8 @@ impl eframe::App for CameraApp {
                                     last_error,
                                     external_streaming,
                                     external_streaming_label,
+                                    preview_interval_ms,
+                                    point_cloud_interval_ms,
                                     close_requested: _,
                                     output,
                                 } = &mut *data;
@@ -3647,15 +3727,33 @@ impl eframe::App for CameraApp {
                                 if viewer.show_aux_windows(ctx) {
                                     popup_output.contrast_changed = true;
                                 }
+                                root_repaint_requested = popup_output.requests_root_update();
                                 output
                                     .get_or_insert_with(Default::default)
                                     .merge(popup_output);
+                                repaint_after = child_viewport_repaint_after(
+                                    viewport_stream_active(*mode, *replay),
+                                    *replay_open_task_active,
+                                    process_interval_for_view_mode(
+                                        viewer.view_mode,
+                                        *preview_interval_ms,
+                                        *point_cloud_interval_ms,
+                                    ),
+                                    *preview_interval_ms,
+                                );
                             });
+                        }
+                        if let Some(duration) = repaint_after {
+                            ctx.request_repaint_after(duration);
+                        }
+                        if root_repaint_requested {
+                            request_root_repaint(ctx);
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             if let Ok(mut d) = shared.lock() {
                                 d.close_requested = true;
                             }
+                            request_root_repaint(ctx);
                         }
                     }
                     egui::viewport::ViewportClass::Embedded => {
@@ -3687,6 +3785,8 @@ impl eframe::App for CameraApp {
                                         last_error,
                                         external_streaming,
                                         external_streaming_label,
+                                        preview_interval_ms: _,
+                                        point_cloud_interval_ms: _,
                                         close_requested: _,
                                         output,
                                     } = &mut *data;
@@ -3720,6 +3820,9 @@ impl eframe::App for CameraApp {
                                     if viewer.show_aux_windows(ctx) {
                                         popup_output.contrast_changed = true;
                                     }
+                                    if popup_output.requests_root_update() {
+                                        request_root_repaint(ctx);
+                                    }
                                     output
                                         .get_or_insert_with(Default::default)
                                         .merge(popup_output);
@@ -3729,6 +3832,7 @@ impl eframe::App for CameraApp {
                             if let Ok(mut d) = shared.lock() {
                                 d.close_requested = true;
                             }
+                            request_root_repaint(ctx);
                         }
                     }
                     _ => {}
@@ -3760,9 +3864,7 @@ impl eframe::App for CameraApp {
         let stream_active = matches!(self.mode, AppMode::Previewing | AppMode::Recording)
             || (self.mode == AppMode::Replaying && !self.replay_paused && !self.replay_finished);
         let process_interval = self.active_preview_process_interval();
-        if self.reconstruction_window_open {
-            ctx.request_repaint();
-        } else if self.replay_open_task.is_some() {
+        if self.replay_open_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);
