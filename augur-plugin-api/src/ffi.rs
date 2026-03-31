@@ -277,6 +277,8 @@ pub struct PluginVTable {
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,
     pub set_setting: unsafe extern "C" fn(*mut c_void, FfiString, FfiSlice<u8>) -> bool,
     pub status_entries: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
+    pub accumulated_localizations:
+        unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize) -> bool,
     pub host_views: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub host_view_dataset:
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,

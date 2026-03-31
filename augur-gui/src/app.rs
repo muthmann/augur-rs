@@ -19,8 +19,8 @@ use augur_core::{
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
 use augur_plugin_api::{
-    EventStore, FfiCdEvent, GlobalSettings, HostViewKind, PluginInput, TableDatasetV1,
-    CTX_GLOBAL_SETTINGS,
+    EventStore, FfiCdEvent, GlobalSettings, HostViewKind, LocalizationTable, PluginInput,
+    TableDatasetV1, CTX_GLOBAL_SETTINGS,
 };
 use augur_prophesee::evk4::Evk4Camera;
 
@@ -44,6 +44,12 @@ use crate::{
     preview::{
         compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
         PreviewDisplaySettings,
+    },
+    reconstruction::{
+        export_csv_to_path as export_reconstruction_csv_to_path,
+        export_image_to_path as export_reconstruction_image_to_path,
+        render_reconstruction_viewport, ReconstructionImageFormat, ReconstructionRenderSettings,
+        ReconstructionSharedData, ReconstructionState,
     },
     settings::draw_settings,
     viewer_widget::{
@@ -292,6 +298,10 @@ pub struct CameraApp {
     camera_info: Option<DeviceInfo>,
     camera_status: String,
     popup_shared: Arc<Mutex<PopupSharedData>>,
+    reconstruction_window_open: bool,
+    reconstruction_settings: ReconstructionRenderSettings,
+    reconstruction_state: ReconstructionState,
+    reconstruction_shared: Arc<Mutex<ReconstructionSharedData>>,
     imagej_dialog: ImageJDialogState,
     external_tool: Option<Box<dyn ExternalTool>>,
     host_view_registry: ResolvedHostViewRegistry,
@@ -361,6 +371,10 @@ impl CameraApp {
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
             popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
+            reconstruction_window_open: false,
+            reconstruction_settings: ReconstructionRenderSettings::default(),
+            reconstruction_state: ReconstructionState::default(),
+            reconstruction_shared: Arc::new(Mutex::new(ReconstructionSharedData::default())),
             imagej_dialog: ImageJDialogState::default(),
             external_tool: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
@@ -486,6 +500,194 @@ impl CameraApp {
             "Streaming to ImageJ ({}:{})",
             self.imagej_dialog.host, self.imagej_dialog.port
         )
+    }
+
+    fn sync_reconstruction_shared(&self) {
+        let mut data = self.reconstruction_shared.lock().unwrap();
+        data.texture = self.reconstruction_state.texture().cloned();
+        data.total_localizations = self
+            .reconstruction_state
+            .table()
+            .map(|table| table.rows.len())
+            .unwrap_or(0);
+        let [width, height] = self.reconstruction_state.rendered_size();
+        data.rendered_width = width;
+        data.rendered_height = height;
+        data.pixel_size_nm = self.reconstruction_settings.pixel_size_nm;
+        data.contrast_percentile = self.reconstruction_settings.contrast_percentile;
+        data.colormap = self.reconstruction_settings.colormap;
+    }
+
+    fn collect_reconstruction_table(&self) -> Result<Option<LocalizationTable>, String> {
+        let mut selected: Option<LocalizationTable> = None;
+        for record in self.plugin_manager.records() {
+            let Some(plugin) = record.plugin() else {
+                continue;
+            };
+            if !plugin.enabled() {
+                continue;
+            }
+
+            let Some(table) = plugin.accumulated_localizations()? else {
+                continue;
+            };
+            if selected
+                .as_ref()
+                .is_some_and(|current| current.rows.len() >= table.rows.len())
+            {
+                continue;
+            }
+            selected = Some(table);
+        }
+        Ok(selected)
+    }
+
+    fn clear_reconstruction_plugins(&mut self) {
+        for record in self.plugin_manager.records_mut() {
+            let Some(plugin) = record.plugin_mut() else {
+                continue;
+            };
+            let has_table = plugin.accumulated_localizations().ok().flatten().is_some();
+            if has_table {
+                plugin.reset();
+            }
+        }
+        self.reconstruction_state.clear();
+        self.sync_reconstruction_shared();
+    }
+
+    fn export_reconstruction_csv(&mut self) {
+        let Some(table) = self.reconstruction_state.table() else {
+            self.last_error = Some("no reconstruction table is available to export".into());
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("reconstruction.csv")
+            .add_filter("CSV", &["csv"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_reconstruction_csv_to_path(&path, table) {
+            Ok(()) => self.last_error = None,
+            Err(err) => self.last_error = Some(err),
+        }
+    }
+
+    fn export_reconstruction_image(&mut self, format: ReconstructionImageFormat) {
+        let Some(image) = self.reconstruction_state.image() else {
+            self.last_error = Some("no reconstruction image is available to export".into());
+            return;
+        };
+        let default_name = format!("reconstruction.{}", format.extension());
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PNG", &["png"])
+            .add_filter("TIFF", &["tif", "tiff"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match export_reconstruction_image_to_path(&path, image) {
+            Ok(()) => self.last_error = None,
+            Err(err) => self.last_error = Some(err),
+        }
+    }
+
+    fn update_reconstruction_window(&mut self, ctx: &egui::Context) {
+        match self.collect_reconstruction_table() {
+            Ok(table) => self.reconstruction_state.set_table(table),
+            Err(err) => {
+                self.last_error = Some(err);
+                self.reconstruction_state.clear();
+            }
+        }
+
+        {
+            let shared = self.reconstruction_shared.lock().unwrap();
+            if (shared.pixel_size_nm - self.reconstruction_settings.pixel_size_nm).abs()
+                > f64::EPSILON
+            {
+                self.reconstruction_settings.pixel_size_nm = shared.pixel_size_nm;
+                self.reconstruction_state.mark_dirty();
+            }
+            if (shared.contrast_percentile - self.reconstruction_settings.contrast_percentile).abs()
+                > f32::EPSILON
+            {
+                self.reconstruction_settings.contrast_percentile = shared.contrast_percentile;
+                self.reconstruction_state.mark_dirty();
+            }
+            if shared.colormap != self.reconstruction_settings.colormap {
+                self.reconstruction_settings.colormap = shared.colormap;
+                self.reconstruction_state.mark_dirty();
+            }
+        }
+
+        self.reconstruction_state
+            .render_if_needed(ctx, self.reconstruction_settings);
+        self.sync_reconstruction_shared();
+
+        let shared = Arc::clone(&self.reconstruction_shared);
+        ctx.show_viewport_deferred(
+            egui::ViewportId::from_hash_of("reconstruction_window"),
+            egui::ViewportBuilder::default()
+                .with_title("Reconstruction — AugurRS")
+                .with_inner_size([1200.0, 860.0]),
+            move |ctx, class| match class {
+                egui::viewport::ViewportClass::Deferred => {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render_reconstruction_viewport(ui, &shared);
+                    });
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        if let Ok(mut data) = shared.lock() {
+                            data.close_requested = true;
+                        }
+                    }
+                }
+                egui::viewport::ViewportClass::Embedded => {
+                    let mut open = true;
+                    egui::Window::new("Reconstruction — AugurRS")
+                        .open(&mut open)
+                        .default_size([1100.0, 760.0])
+                        .show(ctx, |ui| {
+                            render_reconstruction_viewport(ui, &shared);
+                        });
+                    if !open {
+                        if let Ok(mut data) = shared.lock() {
+                            data.close_requested = true;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        );
+
+        let (close, clear, export_csv, export_image) = {
+            let mut data = self.reconstruction_shared.lock().unwrap();
+            let close = data.close_requested;
+            let clear = data.clear_requested;
+            let export_csv = data.export_csv_requested;
+            let export_image = data.export_image_requested.take();
+            data.close_requested = false;
+            data.clear_requested = false;
+            data.export_csv_requested = false;
+            (close, clear, export_csv, export_image)
+        };
+
+        if close {
+            self.reconstruction_window_open = false;
+        }
+        if clear {
+            self.clear_reconstruction_plugins();
+        }
+        if export_csv {
+            self.export_reconstruction_csv();
+        }
+        if let Some(format) = export_image {
+            self.export_reconstruction_image(format);
+        }
     }
 
     fn sync_popup_shared(
@@ -806,6 +1008,8 @@ impl CameraApp {
         self.event_store.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
+        self.reconstruction_state.clear();
+        self.sync_reconstruction_shared();
         self.mark_host_view_datasets_stale();
         self.refresh_host_view_registry();
     }
@@ -2755,6 +2959,10 @@ impl eframe::App for CameraApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
                     ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
+                    ui.checkbox(
+                        &mut self.reconstruction_window_open,
+                        "Reconstruction Window",
+                    );
                     let mut scale_bar_show =
                         self.with_active_viewer(|viewer| viewer.scale_bar_settings.show);
                     if ui.checkbox(&mut scale_bar_show, "Show Scale Bar").changed() {
@@ -3541,6 +3749,10 @@ impl eframe::App for CameraApp {
             }
         }
 
+        if self.reconstruction_window_open {
+            self.update_reconstruction_window(ctx);
+        }
+
         self.render_host_view_windows(ctx);
 
         self.sync_active_pipeline_requirements();
@@ -3548,7 +3760,9 @@ impl eframe::App for CameraApp {
         let stream_active = matches!(self.mode, AppMode::Previewing | AppMode::Recording)
             || (self.mode == AppMode::Replaying && !self.replay_paused && !self.replay_finished);
         let process_interval = self.active_preview_process_interval();
-        if self.replay_open_task.is_some() {
+        if self.reconstruction_window_open {
+            ctx.request_repaint();
+        } else if self.replay_open_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);

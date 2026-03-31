@@ -17,8 +17,8 @@ use augur_core::{
 use augur_plugin_api::{
     AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
     FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-    FfiSubpixelMarker, HostViewRegistry, PluginEntry, PluginInput, PluginVTable, SettingsSchema,
-    StatusEntry, PLUGIN_ENTRY_SYMBOL,
+    FfiSubpixelMarker, HostViewRegistry, LocalizationTable, PluginEntry, PluginInput, PluginVTable,
+    SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -278,6 +278,18 @@ impl DynPlugin {
 
     pub fn status_entries(&self) -> Result<Vec<StatusEntry>, String> {
         self.read_json(self.vtable.status_entries)
+    }
+
+    pub fn accumulated_localizations(&self) -> Result<Option<LocalizationTable>, String> {
+        let bytes = self.call_optional_bytes(|inst, ptr, len| unsafe {
+            (self.vtable.accumulated_localizations)(inst, ptr, len)
+        });
+        match bytes {
+            Some(bytes) => serde_json::from_slice(bytes)
+                .map(Some)
+                .map_err(|err| format!("accumulated localizations JSON invalid: {err}")),
+            None => Ok(None),
+        }
     }
 
     pub fn status_entries_cached(&mut self) -> Result<Vec<StatusEntry>, String> {

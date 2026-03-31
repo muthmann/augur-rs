@@ -314,6 +314,10 @@ pub trait Plugin: Default {
         Vec::new()
     }
 
+    fn accumulated_localizations(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     fn host_views(&self) -> HostViewRegistry {
         HostViewRegistry::default()
     }
