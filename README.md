@@ -34,7 +34,7 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 - **Backpressured 3-thread pipeline** — USB reader → bounded disk writer → lossy preview decoder. Recording never blocks on the UI, never grows unbounded in memory
 - **Reproducible sessions** — every `.raw` file gets a `.toml` config sidecar written automatically
 - **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
-- **Interactive preview workspace** — edge-collapsible side panels, hover `x/y`, drag-to-select ROI, zoom/crop controls, enlarged popup preview, and a toggleable 3D point-cloud view
+- **Interactive preview workspace** — edge-collapsible side panels, pixel inspection, histogram-driven brightness/contrast, colormap switching, line/ruler/annotation tools, scale-bar overlay, enlarged popup preview, ImageJ streaming, and a toggleable 3D point-cloud view
 - **Global settings menu** — top-bar control over pixel scale, sensor geometry, acquisition time, retained event history, and advanced preview/disk tuning
 - **Live preview stats** — 1-second sliding window for Mev/s and MB/s, plus per-frame ON/OFF polarity percentages in the GUI
 

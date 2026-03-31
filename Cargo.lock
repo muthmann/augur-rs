@@ -599,8 +599,11 @@ dependencies = [
  "augur-core",
  "augur-plugin-api",
  "augur-prophesee",
+ "crossbeam-channel",
  "eframe",
  "egui",
+ "egui-phosphor",
+ "egui_plot",
  "image",
  "libloading 0.8.9",
  "rfd",
@@ -1249,6 +1252,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c873785789bc94a14dcbbd361cda1e498957fa1b4ec389ba650fd651849463b"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1297,6 +1309,15 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "winit",
+]
+
+[[package]]
+name = "egui_plot"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7854b86dc1c2d352c5270db3d600011daa913d6b554141a03939761323288a1"
+dependencies = [
+ "egui",
 ]
 
 [[package]]

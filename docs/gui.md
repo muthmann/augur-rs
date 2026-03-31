@@ -19,11 +19,12 @@ A single menu bar row at the top of the window:
 | `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay |
 | `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection |
 | `Settings` | Pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls |
-| `View` | Toggle Settings/Analysis panels, switch 2D/3D view mode |
+| `View` | Toggle Settings/Analysis panels, show/hide the scale bar, switch 2D/3D view mode |
+| `Tools` | Connect or disconnect the ImageJ/Fiji bridge |
 | `Plugins` | Plugin Manager, Scan for New Plugins, Open Plugins Folder |
 | `Analysis` | Per-plugin enable/disable checkboxes (shown only when plugins exist) |
 
-The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), and the current camera/session status label.
+The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), the ImageJ bridge status when connected, and the current camera/session status label.
 
 ---
 
@@ -93,13 +94,27 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 The center panel is now an interactive preview workspace shared by the embedded view and the enlarged popup.
 
+- the entire central viewer, including the heading strip, toolbar, canvas, replay transport, and
+  lower control area, is rendered by one shared viewer component
+- when the popup is open, that same viewer state moves into the popup host and the main window
+  shows a placeholder plus a return button instead of running a second divergent renderer
+
 ### 2D preview tools
 
-- hover the preview to read the current sensor-space `x, y` cursor position
-- `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`
-- `+`, `-`, and `Fit` control zoom
+- hover the preview to read the current sensor-space `x, y` position together with ON / OFF / combined pixel values
+- the preview toolbar uses compact icon buttons with hover tooltips for ROI, line profile, ruler, annotation, histogram, zoom, and popup actions, and it stays on one row instead of wrapping the hover readout below the preview
+- `Histogram` opens a mode-aware histogram plus brightness/contrast window with labeled intensity/count axes, hover readouts, Auto percentile, manual min/max, gamma controls, draggable marker handles, and a display-ramp preview
+- the scroll area below the preview includes a `Mode` selector for red-blue polarity, signed count, time surface, and summed-intensity colormap rendering
+- when `Time Surface` is active, a logarithmic `Decay τ [ms]` slider controls the temporal decay constant and Augur automatically requests raw preview events
+- `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`; during replay the disabled tooltip points users to rectangle annotations instead
+- `Line Profile` samples ON and OFF intensity along a dragged line, opens after the drag completes, and includes labeled axes plus an optional ON+OFF sum trace
+- `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
+- `Rect` and `Ellipse` add host-side software annotations; selecting one shows ROI statistics for ON, OFF, and combined channels
+- `Esc` clears the active ROI/line/ruler/annotation draft, while `Delete` / `Backspace` removes the selected annotation
+- zoom-out, zoom-in, and fit-to-window icon buttons control zoom
 - when zoomed in, dragging the image pans the viewport
-- `Crop to ROI` switches between full-frame and ROI-only rendering
+- `Crop to ROI` switches between full-frame and ROI-only rendering without changing the allocated canvas size
+- a scale-bar overlay can be toggled from `View` or from the preview controls and positioned in any corner
 - `Enlarge` opens a larger resizable popup that reuses the same zoom/crop/ROI state as the main preview
 
 If a ROI is configured, the full-frame preview shows its outline. While dragging a new ROI, the pending selection rectangle is drawn live on top of the image.
@@ -135,7 +150,7 @@ HDF5 replay is optional at build time. Build or run `augur-gui` with `--features
 
 The center panel switches to a `Replay` heading and shows a transport bar between the canvas and the scrollable controls area:
 
-- `▶` / `⏸` Play/Pause, `⏮` Restart, `⏹` Stop buttons
+- play/pause, restart, and stop icon buttons
 - a Speed combo box (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
 - a full-width timeline slider for seeking within the recording
 - current / total replay time
@@ -146,16 +161,58 @@ At EOF, replay shuts down its controller threads but stays in replay mode so the
 
 ---
 
-## Preview Contrast
+## Preview Contrast And Colormaps
 
-A `Contrast` slider below the preview is available in 2D mode only (live and replay). In 3D mode, point cloud metrics are shown instead.
+The 2D preview uses a shared display model for the base image and ROI-grid overlay:
 
-- the slider controls percentile-based normalization (`90.0` to `100.0`)
-- this prevents a single hotpixel from dominating the entire frame
-- lower percentiles reveal dimmer activity at the cost of earlier saturation
-- ON events render in green, OFF events render in red, and mixed pixels appear yellow/orange
+- `Auto` mode updates the display max from the active mode's histogram percentile (`90.0` to `100.0`)
+- `Manual` mode lets you pin display min/max from the histogram window for repeatable inspection
+- `Gamma` defaults to `0.5`, which keeps the previous square-root-like look while allowing flatter or steeper contrast curves
+- `Red-Blue Polarity` uses red for ON-dominant pixels, blue for OFF-dominant pixels, and magenta when both polarities balance at the same pixel
+- `Signed Count` maps the net polarity (`ON - OFF`) through a blue-white-red diverging ramp while preserving a black background for pixels with no events
+- `Time Surface` renders `exp(-(t_now - t_last) / τ)` in grayscale; if the current frame does not yet carry raw events, Augur falls back to grayscale summed intensity until a raw-event frame arrives
+- the intensity modes combine ON+OFF into one channel for grayscale or false-color inspection
+- fire / red hot / grays / green / cyan hot / magenta hot / ice / blue white red use the shared official LUT set
+- changing the preview mode, time-surface decay, or histogram contrast controls immediately re-renders the current frame, including paused replay frames
+- ruler, line-profile, and scale-bar overlays use outline/shadow rendering so they remain readable on bright colormaps
 
-The same contrast setting is used for the base preview image and ROI-grid rendering, with one shared normalization range across both polarity channels so relative ON/OFF strength remains visible.
+In 3D mode, the scroll area still switches over to point-cloud metrics instead of 2D display controls.
+
+---
+
+## External Tools
+
+`Tools -> Stream to ImageJ...` opens a small connection dialog for the bundled Augur Bridge plugin
+running inside ImageJ/Fiji.
+
+- use `Save bundled plugin jar...` in the dialog to export `AugurBridge_.jar`
+- in ImageJ/Fiji, install that jar with `Plugins -> Install PlugIn...`, drag it onto the
+  ImageJ/Fiji window, or copy it into the main `plugins/` folder
+- do not place it in `plugins/Tools`, which is reserved for toolbar tools
+- if ImageJ/Fiji does not refresh automatically, restart it or run `Help -> Refresh Menus`
+- then run `Plugins -> Augur -> Start Bridge`
+- the plugin startup dialog lets you pick `Timeline (stack)` or `Live only (single frame)` and set a
+  persisted `Max frames` cap for timeline mode
+- the dialog includes the plugin-install/start steps, inline bridge status, and inline connection
+  errors
+- the default connection target is `127.0.0.1:57294`
+- while the bridge is active, Augur shows a central placeholder instead of the local 2D preview and
+  forwards frames to ImageJ on a bounded background queue, so short EDT stalls can absorb a brief
+  burst without backpressuring the native preview/capture path
+- in `Timeline (stack)` mode, ImageJ builds a bounded `ImageStack` with the normal slice slider,
+  follows the newest frame while you stay on the live tail, stops auto-follow when you scrub away,
+  resumes when you return to the last slice, and archives the current stack if the incoming frame
+  dimensions change
+- in `Live only (single frame)` mode, the plugin preserves the earlier single-window overwrite
+  behavior
+- `Return to augur` disconnects the bridge and restores the in-app preview surface
+- the connection is best-effort today: use it for live inspection, and verify the exact Fiji-side
+  workflow manually on your machine
+
+The repository includes both the installable jar and its source/build files under
+`augur-gui/imagej-plugin/` in case you need to rebuild the plugin against a local `ij.jar`.
+
+Histogram and line-profile tools also use deferred OS windows when the backend supports them, with embedded `egui::Window` fallbacks on backends that do not.
 
 ---
 
@@ -173,7 +230,9 @@ Status, warning, and error labels adapt to the active GUI theme.
 
 - Acquisition time is only adjustable for live preview and recording
 - sensor geometry and disk-writer buffer are start-time controls, so they are only editable while idle
-- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu
+- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu, which now shows those cadences in Hz instead of milliseconds
+- preview histogram work stays bounded even when a frame contains very large per-pixel counts, and
+  time-surface mode reuses one cached decay pass for both the image and histogram views
 - output path editing is disabled during active recording and replay
 - the camera/replay status line below the toolbar shows the current session state
 - the stats area also shows per-frame `ON % | OFF %` plus the event count for the latest preview frame

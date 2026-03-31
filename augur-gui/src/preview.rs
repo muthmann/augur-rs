@@ -2,22 +2,121 @@ use std::cell::RefCell;
 
 use augur_core::{
     analysis::{roi_grid::RoiGrid, Overlay},
-    pipeline::PreviewFrame,
+    pipeline::{CdEvent, PreviewFrame},
 };
 use egui::{Color32, ColorImage};
+
+use crate::colormap::Colormap;
 
 thread_local! {
     static PREVIEW_SCRATCH: RefCell<PreviewRenderScratch> = RefCell::new(PreviewRenderScratch::default());
 }
 
+const MAX_HISTOGRAM_BINS: usize = 4096;
+const TIME_SURFACE_BINS: usize = 256;
+
 #[derive(Default)]
 struct PreviewRenderScratch {
-    hist: Vec<u32>,
     grid_col_map: Vec<usize>,
     grid_row_map: Vec<usize>,
     grid_x_line: Vec<bool>,
     grid_y_line: Vec<bool>,
     grid_cell_highlight: Vec<bool>,
+    time_surface: Vec<u64>,
+    time_surface_size: [usize; 2],
+    time_surface_frame_end_us: Option<u64>,
+    time_surface_values: Vec<u8>,
+    time_surface_decay_key: Option<TimeSurfaceDecayKey>,
+    time_surface_histogram: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeSurfaceDecayKey {
+    frame_end_us: u64,
+    tau_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewDisplaySettings {
+    pub display_min: u16,
+    pub display_max: u16,
+    pub gamma: f32,
+}
+
+impl Default for PreviewDisplaySettings {
+    fn default() -> Self {
+        Self {
+            display_min: 0,
+            display_max: 255,
+            gamma: 0.5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayNormalizer {
+    display_min: f32,
+    inverse_range: f32,
+    gamma: f32,
+}
+
+impl DisplayNormalizer {
+    fn new(settings: PreviewDisplaySettings) -> Self {
+        let display_min = settings
+            .display_min
+            .min(settings.display_max.saturating_sub(1));
+        let display_max = settings.display_max.max(display_min.saturating_add(1));
+        let range = (f32::from(display_max) - f32::from(display_min)).max(1.0);
+        Self {
+            display_min: f32::from(display_min),
+            inverse_range: 1.0 / range,
+            gamma: settings.gamma.max(0.01),
+        }
+    }
+
+    fn normalize(self, value: u16) -> f32 {
+        ((f32::from(value) - self.display_min).max(0.0) * self.inverse_range)
+            .clamp(0.0, 1.0)
+            .powf(self.gamma)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewMode {
+    RedBlue,
+    SignedCount,
+    Intensity(Colormap),
+    TimeSurface,
+}
+
+impl Default for PreviewMode {
+    fn default() -> Self {
+        Self::Intensity(Colormap::Grays)
+    }
+}
+
+impl PreviewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RedBlue => "Red-Blue Polarity",
+            Self::SignedCount => "Signed Count",
+            Self::Intensity(colormap) => colormap.label(),
+            Self::TimeSurface => "Time Surface",
+        }
+    }
+
+    pub fn requires_raw_events(self) -> bool {
+        matches!(self, Self::TimeSurface)
+    }
+
+    pub fn ramp_label(self) -> &'static str {
+        match self {
+            Self::RedBlue => "Red-blue polarity ramp",
+            Self::SignedCount => "Signed-count diverging ramp",
+            Self::Intensity(_) => "Intensity display ramp",
+            Self::TimeSurface => "Time-surface decay ramp",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -28,14 +127,22 @@ struct PixelRect {
     height: usize,
 }
 
+pub fn reset_preview_render_cache() {
+    PREVIEW_SCRATCH.with(|scratch| {
+        *scratch.borrow_mut() = PreviewRenderScratch::default();
+    });
+}
+
 pub fn frame_to_color_image(
     frame: &PreviewFrame,
     overlays: &[Overlay],
-    contrast_percentile: f32,
+    settings: PreviewDisplaySettings,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
 ) -> ColorImage {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    let max = percentile_value_two(&frame.pixels_on, &frame.pixels_off, contrast_percentile) as f32;
+    let normalizer = DisplayNormalizer::new(settings);
     let mut image = ColorImage::new([w, h], Color32::TRANSPARENT);
 
     // Look for a ROI grid overlay to merge into the base rendering pass.
@@ -47,99 +154,75 @@ pub fn frame_to_color_image(
         _ => None,
     });
 
-    if let Some((grid, top_n)) = roi {
-        PREVIEW_SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
+    PREVIEW_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        if let Some((grid, top_n)) = roi {
             render_base_with_grid(
                 frame,
                 grid,
                 top_n,
-                max,
-                w,
-                h,
+                normalizer,
+                mode,
+                time_surface_tau_us,
+                [w, h],
+                &mut image.pixels[..],
+                &mut scratch,
+            );
+        } else {
+            render_base(
+                frame,
+                normalizer,
+                mode,
+                time_surface_tau_us,
                 &mut image.pixels,
                 &mut scratch,
             );
-        });
-    } else {
-        render_base(frame, max, &mut image.pixels);
-    }
+        }
+    });
 
     render_overlays(frame, overlays, &mut image.pixels, w, h);
 
     image
 }
 
-#[cfg(test)]
-fn percentile_value(pixels: &[u16], percentile: f32) -> u16 {
-    percentile_value_from_slices(&[pixels], percentile)
-}
-
-fn percentile_value_two(on: &[u16], off: &[u16], percentile: f32) -> u16 {
-    percentile_value_from_slices(&[on, off], percentile)
-}
-
-fn percentile_value_from_slices(channels: &[&[u16]], percentile: f32) -> u16 {
-    PREVIEW_SCRATCH.with(|scratch| {
-        let mut scratch = scratch.borrow_mut();
-        percentile_value_from_slices_with_hist(channels, percentile, &mut scratch.hist)
-    })
-}
-
-fn percentile_value_from_slices_with_hist(
-    channels: &[&[u16]],
-    percentile: f32,
-    hist_scratch: &mut Vec<u32>,
-) -> u16 {
-    let max_val = channels
-        .iter()
-        .flat_map(|channel| channel.iter())
-        .copied()
-        .max()
-        .unwrap_or(0) as usize;
-    if max_val == 0 {
-        return 1;
-    }
-
-    // Cap histogram at 4096 entries (16 KB). Values above the cap are clamped
-    // into the last bin, so a single hot pixel at 65535 does not force a
-    // 256 KB allocation every frame.
-    const MAX_BINS: usize = 4096;
-    let hist_size = max_val.min(MAX_BINS - 1) + 1;
-    hist_scratch.resize(hist_size, 0);
-    hist_scratch.fill(0);
-    for channel in channels {
-        for &value in *channel {
-            hist_scratch[(value as usize).min(hist_size - 1)] += 1;
+pub fn compute_frame_histogram(
+    frame: &PreviewFrame,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+) -> Vec<u64> {
+    match mode {
+        PreviewMode::RedBlue | PreviewMode::Intensity(_) => {
+            histogram_from_values(frame.pixels.iter().copied())
         }
-    }
-
-    let percentile = percentile.clamp(0.0, 100.0);
-    let len = channels.iter().map(|channel| channel.len()).sum::<usize>();
-    let target =
-        ((len as f64 * percentile as f64 / 100.0).ceil() as u64).clamp(1, len.max(1) as u64);
-    let mut cumulative = 0u64;
-    for (value, &count) in hist_scratch.iter().enumerate() {
-        cumulative += u64::from(count);
-        if cumulative >= target {
-            return value.max(1) as u16;
-        }
-    }
-
-    hist_size.max(1) as u16
-}
-
-fn render_base(frame: &PreviewFrame, max: f32, pixels: &mut [Color32]) {
-    for (i, pixel) in pixels.iter_mut().enumerate() {
-        let r = normalized_channel(frame.pixels_off[i], max);
-        let g = normalized_channel(frame.pixels_on[i], max);
-        *pixel = Color32::from_rgb(r.max(8), g.max(8), 8);
+        PreviewMode::SignedCount => histogram_from_values(
+            frame
+                .pixels_on
+                .iter()
+                .zip(&frame.pixels_off)
+                .map(|(&on, &off)| on.abs_diff(off)),
+        ),
+        PreviewMode::TimeSurface => PREVIEW_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            if !ensure_time_surface_render_cache(frame, time_surface_tau_us, &mut scratch) {
+                return histogram_from_values(frame.pixels.iter().copied());
+            }
+            scratch.time_surface_histogram.clone()
+        }),
     }
 }
 
-fn normalized_channel(value: u16, max: f32) -> u8 {
-    let clamped = (value as f32).min(max);
-    ((clamped / max).sqrt() * 255.0) as u8
+fn render_base(
+    frame: &PreviewFrame,
+    normalizer: DisplayNormalizer,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+    pixels: &mut [Color32],
+    scratch: &mut PreviewRenderScratch,
+) {
+    prepare_time_surface(frame, mode, time_surface_tau_us, scratch);
+    for (index, pixel) in pixels.iter_mut().enumerate() {
+        *pixel = preview_pixel_color(frame, index, normalizer, mode, time_surface_tau_us, scratch);
+    }
 }
 
 /// Single-pass base frame + ROI grid overlay rendering.
@@ -153,12 +236,14 @@ fn render_base_with_grid(
     frame: &PreviewFrame,
     grid: &RoiGrid,
     top_n: usize,
-    max: f32,
-    w: usize,
-    h: usize,
+    normalizer: DisplayNormalizer,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+    size: [usize; 2],
     pixels: &mut [Color32],
     scratch: &mut PreviewRenderScratch,
 ) {
+    let [w, h] = size;
     let grid_cols = grid.cols();
     let grid_rows = grid.rows();
 
@@ -195,12 +280,14 @@ fn render_base_with_grid(
         let c1 = grid_bound_index(&grid.x_bounds, rect.x + rect.width).min(grid_cols);
         let r0 = grid_bound_index(&grid.y_bounds, rect.y);
         let r1 = grid_bound_index(&grid.y_bounds, rect.y + rect.height).min(grid_rows);
-        for r in r0..r1 {
-            for c in c0..c1 {
-                scratch.grid_cell_highlight[r * grid_cols + c] = true;
+        for row in r0..r1 {
+            for col in c0..c1 {
+                scratch.grid_cell_highlight[row * grid_cols + col] = true;
             }
         }
     }
+
+    prepare_time_surface(frame, mode, time_surface_tau_us, scratch);
 
     // Tint colors as u32 arrays for arithmetic.
     const LINE: [u32; 4] = [0, 220, 220, 100];
@@ -210,18 +297,26 @@ fn render_base_with_grid(
 
     // Single sequential pass - perfect cache locality, no per-cell function calls.
     for py in 0..h {
-        let gr = scratch.grid_row_map[py];
+        let grid_row = scratch.grid_row_map[py];
         let on_hline = scratch.grid_y_line[py];
-        let row_off = py * w;
+        let row_offset = py * w;
 
         for px in 0..w {
-            let on_v = frame.pixels_on[row_off + px];
-            let off_v = frame.pixels_off[row_off + px];
-            let base_g = u32::from(normalized_channel(on_v, max).max(8));
-            let base_r = u32::from(normalized_channel(off_v, max).max(8));
+            let [base_r, base_g, base_b, _] = preview_pixel_color(
+                frame,
+                row_offset + px,
+                normalizer,
+                mode,
+                time_surface_tau_us,
+                scratch,
+            )
+            .to_array();
+            let base_r = u32::from(base_r);
+            let base_g = u32::from(base_g);
+            let base_b = u32::from(base_b);
 
-            let gc = scratch.grid_col_map[px];
-            let cell = gr * grid_cols + gc;
+            let grid_col = scratch.grid_col_map[px];
+            let cell = grid_row * grid_cols + grid_col;
 
             let tint = if on_hline || scratch.grid_x_line[px] {
                 LINE
@@ -233,12 +328,12 @@ fn render_base_with_grid(
                 FREE
             };
 
-            let a = tint[3];
-            let inv = 255 - a;
-            let r = ((base_r * inv + tint[0] * a) / 255) as u8;
-            let g = ((base_g * inv + tint[1] * a) / 255) as u8;
-            let b = ((8 * inv + tint[2] * a) / 255) as u8;
-            pixels[row_off + px] = Color32::from_rgb(r, g, b);
+            let alpha = tint[3];
+            let inv_alpha = 255 - alpha;
+            let r = ((base_r * inv_alpha + tint[0] * alpha) / 255) as u8;
+            let g = ((base_g * inv_alpha + tint[1] * alpha) / 255) as u8;
+            let b = ((base_b * inv_alpha + tint[2] * alpha) / 255) as u8;
+            pixels[row_offset + px] = Color32::from_rgb(r, g, b);
         }
     }
 
@@ -260,26 +355,225 @@ fn render_base_with_grid(
     }
 }
 
+fn preview_pixel_color(
+    frame: &PreviewFrame,
+    index: usize,
+    normalizer: DisplayNormalizer,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+    scratch: &PreviewRenderScratch,
+) -> Color32 {
+    match mode {
+        PreviewMode::RedBlue => polarity_red_blue(frame, index, normalizer),
+        PreviewMode::SignedCount => signed_count_color(frame, index, normalizer),
+        PreviewMode::Intensity(colormap) => {
+            colormap.lookup(normalizer.normalize(frame.pixels[index]))
+        }
+        PreviewMode::TimeSurface => {
+            time_surface_color(frame, index, normalizer, time_surface_tau_us, scratch)
+                .unwrap_or_else(|| {
+                    Colormap::Grays.lookup(normalizer.normalize(frame.pixels[index]))
+                })
+        }
+    }
+}
+
+fn prepare_time_surface(
+    frame: &PreviewFrame,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+    scratch: &mut PreviewRenderScratch,
+) {
+    if matches!(mode, PreviewMode::TimeSurface) {
+        let _ = ensure_time_surface_render_cache(frame, time_surface_tau_us, scratch);
+    }
+}
+
+fn ensure_time_surface_state(frame: &PreviewFrame, scratch: &mut PreviewRenderScratch) -> bool {
+    let size = [frame.width as usize, frame.height as usize];
+    let pixel_count = size[0].saturating_mul(size[1]);
+    let geometry_changed =
+        scratch.time_surface_size != size || scratch.time_surface.len() != pixel_count;
+    let timestamp_regressed = scratch
+        .time_surface_frame_end_us
+        .is_some_and(|last_end| frame.window_end_us < last_end);
+
+    if geometry_changed || timestamp_regressed {
+        scratch.time_surface.resize(pixel_count, 0);
+        scratch.time_surface.fill(0);
+        scratch.time_surface_size = size;
+        scratch.time_surface_frame_end_us = None;
+        scratch.time_surface_values.resize(pixel_count, 0);
+        scratch.time_surface_values.fill(0);
+        scratch.time_surface_decay_key = None;
+        scratch.time_surface_histogram.resize(TIME_SURFACE_BINS, 0);
+        scratch.time_surface_histogram.fill(0);
+    }
+
+    if scratch.time_surface_frame_end_us == Some(frame.window_end_us) {
+        return true;
+    }
+
+    let Some(events) = frame.events.as_deref() else {
+        return false;
+    };
+    update_time_surface(events, frame.width, frame.height, &mut scratch.time_surface);
+    scratch.time_surface_frame_end_us = Some(frame.window_end_us);
+    scratch.time_surface_decay_key = None;
+    true
+}
+
+fn ensure_time_surface_render_cache(
+    frame: &PreviewFrame,
+    time_surface_tau_us: u64,
+    scratch: &mut PreviewRenderScratch,
+) -> bool {
+    if !ensure_time_surface_state(frame, scratch) {
+        return false;
+    }
+
+    let key = TimeSurfaceDecayKey {
+        frame_end_us: frame.window_end_us,
+        tau_us: time_surface_tau_us.max(1),
+    };
+    let pixel_count = frame.width as usize * frame.height as usize;
+    if scratch.time_surface_decay_key == Some(key)
+        && scratch.time_surface_values.len() == pixel_count
+    {
+        return true;
+    }
+
+    scratch.time_surface_values.resize(pixel_count, 0);
+    scratch.time_surface_histogram.resize(TIME_SURFACE_BINS, 0);
+    scratch.time_surface_histogram.fill(0);
+    for (index, &timestamp) in scratch.time_surface.iter().enumerate() {
+        let value = time_surface_value_u8(timestamp, frame.window_end_us, key.tau_us);
+        scratch.time_surface_values[index] = value;
+        scratch.time_surface_histogram[usize::from(value)] += 1;
+    }
+    scratch.time_surface_decay_key = Some(key);
+    true
+}
+
+fn update_time_surface(events: &[CdEvent], width: u16, height: u16, time_surface: &mut [u64]) {
+    for event in events {
+        if event.x >= width || event.y >= height {
+            continue;
+        }
+        let index = event.y as usize * width as usize + event.x as usize;
+        let encoded_timestamp = event.timestamp.saturating_add(1);
+        time_surface[index] = time_surface[index].max(encoded_timestamp);
+    }
+}
+
+fn polarity_red_blue(frame: &PreviewFrame, index: usize, normalizer: DisplayNormalizer) -> Color32 {
+    let total = frame.pixels[index];
+    if total == 0 {
+        return Color32::BLACK;
+    }
+
+    let on = frame.pixels_on[index];
+    let off = frame.pixels_off[index];
+    let brightness = channel_to_u8(normalizer.normalize(total));
+    match on.cmp(&off) {
+        std::cmp::Ordering::Greater => Color32::from_rgb(brightness, 0, 0),
+        std::cmp::Ordering::Less => Color32::from_rgb(0, 0, brightness),
+        std::cmp::Ordering::Equal => Color32::from_rgb(brightness, 0, brightness),
+    }
+}
+
+fn signed_count_color(
+    frame: &PreviewFrame,
+    index: usize,
+    normalizer: DisplayNormalizer,
+) -> Color32 {
+    if frame.pixels[index] == 0 {
+        return Color32::BLACK;
+    }
+
+    let on = frame.pixels_on[index];
+    let off = frame.pixels_off[index];
+    let magnitude = normalizer.normalize(on.abs_diff(off));
+    let signed_t = match on.cmp(&off) {
+        std::cmp::Ordering::Greater => 0.5 + 0.5 * magnitude,
+        std::cmp::Ordering::Less => 0.5 - 0.5 * magnitude,
+        std::cmp::Ordering::Equal => 0.5,
+    };
+    Colormap::BlueWhiteRed.lookup(signed_t)
+}
+
+fn time_surface_color(
+    frame: &PreviewFrame,
+    index: usize,
+    normalizer: DisplayNormalizer,
+    time_surface_tau_us: u64,
+    scratch: &PreviewRenderScratch,
+) -> Option<Color32> {
+    if scratch.time_surface_decay_key
+        != Some(TimeSurfaceDecayKey {
+            frame_end_us: frame.window_end_us,
+            tau_us: time_surface_tau_us.max(1),
+        })
+    {
+        return None;
+    }
+
+    Some(
+        Colormap::Grays.lookup(normalizer.normalize(u16::from(scratch.time_surface_values[index]))),
+    )
+}
+
+fn time_surface_value_u8(timestamp: u64, reference_us: u64, tau_us: u64) -> u8 {
+    if timestamp == 0 {
+        return 0;
+    }
+
+    let last_event_us = timestamp.saturating_sub(1);
+    let dt = reference_us.saturating_sub(last_event_us);
+    let tau_us = tau_us.max(1) as f64;
+    let value = (-(dt as f64) / tau_us).exp();
+    (value * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn histogram_from_values(values: impl IntoIterator<Item = u16>) -> Vec<u64> {
+    let mut histogram = Vec::new();
+    for value in values {
+        let index = (value as usize).min(MAX_HISTOGRAM_BINS - 1);
+        if histogram.len() <= index {
+            histogram.resize(index + 1, 0);
+        }
+        histogram[index] += 1;
+    }
+    if histogram.is_empty() {
+        histogram.push(0);
+    }
+    histogram
+}
+
+fn channel_to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 /// Linear sweep mapping each pixel coordinate to its grid cell index.
 fn build_pixel_to_grid_map(bounds: &[u16], size: usize, out: &mut Vec<usize>) {
     out.resize(size, 0);
     let max_idx = bounds.len().saturating_sub(2);
-    let mut gi = 0;
-    for (px, slot) in out.iter_mut().enumerate() {
-        while gi < max_idx && (px as u16) >= bounds[gi + 1] {
-            gi += 1;
+    let mut grid_index = 0;
+    for (pixel, slot) in out.iter_mut().enumerate() {
+        while grid_index < max_idx && (pixel as u16) >= bounds[grid_index + 1] {
+            grid_index += 1;
         }
-        *slot = gi;
+        *slot = grid_index;
     }
 }
 
 /// Find the boundary index for a grid-aligned value.
 fn grid_bound_index(bounds: &[u16], val: u16) -> usize {
-    bounds.partition_point(|&b| b < val)
+    bounds.partition_point(|&bound| bound < val)
 }
 
 fn blend_color(dst: &mut Color32, src: [u8; 4]) {
-    let [dr, dg, db, _da] = dst.to_array();
+    let [dr, dg, db, _] = dst.to_array();
     let alpha = u32::from(src[3]);
     let inv_alpha = 255 - alpha;
 
@@ -328,8 +622,8 @@ fn blend_pixel(
     if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
         return;
     }
-    let idx = y as usize * width + x as usize;
-    blend_color(&mut pixels[idx], color);
+    let index = y as usize * width + x as usize;
+    blend_color(&mut pixels[index], color);
 }
 
 fn draw_rect_border(
@@ -344,18 +638,18 @@ fn draw_rect_border(
     let y_end = (rect.y + rect.height).min(height);
 
     // Top and bottom edges.
-    for t in 0..thickness {
-        if rect.y + t < y_end {
+    for offset in 0..thickness {
+        if rect.y + offset < y_end {
             for px in rect.x..x_end {
-                let idx = (rect.y + t) * width + px;
-                blend_color(&mut pixels[idx], color);
+                let index = (rect.y + offset) * width + px;
+                blend_color(&mut pixels[index], color);
             }
         }
-        if y_end > t && y_end - 1 - t >= rect.y {
-            let by = y_end - 1 - t;
+        if y_end > offset && y_end - 1 - offset >= rect.y {
+            let by = y_end - 1 - offset;
             for px in rect.x..x_end {
-                let idx = by * width + px;
-                blend_color(&mut pixels[idx], color);
+                let index = by * width + px;
+                blend_color(&mut pixels[index], color);
             }
         }
     }
@@ -363,15 +657,15 @@ fn draw_rect_border(
     let inner_y = (rect.y + thickness).min(y_end);
     let inner_y_end = y_end.saturating_sub(thickness).max(inner_y);
     for py in inner_y..inner_y_end {
-        for t in 0..thickness {
-            if rect.x + t < x_end {
-                let idx = py * width + rect.x + t;
-                blend_color(&mut pixels[idx], color);
+        for offset in 0..thickness {
+            if rect.x + offset < x_end {
+                let index = py * width + rect.x + offset;
+                blend_color(&mut pixels[index], color);
             }
-            if x_end > t && x_end - 1 - t >= rect.x {
-                let rx = x_end - 1 - t;
-                let idx = py * width + rx;
-                blend_color(&mut pixels[idx], color);
+            if x_end > offset && x_end - 1 - offset >= rect.x {
+                let rx = x_end - 1 - offset;
+                let index = py * width + rx;
+                blend_color(&mut pixels[index], color);
             }
         }
     }
@@ -395,8 +689,8 @@ fn render_overlays(
                     if pixel.x >= frame.width || pixel.y >= frame.height {
                         continue;
                     }
-                    let idx = pixel.y as usize * w + pixel.x as usize;
-                    blend_color(&mut pixels[idx], *color);
+                    let index = pixel.y as usize * w + pixel.x as usize;
+                    blend_color(&mut pixels[index], *color);
                 }
             }
             Overlay::CrosshairMarkers {
@@ -422,30 +716,34 @@ fn render_overlays(
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_to_color_image, percentile_value, percentile_value_two};
+    use super::{
+        compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
+        PreviewDisplaySettings, PreviewMode, MAX_HISTOGRAM_BINS, TIME_SURFACE_BINS,
+    };
+    use crate::colormap::Colormap;
     use augur_core::{
         analysis::{roi_grid::compute_roi_grid, Overlay, Pixel, SubpixelMarker},
-        pipeline::PreviewFrame,
+        pipeline::{CdEvent, PreviewFrame},
     };
     use std::sync::Arc;
 
     #[test]
-    fn percentile_ignores_single_hotpixel_outlier() {
-        let pixels = [1, 2, 2, 3, 10_000];
-        assert_eq!(percentile_value(&pixels, 80.0), 3);
-    }
-
-    #[test]
-    fn percentile_returns_one_for_empty_or_all_zero() {
-        assert_eq!(percentile_value(&[], 99.5), 1);
-        assert_eq!(percentile_value(&[0, 0, 0], 99.5), 1);
-    }
-
-    #[test]
-    fn combined_percentile_uses_both_polarity_channels() {
-        let on = [0, 3];
-        let off = [0, 6];
-        assert_eq!(percentile_value_two(&on, &off, 75.0), 3);
+    fn histogram_counts_combined_pixels() {
+        let frame = PreviewFrame {
+            width: 3,
+            height: 1,
+            pixels: vec![0, 2, 2],
+            pixels_on: vec![0, 1, 2],
+            pixels_off: vec![0, 1, 0],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+        let histogram =
+            compute_frame_histogram(&frame, PreviewMode::Intensity(Colormap::Grays), 30_000);
+        assert_eq!(histogram, vec![1, 0, 2]);
     }
 
     #[test]
@@ -474,7 +772,13 @@ mod tests {
             },
         ];
 
-        let image = frame_to_color_image(&frame, &overlays, 80.0);
+        let image = frame_to_color_image(
+            &frame,
+            &overlays,
+            PreviewDisplaySettings::default(),
+            PreviewMode::RedBlue,
+            30_000,
+        );
 
         assert_eq!(image.size, [2, 1]);
         assert_eq!(image.pixels.len(), 2);
@@ -502,9 +806,112 @@ mod tests {
             highlight_top_n: 1,
         }];
 
-        let image = frame_to_color_image(&frame, &overlays, 50.0);
+        let image = frame_to_color_image(
+            &frame,
+            &overlays,
+            PreviewDisplaySettings::default(),
+            PreviewMode::RedBlue,
+            30_000,
+        );
 
         assert_eq!(image.size, [2, 2]);
         assert_eq!(image.pixels.len(), 4);
+    }
+
+    #[test]
+    fn false_color_preview_uses_shared_lookup_tables() {
+        let frame = PreviewFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![1],
+            pixels_on: vec![0],
+            pixels_off: vec![0],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+
+        let image = frame_to_color_image(
+            &frame,
+            &[],
+            PreviewDisplaySettings {
+                display_min: 0,
+                display_max: 1,
+                gamma: 1.0,
+            },
+            PreviewMode::Intensity(Colormap::Green),
+            30_000,
+        );
+
+        assert_eq!(image.pixels[0], Colormap::Green.lookup(1.0));
+    }
+
+    #[test]
+    fn signed_count_histogram_uses_net_polarity_magnitude() {
+        let frame = PreviewFrame {
+            width: 3,
+            height: 1,
+            pixels: vec![4, 6, 3],
+            pixels_on: vec![4, 2, 1],
+            pixels_off: vec![0, 5, 1],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+
+        let histogram = compute_frame_histogram(&frame, PreviewMode::SignedCount, 30_000);
+        assert_eq!(histogram, vec![1, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn time_surface_histogram_uses_decayed_values_when_events_are_available() {
+        reset_preview_render_cache();
+        let frame = PreviewFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![1],
+            pixels_on: vec![1],
+            pixels_off: vec![0],
+            on_count: 1,
+            off_count: 0,
+            events: Some(vec![CdEvent {
+                x: 0,
+                y: 0,
+                timestamp: 10,
+                polarity: true,
+            }]),
+            window_start_us: 0,
+            window_end_us: 10,
+        };
+
+        let histogram = compute_frame_histogram(&frame, PreviewMode::TimeSurface, 30_000);
+        assert_eq!(histogram.len(), TIME_SURFACE_BINS);
+        assert_eq!(histogram[255], 1);
+    }
+
+    #[test]
+    fn histogram_caps_hot_bins_to_keep_ui_work_bounded() {
+        let frame = PreviewFrame {
+            width: 3,
+            height: 1,
+            pixels: vec![0, 4095, 5000],
+            pixels_on: vec![0, 4095, 5000],
+            pixels_off: vec![0, 0, 0],
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+
+        let histogram =
+            compute_frame_histogram(&frame, PreviewMode::Intensity(Colormap::Grays), 30_000);
+        assert_eq!(histogram.len(), MAX_HISTOGRAM_BINS);
+        assert_eq!(histogram[0], 1);
+        assert_eq!(histogram[MAX_HISTOGRAM_BINS - 1], 2);
     }
 }

@@ -100,7 +100,7 @@ impl PointCloudState {
             available.y.min(max_height).max(260.0),
         );
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
 
         painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
         painter.rect_stroke(

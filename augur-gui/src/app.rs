@@ -8,12 +8,12 @@ use std::{
 };
 
 use augur_core::{
-    analysis::{AnalysisOutput, AnalysisSeverity, Overlay},
+    analysis::{AnalysisOutput, AnalysisWarning, Overlay},
     camera::{DeviceInfo, EventCamera},
-    config::{CameraConfig, GlobalSettingsConfig, RoiConfig},
+    config::{CameraConfig, GlobalSettingsConfig},
     pipeline::{
         spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
-        PreviewFrame,
+        PipelineStatsSnapshot, PreviewFrame,
     },
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
@@ -25,6 +25,10 @@ use augur_plugin_api::{
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
+    external_tools::{
+        ExternalTool, ExternalToolStatus, ImageJBridge, BUNDLED_IMAGEJ_PLUGIN_JAR,
+        BUNDLED_IMAGEJ_PLUGIN_JAR_NAME, DEFAULT_IMAGEJ_BRIDGE_PORT,
+    },
     host_views::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
         render_compact_table, render_density2d_view, render_density_window_viewport,
@@ -37,11 +41,20 @@ use crate::{
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
     plugins::create_all_plugins,
-    point_cloud::{PointCloudMetrics, PointCloudState},
-    preview::frame_to_color_image,
+    preview::{
+        compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
+        PreviewDisplaySettings,
+    },
     settings::draw_settings,
+    viewer_widget::{
+        draw_text_placeholder, draw_viewer, AppMode, PreviewTool, ViewMode, ViewerInput,
+        ViewerOutput, ViewerReplayState, ViewerState,
+    },
 };
 
+const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
+const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
+pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
     (0.25, "0.25x"),
     (0.5, "0.5x"),
@@ -50,17 +63,21 @@ const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
     (4.0, "4x"),
     (f32::INFINITY, "Max"),
 ];
-const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
-const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
-pub(crate) const PANEL_ROUNDING: f32 = 6.0;
-const PREVIEW_ZOOM_MIN: f32 = 1.0;
-const PREVIEW_ZOOM_MAX: f32 = 16.0;
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
 fn mib_to_bytes(mib: u64) -> usize {
     mib.saturating_mul(EVENT_STORE_MEBIBYTE as u64)
         .min(usize::MAX as u64) as usize
+}
+
+fn interval_ms_to_hz(interval_ms: u64) -> f64 {
+    1000.0 / interval_ms.max(1) as f64
+}
+
+fn hz_to_interval_ms(hz: f64, hz_range: std::ops::RangeInclusive<f64>) -> u64 {
+    let hz = hz.clamp(*hz_range.start(), *hz_range.end());
+    (1000.0 / hz).round().max(1.0) as u64
 }
 
 #[derive(Debug, Clone)]
@@ -88,26 +105,6 @@ fn cached_table(entry: Option<&HostDatasetCacheEntry>) -> Result<Option<&TableDa
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
-    Preview2d,
-    PointCloud3d,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreviewTool {
-    None,
-    SelectRoi,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppMode {
-    Idle,
-    Previewing,
-    Recording,
-    Replaying,
-}
-
 #[derive(Debug, Clone)]
 struct SavedLiveState {
     config: CameraConfig,
@@ -129,118 +126,79 @@ struct ReplayOpenTask {
     rx: mpsc::Receiver<Result<OpenedReplay, String>>,
 }
 
-#[derive(Debug, Clone)]
-struct PreviewWorkspaceState {
-    view_mode: ViewMode,
-    tool: PreviewTool,
-    popup_open: bool,
-    zoom: f32,
-    pan: egui::Vec2,
-    crop_to_roi: bool,
-    hover_sensor: Option<(u16, u16)>,
-    selection_anchor: Option<egui::Pos2>,
-    pending_roi: Option<egui::Rect>,
-    point_cloud: PointCloudState,
-}
-
-impl Default for PreviewWorkspaceState {
-    fn default() -> Self {
-        Self {
-            view_mode: ViewMode::Preview2d,
-            tool: PreviewTool::None,
-            popup_open: false,
-            zoom: 1.0,
-            pan: egui::Vec2::ZERO,
-            crop_to_roi: false,
-            hover_sensor: None,
-            selection_anchor: None,
-            pending_roi: None,
-            point_cloud: PointCloudState::default(),
-        }
-    }
-}
-
-impl PreviewWorkspaceState {
-    fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-        self.pending_roi = None;
-        self.tool = PreviewTool::None;
-    }
-
-    fn clear_session_state(&mut self) {
-        self.hover_sensor = None;
-        self.selection_anchor = None;
-        self.pending_roi = None;
-        self.point_cloud.clear();
-    }
-
-    fn reset_zoom(&mut self) {
-        self.zoom = 1.0;
-        self.pan = egui::Vec2::ZERO;
-    }
-
-    fn set_view_mode(&mut self, view_mode: ViewMode) {
-        self.view_mode = view_mode;
-        if view_mode != ViewMode::Preview2d {
-            self.clear_selection();
-        }
-    }
-}
-
 struct PopupSharedData {
+    viewer: ViewerState,
     texture: Option<egui::TextureHandle>,
+    frame: Option<PreviewFrame>,
+    overlays: Vec<Overlay>,
+    camera_info: Option<DeviceInfo>,
+    nm_per_pixel: f64,
+    config: CameraConfig,
     mode: AppMode,
-    view_mode: ViewMode,
-    roi: RoiConfig,
-    frame_width: u16,
-    frame_height: u16,
-    // replay
-    replay_paused: bool,
-    replay_finished: bool,
-    replay_speed: f32,
-    replay_fraction: f32,
-    replay_duration_us: u64,
-    replay_time_us: u64,
-    replay_bytes_read: u64,
-    replay_data_len: u64,
-    // actions from popup -> main
+    settings_locked: bool,
+    pipeline_stats: Option<PipelineStatsSnapshot>,
+    replay: ViewerReplayState,
+    analysis_warnings: Vec<AnalysisWarning>,
+    analysis_notice: Option<String>,
+    detected_hotpixels: Vec<(u16, u16)>,
+    config_dirty: bool,
+    acq_dirty: bool,
+    replay_open_task_active: bool,
+    replay_notice: Option<String>,
+    last_error: Option<String>,
+    external_streaming: bool,
+    external_streaming_label: String,
     close_requested: bool,
-    toggle_pause: bool,
-    restart: bool,
-    seek_to: Option<f32>,
-    set_speed: Option<f32>,
-    // popup-internal drag tracking
-    seek_drag: Option<f32>,
+    output: Option<ViewerOutput>,
 }
 
 impl Default for PopupSharedData {
     fn default() -> Self {
         Self {
+            viewer: ViewerState::default(),
             texture: None,
+            frame: None,
+            overlays: Vec::new(),
+            camera_info: None,
+            nm_per_pixel: 1.0,
+            config: CameraConfig::default(),
             mode: AppMode::Idle,
-            view_mode: ViewMode::Preview2d,
-            roi: RoiConfig {
-                x: 0,
-                y: 0,
-                width: 1280,
-                height: 720,
-            },
-            frame_width: 0,
-            frame_height: 0,
-            replay_paused: false,
-            replay_finished: false,
-            replay_speed: 1.0,
-            replay_fraction: 0.0,
-            replay_duration_us: 0,
-            replay_time_us: 0,
-            replay_bytes_read: 0,
-            replay_data_len: 0,
+            settings_locked: false,
+            pipeline_stats: None,
+            replay: ViewerReplayState::default(),
+            analysis_warnings: Vec::new(),
+            analysis_notice: None,
+            detected_hotpixels: Vec::new(),
+            config_dirty: false,
+            acq_dirty: false,
+            replay_open_task_active: false,
+            replay_notice: None,
+            last_error: None,
+            external_streaming: false,
+            external_streaming_label: String::new(),
             close_requested: false,
-            toggle_pause: false,
-            restart: false,
-            seek_to: None,
-            set_speed: None,
-            seek_drag: None,
+            output: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImageJDialogState {
+    open: bool,
+    host: String,
+    port: u16,
+    error: Option<String>,
+    info: Option<String>,
+}
+
+impl Default for ImageJDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            host: "127.0.0.1".into(),
+            port: DEFAULT_IMAGEJ_BRIDGE_PORT,
+            error: None,
+            info: None,
         }
     }
 }
@@ -303,7 +261,6 @@ pub struct CameraApp {
     replay_pause_after_seek_frame: bool,
     replay_speed: f32,
     replay_notice: Option<String>,
-    replay_seek_drag_value: Option<f32>,
     replay_open_task: Option<ReplayOpenTask>,
     saved_live_state: Option<SavedLiveState>,
     builtin_plugins: Vec<Box<dyn AnalysisPlugin>>,
@@ -322,8 +279,8 @@ pub struct CameraApp {
     disk_writer_buffer_mib: u64,
     acq_dirty: bool,
     config_dirty: bool,
-    contrast_percentile: f32,
-    preview_workspace: PreviewWorkspaceState,
+    viewer: ViewerState,
+    popup_open: bool,
     lock_settings_while_recording: bool,
     settings_panel_open: bool,
     analysis_panel_open: bool,
@@ -335,6 +292,8 @@ pub struct CameraApp {
     camera_info: Option<DeviceInfo>,
     camera_status: String,
     popup_shared: Arc<Mutex<PopupSharedData>>,
+    imagej_dialog: ImageJDialogState,
+    external_tool: Option<Box<dyn ExternalTool>>,
     host_view_registry: ResolvedHostViewRegistry,
     host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
@@ -344,7 +303,11 @@ pub struct CameraApp {
 }
 
 impl CameraApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
+
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
         let global_defaults = GlobalSettingsConfig::default();
@@ -367,7 +330,6 @@ impl CameraApp {
             replay_pause_after_seek_frame: false,
             replay_speed: 1.0,
             replay_notice: None,
-            replay_seek_drag_value: None,
             replay_open_task: None,
             saved_live_state: None,
             builtin_plugins: create_all_plugins(),
@@ -386,8 +348,8 @@ impl CameraApp {
             disk_writer_buffer_mib: global_defaults.disk_writer_buffer_mib,
             acq_dirty: false,
             config_dirty: false,
-            contrast_percentile: 99.5,
-            preview_workspace: PreviewWorkspaceState::default(),
+            viewer: ViewerState::default(),
+            popup_open: false,
             lock_settings_while_recording: true,
             settings_panel_open: true,
             analysis_panel_open: true,
@@ -399,6 +361,8 @@ impl CameraApp {
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
             popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
+            imagej_dialog: ImageJDialogState::default(),
+            external_tool: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
             host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
@@ -452,6 +416,380 @@ impl CameraApp {
         self.event_store
             .set_memory_budget(mib_to_bytes(global.event_store_budget_mib.max(1)));
         self.sync_config_global_from_runtime();
+    }
+
+    fn with_active_viewer<R>(&self, f: impl FnOnce(&ViewerState) -> R) -> R {
+        if self.popup_open {
+            let data = self.popup_shared.lock().unwrap();
+            f(&data.viewer)
+        } else {
+            f(&self.viewer)
+        }
+    }
+
+    fn with_active_viewer_mut<R>(&mut self, f: impl FnOnce(&mut ViewerState) -> R) -> R {
+        if self.popup_open {
+            let mut data = self.popup_shared.lock().unwrap();
+            f(&mut data.viewer)
+        } else {
+            f(&mut self.viewer)
+        }
+    }
+
+    fn active_view_mode(&self) -> ViewMode {
+        self.with_active_viewer(|viewer| viewer.view_mode)
+    }
+
+    fn open_popup_viewer(&mut self) {
+        if self.popup_open {
+            return;
+        }
+        let mut data = self.popup_shared.lock().unwrap();
+        data.viewer = std::mem::take(&mut self.viewer);
+        data.close_requested = false;
+        data.output = None;
+        self.popup_open = true;
+    }
+
+    fn close_popup_viewer(&mut self) {
+        if !self.popup_open {
+            return;
+        }
+        let mut data = self.popup_shared.lock().unwrap();
+        self.viewer = std::mem::take(&mut data.viewer);
+        data.close_requested = false;
+        data.output = None;
+        self.popup_open = false;
+    }
+
+    fn viewer_replay_state(&self) -> ViewerReplayState {
+        let (duration_us, data_len) = self
+            .replay_file_info
+            .as_ref()
+            .map(|info| (info.total_duration_us, info.data_len()))
+            .unwrap_or((0, 0));
+        ViewerReplayState {
+            active: self.mode == AppMode::Replaying && duration_us > 0,
+            paused: self.replay_paused,
+            finished: self.replay_finished,
+            speed: self.replay_speed,
+            fraction: self.current_replay_fraction(),
+            duration_us,
+            time_us: self.current_replay_time_us(),
+            bytes_read: self.current_replay_bytes_read(),
+            data_len,
+        }
+    }
+
+    fn current_external_streaming_label(&self) -> String {
+        format!(
+            "Streaming to ImageJ ({}:{})",
+            self.imagej_dialog.host, self.imagej_dialog.port
+        )
+    }
+
+    fn sync_popup_shared(
+        &mut self,
+        settings_locked: bool,
+        external_streaming: bool,
+        external_streaming_label: &str,
+    ) {
+        if !self.popup_open {
+            return;
+        }
+
+        let pipeline_stats = self
+            .controller
+            .as_ref()
+            .map(PipelineController::stats_snapshot);
+        let detected_hotpixels = self.latest_detected_hotpixels();
+        let mut data = self.popup_shared.lock().unwrap();
+        data.texture = self.texture.clone();
+        data.frame = self.latest_frame.clone();
+        data.overlays = self.analysis_output.overlays.clone();
+        data.camera_info = self.camera_info.clone();
+        data.nm_per_pixel = self.nm_per_pixel;
+        data.config = self.config.clone();
+        data.mode = self.mode;
+        data.settings_locked = settings_locked;
+        data.pipeline_stats = pipeline_stats;
+        data.replay = self.viewer_replay_state();
+        data.analysis_warnings = self.analysis_output.warnings.clone();
+        data.analysis_notice = self.analysis_notice.clone();
+        data.detected_hotpixels = detected_hotpixels;
+        data.config_dirty = self.config_dirty;
+        data.acq_dirty = self.acq_dirty;
+        data.replay_open_task_active = self.replay_open_task.is_some();
+        data.replay_notice = self.replay_notice.clone();
+        data.last_error = self.last_error.clone();
+        data.external_streaming = external_streaming;
+        data.external_streaming_label = external_streaming_label.to_owned();
+    }
+
+    fn handle_viewer_output(
+        &mut self,
+        ctx: &egui::Context,
+        output: ViewerOutput,
+        from_popup: bool,
+    ) {
+        if output.popup_toggled {
+            if from_popup || self.popup_open {
+                self.close_popup_viewer();
+            } else {
+                self.open_popup_viewer();
+            }
+        }
+
+        if let Some(new_roi) = output.new_roi {
+            self.config.roi = new_roi;
+            if self.mode != AppMode::Replaying {
+                self.config_dirty = true;
+            }
+        }
+
+        if output.return_from_external {
+            self.disconnect_external_tool();
+        }
+        if output.mask_hotpixels_clicked {
+            self.copy_detected_hotpixels_to_mask();
+        }
+        if output.replay_toggle_pause {
+            self.set_replay_paused(!self.replay_paused);
+        }
+        if output.replay_restart {
+            self.restart_replay();
+        }
+        if output.replay_stop {
+            self.stop_pipeline();
+        }
+        if let Some(fraction) = output.replay_seek_to {
+            self.seek_replay(fraction);
+        }
+        if let Some(speed) = output.replay_set_speed {
+            self.set_replay_speed(speed);
+        }
+
+        if output.needs_preview_refresh() {
+            self.refresh_preview_if_needed(ctx, true);
+        }
+    }
+
+    fn external_tool_status(&self) -> ExternalToolStatus {
+        self.external_tool
+            .as_ref()
+            .map(|tool| tool.status())
+            .unwrap_or(ExternalToolStatus::Disconnected)
+    }
+
+    fn disconnect_external_tool(&mut self) {
+        if let Some(mut tool) = self.external_tool.take() {
+            tool.disconnect();
+        }
+    }
+
+    fn show_imagej_dialog(&mut self, ctx: &egui::Context) {
+        if !self.imagej_dialog.open {
+            return;
+        }
+
+        let mut open = self.imagej_dialog.open;
+        let mut connect_requested = false;
+        let mut disconnect_requested = false;
+        let mut export_plugin_requested = false;
+        let external_status = self.external_tool_status();
+        egui::Window::new("Stream to ImageJ")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(380.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                // Scale font sizes based on the available width so the dialog
+                // becomes more readable when the user drags the resize handle.
+                let base_width = 380.0_f32;
+                let scale = (ui.available_width() / base_width).clamp(1.0, 2.0);
+                let body_size = 14.0 * scale;
+                let small_size = 12.0 * scale;
+
+                let (status_label, status_color) = match &external_status {
+                    ExternalToolStatus::Disconnected => (
+                        "Disconnected",
+                        ui.visuals().widgets.inactive.fg_stroke.color,
+                    ),
+                    ExternalToolStatus::Connecting => ("Connecting...", analysis_info_color()),
+                    ExternalToolStatus::Streaming => ("Connected", status_success_color()),
+                    ExternalToolStatus::Error(_) => ("Error", ui.visuals().error_fg_color),
+                };
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Status:").size(body_size));
+                    ui.label(
+                        egui::RichText::new(status_label)
+                            .size(body_size)
+                            .color(status_color),
+                    );
+                });
+                ui.add_space(4.0 * scale);
+
+                ui.separator();
+
+                // --- Setup instructions ---
+                ui.add_space(2.0 * scale);
+                ui.label(egui::RichText::new("Plugin Setup").size(body_size).strong());
+                ui.add_space(2.0 * scale);
+
+                let steps = [
+                    "Export the plugin with the button below.",
+                    "Install it in ImageJ/Fiji via Plugins > Install...",
+                    "Or drag it onto ImageJ/Fiji or copy it into the main plugins/ folder.",
+                    "Do not place it in plugins/Tools (reserved for toolbar tools).",
+                    "Restart ImageJ/Fiji (or Help > Refresh Menus).",
+                    "Start the bridge: Plugins > Augur > Start Bridge.",
+                ];
+                for (i, step) in steps.iter().enumerate() {
+                    ui.label(egui::RichText::new(format!("{}. {step}", i + 1)).size(small_size));
+                }
+
+                ui.add_space(6.0 * scale);
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(format!("Save {BUNDLED_IMAGEJ_PLUGIN_JAR_NAME}..."))
+                            .size(body_size),
+                    ))
+                    .clicked()
+                {
+                    export_plugin_requested = true;
+                }
+                ui.add_space(2.0 * scale);
+
+                ui.separator();
+
+                // --- Connection settings ---
+                ui.add_space(2.0 * scale);
+                ui.label(egui::RichText::new("Connection").size(body_size).strong());
+                ui.add_space(2.0 * scale);
+
+                egui::Grid::new("imagej_conn_grid")
+                    .num_columns(2)
+                    .spacing([8.0 * scale, 4.0 * scale])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Host").size(small_size));
+                        ui.add_sized(
+                            [ui.available_width(), 0.0],
+                            egui::TextEdit::singleline(&mut self.imagej_dialog.host)
+                                .font(egui::TextStyle::Body),
+                        );
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("Port").size(small_size));
+                        ui.add(
+                            egui::DragValue::new(&mut self.imagej_dialog.port)
+                                .clamp_range(1..=u16::MAX),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0 * scale);
+
+                // --- Feedback messages ---
+                if let Some(error) =
+                    self.imagej_dialog
+                        .error
+                        .as_deref()
+                        .or(match &external_status {
+                            ExternalToolStatus::Error(error) => Some(error.as_str()),
+                            _ => None,
+                        })
+                {
+                    ui.label(
+                        egui::RichText::new(error)
+                            .size(small_size)
+                            .color(ui.visuals().error_fg_color),
+                    );
+                }
+                if let Some(info) = self.imagej_dialog.info.as_deref() {
+                    ui.label(
+                        egui::RichText::new(info)
+                            .size(small_size)
+                            .color(analysis_info_color()),
+                    );
+                }
+
+                // --- Action buttons ---
+                ui.add_space(4.0 * scale);
+                ui.horizontal(|ui| {
+                    let connect_enabled = self.external_tool.is_none();
+                    if ui
+                        .add_enabled(
+                            connect_enabled,
+                            egui::Button::new(egui::RichText::new("Connect").size(body_size)),
+                        )
+                        .clicked()
+                    {
+                        connect_requested = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.external_tool.is_some(),
+                            egui::Button::new(egui::RichText::new("Disconnect").size(body_size)),
+                        )
+                        .clicked()
+                    {
+                        disconnect_requested = true;
+                    }
+                });
+            });
+
+        if disconnect_requested {
+            self.disconnect_external_tool();
+            self.imagej_dialog.error = None;
+            self.imagej_dialog.info = None;
+        }
+
+        if export_plugin_requested {
+            self.imagej_dialog.error = None;
+            self.imagej_dialog.info = None;
+            if let Some(path) = rfd::FileDialog::new()
+                .set_file_name(BUNDLED_IMAGEJ_PLUGIN_JAR_NAME)
+                .save_file()
+            {
+                match fs::write(&path, BUNDLED_IMAGEJ_PLUGIN_JAR) {
+                    Ok(()) => {
+                        self.imagej_dialog.info = Some(format!(
+                            "Saved {} to {}",
+                            BUNDLED_IMAGEJ_PLUGIN_JAR_NAME,
+                            path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        self.imagej_dialog.error = Some(format!(
+                            "failed to save {}: {err}",
+                            BUNDLED_IMAGEJ_PLUGIN_JAR_NAME
+                        ));
+                    }
+                }
+            }
+        }
+
+        if connect_requested {
+            self.imagej_dialog.error = None;
+            self.imagej_dialog.info = None;
+            if self.external_tool.is_some() {
+                self.disconnect_external_tool();
+            }
+
+            let mut bridge =
+                ImageJBridge::new(self.imagej_dialog.host.clone(), self.imagej_dialog.port);
+            match bridge.connect() {
+                Ok(()) => {
+                    self.external_tool = Some(Box::new(bridge));
+                }
+                Err(err) => {
+                    self.imagej_dialog.error = Some(err);
+                }
+            }
+        }
+
+        self.imagej_dialog.open = open;
     }
 
     fn reset_analysis(&mut self) {
@@ -1130,7 +1468,9 @@ impl CameraApp {
     }
 
     fn raw_events_required(&self) -> bool {
-        self.preview_workspace.view_mode == ViewMode::PointCloud3d || self.plugins_need_raw_events()
+        self.active_view_mode() == ViewMode::PointCloud3d
+            || self.with_active_viewer(|viewer| viewer.preview_mode.requires_raw_events())
+            || self.plugins_need_raw_events()
     }
 
     fn sync_pipeline_requirements(&self, controller: &PipelineController) {
@@ -1216,7 +1556,7 @@ impl CameraApp {
                 self.controller = Some(controller);
                 self.last_preview_process_at = None;
                 self.mode = AppMode::Previewing;
-                self.preview_workspace.clear_session_state();
+                self.with_active_viewer_mut(ViewerState::clear_session_state);
                 self.reset_analysis();
                 self.config_dirty = false;
                 self.acq_dirty = false;
@@ -1240,7 +1580,7 @@ impl CameraApp {
                 self.controller = Some(controller);
                 self.last_preview_process_at = None;
                 self.mode = AppMode::Recording;
-                self.preview_workspace.clear_session_state();
+                self.with_active_viewer_mut(ViewerState::clear_session_state);
                 self.reset_analysis();
                 self.config_dirty = false;
                 self.acq_dirty = false;
@@ -1369,7 +1709,7 @@ impl CameraApp {
         self.controller = Some(controller);
         self.last_preview_process_at = None;
         self.mode = AppMode::Replaying;
-        self.preview_workspace.clear_session_state();
+        self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.camera_info = Some(replay_info);
         self.config = display_config;
         let global = self.config.global.clone();
@@ -1384,7 +1724,6 @@ impl CameraApp {
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
         self.replay_speed = 1.0;
-        self.replay_seek_drag_value = None;
         self.saved_live_state = Some(saved_live_state);
         self.reset_analysis();
         self.config_dirty = false;
@@ -1538,6 +1877,54 @@ impl CameraApp {
         }
     }
 
+    fn preview_display_settings(&self) -> PreviewDisplaySettings {
+        self.with_active_viewer(ViewerState::preview_display_settings)
+    }
+
+    fn render_preview_image(&self, frame: &PreviewFrame) -> egui::ColorImage {
+        let (preview_mode, time_surface_tau_us) =
+            self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
+        frame_to_color_image(
+            frame,
+            &self.analysis_output.overlays,
+            self.preview_display_settings(),
+            preview_mode,
+            time_surface_tau_us,
+        )
+    }
+
+    fn refresh_preview_texture_from_latest_frame(&mut self, ctx: &egui::Context) {
+        let Some(frame) = self.latest_frame.as_ref() else {
+            return;
+        };
+        let image = self.render_preview_image(frame);
+        if let Some(texture) = &mut self.texture {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.texture = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
+        }
+    }
+
+    fn apply_preview_histogram(&mut self, histogram: Vec<u64>) {
+        self.with_active_viewer_mut(|viewer| viewer.apply_histogram(histogram));
+    }
+
+    fn refresh_preview_if_needed(&mut self, ctx: &egui::Context, settings_changed: bool) {
+        if !settings_changed || self.active_view_mode() != ViewMode::Preview2d {
+            return;
+        }
+        let Some(frame) = self.latest_frame.as_ref() else {
+            return;
+        };
+        let (preview_mode, time_surface_tau_us) =
+            self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
+        let histogram = compute_frame_histogram(frame, preview_mode, time_surface_tau_us);
+        self.apply_preview_histogram(histogram);
+        if self.mode != AppMode::Idle {
+            self.refresh_preview_texture_from_latest_frame(ctx);
+        }
+    }
+
     fn set_replay_speed(&mut self, speed: f32) {
         let Some(controls) = &self.replay_controls else {
             return;
@@ -1603,7 +1990,6 @@ impl CameraApp {
             Err(err) => {
                 self.replay_finished = true;
                 self.replay_paused = true;
-                self.replay_seek_drag_value = None;
                 self.last_error = Some(err);
                 if let Some(existing_controls) = &self.replay_controls {
                     existing_controls.paused.store(true, Ordering::Relaxed);
@@ -1623,9 +2009,8 @@ impl CameraApp {
         self.replay_paused = desired_paused;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = pause_after_first_frame;
-        self.replay_seek_drag_value = None;
         self.last_error = None;
-        self.preview_workspace.clear_session_state();
+        self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.camera_status = format!(
             "Replaying {}.",
             path.file_name()
@@ -1633,6 +2018,7 @@ impl CameraApp {
                 .unwrap_or_else(|| path.display().to_string())
         );
         self.latest_frame = None;
+        reset_preview_render_cache();
         self.reset_analysis();
     }
 
@@ -1660,12 +2046,12 @@ impl CameraApp {
         self.replay_speed = 1.0;
         self.replay_notice = None;
         self.replay_path = None;
-        self.replay_seek_drag_value = None;
         self.restore_saved_live_state();
     }
 
     fn stop_pipeline(&mut self) {
         let was_replaying = self.mode == AppMode::Replaying;
+        self.disconnect_external_tool();
         if let Some(controller) = self.controller.take() {
             if let Err(e) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {e}"));
@@ -1676,8 +2062,14 @@ impl CameraApp {
         }
         self.texture = None;
         self.latest_frame = None;
+        reset_preview_render_cache();
         self.last_preview_process_at = None;
-        self.preview_workspace.clear_session_state();
+        self.with_active_viewer_mut(|viewer| {
+            viewer.clear_session_state();
+            viewer.line_profile_tool.clear();
+            viewer.ruler_tool.clear();
+            viewer.annotation_manager = Default::default();
+        });
         self.reset_analysis();
         self.mode = AppMode::Idle;
         self.camera_status =
@@ -1701,7 +2093,6 @@ impl CameraApp {
         self.replay_finished = true;
         self.replay_paused = true;
         self.replay_pause_after_seek_frame = false;
-        self.replay_seek_drag_value = None;
         if self.last_error.is_none() {
             self.camera_status = "Replay finished.".into();
         }
@@ -1840,8 +2231,8 @@ impl CameraApp {
             return;
         };
 
-        let needs_texture = self.preview_workspace.view_mode == ViewMode::Preview2d
-            || self.preview_workspace.popup_open;
+        let external_streaming = self.external_tool_status().is_streaming();
+        let needs_texture = !external_streaming && self.active_view_mode() == ViewMode::Preview2d;
         let force_process =
             (needs_texture && self.texture.is_none()) || self.replay_pause_after_seek_frame;
         let process_interval = self.active_preview_process_interval();
@@ -1863,12 +2254,31 @@ impl CameraApp {
 
         self.run_analysis_plugins(&frame);
 
+        let (preview_mode, time_surface_tau_us) =
+            self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
+        let histogram = compute_frame_histogram(&frame, preview_mode, time_surface_tau_us);
+        self.apply_preview_histogram(histogram);
+
+        self.with_active_viewer_mut(|viewer| {
+            if viewer.line_profile_tool.has_line() {
+                viewer.line_profile_tool.recompute(&frame);
+            }
+        });
+
+        let external_tool_error = if let Some(tool) = &mut self.external_tool {
+            tool.send_frame(&frame, self.nm_per_pixel)
+                .err()
+                .map(|err| format!("{} bridge failed: {err}", tool.name()))
+        } else {
+            None
+        };
+        if let Some(err) = external_tool_error {
+            self.last_error = Some(err);
+            self.disconnect_external_tool();
+        }
+
         if needs_texture {
-            let image = frame_to_color_image(
-                &frame,
-                &self.analysis_output.overlays,
-                self.contrast_percentile,
-            );
+            let image = self.render_preview_image(&frame);
             if let Some(texture) = &mut self.texture {
                 texture.set(image, egui::TextureOptions::LINEAR);
             } else {
@@ -1877,7 +2287,7 @@ impl CameraApp {
             }
         }
         if let Some(events) = frame.events.as_deref() {
-            self.preview_workspace.point_cloud.push_events(events);
+            self.with_active_viewer_mut(|viewer| viewer.workspace.point_cloud.push_events(events));
         }
         self.latest_frame = Some(frame);
         self.last_preview_process_at = Some(Instant::now());
@@ -1889,10 +2299,6 @@ impl CameraApp {
     }
 
     fn current_replay_fraction(&self) -> f32 {
-        if let Some(drag_value) = self.replay_seek_drag_value {
-            return drag_value.clamp(0.0, 1.0);
-        }
-
         let Some(controls) = &self.replay_controls else {
             return 0.0;
         };
@@ -1930,7 +2336,7 @@ impl CameraApp {
     }
 
     fn active_preview_process_interval(&self) -> Duration {
-        if self.preview_workspace.view_mode == ViewMode::PointCloud3d {
+        if self.active_view_mode() == ViewMode::PointCloud3d {
             Duration::from_millis(self.point_cloud_interval_ms)
         } else {
             Duration::from_millis(self.preview_interval_ms)
@@ -1954,106 +2360,6 @@ impl CameraApp {
             }
         }
         pixels
-    }
-
-    fn draw_replay_transport(&mut self, ui: &mut egui::Ui) {
-        let Some(info) = self.replay_file_info.clone() else {
-            return;
-        };
-
-        // Precompute time label so we can measure its width for the slider.
-        let time_text = format!(
-            "{} / {}",
-            format_replay_time(self.current_replay_time_us()),
-            format_replay_time(info.total_duration_us)
-        );
-
-        // Collect deferred actions to avoid borrow issues inside closures.
-        let mut new_speed: Option<f32> = None;
-        let mut stop_requested = false;
-
-        let current_speed = self.replay_speed;
-
-        ui.horizontal(|ui| {
-            // Play/Pause
-            let play_pause = if self.replay_paused {
-                "\u{25B6}"
-            } else {
-                "\u{23F8}"
-            };
-            if ui
-                .add_enabled(!self.replay_finished, egui::Button::new(play_pause))
-                .clicked()
-            {
-                self.set_replay_paused(!self.replay_paused);
-            }
-
-            // Restart
-            if ui.button("\u{23EE}").clicked() {
-                self.restart_replay();
-            }
-
-            // Stop
-            if ui.button("\u{23F9}").clicked() {
-                stop_requested = true;
-            }
-
-            ui.separator();
-
-            // Speed combo box — use id_salt for stable identity
-            let selected_label = replay_speed_label(current_speed);
-            egui::ComboBox::from_id_source("replay_speed_combo")
-                .selected_text(format!("Speed: {selected_label}"))
-                .show_ui(ui, |ui| {
-                    for (speed, label) in REPLAY_SPEED_OPTIONS {
-                        if ui
-                            .selectable_label(replay_speed_matches(current_speed, speed), label)
-                            .clicked()
-                        {
-                            new_speed = Some(speed);
-                        }
-                    }
-                });
-
-            ui.separator();
-
-            // Measure time label width so the slider fills the rest.
-            let time_width =
-                ui.fonts(|f| {
-                    f.layout_no_wrap(
-                        time_text.clone(),
-                        egui::FontId::default(),
-                        egui::Color32::WHITE,
-                    )
-                })
-                .size()
-                .x + ui.spacing().item_spacing.x * 2.0;
-
-            // Timeline slider — fill remaining width minus time label
-            let mut timeline_fraction = self
-                .replay_seek_drag_value
-                .unwrap_or_else(|| self.current_replay_fraction());
-            let slider = egui::Slider::new(&mut timeline_fraction, 0.0..=1.0).show_value(false);
-            let slider_width = (ui.available_width() - time_width).max(80.0);
-            let response = ui.add_sized([slider_width, ui.spacing().interact_size.y], slider);
-            if response.dragged() {
-                self.replay_seek_drag_value = Some(timeline_fraction);
-            }
-            if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                self.replay_seek_drag_value = None;
-                self.seek_replay(timeline_fraction);
-            }
-
-            // Time label
-            ui.label(&time_text);
-        });
-
-        if let Some(speed) = new_speed {
-            self.set_replay_speed(speed);
-        }
-        if stop_requested {
-            self.stop_pipeline();
-        }
     }
 
     fn copy_detected_hotpixels_to_mask(&mut self) {
@@ -2105,6 +2411,7 @@ impl eframe::App for CameraApp {
         let mut view_mode_changed = false;
         let mut plugin_scan_requested = false;
         let mut open_plugins_dir_requested = false;
+        let mut disconnect_external_tool_requested = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 // ── File ──────────────────────────────────────────────────────
@@ -2390,28 +2697,36 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Preview update [ms]")
+                            let mut preview_hz = interval_ms_to_hz(self.preview_interval_ms);
+                            ui.label("Preview update [Hz]")
                                 .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
                             let response = ui
                                 .add(
-                                    egui::DragValue::new(&mut self.preview_interval_ms)
-                                        .clamp_range(10..=200),
+                                    egui::DragValue::new(&mut preview_hz)
+                                        .clamp_range(5.0..=100.0)
+                                        .speed(0.5),
                                 )
                                 .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
                             if response.changed() {
+                                self.preview_interval_ms =
+                                    hz_to_interval_ms(preview_hz, 5.0..=100.0);
                                 global_settings_changed = true;
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Point cloud update [ms]")
+                            let mut point_cloud_hz = interval_ms_to_hz(self.point_cloud_interval_ms);
+                            ui.label("Point cloud update [Hz]")
                                 .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
                             let response = ui
                                 .add(
-                                    egui::DragValue::new(&mut self.point_cloud_interval_ms)
-                                        .clamp_range(20..=500),
+                                    egui::DragValue::new(&mut point_cloud_hz)
+                                        .clamp_range(2.0..=50.0)
+                                        .speed(0.5),
                                 )
                                 .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
                             if response.changed() {
+                                self.point_cloud_interval_ms =
+                                    hz_to_interval_ms(point_cloud_hz, 2.0..=50.0);
                                 global_settings_changed = true;
                             }
                         });
@@ -2440,6 +2755,13 @@ impl eframe::App for CameraApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
                     ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
+                    let mut scale_bar_show =
+                        self.with_active_viewer(|viewer| viewer.scale_bar_settings.show);
+                    if ui.checkbox(&mut scale_bar_show, "Show Scale Bar").changed() {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer.scale_bar_settings.show = scale_bar_show;
+                        });
+                    }
                     let window_views: Vec<ResolvedHostView> =
                         self.host_view_registry.window_views().cloned().collect();
                     for view in window_views {
@@ -2450,13 +2772,31 @@ impl eframe::App for CameraApp {
                         ui.checkbox(open, &view.descriptor.title);
                     }
                     ui.separator();
-                    let mut view_mode = self.preview_workspace.view_mode;
+                    let mut view_mode = self.active_view_mode();
                     let r2d = ui.radio_value(&mut view_mode, ViewMode::Preview2d, "2D Preview");
                     let r3d =
                         ui.radio_value(&mut view_mode, ViewMode::PointCloud3d, "3D Point Cloud");
                     if r2d.changed() || r3d.changed() {
                         view_mode_changed = true;
-                        self.preview_workspace.set_view_mode(view_mode);
+                        self.with_active_viewer_mut(|viewer| viewer.set_view_mode(view_mode));
+                    }
+                });
+
+                // ── Tools ─────────────────────────────────────────────────────
+                ui.menu_button("Tools", |ui| {
+                    match self.external_tool_status() {
+                        ExternalToolStatus::Streaming | ExternalToolStatus::Connecting => {
+                            if ui.button("Disconnect ImageJ").clicked() {
+                                disconnect_external_tool_requested = true;
+                                ui.close_menu();
+                            }
+                        }
+                        _ => {
+                            if ui.button("Stream to ImageJ...").clicked() {
+                                self.imagej_dialog.open = true;
+                                ui.close_menu();
+                            }
+                        }
                     }
                 });
 
@@ -2516,12 +2856,17 @@ impl eframe::App for CameraApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.camera_status);
                     ui.separator();
-                    let mut view_mode = self.preview_workspace.view_mode;
+                    let external_status = self.external_tool_status();
+                    if !matches!(external_status, ExternalToolStatus::Disconnected) {
+                        ui.label(format!("ImageJ: {}", external_status.label()));
+                        ui.separator();
+                    }
+                    let mut view_mode = self.active_view_mode();
                     let r3d = ui.selectable_value(&mut view_mode, ViewMode::PointCloud3d, "3D");
                     let r2d = ui.selectable_value(&mut view_mode, ViewMode::Preview2d, "2D");
                     if r2d.changed() || r3d.changed() {
                         view_mode_changed = true;
-                        self.preview_workspace.set_view_mode(view_mode);
+                        self.with_active_viewer_mut(|viewer| viewer.set_view_mode(view_mode));
                     }
                     if mode == AppMode::Recording {
                         ui.separator();
@@ -2552,12 +2897,28 @@ impl eframe::App for CameraApp {
             }
         }
 
+        if disconnect_external_tool_requested {
+            self.disconnect_external_tool();
+        }
+
         if plugin_toggle_changed {
             self.reset_analysis();
         }
 
+        if ctx.input(|input| {
+            input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
+        }) {
+            self.with_active_viewer_mut(|viewer| {
+                viewer.annotation_manager.delete_selected();
+            });
+        }
+
         if settings_locked {
-            self.preview_workspace.clear_selection();
+            self.with_active_viewer_mut(|viewer| {
+                if viewer.workspace.tool == PreviewTool::SelectRoi {
+                    viewer.workspace.clear_selection();
+                }
+            });
         }
 
         if self.settings_panel_open {
@@ -2667,6 +3028,7 @@ impl eframe::App for CameraApp {
         if self.analysis_panel_open && !enabled_plugin_names.is_empty() {
             egui::SidePanel::right("analysis")
                 .min_width(360.0)
+                .show_separator_line(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -2793,6 +3155,7 @@ impl eframe::App for CameraApp {
             egui::SidePanel::right("analysis-collapsed")
                 .exact_width(COLLAPSED_PANEL_WIDTH)
                 .resizable(false)
+                .show_separator_line(true)
                 .show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
                         if ui
@@ -2935,246 +3298,82 @@ impl eframe::App for CameraApp {
             self.host_view_registry_dirty = true;
         }
 
-        let mut pc_metrics: Option<PointCloudMetrics> = None;
+        let external_status = self.external_tool_status();
+        let external_streaming = external_status.is_streaming();
+        let external_streaming_label = self.current_external_streaming_label();
+        let pipeline_stats = self
+            .controller
+            .as_ref()
+            .map(PipelineController::stats_snapshot);
+        let detected_hotpixels = self.latest_detected_hotpixels();
+        let mut main_viewer_output = None;
+        let mut return_preview_to_main = false;
+
+        if self.popup_open {
+            self.sync_popup_shared(
+                settings_locked,
+                external_streaming,
+                &external_streaming_label,
+            );
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(preview_heading(mode, self.preview_workspace.view_mode));
-            ui.separator();
-
-            if let Some(info) = &self.camera_info {
-                ui.label(format!(
-                    "{} | serial: {} | firmware: {}",
-                    info.compatible.as_deref().unwrap_or(&info.model),
-                    info.serial.as_deref().unwrap_or("-"),
-                    info.firmware.as_deref().unwrap_or("-"),
-                ));
-            }
-
-            // Reserve space for controls below so the canvas never crowds them out.
-            let controls_reserve = 190.0;
-
-            if self.preview_workspace.popup_open {
-                // When the popup is open, show a placeholder in the main window.
-                draw_preview_toolbar(ui, &mut self.preview_workspace, settings_locked, "Enlarge");
-                let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
-                let placeholder_height = max_image_height;
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), placeholder_height),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter_at(rect);
-                painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
-                painter.rect_stroke(
-                    rect,
-                    PANEL_ROUNDING,
-                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-                );
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Preview open in separate window",
-                    egui::FontId::proportional(16.0),
-                    ui.visuals().weak_text_color(),
-                );
-            } else {
-                match self.preview_workspace.view_mode {
-                    ViewMode::Preview2d => {
-                        draw_preview_toolbar(
-                            ui,
-                            &mut self.preview_workspace,
-                            settings_locked,
-                            "Enlarge",
-                        );
-                        let max_image_height =
-                            (ui.available_size().y - controls_reserve).max(180.0);
-                        if let (Some(texture), Some(frame)) =
-                            (self.texture.as_ref(), self.latest_frame.as_ref())
-                        {
-                            if draw_preview_canvas(
-                                ui,
-                                texture,
-                                frame,
-                                &mut self.config,
-                                &mut self.preview_workspace,
-                                settings_locked,
-                                max_image_height,
-                            ) && mode != AppMode::Replaying
-                            {
-                                self.config_dirty = true;
-                            }
-                        } else {
-                            self.preview_workspace.hover_sensor = None;
-                            draw_empty_preview_placeholder(
-                                ui,
-                                max_image_height,
-                                mode,
-                                self.preview_workspace.view_mode,
-                            );
-                        }
-                    }
-                    ViewMode::PointCloud3d => {
-                        draw_point_cloud_toolbar(ui, &mut self.preview_workspace, "Enlarge");
-                        let max_image_height =
-                            (ui.available_size().y - controls_reserve).max(180.0);
-                        pc_metrics = Some(self.preview_workspace.point_cloud.draw(
-                            ui,
-                            self.config.roi,
-                            max_image_height,
-                        ));
-                    }
+            if self.popup_open {
+                ui.heading("Viewer open in separate window");
+                ui.separator();
+                let max_image_height = (ui.available_size().y - 56.0).max(180.0);
+                draw_text_placeholder(ui, max_image_height, "Preview open in separate window");
+                ui.add_space(8.0);
+                if ui.button("Return preview to main window").clicked() {
+                    return_preview_to_main = true;
                 }
+            } else {
+                let input = ViewerInput {
+                    texture: self.texture.as_ref(),
+                    frame: self.latest_frame.as_ref(),
+                    overlays: &self.analysis_output.overlays,
+                    camera_info: self.camera_info.as_ref(),
+                    nm_per_pixel: self.nm_per_pixel,
+                    config: &self.config,
+                    mode: self.mode,
+                    settings_locked,
+                    pipeline_stats: pipeline_stats.as_ref(),
+                    replay: self.viewer_replay_state(),
+                    analysis_warnings: &self.analysis_output.warnings,
+                    analysis_notice: self.analysis_notice.as_deref(),
+                    detected_hotpixels: &detected_hotpixels,
+                    config_dirty: self.config_dirty,
+                    acq_dirty: self.acq_dirty,
+                    replay_open_task_active: self.replay_open_task.is_some(),
+                    replay_notice: self.replay_notice.as_deref(),
+                    last_error: self.last_error.as_deref(),
+                    external_streaming,
+                    external_streaming_label: &external_streaming_label,
+                    popup_active: false,
+                    popup_button_label: "Enlarge",
+                    popup_button_tooltip: "Open in separate window",
+                    viewer_id: "main",
+                };
+                main_viewer_output = Some(draw_viewer(ctx, ui, &mut self.viewer, input));
             }
-
-            if mode == AppMode::Replaying {
-                ui.add_space(4.0);
-                self.draw_replay_transport(ui);
-            }
-
-            // ── Scrollable controls below the canvas ─────────────────────────
-            egui::ScrollArea::vertical()
-                .max_height(controls_reserve)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.separator();
-                    match self.preview_workspace.view_mode {
-                        ViewMode::Preview2d => {
-                            ui.horizontal(|ui| {
-                                ui.label("Contrast");
-                                ui.add(egui::Slider::new(
-                                    &mut self.contrast_percentile,
-                                    90.0..=100.0,
-                                ));
-                                ui.label(format!("{:.1}th percentile", self.contrast_percentile));
-                            });
-                        }
-                        ViewMode::PointCloud3d => {
-                            if let Some(metrics) = pc_metrics {
-                                draw_point_cloud_metrics(ui, metrics);
-                            }
-                        }
-                    }
-
-                    if let Some(ctrl) = &self.controller {
-                        let s = ctrl.stats_snapshot();
-                        ui.label(format!(
-                            "{:.2} Mev/s  |  {:.2} MB/s  |  {:02}:{:02}:{:02} elapsed",
-                            s.mev_per_s,
-                            s.mb_per_s,
-                            (s.elapsed_s as u64) / 3600,
-                            (s.elapsed_s as u64 % 3600) / 60,
-                            s.elapsed_s as u64 % 60
-                        ));
-                        ui.small(format!(
-                            "Preview drops: {} packets / {} frames  |  Preview queues HW: {} / {}  |  Disk queue HW: {}  |  Disk wait/write: {:.1} / {:.1} ms",
-                            s.preview_packet_drops,
-                            s.preview_frame_drops,
-                            s.preview_packet_queue_high_water,
-                            s.preview_frame_queue_high_water,
-                            s.disk_queue_high_water,
-                            s.disk_send_wait_us as f64 / 1_000.0,
-                            s.disk_write_us as f64 / 1_000.0,
-                        ));
-                    }
-                    if let Some(frame) = &self.latest_frame {
-                        let total = frame.on_count + frame.off_count;
-                        if total > 0 {
-                            let on_pct = frame.on_count as f64 * 100.0 / total as f64;
-                            let off_pct = frame.off_count as f64 * 100.0 / total as f64;
-                            ui.label(format!(
-                                "ON {:.1}%  |  OFF {:.1}%  ({} ev this frame)",
-                                on_pct, off_pct, total
-                            ));
-                        }
-                    }
-
-                    if mode != AppMode::Idle && mode != AppMode::Replaying {
-                        if self.config_dirty || self.acq_dirty {
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                "There are unapplied runtime changes.",
-                            );
-                        } else {
-                            ui.label("Runtime settings on the camera are up to date.");
-                        }
-                    }
-
-                    if !self.analysis_output.warnings.is_empty() {
-                        ui.separator();
-                        for warning in &self.analysis_output.warnings {
-                            ui.colored_label(
-                                analysis_warning_color(warning.severity, ui.visuals()),
-                                format!("{}: {}", warning.source, warning.message),
-                            );
-                        }
-
-                        let detected_pixels = self.latest_detected_hotpixels();
-                        if !detected_pixels.is_empty() {
-                            let can_copy = !settings_locked;
-                            if ui
-                                .add_enabled(can_copy, egui::Button::new("Mask detected hotpixels"))
-                                .clicked()
-                            {
-                                self.copy_detected_hotpixels_to_mask();
-                            }
-                            if !can_copy {
-                                ui.label(
-                                    "Unlock runtime settings to copy detections into the DEM mask.",
-                                );
-                            }
-                        }
-                    }
-
-                    if let Some(notice) = &self.analysis_notice {
-                        ui.label(notice);
-                    }
-
-                    if self.replay_open_task.is_some() {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                self.replay_notice
-                                    .as_deref()
-                                    .unwrap_or("Opening replay..."),
-                            );
-                        });
-                    }
-
-                    if let Some(err) = &self.last_error {
-                        ui.separator();
-                        ui.colored_label(ui.visuals().error_fg_color, err);
-                    }
-                });
         });
 
-        if self.preview_workspace.popup_open {
-            // Update shared data for the popup viewport.
-            {
-                let mut data = self.popup_shared.lock().unwrap();
-                data.texture = self.texture.clone();
-                data.mode = mode;
-                data.view_mode = self.preview_workspace.view_mode;
-                data.roi = self.config.roi;
-                if let Some(frame) = &self.latest_frame {
-                    data.frame_width = frame.width;
-                    data.frame_height = frame.height;
-                } else {
-                    data.frame_width = 0;
-                    data.frame_height = 0;
-                }
-                data.replay_paused = self.replay_paused;
-                data.replay_finished = self.replay_finished;
-                data.replay_speed = self.replay_speed;
-                data.replay_fraction = self.current_replay_fraction();
-                data.replay_time_us = self.current_replay_time_us();
-                data.replay_bytes_read = self.current_replay_bytes_read();
-                if let Some(info) = &self.replay_file_info {
-                    data.replay_duration_us = info.total_duration_us;
-                    data.replay_data_len = info.data_len();
-                } else {
-                    data.replay_duration_us = 0;
-                    data.replay_data_len = 0;
-                }
-            }
+        if return_preview_to_main {
+            self.close_popup_viewer();
+        }
 
+        if let Some(output) = main_viewer_output {
+            self.handle_viewer_output(ctx, output, false);
+        }
+        if !self.popup_open {
+            let contrast_changed = self.viewer.show_aux_windows(ctx);
+            if contrast_changed {
+                self.refresh_preview_if_needed(ctx, true);
+            }
+        }
+        self.show_imagej_dialog(ctx);
+
+        if self.popup_open {
             let shared = Arc::clone(&self.popup_shared);
             ctx.show_viewport_deferred(
                 egui::ViewportId::from_hash_of("popup_preview"),
@@ -3183,9 +3382,68 @@ impl eframe::App for CameraApp {
                     .with_inner_size([1280.0, 820.0]),
                 move |ctx, class| match class {
                     egui::viewport::ViewportClass::Deferred => {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            render_popup_content(ui, &shared);
-                        });
+                        if let Ok(mut data) = shared.lock() {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let PopupSharedData {
+                                    viewer,
+                                    texture,
+                                    frame,
+                                    overlays,
+                                    camera_info,
+                                    nm_per_pixel,
+                                    config,
+                                    mode,
+                                    settings_locked,
+                                    pipeline_stats,
+                                    replay,
+                                    analysis_warnings,
+                                    analysis_notice,
+                                    detected_hotpixels,
+                                    config_dirty,
+                                    acq_dirty,
+                                    replay_open_task_active,
+                                    replay_notice,
+                                    last_error,
+                                    external_streaming,
+                                    external_streaming_label,
+                                    close_requested: _,
+                                    output,
+                                } = &mut *data;
+                                let input = ViewerInput {
+                                    texture: texture.as_ref(),
+                                    frame: frame.as_ref(),
+                                    overlays,
+                                    camera_info: camera_info.as_ref(),
+                                    nm_per_pixel: *nm_per_pixel,
+                                    config,
+                                    mode: *mode,
+                                    settings_locked: *settings_locked,
+                                    pipeline_stats: pipeline_stats.as_ref(),
+                                    replay: *replay,
+                                    analysis_warnings,
+                                    analysis_notice: analysis_notice.as_deref(),
+                                    detected_hotpixels,
+                                    config_dirty: *config_dirty,
+                                    acq_dirty: *acq_dirty,
+                                    replay_open_task_active: *replay_open_task_active,
+                                    replay_notice: replay_notice.as_deref(),
+                                    last_error: last_error.as_deref(),
+                                    external_streaming: *external_streaming,
+                                    external_streaming_label: external_streaming_label.as_str(),
+                                    popup_active: true,
+                                    popup_button_label: "Return to augur",
+                                    popup_button_tooltip: "Return viewer to main window",
+                                    viewer_id: "popup",
+                                };
+                                let mut popup_output = draw_viewer(ctx, ui, viewer, input);
+                                if viewer.show_aux_windows(ctx) {
+                                    popup_output.contrast_changed = true;
+                                }
+                                output
+                                    .get_or_insert_with(Default::default)
+                                    .merge(popup_output);
+                            });
+                        }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             if let Ok(mut d) = shared.lock() {
                                 d.close_requested = true;
@@ -3198,7 +3456,66 @@ impl eframe::App for CameraApp {
                             .open(&mut open)
                             .default_size([1100.0, 760.0])
                             .show(ctx, |ui| {
-                                render_popup_content(ui, &shared);
+                                if let Ok(mut data) = shared.lock() {
+                                    let PopupSharedData {
+                                        viewer,
+                                        texture,
+                                        frame,
+                                        overlays,
+                                        camera_info,
+                                        nm_per_pixel,
+                                        config,
+                                        mode,
+                                        settings_locked,
+                                        pipeline_stats,
+                                        replay,
+                                        analysis_warnings,
+                                        analysis_notice,
+                                        detected_hotpixels,
+                                        config_dirty,
+                                        acq_dirty,
+                                        replay_open_task_active,
+                                        replay_notice,
+                                        last_error,
+                                        external_streaming,
+                                        external_streaming_label,
+                                        close_requested: _,
+                                        output,
+                                    } = &mut *data;
+                                    let input = ViewerInput {
+                                        texture: texture.as_ref(),
+                                        frame: frame.as_ref(),
+                                        overlays,
+                                        camera_info: camera_info.as_ref(),
+                                        nm_per_pixel: *nm_per_pixel,
+                                        config,
+                                        mode: *mode,
+                                        settings_locked: *settings_locked,
+                                        pipeline_stats: pipeline_stats.as_ref(),
+                                        replay: *replay,
+                                        analysis_warnings,
+                                        analysis_notice: analysis_notice.as_deref(),
+                                        detected_hotpixels,
+                                        config_dirty: *config_dirty,
+                                        acq_dirty: *acq_dirty,
+                                        replay_open_task_active: *replay_open_task_active,
+                                        replay_notice: replay_notice.as_deref(),
+                                        last_error: last_error.as_deref(),
+                                        external_streaming: *external_streaming,
+                                        external_streaming_label: external_streaming_label.as_str(),
+                                        popup_active: true,
+                                        popup_button_label: "Return to augur",
+                                        popup_button_tooltip: "Return viewer to main window",
+                                        viewer_id: "popup",
+                                    };
+                                    let mut popup_output = draw_viewer(ctx, ui, viewer, input);
+                                    if viewer.show_aux_windows(ctx) {
+                                        popup_output.contrast_changed = true;
+                                    }
+                                    output
+                                        .get_or_insert_with(Default::default)
+                                        .merge(popup_output);
+                                }
                             });
                         if !open {
                             if let Ok(mut d) = shared.lock() {
@@ -3210,35 +3527,17 @@ impl eframe::App for CameraApp {
                 },
             );
 
-            // Drain actions from the popup — extract values before dropping
-            // the MutexGuard so we can call &mut self methods afterwards.
-            let (close, toggle_pause, restart, seek_to, set_speed) = {
+            let (close, popup_output) = {
                 let mut data = self.popup_shared.lock().unwrap();
                 let close = data.close_requested;
-                let toggle = data.toggle_pause;
-                let restart = data.restart;
-                let seek = data.seek_to.take();
-                let speed = data.set_speed.take();
                 data.close_requested = false;
-                data.toggle_pause = false;
-                data.restart = false;
-                (close, toggle, restart, seek, speed)
+                (close, data.output.take())
             };
             if close {
-                self.preview_workspace.popup_open = false;
+                self.close_popup_viewer();
             }
-            if toggle_pause {
-                let new_paused = !self.replay_paused;
-                self.set_replay_paused(new_paused);
-            }
-            if restart {
-                self.restart_replay();
-            }
-            if let Some(fraction) = seek_to {
-                self.seek_replay(fraction);
-            }
-            if let Some(speed) = set_speed {
-                self.set_replay_speed(speed);
+            if let Some(output) = popup_output {
+                self.handle_viewer_output(ctx, output, true);
             }
         }
 
@@ -3257,567 +3556,12 @@ impl eframe::App for CameraApp {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PreviewViewport {
-    base_sensor_rect: egui::Rect,
-    visible_sensor_rect: egui::Rect,
-    /// ROI rect in sensor coordinates, if the config ROI is valid for this frame.
-    roi_rect: Option<egui::Rect>,
-}
-
-impl PreviewViewport {
-    fn display_size(&self, available: egui::Vec2) -> egui::Vec2 {
-        let sensor_size = self.base_sensor_rect.size();
-        let scale = (available.x / sensor_size.x)
-            .min(available.y / sensor_size.y)
-            .max(0.1);
-        sensor_size * scale
-    }
-
-    fn uv_rect(&self, frame: &PreviewFrame) -> egui::Rect {
-        let width = frame.width.max(1) as f32;
-        let height = frame.height.max(1) as f32;
-        egui::Rect::from_min_max(
-            egui::pos2(
-                self.visible_sensor_rect.min.x / width,
-                self.visible_sensor_rect.min.y / height,
-            ),
-            egui::pos2(
-                self.visible_sensor_rect.max.x / width,
-                self.visible_sensor_rect.max.y / height,
-            ),
-        )
-    }
-
-    fn screen_to_sensor(
-        &self,
-        image_rect: egui::Rect,
-        pointer_pos: egui::Pos2,
-    ) -> Option<(u16, u16)> {
-        if !image_rect.contains(pointer_pos) {
-            return None;
-        }
-
-        let rel_x = ((pointer_pos.x - image_rect.min.x) / image_rect.width()).clamp(0.0, 1.0);
-        let rel_y = ((pointer_pos.y - image_rect.min.y) / image_rect.height()).clamp(0.0, 1.0);
-        let sensor_x = (self.visible_sensor_rect.min.x + rel_x * self.visible_sensor_rect.width())
-            .floor()
-            .max(0.0) as u16;
-        let sensor_y = (self.visible_sensor_rect.min.y + rel_y * self.visible_sensor_rect.height())
-            .floor()
-            .max(0.0) as u16;
-        Some((sensor_x, sensor_y))
-    }
-
-    fn sensor_to_screen(&self, image_rect: egui::Rect, sensor_pos: egui::Pos2) -> egui::Pos2 {
-        let rel_x =
-            (sensor_pos.x - self.visible_sensor_rect.min.x) / self.visible_sensor_rect.width();
-        let rel_y =
-            (sensor_pos.y - self.visible_sensor_rect.min.y) / self.visible_sensor_rect.height();
-        egui::pos2(
-            image_rect.min.x + rel_x * image_rect.width(),
-            image_rect.min.y + rel_y * image_rect.height(),
-        )
-    }
-}
-
-fn preview_heading(mode: AppMode, view_mode: ViewMode) -> &'static str {
-    match (mode, view_mode) {
-        (AppMode::Replaying, ViewMode::Preview2d) => "Replay",
-        (AppMode::Replaying, ViewMode::PointCloud3d) => "Replay 3D View",
-        (_, ViewMode::Preview2d) => "Live Preview",
-        (_, ViewMode::PointCloud3d) => "3D Point Cloud",
-    }
-}
-
-fn empty_preview_message(mode: AppMode, view_mode: ViewMode) -> &'static str {
-    match (mode, view_mode) {
-        (AppMode::Idle, ViewMode::Preview2d) => {
-            "No camera probed. Click Probe Camera to connect, or open a replay file."
-        }
-        (AppMode::Replaying, ViewMode::Preview2d) => {
-            "No replay frame yet. Use the timeline or wait for playback to decode the next frame."
-        }
-        (_, ViewMode::Preview2d) => {
-            "No preview yet. Probe the camera, then click Preview or Record."
-        }
-        (_, ViewMode::PointCloud3d) => "No recent raw events available for the 3D view yet.",
-    }
-}
-
-fn draw_preview_toolbar(
-    ui: &mut egui::Ui,
-    workspace: &mut PreviewWorkspaceState,
-    settings_locked: bool,
-    popup_button_label: &str,
-) {
-    ui.horizontal_wrapped(|ui| {
-        let mut select_roi_button = ui.add_enabled(
-            !settings_locked,
-            egui::SelectableLabel::new(workspace.tool == PreviewTool::SelectRoi, "Select ROI"),
-        );
-        if settings_locked {
-            select_roi_button = select_roi_button.on_hover_text(
-                "ROI editing is disabled while replay is active or settings are locked.",
-            );
-        }
-        if select_roi_button.clicked() {
-            if workspace.tool == PreviewTool::SelectRoi {
-                workspace.clear_selection();
-            } else {
-                workspace.tool = PreviewTool::SelectRoi;
-                workspace.selection_anchor = None;
-                workspace.pending_roi = None;
-            }
-        }
-
-        if ui.button("-").clicked() {
-            workspace.zoom = (workspace.zoom / 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
-            if (workspace.zoom - PREVIEW_ZOOM_MIN).abs() < f32::EPSILON {
-                workspace.pan = egui::Vec2::ZERO;
-            }
-        }
-        if ui.button("+").clicked() {
-            workspace.zoom = (workspace.zoom * 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
-        }
-        if ui.button("Fit").clicked() {
-            workspace.reset_zoom();
-        }
-
-        ui.checkbox(&mut workspace.crop_to_roi, "Crop to ROI");
-
-        if ui.button(popup_button_label).clicked() {
-            workspace.popup_open = !workspace.popup_open;
-        }
-
-        ui.separator();
-        if let Some((x, y)) = workspace.hover_sensor {
-            ui.monospace(format!("x {x}, y {y}"));
-        } else {
-            ui.weak("Hover preview for x/y");
-        }
-    });
-}
-
-fn draw_point_cloud_toolbar(
-    ui: &mut egui::Ui,
-    workspace: &mut PreviewWorkspaceState,
-    popup_button_label: &str,
-) {
-    workspace.point_cloud.sanitize_controls();
-
-    egui::Grid::new("pc_controls_grid")
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label("Time range [ms]")
-                .on_hover_text("How far back in time to show events");
-            ui.add(
-                egui::DragValue::new(&mut workspace.point_cloud.time_window_ms)
-                    .speed(5.0)
-                    .clamp_range(5.0..=2_000.0),
-            );
-            ui.end_row();
-
-            ui.label("Max render")
-                .on_hover_text("Limits rendered points for smoother interaction");
-            ui.add(
-                egui::DragValue::new(&mut workspace.point_cloud.point_limit)
-                    .speed(250.0)
-                    .clamp_range(1_000..=100_000),
-            );
-            ui.end_row();
-        });
-
-    ui.horizontal(|ui| {
-        if ui.button("Reset Camera").clicked() {
-            workspace.point_cloud.reset_camera();
-        }
-        if ui.button(popup_button_label).clicked() {
-            workspace.popup_open = !workspace.popup_open;
-        }
-        ui.small("Drag to orbit. Scroll to zoom.");
-    });
-}
-
-fn draw_point_cloud_metrics(ui: &mut egui::Ui, metrics: PointCloudMetrics) {
-    if metrics.visible_points == 0 {
-        ui.label("No events in view");
-    } else if metrics.rendered_points < metrics.visible_points {
-        ui.label(format!(
-            "Showing {} of {} events (downsampled)",
-            metrics.rendered_points, metrics.visible_points
-        ));
-    } else {
-        ui.label(format!("Showing {} events", metrics.rendered_points));
-    }
-}
-
-fn draw_empty_preview_placeholder(
-    ui: &mut egui::Ui,
-    max_image_height: f32,
-    mode: AppMode,
-    view_mode: ViewMode,
-) {
-    let placeholder_height = max_image_height;
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), placeholder_height),
-        egui::Sense::hover(),
-    );
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
-    painter.rect_stroke(
-        rect,
-        PANEL_ROUNDING,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-    );
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        empty_preview_message(mode, view_mode),
-        egui::FontId::proportional(16.0),
-        ui.visuals().weak_text_color(),
-    );
-}
-
-fn render_popup_content(ui: &mut egui::Ui, shared: &Arc<Mutex<PopupSharedData>>) {
-    let data = shared.lock().unwrap();
-
-    // Extract everything we need, then drop the lock before rendering.
-    let texture = data.texture.clone();
-    let view_mode = data.view_mode;
-    let mode = data.mode;
-    let is_replay = mode == AppMode::Replaying && data.replay_duration_us > 0;
-    let fraction = data.seek_drag.unwrap_or(data.replay_fraction);
-    let paused = data.replay_paused;
-    let finished = data.replay_finished;
-    let speed = data.replay_speed;
-    let duration_us = data.replay_duration_us;
-    let time_us = data.replay_time_us;
-    let bytes_read = data.replay_bytes_read;
-    let data_len = data.replay_data_len;
-    drop(data);
-
-    match view_mode {
-        ViewMode::Preview2d => {
-            if let Some(texture) = &texture {
-                let reserve = if is_replay { 80.0 } else { 0.0 };
-                let available = ui.available_size();
-                let max_h = (available.y - reserve).max(100.0);
-                ui.add(
-                    egui::Image::new(texture)
-                        .shrink_to_fit()
-                        .max_size(egui::vec2(available.x, max_h)),
-                );
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("No preview available").weak().italics());
-                });
-            }
-        }
-        ViewMode::PointCloud3d => {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new("3D view available in main window")
-                        .weak()
-                        .italics(),
-                );
-            });
-        }
-    }
-
-    // Replay controls
-    if is_replay {
-        ui.separator();
-        ui.horizontal(|ui| {
-            let play_label = if paused { "Play" } else { "Pause" };
-            if ui
-                .add_enabled(!finished, egui::Button::new(play_label))
-                .clicked()
-            {
-                shared.lock().unwrap().toggle_pause = true;
-            }
-            if ui.button("Restart").clicked() {
-                shared.lock().unwrap().restart = true;
-            }
-            ui.label("Speed:");
-            ui.label(format!(
-                "{:.1}x",
-                if speed.is_infinite() {
-                    f32::INFINITY
-                } else {
-                    speed
-                }
-            ));
-        });
-
-        let mut timeline = fraction;
-        let slider = egui::Slider::new(&mut timeline, 0.0..=1.0)
-            .show_value(false)
-            .text("Timeline");
-        let response = ui.add_sized([ui.available_width().max(300.0), 0.0], slider);
-        if response.dragged() {
-            shared.lock().unwrap().seek_drag = Some(timeline);
-        }
-        if response.drag_stopped() || (response.changed() && !response.dragged()) {
-            let mut d = shared.lock().unwrap();
-            d.seek_drag = None;
-            d.seek_to = Some(timeline);
-        }
-
-        ui.horizontal(|ui| {
-            ui.label(format!(
-                "{} / {}",
-                format_replay_time(time_us),
-                format_replay_time(duration_us)
-            ));
-            ui.separator();
-            ui.label(format!(
-                "{:.1} / {:.1} MB",
-                bytes_read as f64 / (1024.0 * 1024.0),
-                data_len as f64 / (1024.0 * 1024.0)
-            ));
-        });
-    }
-}
-
-fn draw_preview_canvas(
-    ui: &mut egui::Ui,
-    texture: &egui::TextureHandle,
-    frame: &PreviewFrame,
-    config: &mut CameraConfig,
-    workspace: &mut PreviewWorkspaceState,
-    settings_locked: bool,
-    max_height: f32,
-) -> bool {
-    let viewport = build_preview_viewport(frame, config, workspace);
-    let available = ui.available_size_before_wrap();
-    let display_size = viewport.display_size(egui::vec2(available.x, available.y.min(max_height)));
-    let response = ui.add(
-        egui::Image::new(texture)
-            .uv(viewport.uv_rect(frame))
-            .fit_to_exact_size(display_size)
-            .sense(egui::Sense::click_and_drag()),
-    );
-
-    workspace.hover_sensor = response
-        .hover_pos()
-        .and_then(|pos| viewport.screen_to_sensor(response.rect, pos));
-
-    let mut roi_committed = false;
-    if workspace.tool == PreviewTool::SelectRoi && !settings_locked {
-        if response.drag_started() {
-            if let Some(pointer_pos) = response
-                .interact_pointer_pos()
-                .and_then(|pos| viewport.screen_to_sensor(response.rect, pos))
-            {
-                let anchor = egui::pos2(pointer_pos.0 as f32, pointer_pos.1 as f32);
-                workspace.selection_anchor = Some(anchor);
-                workspace.pending_roi = Some(sensor_rect_from_points(anchor, anchor, frame));
-            }
-        }
-
-        if response.dragged() {
-            if let (Some(anchor), Some(pointer_pos)) = (
-                workspace.selection_anchor,
-                response
-                    .interact_pointer_pos()
-                    .and_then(|pos| viewport.screen_to_sensor(response.rect, pos)),
-            ) {
-                workspace.pending_roi = Some(sensor_rect_from_points(
-                    anchor,
-                    egui::pos2(pointer_pos.0 as f32, pointer_pos.1 as f32),
-                    frame,
-                ));
-            }
-        }
-
-        if response.drag_stopped() {
-            if let Some(pending_roi) = workspace.pending_roi.take() {
-                if let Some(roi) = sensor_rect_to_roi_config(pending_roi, frame) {
-                    config.roi = roi;
-                    roi_committed = true;
-                    if workspace.crop_to_roi {
-                        workspace.reset_zoom();
-                    }
-                }
-            }
-            workspace.selection_anchor = None;
-        }
-    } else if response.dragged() && workspace.zoom > PREVIEW_ZOOM_MIN {
-        let delta = ui.ctx().input(|input| input.pointer.delta());
-        workspace.pan += egui::vec2(
-            -delta.x * viewport.visible_sensor_rect.width() / response.rect.width().max(1.0),
-            -delta.y * viewport.visible_sensor_rect.height() / response.rect.height().max(1.0),
-        );
-    }
-
-    let painter = ui.painter().with_clip_rect(response.rect);
-    if let Some(current_roi) = viewport.roi_rect {
-        if !workspace.crop_to_roi {
-            paint_sensor_rect(
-                &painter,
-                response.rect,
-                viewport,
-                current_roi,
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 196, 64)),
-            );
-        }
-    }
-    if let Some(pending_roi) = workspace.pending_roi {
-        paint_sensor_rect(
-            &painter,
-            response.rect,
-            viewport,
-            pending_roi,
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
-        );
-    }
-
-    roi_committed
-}
-
-fn build_preview_viewport(
-    frame: &PreviewFrame,
-    config: &CameraConfig,
-    workspace: &mut PreviewWorkspaceState,
-) -> PreviewViewport {
-    workspace.zoom = workspace.zoom.clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
-
-    let full_sensor_rect = egui::Rect::from_min_size(
-        egui::Pos2::ZERO,
-        egui::vec2(frame.width as f32, frame.height as f32),
-    );
-    let roi_rect = roi_sensor_rect(config, frame);
-    let base_sensor_rect = if workspace.crop_to_roi {
-        roi_rect.unwrap_or(full_sensor_rect)
-    } else {
-        full_sensor_rect
-    };
-
-    let visible_size = egui::vec2(
-        (base_sensor_rect.width() / workspace.zoom).max(1.0),
-        (base_sensor_rect.height() / workspace.zoom).max(1.0),
-    );
-    let max_pan = egui::vec2(
-        ((base_sensor_rect.width() - visible_size.x) * 0.5).max(0.0),
-        ((base_sensor_rect.height() - visible_size.y) * 0.5).max(0.0),
-    );
-    workspace.pan.x = workspace.pan.x.clamp(-max_pan.x, max_pan.x);
-    workspace.pan.y = workspace.pan.y.clamp(-max_pan.y, max_pan.y);
-
-    let center = base_sensor_rect.center() + workspace.pan;
-    let min = egui::pos2(
-        (center.x - visible_size.x * 0.5).clamp(
-            base_sensor_rect.min.x,
-            base_sensor_rect.max.x - visible_size.x,
-        ),
-        (center.y - visible_size.y * 0.5).clamp(
-            base_sensor_rect.min.y,
-            base_sensor_rect.max.y - visible_size.y,
-        ),
-    );
-
-    PreviewViewport {
-        base_sensor_rect,
-        visible_sensor_rect: egui::Rect::from_min_size(min, visible_size),
-        roi_rect,
-    }
-}
-
-fn roi_sensor_rect(config: &CameraConfig, frame: &PreviewFrame) -> Option<egui::Rect> {
-    if frame.width == 0 || frame.height == 0 {
-        return None;
-    }
-
-    let min_x = config.roi.x.min(frame.width.saturating_sub(1)) as f32;
-    let min_y = config.roi.y.min(frame.height.saturating_sub(1)) as f32;
-    let max_x =
-        (u32::from(config.roi.x) + u32::from(config.roi.width)).min(u32::from(frame.width)) as f32;
-    let max_y = (u32::from(config.roi.y) + u32::from(config.roi.height))
-        .min(u32::from(frame.height)) as f32;
-    if max_x <= min_x || max_y <= min_y {
-        return None;
-    }
-
-    Some(egui::Rect::from_min_max(
-        egui::pos2(min_x, min_y),
-        egui::pos2(max_x, max_y),
-    ))
-}
-
-fn sensor_rect_from_points(start: egui::Pos2, end: egui::Pos2, frame: &PreviewFrame) -> egui::Rect {
-    let max_x = frame.width.max(1) as f32;
-    let max_y = frame.height.max(1) as f32;
-    let min_x = start.x.min(end.x).floor().clamp(0.0, max_x - 1.0);
-    let min_y = start.y.min(end.y).floor().clamp(0.0, max_y - 1.0);
-    let max_x_rect = start.x.max(end.x).ceil().clamp(min_x + 1.0, max_x);
-    let max_y_rect = start.y.max(end.y).ceil().clamp(min_y + 1.0, max_y);
-    egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x_rect, max_y_rect))
-}
-
-fn sensor_rect_to_roi_config(sensor_rect: egui::Rect, frame: &PreviewFrame) -> Option<RoiConfig> {
-    if frame.width == 0 || frame.height == 0 {
-        return None;
-    }
-
-    let min_x = sensor_rect
-        .min
-        .x
-        .floor()
-        .clamp(0.0, frame.width as f32 - 1.0) as u16;
-    let min_y = sensor_rect
-        .min
-        .y
-        .floor()
-        .clamp(0.0, frame.height as f32 - 1.0) as u16;
-    let max_x = sensor_rect
-        .max
-        .x
-        .ceil()
-        .clamp(min_x as f32 + 1.0, frame.width as f32) as u16;
-    let max_y = sensor_rect
-        .max
-        .y
-        .ceil()
-        .clamp(min_y as f32 + 1.0, frame.height as f32) as u16;
-
-    Some(RoiConfig {
-        x: min_x,
-        y: min_y,
-        width: max_x.saturating_sub(min_x).max(1),
-        height: max_y.saturating_sub(min_y).max(1),
-    })
-}
-
-fn paint_sensor_rect(
-    painter: &egui::Painter,
-    image_rect: egui::Rect,
-    viewport: PreviewViewport,
-    sensor_rect: egui::Rect,
-    stroke: egui::Stroke,
-) {
-    let screen_rect = egui::Rect::from_min_max(
-        viewport.sensor_to_screen(image_rect, sensor_rect.min),
-        viewport.sensor_to_screen(image_rect, sensor_rect.max),
-    );
-    painter.rect_stroke(screen_rect, 0.0, stroke);
-}
-
 fn status_success_color() -> egui::Color32 {
     egui::Color32::from_rgb(0, 160, 60)
 }
 
 fn analysis_info_color() -> egui::Color32 {
     egui::Color32::from_rgb(30, 100, 220)
-}
-
-fn analysis_warning_color(severity: AnalysisSeverity, visuals: &egui::Visuals) -> egui::Color32 {
-    match severity {
-        AnalysisSeverity::Info => analysis_info_color(),
-        AnalysisSeverity::Warning => visuals.warn_fg_color,
-        AnalysisSeverity::Error => visuals.error_fg_color,
-    }
 }
 
 fn replay_pipeline_config(info: &ReplayFileInfo) -> CameraConfig {
@@ -3841,29 +3585,12 @@ fn replay_config_path(raw_path: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{stem}.toml")))
 }
 
-fn replay_speed_label(speed: f32) -> &'static str {
-    for &(s, label) in &REPLAY_SPEED_OPTIONS {
-        if replay_speed_matches(speed, s) {
-            return label;
-        }
-    }
-    "1x"
-}
-
 fn replay_speed_matches(current: f32, candidate: f32) -> bool {
     if current.is_infinite() || candidate.is_infinite() {
         current.is_infinite() && candidate.is_infinite()
     } else {
         (current - candidate).abs() < f32::EPSILON
     }
-}
-
-fn format_replay_time(duration_us: u64) -> String {
-    let total_tenths = ((duration_us as f64) / 100_000.0).round() as u64;
-    let minutes = total_tenths / 600;
-    let seconds = (total_tenths % 600) / 10;
-    let tenths = total_tenths % 10;
-    format!("{minutes:02}:{seconds:02}.{tenths}")
 }
 
 fn sanitize_file_stem(title: &str) -> String {
@@ -3887,77 +3614,5 @@ fn sanitize_file_stem(title: &str) -> String {
 impl Drop for CameraApp {
     fn drop(&mut self) {
         self.stop_pipeline();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_preview_viewport, sensor_rect_to_roi_config, PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
-    };
-    use augur_core::{config::CameraConfig, pipeline::PreviewFrame};
-
-    fn test_frame() -> PreviewFrame {
-        PreviewFrame {
-            width: 1280,
-            height: 720,
-            pixels: vec![0; 1280 * 720],
-            pixels_on: vec![0; 1280 * 720],
-            pixels_off: vec![0; 1280 * 720],
-            on_count: 0,
-            off_count: 0,
-            events: None,
-            window_start_us: 0,
-            window_end_us: 0,
-        }
-    }
-
-    #[test]
-    fn preview_viewport_uses_roi_when_crop_is_enabled() {
-        let frame = test_frame();
-        let mut config = CameraConfig::default();
-        config.roi.x = 120;
-        config.roi.y = 90;
-        config.roi.width = 320;
-        config.roi.height = 180;
-
-        let mut workspace = PreviewWorkspaceState {
-            crop_to_roi: true,
-            ..Default::default()
-        };
-        let viewport = build_preview_viewport(&frame, &config, &mut workspace);
-
-        assert_eq!(viewport.base_sensor_rect.min, egui::pos2(120.0, 90.0));
-        assert_eq!(viewport.base_sensor_rect.size(), egui::vec2(320.0, 180.0));
-    }
-
-    #[test]
-    fn preview_viewport_clamps_pan_inside_base_rect() {
-        let frame = test_frame();
-        let config = CameraConfig::default();
-        let mut workspace = PreviewWorkspaceState {
-            zoom: PREVIEW_ZOOM_MAX,
-            pan: egui::vec2(10_000.0, -10_000.0),
-            ..Default::default()
-        };
-
-        let viewport = build_preview_viewport(&frame, &config, &mut workspace);
-
-        assert!(viewport.visible_sensor_rect.min.x >= 0.0);
-        assert!(viewport.visible_sensor_rect.min.y >= 0.0);
-        assert!(viewport.visible_sensor_rect.max.x <= frame.width as f32);
-        assert!(viewport.visible_sensor_rect.max.y <= frame.height as f32);
-    }
-
-    #[test]
-    fn roi_conversion_rounds_selection_to_sensor_bounds() {
-        let frame = test_frame();
-        let rect = egui::Rect::from_min_max(egui::pos2(10.2, 20.1), egui::pos2(25.8, 30.0));
-        let roi = sensor_rect_to_roi_config(rect, &frame).expect("roi should be produced");
-
-        assert_eq!(roi.x, 10);
-        assert_eq!(roi.y, 20);
-        assert_eq!(roi.width, 16);
-        assert_eq!(roi.height, 10);
     }
 }
