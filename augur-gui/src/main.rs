@@ -10,6 +10,7 @@ mod point_cloud;
 mod preview;
 mod settings;
 mod viewer_tools;
+mod viewer_widget;
 
 use app::CameraApp;
 

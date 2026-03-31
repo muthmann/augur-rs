@@ -71,6 +71,9 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 ## Architecture Notes
 
 - viewer tools live under `augur-gui/src/viewer_tools/`
+- the full central viewer panel now lives in `augur-gui/src/viewer_widget.rs`, and both the main
+  window and popup host render that same component from a shared `ViewerState` / `ViewerInput` /
+  `ViewerOutput` contract instead of maintaining a popup-specific mini renderer
 - preview rendering now uses explicit display settings (`min`, `max`, `gamma`) plus a
   `PreviewMode` enum that covers red/blue polarity, signed counts, intensity colormaps, and the
   host-side time-surface path instead of a single percentile slider plus `Option<Colormap>`
@@ -101,9 +104,10 @@ This bridge is intentionally lightweight and generic. ImageJ is only the first b
 | `augur-gui/imagej-plugin/` | bundled ImageJ plugin source, menu config, build script, and installable jar |
 | `augur-gui/src/colormap.rs` | shared ImageJ colormaps and LUT generation for preview + host views |
 | `augur-gui/src/preview.rs` | preview-mode-aware rendering, signed/time-surface helpers, and mode-aware histograms |
+| `augur-gui/src/viewer_widget.rs` | reusable central viewer UI shared by the embedded host and popup viewport |
 | `augur-gui/src/viewer_tools/` | histogram, line profile, ruler, annotations, and scale-bar state/helpers |
 | `augur-gui/src/external_tools/` | generic external-tool trait plus ImageJ bridge |
-| `augur-gui/src/app.rs` | menu wiring, preview toolbar/canvas interactions, tool windows, and bridge placeholder flow |
+| `augur-gui/src/app.rs` | menu wiring, popup handoff, preview rendering orchestration, and bridge placeholder flow |
 | `docs/gui.md` | user-facing GUI workflow updates |
 
 ## Verification
