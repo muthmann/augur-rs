@@ -94,6 +94,11 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 The center panel is now an interactive preview workspace shared by the embedded view and the enlarged popup.
 
+- the entire central viewer, including the heading strip, toolbar, canvas, replay transport, and
+  lower control area, is rendered by one shared viewer component
+- when the popup is open, that same viewer state moves into the popup host and the main window
+  shows a placeholder plus a return button instead of running a second divergent renderer
+
 ### 2D preview tools
 
 - hover the preview to read the current sensor-space `x, y` position together with ON / OFF / combined pixel values
