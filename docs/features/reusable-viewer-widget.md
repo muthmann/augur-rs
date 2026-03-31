@@ -21,6 +21,11 @@ The shared viewer now owns:
 The host app still owns pipeline lifecycle, replay controller actions, config writes, analysis
 execution, and texture generation.
 
+When the shared viewer runs in the popup deferred viewport, it also requests its own repaint
+cadence during live preview or replay and explicitly wakes the root viewport when it queues
+host-owned actions such as replay transport changes. That keeps the popup transport controls
+responsive even when focus is in the external window.
+
 ## Host Contract
 
 `viewer_widget.rs` exposes three core types:

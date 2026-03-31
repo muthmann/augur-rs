@@ -88,7 +88,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
-        assert_eq!(std::mem::size_of::<PluginVTable>(), 152);
+        assert_eq!(std::mem::size_of::<PluginVTable>(), 160);
         assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
         assert_eq!(
             std::mem::size_of::<EventStoreFrameRangeForTimestampsFn>(),
