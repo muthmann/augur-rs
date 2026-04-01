@@ -13,7 +13,7 @@ single-window overwrite workflow.
 
 ## Viewer Tools
 
-- hover the preview to see `x`, `y`, ON, OFF, and combined pixel values
+- hover the preview to see `x` and `y` plus a mode-aware pixel readout: most modes show `ON`, `OFF`, and `Total`, while `Time Surface` shows the rendered decay `Value` and `Total`
 - the preview toolbar now uses compact icon buttons with hover tooltips instead of long text labels, and it stays on one row instead of wrapping the hover readout
 - `Esc` clears the active ROI/line/ruler drawing mode, and `Delete` / `Backspace` removes the selected software annotation
 - `Histogram` opens a mode-aware histogram with labeled intensity/count axes, better hover readouts, and:
