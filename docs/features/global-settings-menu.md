@@ -106,4 +106,4 @@ data at the new speed.
 - `cargo test -p augur-core`
 - `cargo test -p augur-gui`
 - `cargo clippy --workspace`
-- `mdbook build`
+- `cargo check -p augur-gui`

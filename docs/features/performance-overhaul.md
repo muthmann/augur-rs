@@ -67,7 +67,7 @@ This is a breaking runtime-plugin ABI change.
 - `FfiEventStoreHandle` switched from contiguous event slices to frame-based callbacks
 - runtime plugins must rebuild against the current `augur-plugin-api`
 
-See [Plugin API v0.3 Migration](./plugin-api-v0-3-migration.md) for the exact adaptation notes.
+See the [Plugin API Migration History](./plugin-api-migration-history.md) for the exact adaptation notes.
 
 ## Verification
 
@@ -77,5 +77,5 @@ cargo test -p augur-core
 cargo test -p augur-plugin-api
 cargo test -p augur-gui
 cargo build -p augur-gui --release
-mdbook build
+cargo check -p augur-gui
 ```

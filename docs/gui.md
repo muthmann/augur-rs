@@ -71,12 +71,10 @@ When at least one analysis plugin is enabled, a right-side **Analysis Tools** pa
 
 ### Available plugin types
 
-- Hotpixel detection
-- ROI grid analysis
-- Molecule localization
-- Focus metrics
+- **ROI Grid** — built-in sensor partitioning and hotpixel-aware ROI selection
+- **Runtime plugins** — any plugin loaded from `~/.augur/plugins/`, including scientific plugins from the [augur-plugins](https://github.com/muthmann/augur-plugins) repository
 
-See [Plugin Architecture](./features/analysis-plugins.md) for the plugin host model.
+See the [Plugin Authoring Guide](./features/plugin-authoring-guide.md) for the plugin host model.
 
 ## Plugin Manager
 

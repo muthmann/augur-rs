@@ -1,10 +1,13 @@
 <div align="center">
 
+<!-- TODO: Add project logo / banner here -->
+<!-- ![AugurRS](resources/augur-banner.png) -->
+
 # AugurRS
 
 **A fast, direct event camera recorder and live preview tool for Prophesee EVK4 / IMX636 — written entirely in Rust.**
 
-*No vendor runtime. No opaque SDK stack. Clean raw capture, full runtime sensor control, and a plugin system that can run any live analysis you want.*
+*No vendor runtime. No opaque SDK stack. Clean raw capture, full runtime sensor control, and a plugin system that lets you build any live analysis you need.*
 
 [![CI](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/muthmann/augur-rs/actions/workflows/release.yml/badge.svg)](https://github.com/muthmann/augur-rs/releases)
@@ -20,7 +23,10 @@
 
 AugurRS gives you direct, auditable control over an EVK4 event camera. Whether you are capturing raw event streams for computer vision research, running robotics experiments, doing high-speed measurements, or building a custom imaging workflow — the core tool does exactly what you need: reliable capture, live preview, recorded-file replay, and full sensor control. Nothing more, nothing less.
 
-If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything — signal processing, detection, localization, metrics, custom overlays. Scientific plugins for SMLM microscopy and biophotonics workflows are maintained in the companion [**augur-plugins**](#plugin-ecosystem) repository.
+If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything from signal processing to detection, localization, metrics, and custom overlays. Scientific plugins for SMLM microscopy and biophotonics ship separately in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
+
+<!-- TODO: Add screenshot of augur-gui live preview here -->
+<!-- ![Screenshot](resources/screenshot-gui.png) -->
 
 ---
 
@@ -79,20 +85,20 @@ augur-gui ─────────────┤      camera traits · TOML 
          └──► plugin host  ← plugins live here, not in augur-core
 ```
 
-**`augur-core` is a pure camera SDK.** The plugin host in `augur-gui` is the only place your data analysation pipeline can live.
+**`augur-core` is a pure camera SDK.** The plugin host in `augur-gui` is the only place analysis logic runs.
 
 ### Streaming Pipeline
 
 ```
 ┌──────────────┐  raw EVT3       ┌──────────────┐  bounded   ┌──────────┐
-│  USB reader  │ ──────────────► │  Disk writer │ ─────────► │ .raw file│
+│  USB reader   │ ─────────────► │  Disk writer  │ ────────► │ .raw file.│
 └──────────────┘                 └──────────────┘            └──────────┘
         │
         │  lossy (drops frames, never blocks capture)
         ▼
 ┌──────────────┐  decoded frame  ┌──────────────────────────┐
-│   Preview    │ ──────────────► │  Plugin host (optional)  │
-│   decoder    │                 └──────────────────────────┘
+│   Preview     │ ─────────────► │  Plugin host (optional)    │
+│   decoder     │                 └──────────────────────────┘
 └──────────────┘
 ```
 
@@ -152,59 +158,15 @@ captures/
 
 ---
 
-## Plugin Ecosystem
+## Plugin System
 
-The core AugurRS repo defines the plugin API and hosts the runtime loader. Runtime analysis
-plugins live in the companion **[augur-plugins](https://github.com/muthmann/augur-plugins)**
-repository; this workspace keeps only the built-in ROI-grid tool plus the host/runtime API.
+AugurRS ships a generic, FFI-based plugin system that turns the live preview into a programmable analysis surface. Plugins run frame-by-frame alongside the preview stream, declare what data they need (decoded frames, raw events, or upstream plugin results), and publish their output through a host-owned rendering pipeline — tables, scatter plots, density maps, line charts, image views.
 
-The plugin system is a first-class extension point, not an afterthought. Plugins:
+Drop a compiled plugin into `~/.augur/plugins/`, and the GUI's **Plugin Manager** picks it up. Enable, disable, reload — no recompilation of the host required.
 
-- run live alongside the preview stream, frame by frame
-- are loaded at runtime from `~/.augur/plugins/`
-- share derived data through per-frame and persistent string-keyed JSON context buses
-- declare their input kind (decoded frame, raw events, or upstream plugin results)
-- run in ordered phases so one plugin can feed the next within the same frame
-- can query retained decoded-event history through the host-owned EventStore
-- can read host-published global experiment settings through the shared context bus
-- expose settings and status through a declarative JSON schema instead of direct `egui` access
+The only built-in plugin is **ROI Grid** (sensor partitioning and hotpixel-aware ROI selection). Everything else loads at runtime. Scientific plugins for SMLM, biophotonics, and other domains are maintained in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
 
-Anyone can write a plugin. The API is documented in [Plugin Architecture](./docs/features/analysis-plugins.md).
-
-### What Plugins Can Do
-
-Plugins can operate on anything the preview pipeline produces:
-
-| Input kind | Example use cases |
-|---|---|
-| Decoded preview frame | Overlay rendering, pixel statistics, motion detection, sharpness estimation |
-| Raw `CdEvent` stream | Event-based reconstruction, spatiotemporal filtering, spike detection |
-| Upstream plugin results | Chained metrics, decision logic that consumes another plugin's output |
-
-### Built-In / Runtime Split
-
-| Plugin | What it does |
-|---|---|
-| **ROI Grid** | Built-in plugin that partitions the sensor around masked hotpixels and offers one-click "Use as ROI" |
-
-Scientific runtime plugins such as Hotpixel Detection, Molecule Localization, Focus Metrics, and
-the `eveSMLM` chain are maintained in [augur-plugins](https://github.com/muthmann/augur-plugins).
-
-Build a plugin crate, copy its `plugin.toml` plus the generated `.dylib/.so/.dll` into `~/.augur/plugins/<plugin-name>/`, then use the GUI's **Plugins** menu and **Plugin Manager** window to scan, enable, disable, and reload it without recompiling `augur-gui`.
-
----
-
-## Why Not Metavision / OpenEB?
-
-| | OpenEB | AugurRS |
-|---|---|---|
-| Dependencies | Large C++/Python ecosystem | Pure Rust, `rusb` + `eframe` |
-| Sensor support | Broad (all Prophesee sensors) | Focused (EVK4 / IMX636) |
-| Recording path | Shared with analysis layer | Isolated 3-thread pipeline |
-| Live analysis | Separate ecosystem | Plugin system in the same binary |
-| Audit surface | Large | Small, readable |
-| Config | Custom formats | TOML with automatic sidecar |
-| Reproducibility | Manual | Built in |
+**Want to write a plugin?** See the [**Plugin Authoring Guide**](./docs/features/plugin-authoring-guide.md).
 
 ---
 
@@ -231,7 +193,7 @@ Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned mac
 | [Recording Format](./docs/recording.md) | EVT3 output and pipeline behavior |
 | [Performance](./docs/performance.md) | Architecture and design rationale |
 | [HDF5 File Support](./docs/features/hdf5-file-support.md) | Native HDF5 + ECF plugin setup for `.h5` / `.hdf5` replay |
-| [Plugin Architecture](./docs/features/analysis-plugins.md) | Plugin API: FFI host, phases, context bus |
+| [Plugin Authoring Guide](./docs/features/plugin-authoring-guide.md) | Write your own plugin: FFI host, phases, context bus, host views |
 | [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
 | [Technical Notes](./docs/features/README.md) | SDK internals, ROI grid, and feature details |
 | [Architecture Decisions](./docs/adr/README.md) | ADRs |

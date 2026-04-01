@@ -28,7 +28,6 @@ When the analysis panel is hidden, plugins still run if they are enabled. Hiding
 |---|---|
 | `augur-gui/src/app.rs` | Edge toggle buttons, collapsed strips, and scrollable side-panel rendering |
 | `docs/gui.md` | User-facing GUI workflow documentation |
-| `book/src/gui.md` | mdBook GUI guide |
 
 ## Verification
 
