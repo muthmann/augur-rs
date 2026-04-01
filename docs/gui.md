@@ -16,7 +16,7 @@ A single menu bar row at the top of the window:
 
 | Menu | Contents |
 |---|---|
-| `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay |
+| `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay, Export TIFF Stack during replay |
 | `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection |
 | `Settings` | Pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls |
 | `View` | Toggle Settings/Analysis panels, show/hide the scale bar, switch 2D/3D view mode |
@@ -45,6 +45,7 @@ Camera-only controls are shown in the left panel.
 
 - the left camera settings panel becomes read-only
 - if a companion `<capture>.toml` sidecar exists, both the panel and the top-bar `Settings` menu use it as replay reference data
+- `Acq time [ms]` in the top-bar `Settings` menu stays editable during replay and applies on the next replay frame boundary
 - if no sidecar exists, the GUI shows a default geometry-matched reference config instead
 
 ### Camera sections
@@ -157,6 +158,13 @@ The center panel switches to a `Replay` heading and shows a transport bar betwee
 
 Enabled plugins continue to process replayed frames through the normal `PreviewFrame` path.
 
+The top-bar `Settings -> Acq time [ms]` control remains active during replay. Changing it updates
+the replay preview accumulation window on the next frame boundary without restarting replay.
+
+`File -> Export TIFF Stack…` opens a modal batch-export dialog during replay. It lets you choose a
+time range, acquisition time, optional ROI crop, and output path, then writes one 16-bit grayscale
+TIFF page per accumulation window.
+
 At EOF, replay shuts down its controller threads but stays in replay mode so the last frame, timeline, and transport controls remain available. Use `Restart`, drag the timeline, or click `Stop` to leave replay mode.
 
 ---
@@ -228,7 +236,7 @@ Status, warning, and error labels adapt to the active GUI theme.
 
 ## Runtime Notes
 
-- Acquisition time is only adjustable for live preview and recording
+- acquisition time is adjustable during live preview, recording, and replay; replay applies changes on the next frame boundary
 - sensor geometry and disk-writer buffer are start-time controls, so they are only editable while idle
 - EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu, which now shows those cadences in Hz instead of milliseconds
 - preview histogram work stays bounded even when a frame contains very large per-pixel counts, and

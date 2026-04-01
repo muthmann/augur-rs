@@ -6,8 +6,9 @@
 splitting them across the `Camera` menu and the left settings panel.
 
 This pass adds a persisted `[global]` config block, publishes shared `GlobalSettings` into the
-runtime plugin context bus, and fixes replay-speed changes so they reset pacing baselines instead
-of causing jumps or long freezes.
+runtime plugin context bus, fixes replay-speed changes so they reset pacing baselines instead of
+causing jumps or long freezes, and keeps acquisition time editable during replay so the next replay
+frame uses the new accumulation window.
 
 ## User-Facing Changes
 
@@ -17,7 +18,8 @@ of causing jumps or long freezes.
 - `Settings` also owns pixel scale, sensor geometry, preview cadence, point-cloud cadence, and the
   recording disk-writer buffer size.
 - Sensor geometry and disk-writer buffer are idle-only controls because they shape a pipeline at
-  start time. Pixel scale, replay/runtime history budget, and preview cadences update immediately.
+  start time. Pixel scale, replay/runtime history budget, preview cadences, and acquisition time
+  update immediately when the underlying pipeline/controller supports it.
 
 ## Persisted Config
 
@@ -85,6 +87,11 @@ When replay speed changes, both replay backends reset their local pacing baselin
 
 That keeps the approximate byte-rate throttle responsive without misinterpreting already-played
 data at the new speed.
+
+Replay also now keeps `Acq time [ms]` enabled in the top-bar `Settings` menu. The GUI already
+stores the value through `PipelineController::acq_time_us`, and the preview pipeline samples that
+atomic on each frame boundary, so replay-time edits take effect on the next decoded frame window
+without rebuilding the replay session.
 
 ## Files
 

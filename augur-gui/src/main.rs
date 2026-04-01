@@ -1,5 +1,7 @@
 mod app;
 mod colormap;
+mod export;
+mod export_dialog;
 mod external_tools;
 mod host_views;
 mod plugin;
