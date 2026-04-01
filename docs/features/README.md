@@ -17,7 +17,8 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
 - [Performance Safeguards](./performance-safeguards.md) — capture-path fail-fast setup, stop-time drain behavior, preview throttling, and UI-side load shedding
 - [Performance Overhaul](./performance-overhaul.md) — split pipeline telemetry, direct `Color32` preview rendering, async decoded replay opening, and generation-aware host caching
-- [Global Settings Menu and Replay Pacing](./global-settings-menu.md) — top-bar settings controls, hover/reference guidance, persisted `[global]` config, plugin `GlobalSettings`, and speed-change replay resets
+- [Global Settings Menu and Replay Pacing](./global-settings-menu.md) — top-bar settings controls, hover/reference guidance, persisted `[global]` config, plugin `GlobalSettings`, replay-editable acquisition time, and speed-change replay resets
+- [TIFF Stack Export](./tiff-stack-export.md) — File-menu batch export of replay accumulations to multi-page 16-bit TIFF with time-window and ROI controls
 - [Release Distribution](./release-distribution.md) — cross-platform tagged artifacts, macOS signing/notarization, and cargo-release workflow
 - [HDF5 File Support](./hdf5-file-support.md) — native HDF5 build requirements, ECF plugin installation, runtime environment setup
 - [Replay](./raw-replay.md) — `.raw` plus decoded-event replay, seekable transport controls, persisted EOF state

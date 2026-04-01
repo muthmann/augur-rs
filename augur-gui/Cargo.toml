@@ -27,4 +27,5 @@ image.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tiff.workspace = true
 toml.workspace = true

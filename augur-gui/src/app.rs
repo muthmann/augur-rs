@@ -25,6 +25,8 @@ use augur_plugin_api::{
 use augur_prophesee::evk4::Evk4Camera;
 
 use crate::{
+    export::{export_tiff_stack, ExportEventSource, TiffStackExportParams},
+    export_dialog::{ExportDialog, ExportDialogAction},
     external_tools::{
         ExternalTool, ExternalToolStatus, ImageJBridge, BUNDLED_IMAGEJ_PLUGIN_JAR,
         BUNDLED_IMAGEJ_PLUGIN_JAR_NAME, DEFAULT_IMAGEJ_BRIDGE_PORT,
@@ -169,6 +171,11 @@ struct ReplayOpenTask {
     path: PathBuf,
     saved_live_state: SavedLiveState,
     rx: mpsc::Receiver<Result<OpenedReplay, String>>,
+}
+
+struct TiffStackExportTask {
+    output_path: PathBuf,
+    rx: mpsc::Receiver<Result<usize, String>>,
 }
 
 struct PopupSharedData {
@@ -348,6 +355,8 @@ pub struct CameraApp {
     reconstruction_shared: Arc<Mutex<ReconstructionSharedData>>,
     reconstruction_source_dirty: bool,
     imagej_dialog: ImageJDialogState,
+    export_dialog: ExportDialog,
+    export_task: Option<TiffStackExportTask>,
     external_tool: Option<Box<dyn ExternalTool>>,
     host_view_registry: ResolvedHostViewRegistry,
     host_view_registry_dirty: bool,
@@ -422,6 +431,8 @@ impl CameraApp {
             reconstruction_shared: Arc::new(Mutex::new(ReconstructionSharedData::default())),
             reconstruction_source_dirty: true,
             imagej_dialog: ImageJDialogState::default(),
+            export_dialog: ExportDialog::default(),
+            export_task: None,
             external_tool: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
             host_view_registry_dirty: true,
@@ -2043,6 +2054,93 @@ impl CameraApp {
         }
     }
 
+    fn current_export_event_source(&self) -> Result<ExportEventSource, String> {
+        if let Some(events) = &self.replay_decoded_events {
+            return Ok(ExportEventSource::Decoded(Arc::clone(events)));
+        }
+
+        let path = self
+            .replay_path
+            .as_ref()
+            .map(PathBuf::from)
+            .ok_or_else(|| "replay path is missing".to_owned())?;
+        let info = self
+            .replay_file_info
+            .as_ref()
+            .ok_or_else(|| "replay file metadata is missing".to_owned())?;
+
+        Ok(ExportEventSource::RawEvt3 {
+            path,
+            data_offset: info.data_offset,
+        })
+    }
+
+    fn open_tiff_stack_export_dialog(&mut self) {
+        let Some(path) = self.replay_path.as_ref().map(PathBuf::from) else {
+            self.last_error = Some("replay path is missing".into());
+            return;
+        };
+        let Some(info) = self.replay_file_info.as_ref() else {
+            self.last_error = Some("replay file metadata is missing".into());
+            return;
+        };
+
+        self.export_dialog
+            .open_for_replay(&path, info, self.acq_time_ms, self.config.roi);
+    }
+
+    fn start_tiff_stack_export(&mut self, mut params: TiffStackExportParams) {
+        if self.export_task.is_some() {
+            return;
+        }
+
+        let source = match self.current_export_event_source() {
+            Ok(source) => source,
+            Err(err) => {
+                self.export_dialog.finish_error(err.clone());
+                self.last_error = Some(err);
+                return;
+            }
+        };
+
+        params.output_path = ensure_extension(params.output_path, "tiff");
+        let output_path = params.output_path.clone();
+        let (tx, rx) = mpsc::channel();
+        self.export_dialog.set_exporting(true);
+        thread::spawn(move || {
+            let result = export_tiff_stack(source, &params);
+            let _ = tx.send(result);
+        });
+        self.export_task = Some(TiffStackExportTask { output_path, rx });
+        self.last_error = None;
+    }
+
+    fn poll_tiff_stack_export_task(&mut self) {
+        let Some(task) = self.export_task.take() else {
+            return;
+        };
+
+        match task.rx.try_recv() {
+            Ok(Ok(frame_count)) => {
+                self.export_dialog
+                    .finish_success(frame_count, &task.output_path);
+                self.last_error = None;
+            }
+            Ok(Err(err)) => {
+                self.export_dialog.finish_error(err.clone());
+                self.last_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.export_task = Some(task);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "TIFF export task ended unexpectedly".to_owned();
+                self.export_dialog.finish_error(message.clone());
+                self.last_error = Some(message);
+            }
+        }
+    }
+
     fn load_replay_display_settings(
         &self,
         raw_path: &Path,
@@ -2323,6 +2421,9 @@ impl CameraApp {
         self.replay_speed = 1.0;
         self.replay_notice = None;
         self.replay_path = None;
+        if self.export_task.is_none() {
+            self.export_dialog = ExportDialog::default();
+        }
         self.restore_saved_live_state();
     }
 
@@ -2680,6 +2781,7 @@ impl CameraApp {
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_replay_open_task();
+        self.poll_tiff_stack_export_task();
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
         self.refresh_host_view_registry_if_dirty();
@@ -2708,6 +2810,19 @@ impl eframe::App for CameraApp {
                                 ),
                             );
                         }
+                        if ui
+                            .add_enabled(
+                                self.replay_file_info.is_some()
+                                    && self.replay_path.is_some()
+                                    && self.export_task.is_none(),
+                                egui::Button::new("Export TIFF Stack…"),
+                            )
+                            .clicked()
+                        {
+                            self.open_tiff_stack_export_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         if ui.button("Close Replay").clicked() {
                             self.stop_pipeline();
                             ui.close_menu();
@@ -2943,9 +3058,11 @@ impl eframe::App for CameraApp {
 
                     ui.horizontal(|ui| {
                         ui.label("Acq time [ms]").on_hover_text(ACQ_TIME_TOOLTIP);
+                        let acq_time_locked =
+                            mode == AppMode::Recording && settings_locked;
                         let response = ui
                             .add_enabled(
-                                mode != AppMode::Replaying && !settings_locked,
+                                !acq_time_locked,
                                 egui::Slider::new(&mut self.acq_time_ms, 1..=1000),
                             )
                             .on_hover_text(ACQ_TIME_TOOLTIP);
@@ -3656,6 +3773,12 @@ impl eframe::App for CameraApp {
             }
         }
         self.show_imagej_dialog(ctx);
+        if let Some(action) = self.export_dialog.show(ctx) {
+            match action {
+                ExportDialogAction::Export(params) => self.start_tiff_stack_export(params),
+                ExportDialogAction::Cancel => {}
+            }
+        }
 
         if self.popup_open {
             let shared = Arc::clone(&self.popup_shared);
@@ -3925,6 +4048,13 @@ fn sanitize_file_stem(title: &str) -> String {
     } else {
         stem
     }
+}
+
+fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension(extension);
+    }
+    path
 }
 
 impl Drop for CameraApp {
