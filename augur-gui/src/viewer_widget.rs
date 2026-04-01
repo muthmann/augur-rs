@@ -10,7 +10,9 @@ use crate::{
     app::PANEL_ROUNDING,
     colormap::Colormap,
     point_cloud::{PointCloudMetrics, PointCloudState},
-    preview::{reset_preview_render_cache, PreviewDisplaySettings, PreviewMode},
+    preview::{
+        query_time_surface_value, reset_preview_render_cache, PreviewDisplaySettings, PreviewMode,
+    },
     viewer_tools::{
         compute_scale_bar, AnnotationManager, AnnotationShape, AnnotationShapeKind, ContrastMode,
         ContrastSettings, HistogramWindow, LineProfileTool, RulerTool, ScaleBarPosition,
@@ -774,10 +776,18 @@ fn draw_preview_toolbar(
             let width = usize::from(frame.width.max(1));
             let idx = usize::from(y) * width + usize::from(x);
             if idx < frame.pixels.len() {
-                let full = format!(
-                    "x {x}, y {y} | ON: {} OFF: {} Total: {}",
-                    frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
-                );
+                let full = match state.preview_mode {
+                    PreviewMode::TimeSurface => {
+                        let value = query_time_surface_value(idx)
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "n/a".to_owned());
+                        format!("x {x}, y {y} | Value: {value} Total: {}", frame.pixels[idx])
+                    }
+                    _ => format!(
+                        "x {x}, y {y} | ON: {} OFF: {} Total: {}",
+                        frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
+                    ),
+                };
                 let short = format!("x {x}, y {y}");
                 let avail = ui.available_width();
                 let full_w = ui.fonts(|f| {

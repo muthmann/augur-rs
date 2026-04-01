@@ -133,6 +133,17 @@ pub fn reset_preview_render_cache() {
     });
 }
 
+pub fn query_time_surface_value(index: usize) -> Option<u8> {
+    PREVIEW_SCRATCH.with(|scratch| {
+        let scratch = scratch.borrow();
+        scratch
+            .time_surface_values
+            .get(index)
+            .copied()
+            .filter(|_| scratch.time_surface_decay_key.is_some())
+    })
+}
+
 pub fn frame_to_color_image(
     frame: &PreviewFrame,
     overlays: &[Overlay],
@@ -717,8 +728,9 @@ fn render_overlays(
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
-        PreviewDisplaySettings, PreviewMode, MAX_HISTOGRAM_BINS, TIME_SURFACE_BINS,
+        compute_frame_histogram, frame_to_color_image, query_time_surface_value,
+        reset_preview_render_cache, PreviewDisplaySettings, PreviewMode, MAX_HISTOGRAM_BINS,
+        TIME_SURFACE_BINS,
     };
     use crate::colormap::Colormap;
     use augur_core::{
@@ -891,6 +903,35 @@ mod tests {
         let histogram = compute_frame_histogram(&frame, PreviewMode::TimeSurface, 30_000);
         assert_eq!(histogram.len(), TIME_SURFACE_BINS);
         assert_eq!(histogram[255], 1);
+    }
+
+    #[test]
+    fn query_time_surface_value_returns_cached_decay_values() {
+        reset_preview_render_cache();
+        let frame = PreviewFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![1],
+            pixels_on: vec![1],
+            pixels_off: vec![0],
+            on_count: 1,
+            off_count: 0,
+            events: Some(vec![CdEvent {
+                x: 0,
+                y: 0,
+                timestamp: 10,
+                polarity: true,
+            }]),
+            window_start_us: 0,
+            window_end_us: 10,
+        };
+
+        assert_eq!(query_time_surface_value(0), None);
+
+        let _ = compute_frame_histogram(&frame, PreviewMode::TimeSurface, 30_000);
+
+        assert_eq!(query_time_surface_value(0), Some(255));
+        assert_eq!(query_time_surface_value(1), None);
     }
 
     #[test]

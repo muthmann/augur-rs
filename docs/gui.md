@@ -101,7 +101,7 @@ The center panel is now an interactive preview workspace shared by the embedded 
 
 ### 2D preview tools
 
-- hover the preview to read the current sensor-space `x, y` position together with ON / OFF / combined pixel values
+- hover the preview to read the current sensor-space `x, y` position together with a mode-aware pixel readout: most modes show ON / OFF / Total, while `Time Surface` shows the rendered decay `Value` plus `Total`
 - the preview toolbar uses compact icon buttons with hover tooltips for ROI, line profile, ruler, annotation, histogram, zoom, and popup actions, and it stays on one row instead of wrapping the hover readout below the preview
 - `Histogram` opens a mode-aware histogram plus brightness/contrast window with labeled intensity/count axes, hover readouts, Auto percentile, manual min/max, gamma controls, draggable marker handles, and a display-ramp preview
 - the scroll area below the preview includes a `Mode` selector for red-blue polarity, signed count, time surface, and summed-intensity colormap rendering
