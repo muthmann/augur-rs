@@ -7,16 +7,17 @@ mod settings;
 
 pub use context::{
     GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
-    HostViewPlacement, HostViewRegistry, Localization, LocalizationResults, LocalizationRow,
-    LocalizationTable, TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d,
-    TableDatasetV1, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_LOCALIZATION_RESULTS,
+    HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine, Series1dPoint, Series1dV1,
+    TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
+    TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
 };
 pub use event_store::EventStore;
 pub use ffi::{
     AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
     FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
     FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
-    HostViewDatasetGenerationFn, PluginEntry, PluginInput, PluginVTable, PLUGIN_ENTRY_SYMBOL,
+    HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn, PluginEntry,
+    PluginInput, PluginVTable, PLUGIN_ENTRY_SYMBOL,
 };
 pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
@@ -67,15 +68,16 @@ mod tests {
     use super::{
         context::{
             GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor,
-            HostViewKind, HostViewPlacement, HostViewRegistry, Localization, LocalizationResults,
-            LocalizationRow, LocalizationTable, TableColumn, TableColumnData, TableColumnValues,
+            HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine,
+            Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
             TableCoordinateSpace2d, TableDatasetV1, TableSchema, TableValueType,
-            CTX_GLOBAL_SETTINGS, CTX_LOCALIZATION_RESULTS,
+            CTX_GLOBAL_SETTINGS,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
         FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiPixel, FfiSlice, FfiString,
-        FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginInput, PluginVTable,
+        FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
+        PluginInput, PluginVTable,
     };
 
     #[test]
@@ -95,6 +97,7 @@ mod tests {
             8
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
+        assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
     }
 
     #[test]
@@ -131,30 +134,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_context_types_round_trip_through_json() {
-        let results = LocalizationResults {
-            localizations: vec![Localization {
-                x: 12.5,
-                y: 7.25,
-                sigma_x: 1.4,
-                sigma_y: 1.6,
-                amplitude: 42.0,
-                background: 2.5,
-                timestamp_us: 1_234,
-                fit_error: 0.12,
-            }],
-            frame_window_start_us: 10,
-            frame_window_end_us: 110,
-        };
-
-        let json = serde_json::to_vec(&results).expect("results must serialize");
-        let decoded: LocalizationResults =
-            serde_json::from_slice(&json).expect("results must deserialize");
-        assert_eq!(decoded, results);
-        assert_eq!(CTX_LOCALIZATION_RESULTS, "augur.localization.results");
-    }
-
-    #[test]
     fn global_settings_round_trip_through_json() {
         let settings = GlobalSettings {
             nm_per_pixel: 65.0,
@@ -172,28 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn localization_table_round_trips_through_json() {
-        let table = LocalizationTable {
-            rows: vec![LocalizationRow {
-                id: 7,
-                frame: 3,
-                x_nm: 812.5,
-                y_nm: 455.0,
-                sigma_nm: 132.0,
-                intensity: 4_200.0,
-                offset: 14.0,
-                uncertainty_xy_nm: 19.5,
-                timestamp_us: 12_345,
-            }],
-            nm_per_pixel: 65.0,
-            sensor_width: 1280,
-            sensor_height: 720,
-        };
-
-        let json = serde_json::to_vec(&table).expect("table must serialize");
-        let decoded: LocalizationTable =
-            serde_json::from_slice(&json).expect("table must deserialize");
-        assert_eq!(decoded, table);
+    fn plugin_capabilities_default_to_no_optional_features() {
+        let capabilities = PluginCapabilities::default();
+        assert!(!capabilities.retained_event_history);
     }
 
     #[test]
@@ -224,38 +184,52 @@ mod tests {
     #[test]
     fn host_view_registry_round_trips_through_json() {
         let registry = HostViewRegistry {
-            datasets: vec![HostDatasetDescriptor {
-                id: "table.localization".into(),
-                title: "Localizations".into(),
-                kind: HostDatasetKind::TableV1(TableSchema {
-                    columns: vec![
-                        TableColumn {
-                            id: "frame".into(),
-                            title: "Frame".into(),
-                            value_type: TableValueType::U64,
-                        },
-                        TableColumn {
-                            id: "x_nm".into(),
-                            title: "X [nm]".into(),
-                            value_type: TableValueType::F64,
-                        },
-                        TableColumn {
-                            id: "y_nm".into(),
-                            title: "Y [nm]".into(),
-                            value_type: TableValueType::F64,
-                        },
-                    ],
-                    coordinate_space_2d: Some(TableCoordinateSpace2d {
-                        x_column: "x_nm".into(),
-                        y_column: "y_nm".into(),
-                        x_min: 0.0,
-                        x_max: 100.0,
-                        y_min: 0.0,
-                        y_max: 100.0,
+            datasets: vec![
+                HostDatasetDescriptor {
+                    id: "table.localization".into(),
+                    title: "Localizations".into(),
+                    kind: HostDatasetKind::TableV1(TableSchema {
+                        columns: vec![
+                            TableColumn {
+                                id: "frame".into(),
+                                title: "Frame".into(),
+                                value_type: TableValueType::U64,
+                            },
+                            TableColumn {
+                                id: "x_nm".into(),
+                                title: "X [nm]".into(),
+                                value_type: TableValueType::F64,
+                            },
+                            TableColumn {
+                                id: "y_nm".into(),
+                                title: "Y [nm]".into(),
+                                value_type: TableValueType::F64,
+                            },
+                        ],
+                        coordinate_space_2d: Some(TableCoordinateSpace2d {
+                            x_column: "x_nm".into(),
+                            y_column: "y_nm".into(),
+                            x_min: 0.0,
+                            x_max: 100.0,
+                            y_min: 0.0,
+                            y_max: 100.0,
+                        }),
                     }),
-                }),
-                empty_message: "No rows yet".into(),
-            }],
+                    empty_message: "No rows yet".into(),
+                },
+                HostDatasetDescriptor {
+                    id: "image.preview".into(),
+                    title: "Rendered Image".into(),
+                    kind: HostDatasetKind::Image2dV1,
+                    empty_message: "No image yet".into(),
+                },
+                HostDatasetDescriptor {
+                    id: "series.focus".into(),
+                    title: "Focus Series".into(),
+                    kind: HostDatasetKind::Series1dV1,
+                    empty_message: "No samples yet".into(),
+                },
+            ],
             views: vec![
                 HostViewDescriptor {
                     id: "panel.localization".into(),
@@ -273,6 +247,30 @@ mod tests {
                         x_column: "x_nm".into(),
                         y_column: "y_nm".into(),
                     },
+                },
+                HostViewDescriptor {
+                    id: "window.scatter".into(),
+                    title: "Localization Scatter".into(),
+                    dataset_id: "table.localization".into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::Scatter2dFromTable {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                    },
+                },
+                HostViewDescriptor {
+                    id: "window.image".into(),
+                    title: "Rendered Image".into(),
+                    dataset_id: "image.preview".into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::ImageWindow,
+                },
+                HostViewDescriptor {
+                    id: "window.series".into(),
+                    title: "Focus Series".into(),
+                    dataset_id: "series.focus".into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::LineSeriesWindow,
                 },
             ],
         };
@@ -328,5 +326,48 @@ mod tests {
         let err = serde_json::from_value::<TableDatasetV1>(json)
             .expect_err("dataset must reject mismatched lengths");
         assert!(err.to_string().contains("identical lengths"));
+    }
+
+    #[test]
+    fn image_dataset_v1_round_trips_through_json() {
+        let image = Image2dV1::new(2, 2, vec![0.0, 1.0, 2.0, 3.0]).expect("image must validate");
+
+        let json = serde_json::to_vec(&image).expect("image must serialize");
+        let decoded: Image2dV1 = serde_json::from_slice(&json).expect("image must deserialize");
+        assert_eq!(decoded, image);
+        assert_eq!(decoded.size(), [2, 2]);
+    }
+
+    #[test]
+    fn image_dataset_v1_rejects_dimension_mismatches() {
+        let json = serde_json::json!({
+            "width": 2,
+            "height": 2,
+            "pixels": [0.0, 1.0, 2.0]
+        });
+
+        let err = serde_json::from_value::<Image2dV1>(json)
+            .expect_err("image must reject mismatched dimensions");
+        assert!(err.to_string().contains("pixel count"));
+    }
+
+    #[test]
+    fn series_dataset_v1_round_trips_through_json() {
+        let dataset = Series1dV1 {
+            x_label: "Frame".into(),
+            y_label: "Score".into(),
+            lines: vec![Series1dLine {
+                name: "Focus".into(),
+                points: vec![
+                    Series1dPoint { x: 0.0, y: 1.0 },
+                    Series1dPoint { x: 1.0, y: 1.5 },
+                ],
+            }],
+        };
+
+        let json = serde_json::to_vec(&dataset).expect("series must serialize");
+        let decoded: Series1dV1 = serde_json::from_slice(&json).expect("series must deserialize");
+        assert_eq!(decoded, dataset);
+        assert_eq!(decoded.total_points(), 2);
     }
 }

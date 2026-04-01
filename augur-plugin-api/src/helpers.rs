@@ -4,7 +4,7 @@ use crate::{
     ffi::{
         AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
         FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-        FfiSubpixelMarker, PluginInput,
+        FfiSubpixelMarker, PluginCapabilities, PluginInput,
     },
     settings::{SettingsSchema, StatusEntry},
     HostViewRegistry,
@@ -286,6 +286,10 @@ pub trait Plugin: Default {
         PluginInput::FrameOnly
     }
 
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities::default()
+    }
+
     fn dependencies(&self) -> &[&'static str] {
         &[]
     }
@@ -312,10 +316,6 @@ pub trait Plugin: Default {
 
     fn status_entries(&self) -> Vec<StatusEntry> {
         Vec::new()
-    }
-
-    fn accumulated_localizations(&self) -> Option<Vec<u8>> {
-        None
     }
 
     fn host_views(&self) -> HostViewRegistry {

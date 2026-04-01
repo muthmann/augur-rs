@@ -2,26 +2,34 @@
 
 ## Summary
 
-`augur-gui` now resolves plugin-owned datasets into a host-owned registry of reusable analysis
-views. Plugins describe what they can expose, while the GUI owns the rendering, window state, data
-fetch timing, and export behavior.
+`augur-gui` resolves plugin-owned datasets into a host-owned registry of reusable analysis views.
+Plugins describe what they can expose, while the GUI owns rendering, window state, cache
+invalidation, and export behavior.
 
-This replaces the old reconstruction-specific host hook with a generic path that works for both
-built-in plugins and runtime-loaded plugins.
+This is now the only supported path for plugin-owned analysis UI in this repository. The old
+reconstruction-specific host hook is gone.
 
 ## Model
 
-The registry is split into two layers:
+The registry has two plugin-facing layers:
 
 - `HostDatasetDescriptor`: stable dataset id, title, kind, and empty-state message
 - `HostViewDescriptor`: stable view id, dataset reference, placement, and host-rendered view kind
 
-Current table-oriented dataset and view kinds are:
+Current dataset kinds:
 
 - `HostDatasetKind::TableV1`
+- `HostDatasetKind::Image2dV1`
+- `HostDatasetKind::Series1dV1`
+
+Current view kinds:
+
 - `HostViewKind::CompactTable`
 - `HostViewKind::TableWindow`
 - `HostViewKind::Density2dFromTable`
+- `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::ImageWindow`
+- `HostViewKind::LineSeriesWindow`
 
 ## Resolution Rules
 
@@ -31,33 +39,55 @@ for frame processing.
 - later providers override earlier ones only when the descriptor metadata matches exactly
 - conflicting duplicate ids are ignored and logged
 - views whose dataset ids do not resolve are ignored and logged
+- views whose kinds do not match the dataset kind are ignored and logged
 
-## Loading Contract
+The result is a resolved host-owned registry that is safe to render without plugin-specific UI
+branches.
 
-Host-view callbacks now live directly on the flat `PluginVTable` exported through
-`augur_plugin_vtable`. The host requires a current `augur-plugin-api` build and does not keep a
-legacy ABI fallback path anymore.
+## Loading And Caching Contract
+
+Host-view callbacks live directly on the flat `PluginVTable` exported through
+`augur_plugin_vtable`.
+
+The host requires a current `augur-plugin-api` build and does not keep any ABI fallback path.
+
+Dataset payloads are:
+
+- fetched lazily, only when a visible panel or open window needs them
+- decoded into host-owned snapshot types
+- cached by dataset id
+- invalidated when `host_view_dataset_generation(dataset_id)` increases
+
+Per-view render state is also host-owned. Density and image views keep their rendered textures
+alive until either the dataset generation changes or the view settings change.
 
 ## Host Rendering
 
 `augur-gui` currently renders:
 
-- compact analysis-panel tables with a 10-row preview cap
+- compact panel tables with a 10-row preview cap
 - read-only table windows with CSV export
-- density maps derived from numeric table columns with zoom, contrast, colormap, image export, and provider-scoped `Clear`
+- density maps derived from numeric table columns, with zoom/contrast/colormap/image export
+- scatter plots derived from numeric table columns, with CSV export
+- generic 2D image windows with zoom/contrast/colormap/image export
+- generic 1D line-series plots
 
-Dataset payloads are fetched lazily and cached per dataset id only when at least one visible panel
-or open window needs them.
+Exports stay generic:
 
-The host also tracks `host_view_dataset_generation(dataset_id)` and only reloads a cached dataset
-snapshot when the provider reports a newer generation. Density render state stays alive until
-either the dataset generation changes or the view settings change.
+- CSV export for table-backed views
+- PNG/TIFF export for rendered image/density views
+
+## Reconstruction Direction
+
+Reconstruction is no longer a dedicated host feature. A runtime plugin now publishes a generic
+table dataset, and the host can render that dataset through table, scatter, and density views.
+
+That keeps `augur-gui` generic while still supporting localization/reconstruction workflows.
 
 ## Verification
 
 ```bash
-cargo fmt --all
+cargo test -p augur-gui host_view
 cargo test -p augur-plugin-api
-cargo test -p augur-gui
-cargo build -p augur-gui
+cargo check -p augur-gui
 ```

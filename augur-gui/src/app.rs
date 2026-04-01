@@ -19,8 +19,8 @@ use augur_core::{
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
 use augur_plugin_api::{
-    EventStore, FfiCdEvent, GlobalSettings, HostViewKind, LocalizationTable, PluginInput,
-    TableDatasetV1, CTX_GLOBAL_SETTINGS,
+    EventStore, FfiCdEvent, GlobalSettings, HostDatasetKind, HostViewKind, Image2dV1, PluginInput,
+    Series1dV1, TableDatasetV1, CTX_GLOBAL_SETTINGS,
 };
 use augur_prophesee::evk4::Evk4Camera;
 
@@ -32,10 +32,14 @@ use crate::{
     host_views::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
         render_compact_table, render_density2d_view, render_density_window_viewport,
+        render_image2d_view, render_image_window_viewport, render_line_series_view,
+        render_scatter2d_view, render_scatter_window_viewport, render_series_window_viewport,
         render_table_window, render_table_window_viewport, reset_provider_for_dataset,
         resolve_host_view_registry, DensityWindowViewportData, HostDatasetSnapshot,
         HostRegistryContribution, HostViewImageFormat, HostViewProviderKey, HostViewRenderState,
-        HostViewUiActions, ResolvedHostView, ResolvedHostViewRegistry, TableWindowViewportData,
+        HostViewUiActions, ImageWindowViewportData, ResolvedHostView, ResolvedHostViewRegistry,
+        Scatter2dViewOptions, ScatterWindowViewportData, SeriesWindowViewportData,
+        TableWindowViewportData,
     },
     plugin::AnalysisPlugin,
     plugin_loader::PluginManager,
@@ -44,12 +48,6 @@ use crate::{
     preview::{
         compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
         PreviewDisplaySettings,
-    },
-    reconstruction::{
-        export_csv_to_path as export_reconstruction_csv_to_path,
-        export_image_to_path as export_reconstruction_image_to_path,
-        render_reconstruction_viewport, ReconstructionImageFormat, ReconstructionRenderSettings,
-        ReconstructionSharedData, ReconstructionState,
     },
     settings::draw_settings,
     viewer_widget::{
@@ -147,6 +145,50 @@ fn cached_table(entry: Option<&HostDatasetCacheEntry>) -> Result<Option<&TableDa
         Some(HostDatasetCacheEntry {
             snapshot: Err(err), ..
         }) => Err(err.as_str()),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(Some(HostDatasetSnapshot::Image2d(_) | HostDatasetSnapshot::Series1d(_))),
+            ..
+        }) => Err("cached dataset is not a table dataset"),
+    }
+}
+
+fn cached_image(entry: Option<&HostDatasetCacheEntry>) -> Result<Option<&Image2dV1>, &str> {
+    match entry {
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(Some(HostDatasetSnapshot::Image2d(image))),
+            ..
+        }) => Ok(Some(image.as_ref())),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(None), ..
+        })
+        | None => Ok(None),
+        Some(HostDatasetCacheEntry {
+            snapshot: Err(err), ..
+        }) => Err(err.as_str()),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(Some(HostDatasetSnapshot::Table(_) | HostDatasetSnapshot::Series1d(_))),
+            ..
+        }) => Err("cached dataset is not an image dataset"),
+    }
+}
+
+fn cached_series(entry: Option<&HostDatasetCacheEntry>) -> Result<Option<&Series1dV1>, &str> {
+    match entry {
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(Some(HostDatasetSnapshot::Series1d(series))),
+            ..
+        }) => Ok(Some(series.as_ref())),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(None), ..
+        })
+        | None => Ok(None),
+        Some(HostDatasetCacheEntry {
+            snapshot: Err(err), ..
+        }) => Err(err.as_str()),
+        Some(HostDatasetCacheEntry {
+            snapshot: Ok(Some(HostDatasetSnapshot::Table(_) | HostDatasetSnapshot::Image2d(_))),
+            ..
+        }) => Err("cached dataset is not a line-series dataset"),
     }
 }
 
@@ -342,11 +384,6 @@ pub struct CameraApp {
     camera_info: Option<DeviceInfo>,
     camera_status: String,
     popup_shared: Arc<Mutex<PopupSharedData>>,
-    reconstruction_window_open: bool,
-    reconstruction_settings: ReconstructionRenderSettings,
-    reconstruction_state: ReconstructionState,
-    reconstruction_shared: Arc<Mutex<ReconstructionSharedData>>,
-    reconstruction_source_dirty: bool,
     imagej_dialog: ImageJDialogState,
     external_tool: Option<Box<dyn ExternalTool>>,
     host_view_registry: ResolvedHostViewRegistry,
@@ -416,11 +453,6 @@ impl CameraApp {
             camera_info: None,
             camera_status: "Camera not probed yet.".into(),
             popup_shared: Arc::new(Mutex::new(PopupSharedData::default())),
-            reconstruction_window_open: false,
-            reconstruction_settings: ReconstructionRenderSettings::default(),
-            reconstruction_state: ReconstructionState::default(),
-            reconstruction_shared: Arc::new(Mutex::new(ReconstructionSharedData::default())),
-            reconstruction_source_dirty: true,
             imagej_dialog: ImageJDialogState::default(),
             external_tool: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
@@ -546,218 +578,6 @@ impl CameraApp {
             "Streaming to ImageJ ({}:{})",
             self.imagej_dialog.host, self.imagej_dialog.port
         )
-    }
-
-    fn sync_reconstruction_shared(&self) {
-        let replay = self.viewer_replay_state();
-        let refresh_interval_ms = self.active_preview_process_interval().as_millis() as u64;
-        let mut data = self.reconstruction_shared.lock().unwrap();
-        data.texture = self.reconstruction_state.texture().cloned();
-        data.total_localizations = self
-            .reconstruction_state
-            .table()
-            .map(|table| table.rows.len())
-            .unwrap_or(0);
-        let [width, height] = self.reconstruction_state.rendered_size();
-        data.rendered_width = width;
-        data.rendered_height = height;
-        data.pixel_size_nm = self.reconstruction_settings.pixel_size_nm;
-        data.contrast_percentile = self.reconstruction_settings.contrast_percentile;
-        data.colormap = self.reconstruction_settings.colormap;
-        data.stream_active = self.controller.is_some() && viewport_stream_active(self.mode, replay);
-        data.refresh_interval_ms = refresh_interval_ms.max(1);
-    }
-
-    fn collect_reconstruction_table(&self) -> Result<Option<LocalizationTable>, String> {
-        let mut selected: Option<LocalizationTable> = None;
-        for record in self.plugin_manager.records() {
-            let Some(plugin) = record.plugin() else {
-                continue;
-            };
-            if !plugin.enabled() {
-                continue;
-            }
-
-            let Some(table) = plugin.accumulated_localizations()? else {
-                continue;
-            };
-            if selected
-                .as_ref()
-                .is_some_and(|current| current.rows.len() >= table.rows.len())
-            {
-                continue;
-            }
-            selected = Some(table);
-        }
-        Ok(selected)
-    }
-
-    fn clear_reconstruction_plugins(&mut self) {
-        for record in self.plugin_manager.records_mut() {
-            let Some(plugin) = record.plugin_mut() else {
-                continue;
-            };
-            let has_table = plugin.accumulated_localizations().ok().flatten().is_some();
-            if has_table {
-                plugin.reset();
-            }
-        }
-        self.reconstruction_state.clear();
-        self.reconstruction_source_dirty = false;
-        self.sync_reconstruction_shared();
-    }
-
-    fn export_reconstruction_csv(&mut self) {
-        let Some(table) = self.reconstruction_state.table() else {
-            self.last_error = Some("no reconstruction table is available to export".into());
-            return;
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name("reconstruction.csv")
-            .add_filter("CSV", &["csv"])
-            .save_file()
-        else {
-            return;
-        };
-
-        match export_reconstruction_csv_to_path(&path, table) {
-            Ok(()) => self.last_error = None,
-            Err(err) => self.last_error = Some(err),
-        }
-    }
-
-    fn export_reconstruction_image(&mut self, format: ReconstructionImageFormat) {
-        let Some(image) = self.reconstruction_state.image() else {
-            self.last_error = Some("no reconstruction image is available to export".into());
-            return;
-        };
-        let default_name = format!("reconstruction.{}", format.extension());
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter("PNG", &["png"])
-            .add_filter("TIFF", &["tif", "tiff"])
-            .save_file()
-        else {
-            return;
-        };
-
-        match export_reconstruction_image_to_path(&path, image) {
-            Ok(()) => self.last_error = None,
-            Err(err) => self.last_error = Some(err),
-        }
-    }
-
-    fn update_reconstruction_window(&mut self, ctx: &egui::Context) {
-        if self.reconstruction_source_dirty {
-            match self.collect_reconstruction_table() {
-                Ok(table) => self.reconstruction_state.set_table(table),
-                Err(err) => {
-                    self.last_error = Some(err);
-                    self.reconstruction_state.clear();
-                }
-            }
-            self.reconstruction_source_dirty = false;
-        }
-
-        {
-            let shared = self.reconstruction_shared.lock().unwrap();
-            if (shared.pixel_size_nm - self.reconstruction_settings.pixel_size_nm).abs()
-                > f64::EPSILON
-            {
-                self.reconstruction_settings.pixel_size_nm = shared.pixel_size_nm;
-                self.reconstruction_state.mark_dirty();
-            }
-            if (shared.contrast_percentile - self.reconstruction_settings.contrast_percentile).abs()
-                > f32::EPSILON
-            {
-                self.reconstruction_settings.contrast_percentile = shared.contrast_percentile;
-                self.reconstruction_state.mark_dirty();
-            }
-            if shared.colormap != self.reconstruction_settings.colormap {
-                self.reconstruction_settings.colormap = shared.colormap;
-                self.reconstruction_state.mark_dirty();
-            }
-        }
-
-        self.reconstruction_state
-            .render_if_needed(ctx, self.reconstruction_settings);
-        self.sync_reconstruction_shared();
-
-        let shared = Arc::clone(&self.reconstruction_shared);
-        ctx.show_viewport_deferred(
-            egui::ViewportId::from_hash_of("reconstruction_window"),
-            egui::ViewportBuilder::default()
-                .with_title("Reconstruction — AugurRS")
-                .with_inner_size([1200.0, 860.0]),
-            move |ctx, class| match class {
-                egui::viewport::ViewportClass::Deferred => {
-                    let mut root_repaint_requested = false;
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        root_repaint_requested =
-                            render_reconstruction_viewport(ui, &shared).root_repaint_requested;
-                    });
-                    let repaint_after = shared.lock().ok().and_then(|data| {
-                        data.stream_active
-                            .then_some(Duration::from_millis(data.refresh_interval_ms.max(1)))
-                    });
-                    if let Some(duration) = repaint_after {
-                        ctx.request_repaint_after(duration);
-                    }
-                    if root_repaint_requested {
-                        request_root_repaint(ctx);
-                    }
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        if let Ok(mut data) = shared.lock() {
-                            data.close_requested = true;
-                        }
-                        request_root_repaint(ctx);
-                    }
-                }
-                egui::viewport::ViewportClass::Embedded => {
-                    let mut open = true;
-                    egui::Window::new("Reconstruction — AugurRS")
-                        .open(&mut open)
-                        .default_size([1100.0, 760.0])
-                        .show(ctx, |ui| {
-                            if render_reconstruction_viewport(ui, &shared).root_repaint_requested {
-                                request_root_repaint(ctx);
-                            }
-                        });
-                    if !open {
-                        if let Ok(mut data) = shared.lock() {
-                            data.close_requested = true;
-                        }
-                        request_root_repaint(ctx);
-                    }
-                }
-                _ => {}
-            },
-        );
-
-        let (close, clear, export_csv, export_image) = {
-            let mut data = self.reconstruction_shared.lock().unwrap();
-            let close = data.close_requested;
-            let clear = data.clear_requested;
-            let export_csv = data.export_csv_requested;
-            let export_image = data.export_image_requested.take();
-            data.close_requested = false;
-            data.clear_requested = false;
-            data.export_csv_requested = false;
-            (close, clear, export_csv, export_image)
-        };
-
-        if close {
-            self.reconstruction_window_open = false;
-        }
-        if clear {
-            self.clear_reconstruction_plugins();
-        }
-        if export_csv {
-            self.export_reconstruction_csv();
-        }
-        if let Some(format) = export_image {
-            self.export_reconstruction_image(format);
-        }
     }
 
     fn sync_popup_shared(
@@ -1080,9 +900,6 @@ impl CameraApp {
         self.event_store.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
-        self.reconstruction_state.clear();
-        self.reconstruction_source_dirty = false;
-        self.sync_reconstruction_shared();
         self.mark_host_view_datasets_stale();
         self.refresh_host_view_registry();
     }
@@ -1269,6 +1086,13 @@ impl CameraApp {
             ));
             return;
         };
+        let HostDatasetKind::TableV1(schema) = &dataset.descriptor.kind else {
+            self.last_error = Some(format!(
+                "{} is not a tabular dataset and cannot be exported as CSV",
+                dataset.descriptor.title
+            ));
+            return;
+        };
 
         self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
         let table = match cached_table(
@@ -1295,7 +1119,7 @@ impl CameraApp {
             return;
         };
 
-        match export_table_csv_to_path(&path, dataset.descriptor.kind.table_schema(), table) {
+        match export_table_csv_to_path(&path, schema, table) {
             Ok(()) => self.last_error = None,
             Err(err) => self.last_error = Some(err),
         }
@@ -1304,6 +1128,7 @@ impl CameraApp {
     fn export_host_view_image(&mut self, view: &ResolvedHostView, format: HostViewImageFormat) {
         let image = match self.host_view_render_state.get(&view.descriptor.id) {
             Some(HostViewRenderState::Density2d(state)) => state.image(),
+            Some(HostViewRenderState::Image2d(state)) => state.image(),
             _ => None,
         };
         let Some(image) = image else {
@@ -1390,21 +1215,23 @@ impl CameraApp {
         };
 
         self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
-        let schema = dataset.descriptor.kind.table_schema();
         let cache_entry = self
             .host_view_dataset_cache
             .get(&view.descriptor.dataset_id);
+        let dataset_generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
 
-        match &view.descriptor.kind {
-            HostViewKind::CompactTable => match cached_table(cache_entry) {
-                Ok(table) => {
-                    render_compact_table(ui, schema, table, &dataset.descriptor.empty_message);
+        match (&view.descriptor.kind, &dataset.descriptor.kind) {
+            (HostViewKind::CompactTable, HostDatasetKind::TableV1(schema)) => {
+                match cached_table(cache_entry) {
+                    Ok(table) => {
+                        render_compact_table(ui, schema, table, &dataset.descriptor.empty_message);
+                    }
+                    Err(err) => {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
                 }
-                Err(err) => {
-                    ui.colored_label(ui.visuals().error_fg_color, err);
-                }
-            },
-            HostViewKind::TableWindow => {
+            }
+            (HostViewKind::TableWindow, HostDatasetKind::TableV1(schema)) => {
                 let actions = match cached_table(cache_entry) {
                     Ok(table) => {
                         render_table_window(ui, schema, table, &dataset.descriptor.empty_message)
@@ -1416,15 +1243,16 @@ impl CameraApp {
                 };
                 self.handle_host_view_actions(view, actions);
             }
-            HostViewKind::Density2dFromTable { x_column, y_column } => {
+            (
+                HostViewKind::Density2dFromTable { x_column, y_column },
+                HostDatasetKind::TableV1(schema),
+            ) => {
                 let actions = {
                     let state = self
                         .host_view_render_state
                         .entry(view.descriptor.id.clone())
                         .or_default()
                         .density_state();
-                    let dataset_generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
-
                     let table = match cached_table(cache_entry) {
                         Ok(table) => table,
                         Err(err) => {
@@ -1455,6 +1283,83 @@ impl CameraApp {
                     )
                 };
                 self.handle_host_view_actions(view, actions);
+            }
+            (
+                HostViewKind::Scatter2dFromTable { x_column, y_column },
+                HostDatasetKind::TableV1(schema),
+            ) => {
+                let actions = match cached_table(cache_entry) {
+                    Ok(table) => render_scatter2d_view(
+                        ui,
+                        schema,
+                        table,
+                        &dataset.descriptor.empty_message,
+                        Scatter2dViewOptions {
+                            view_id: &view.descriptor.id,
+                            x_column,
+                            y_column,
+                            allow_clear: true,
+                        },
+                    ),
+                    Err(err) => {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                        HostViewUiActions::default()
+                    }
+                };
+                self.handle_host_view_actions(view, actions);
+            }
+            (HostViewKind::ImageWindow, HostDatasetKind::Image2dV1) => {
+                let actions = {
+                    let state = self
+                        .host_view_render_state
+                        .entry(view.descriptor.id.clone())
+                        .or_default()
+                        .image_state();
+                    let image = match cached_image(cache_entry) {
+                        Ok(image) => image,
+                        Err(err) => {
+                            ui.colored_label(ui.visuals().error_fg_color, err);
+                            return;
+                        }
+                    };
+                    if let Err(err) = state.render_if_needed(ctx, image, dataset_generation) {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                        return;
+                    }
+                    render_image2d_view(
+                        ui,
+                        &view.descriptor.id,
+                        state,
+                        image,
+                        &dataset.descriptor.empty_message,
+                        true,
+                    )
+                };
+                self.handle_host_view_actions(view, actions);
+            }
+            (HostViewKind::LineSeriesWindow, HostDatasetKind::Series1dV1) => {
+                match cached_series(cache_entry) {
+                    Ok(series) => {
+                        render_line_series_view(
+                            ui,
+                            &view.descriptor.id,
+                            series,
+                            &dataset.descriptor.empty_message,
+                        );
+                    }
+                    Err(err) => {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
+                }
+            }
+            _ => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!(
+                        "View {} does not match dataset {}.",
+                        view.descriptor.id, dataset.descriptor.id
+                    ),
+                );
             }
         }
     }
@@ -1519,8 +1424,8 @@ impl CameraApp {
                 egui::ViewportId::from_hash_of(("host_view_window", &view.descriptor.id));
             let title = format!("{} — AugurRS", view.descriptor.title);
 
-            match &view.descriptor.kind {
-                HostViewKind::TableWindow => {
+            match (&view.descriptor.kind, &dataset.descriptor.kind) {
+                (HostViewKind::TableWindow, HostDatasetKind::TableV1(schema)) => {
                     let (table_arc, error_message) = match &cache_entry {
                         Some(HostDatasetCacheEntry {
                             snapshot: Ok(Some(HostDatasetSnapshot::Table(table))),
@@ -1532,7 +1437,7 @@ impl CameraApp {
                         _ => (None, None),
                     };
                     let shared = Arc::new(Mutex::new(TableWindowViewportData {
-                        schema: dataset.descriptor.kind.table_schema().clone(),
+                        schema: schema.clone(),
                         dataset: table_arc,
                         empty_message: dataset.descriptor.empty_message.clone(),
                         error_message,
@@ -1540,10 +1445,11 @@ impl CameraApp {
                         export_csv_requested: false,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
+                    let window_title = title.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
-                            .with_title(&title)
+                            .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
                         move |ctx, class| match class {
                             egui::viewport::ViewportClass::Deferred => {
@@ -1558,7 +1464,7 @@ impl CameraApp {
                             }
                             egui::viewport::ViewportClass::Embedded => {
                                 let mut open = true;
-                                egui::Window::new(&title)
+                                egui::Window::new(&window_title)
                                     .open(&mut open)
                                     .default_size([1100.0, 760.0])
                                     .show(ctx, |ui| {
@@ -1591,7 +1497,10 @@ impl CameraApp {
                         self.export_host_view_csv(&view);
                     }
                 }
-                HostViewKind::Density2dFromTable { x_column, y_column } => {
+                (
+                    HostViewKind::Density2dFromTable { x_column, y_column },
+                    HostDatasetKind::TableV1(schema),
+                ) => {
                     let (settings, texture, rendered_size, total_rows, error_message) = {
                         let state = self
                             .host_view_render_state
@@ -1603,16 +1512,19 @@ impl CameraApp {
                             .map(|entry| entry.generation)
                             .unwrap_or(0);
 
-                        let table = cached_table(cache_entry.as_ref()).unwrap_or(None);
-
-                        let render_result = state.render_if_needed(
-                            ctx,
-                            dataset.descriptor.kind.table_schema(),
-                            table,
-                            dataset_generation,
-                            x_column,
-                            y_column,
-                        );
+                        let table_result = cached_table(cache_entry.as_ref());
+                        let table = table_result.as_ref().ok().and_then(|table| *table);
+                        let render_result = match table_result {
+                            Ok(table) => state.render_if_needed(
+                                ctx,
+                                schema,
+                                table,
+                                dataset_generation,
+                                x_column,
+                                y_column,
+                            ),
+                            Err(err) => Err(err.to_owned()),
+                        };
                         let error_message = match (&cache_entry, render_result) {
                             (
                                 Some(HostDatasetCacheEntry {
@@ -1649,10 +1561,11 @@ impl CameraApp {
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
+                    let window_title = title.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
-                            .with_title(&title)
+                            .with_title(&window_title)
                             .with_inner_size([1200.0, 860.0]),
                         move |ctx, class| match class {
                             egui::viewport::ViewportClass::Deferred => {
@@ -1671,7 +1584,7 @@ impl CameraApp {
                             }
                             egui::viewport::ViewportClass::Embedded => {
                                 let mut open = true;
-                                egui::Window::new(&title)
+                                egui::Window::new(&window_title)
                                     .open(&mut open)
                                     .default_size([1100.0, 760.0])
                                     .show(ctx, |ui| {
@@ -1728,7 +1641,299 @@ impl CameraApp {
                         self.export_host_view_image(&view, format);
                     }
                 }
-                HostViewKind::CompactTable => {}
+                (
+                    HostViewKind::Scatter2dFromTable { x_column, y_column },
+                    HostDatasetKind::TableV1(schema),
+                ) => {
+                    let (table_arc, error_message) = match &cache_entry {
+                        Some(HostDatasetCacheEntry {
+                            snapshot: Ok(Some(HostDatasetSnapshot::Table(table))),
+                            ..
+                        }) => (Some(Arc::clone(table)), None),
+                        Some(HostDatasetCacheEntry {
+                            snapshot: Err(err), ..
+                        }) => (None, Some(err.clone())),
+                        _ => (None, None),
+                    };
+                    let shared = Arc::new(Mutex::new(ScatterWindowViewportData {
+                        schema: schema.clone(),
+                        dataset: table_arc,
+                        x_column: x_column.clone(),
+                        y_column: y_column.clone(),
+                        empty_message: dataset.descriptor.empty_message.clone(),
+                        error_message,
+                        close_requested: false,
+                        export_csv_requested: false,
+                        clear_requested: false,
+                    }));
+                    let shared_for_viewport = Arc::clone(&shared);
+                    let view_id = view.descriptor.id.clone();
+                    let window_title = title.clone();
+                    ctx.show_viewport_deferred(
+                        viewport_id,
+                        egui::ViewportBuilder::default()
+                            .with_title(&window_title)
+                            .with_inner_size([1100.0, 760.0]),
+                        move |ctx, class| match class {
+                            egui::viewport::ViewportClass::Deferred => {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    render_scatter_window_viewport(
+                                        ui,
+                                        &view_id,
+                                        &shared_for_viewport,
+                                    );
+                                });
+                                if ctx.input(|i| i.viewport().close_requested()) {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            egui::viewport::ViewportClass::Embedded => {
+                                let mut open = true;
+                                egui::Window::new(&window_title)
+                                    .open(&mut open)
+                                    .default_size([1100.0, 760.0])
+                                    .show(ctx, |ui| {
+                                        render_scatter_window_viewport(
+                                            ui,
+                                            &view_id,
+                                            &shared_for_viewport,
+                                        );
+                                    });
+                                if !open {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                    );
+
+                    let (close, clear, export_csv) = {
+                        let Ok(mut data) = shared.lock() else {
+                            continue;
+                        };
+                        let result = (
+                            data.close_requested,
+                            data.clear_requested,
+                            data.export_csv_requested,
+                        );
+                        data.close_requested = false;
+                        data.clear_requested = false;
+                        data.export_csv_requested = false;
+                        result
+                    };
+                    if close {
+                        self.host_view_window_open
+                            .insert(view.descriptor.id.clone(), false);
+                    }
+                    if clear {
+                        self.clear_host_view_provider(&view.descriptor.dataset_id);
+                    }
+                    if export_csv {
+                        self.export_host_view_csv(&view);
+                    }
+                }
+                (HostViewKind::ImageWindow, HostDatasetKind::Image2dV1) => {
+                    let (settings, texture, rendered_size, error_message) = {
+                        let state = self
+                            .host_view_render_state
+                            .entry(view.descriptor.id.clone())
+                            .or_default()
+                            .image_state();
+                        let dataset_generation = cache_entry
+                            .as_ref()
+                            .map(|entry| entry.generation)
+                            .unwrap_or(0);
+                        let image_result = cached_image(cache_entry.as_ref());
+                        let render_result = match image_result {
+                            Ok(image) => state.render_if_needed(ctx, image, dataset_generation),
+                            Err(err) => Err(err.to_owned()),
+                        };
+                        let error_message = match (&cache_entry, render_result) {
+                            (
+                                Some(HostDatasetCacheEntry {
+                                    snapshot: Err(err), ..
+                                }),
+                                _,
+                            ) => Some(err.clone()),
+                            (_, Err(err)) => Some(err),
+                            _ => None,
+                        };
+                        (
+                            state.settings(),
+                            state.texture().cloned(),
+                            state.rendered_size(),
+                            error_message,
+                        )
+                    };
+
+                    let shared = Arc::new(Mutex::new(ImageWindowViewportData {
+                        texture,
+                        rendered_width: rendered_size[0],
+                        rendered_height: rendered_size[1],
+                        settings,
+                        empty_message: dataset.descriptor.empty_message.clone(),
+                        error_message,
+                        close_requested: false,
+                        export_image_requested: None,
+                        clear_requested: false,
+                    }));
+                    let shared_for_viewport = Arc::clone(&shared);
+                    let view_id = view.descriptor.id.clone();
+                    let window_title = title.clone();
+                    ctx.show_viewport_deferred(
+                        viewport_id,
+                        egui::ViewportBuilder::default()
+                            .with_title(&window_title)
+                            .with_inner_size([1100.0, 760.0]),
+                        move |ctx, class| match class {
+                            egui::viewport::ViewportClass::Deferred => {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    render_image_window_viewport(
+                                        ui,
+                                        &view_id,
+                                        &shared_for_viewport,
+                                    );
+                                });
+                                if ctx.input(|i| i.viewport().close_requested()) {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            egui::viewport::ViewportClass::Embedded => {
+                                let mut open = true;
+                                egui::Window::new(&window_title)
+                                    .open(&mut open)
+                                    .default_size([1100.0, 760.0])
+                                    .show(ctx, |ui| {
+                                        render_image_window_viewport(
+                                            ui,
+                                            &view_id,
+                                            &shared_for_viewport,
+                                        );
+                                    });
+                                if !open {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                    );
+
+                    let (next_settings, close, clear, export_image) = {
+                        let Ok(mut data) = shared.lock() else {
+                            continue;
+                        };
+                        let result = (
+                            data.settings,
+                            data.close_requested,
+                            data.clear_requested,
+                            data.export_image_requested.take(),
+                        );
+                        data.close_requested = false;
+                        data.clear_requested = false;
+                        result
+                    };
+
+                    self.host_view_render_state
+                        .entry(view.descriptor.id.clone())
+                        .or_default()
+                        .image_state()
+                        .set_settings(next_settings);
+
+                    if close {
+                        self.host_view_window_open
+                            .insert(view.descriptor.id.clone(), false);
+                    }
+                    if clear {
+                        self.clear_host_view_provider(&view.descriptor.dataset_id);
+                    }
+                    if let Some(format) = export_image {
+                        self.export_host_view_image(&view, format);
+                    }
+                }
+                (HostViewKind::LineSeriesWindow, HostDatasetKind::Series1dV1) => {
+                    let (series_arc, error_message) = match &cache_entry {
+                        Some(HostDatasetCacheEntry {
+                            snapshot: Ok(Some(HostDatasetSnapshot::Series1d(series))),
+                            ..
+                        }) => (Some(Arc::clone(series)), None),
+                        Some(HostDatasetCacheEntry {
+                            snapshot: Err(err), ..
+                        }) => (None, Some(err.clone())),
+                        _ => (None, None),
+                    };
+                    let shared = Arc::new(Mutex::new(SeriesWindowViewportData {
+                        dataset: series_arc,
+                        empty_message: dataset.descriptor.empty_message.clone(),
+                        error_message,
+                        close_requested: false,
+                    }));
+                    let shared_for_viewport = Arc::clone(&shared);
+                    let view_id = view.descriptor.id.clone();
+                    let window_title = title.clone();
+                    ctx.show_viewport_deferred(
+                        viewport_id,
+                        egui::ViewportBuilder::default()
+                            .with_title(&window_title)
+                            .with_inner_size([1100.0, 760.0]),
+                        move |ctx, class| match class {
+                            egui::viewport::ViewportClass::Deferred => {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    render_series_window_viewport(
+                                        ui,
+                                        &view_id,
+                                        &shared_for_viewport,
+                                    );
+                                });
+                                if ctx.input(|i| i.viewport().close_requested()) {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            egui::viewport::ViewportClass::Embedded => {
+                                let mut open = true;
+                                egui::Window::new(&window_title)
+                                    .open(&mut open)
+                                    .default_size([1100.0, 760.0])
+                                    .show(ctx, |ui| {
+                                        render_series_window_viewport(
+                                            ui,
+                                            &view_id,
+                                            &shared_for_viewport,
+                                        );
+                                    });
+                                if !open {
+                                    if let Ok(mut data) = shared_for_viewport.lock() {
+                                        data.close_requested = true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                    );
+
+                    let close = {
+                        let Ok(mut data) = shared.lock() else {
+                            continue;
+                        };
+                        let close = data.close_requested;
+                        data.close_requested = false;
+                        close
+                    };
+                    if close {
+                        self.host_view_window_open
+                            .insert(view.descriptor.id.clone(), false);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1744,10 +1949,22 @@ impl CameraApp {
             })
     }
 
+    fn plugins_need_retained_event_history(&self) -> bool {
+        self.builtin_plugins
+            .iter()
+            .any(|plugin| plugin.enabled() && plugin.capabilities().retained_event_history)
+            || self.plugin_manager.records().iter().any(|record| {
+                record.plugin().is_some_and(|plugin| {
+                    plugin.enabled() && plugin.capabilities().retained_event_history
+                })
+            })
+    }
+
     fn raw_events_required(&self) -> bool {
         self.active_view_mode() == ViewMode::PointCloud3d
             || self.with_active_viewer(|viewer| viewer.preview_mode.requires_raw_events())
             || self.plugins_need_raw_events()
+            || self.plugins_need_retained_event_history()
     }
 
     fn sync_pipeline_requirements(&self, controller: &PipelineController) {
@@ -2439,6 +2656,7 @@ impl CameraApp {
             self.plugin_context_data
                 .insert(CTX_GLOBAL_SETTINGS.to_owned(), json);
         }
+        let retained_history_needed = self.plugins_need_retained_event_history();
         let runtime_plugins_enabled = self
             .plugin_manager
             .records()
@@ -2457,8 +2675,15 @@ impl CameraApp {
                     polarity: u8::from(event.polarity),
                 })
                 .collect();
-            self.event_store
-                .push_frame(&ffi_events, frame.window_start_us, frame.window_end_us);
+            if retained_history_needed {
+                self.event_store.push_frame(
+                    &ffi_events,
+                    frame.window_start_us,
+                    frame.window_end_us,
+                );
+            } else {
+                self.event_store.clear();
+            }
             ffi_events
         } else {
             self.event_store.clear();
@@ -2492,8 +2717,6 @@ impl CameraApp {
                 }
             }
         }
-
-        self.reconstruction_source_dirty = true;
     }
 
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
@@ -3034,10 +3257,6 @@ impl eframe::App for CameraApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
                     ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
-                    ui.checkbox(
-                        &mut self.reconstruction_window_open,
-                        "Reconstruction Window",
-                    );
                     let mut scale_bar_show =
                         self.with_active_viewer(|viewer| viewer.scale_bar_settings.show);
                     if ui.checkbox(&mut scale_bar_show, "Show Scale Bar").changed() {
@@ -3579,7 +3798,6 @@ impl eframe::App for CameraApp {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
             self.host_view_registry_dirty = true;
-            self.reconstruction_source_dirty = true;
         }
 
         let external_status = self.external_tool_status();
@@ -3851,10 +4069,6 @@ impl eframe::App for CameraApp {
             if let Some(output) = popup_output {
                 self.handle_viewer_output(ctx, output, true);
             }
-        }
-
-        if self.reconstruction_window_open {
-            self.update_reconstruction_window(ctx);
         }
 
         self.render_host_view_windows(ctx);

@@ -1,7 +1,6 @@
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 pub const CTX_GLOBAL_SETTINGS: &str = "augur.global_settings";
-pub const CTX_LOCALIZATION_RESULTS: &str = "augur.localization.results";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalSettings {
@@ -10,46 +9,6 @@ pub struct GlobalSettings {
     pub sensor_height: u16,
     pub acq_time_ms: u64,
     pub event_store_budget_bytes: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Localization {
-    pub x: f64,
-    pub y: f64,
-    pub sigma_x: f64,
-    pub sigma_y: f64,
-    pub amplitude: f64,
-    pub background: f64,
-    pub timestamp_us: u64,
-    pub fit_error: f64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct LocalizationResults {
-    pub localizations: Vec<Localization>,
-    pub frame_window_start_us: u64,
-    pub frame_window_end_us: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct LocalizationTable {
-    pub rows: Vec<LocalizationRow>,
-    pub nm_per_pixel: f64,
-    pub sensor_width: u16,
-    pub sensor_height: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LocalizationRow {
-    pub id: u64,
-    pub frame: u64,
-    pub x_nm: f64,
-    pub y_nm: f64,
-    pub sigma_nm: f64,
-    pub intensity: f64,
-    pub offset: f64,
-    pub uncertainty_xy_nm: f64,
-    pub timestamp_us: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -79,12 +38,15 @@ pub struct HostViewDescriptor {
 #[serde(tag = "kind", content = "schema", rename_all = "snake_case")]
 pub enum HostDatasetKind {
     TableV1(TableSchema),
+    Image2dV1,
+    Series1dV1,
 }
 
 impl HostDatasetKind {
-    pub fn table_schema(&self) -> &TableSchema {
+    pub fn table_schema(&self) -> Option<&TableSchema> {
         match self {
-            Self::TableV1(schema) => schema,
+            Self::TableV1(schema) => Some(schema),
+            Self::Image2dV1 | Self::Series1dV1 => None,
         }
     }
 }
@@ -102,6 +64,9 @@ pub enum HostViewKind {
     CompactTable,
     TableWindow,
     Density2dFromTable { x_column: String, y_column: String },
+    Scatter2dFromTable { x_column: String, y_column: String },
+    ImageWindow,
+    LineSeriesWindow,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -329,5 +294,96 @@ impl TableColumnValues {
             Self::String(values) => values.get(index).cloned(),
             Self::Bool(values) => values.get(index).map(ToString::to_string),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Image2dV1 {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<f32>,
+}
+
+impl Image2dV1 {
+    pub fn new(width: u32, height: u32, pixels: Vec<f32>) -> Result<Self, String> {
+        let image = Self {
+            width,
+            height,
+            pixels,
+        };
+        image.validate()?;
+        Ok(image)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.width == 0 || self.height == 0 {
+            return Err("image dimensions must be greater than zero".into());
+        }
+
+        let expected = self.width as usize * self.height as usize;
+        if self.pixels.len() != expected {
+            return Err(format!(
+                "image pixel count {} does not match {}x{} dimensions",
+                self.pixels.len(),
+                self.width,
+                self.height
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn size(&self) -> [usize; 2] {
+        [self.width as usize, self.height as usize]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pixels.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for Image2dV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawImage2dV1 {
+            width: u32,
+            height: u32,
+            pixels: Vec<f32>,
+        }
+
+        let raw = RawImage2dV1::deserialize(deserializer)?;
+        Self::new(raw.width, raw.height, raw.pixels).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Series1dPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Series1dLine {
+    pub name: String,
+    pub points: Vec<Series1dPoint>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Series1dV1 {
+    pub x_label: String,
+    pub y_label: String,
+    pub lines: Vec<Series1dLine>,
+}
+
+impl Series1dV1 {
+    pub fn is_empty(&self) -> bool {
+        self.lines.iter().all(|line| line.points.is_empty())
+    }
+
+    pub fn total_points(&self) -> usize {
+        self.lines.iter().map(|line| line.points.len()).sum()
     }
 }

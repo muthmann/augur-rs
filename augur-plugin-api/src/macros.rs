@@ -8,7 +8,6 @@ macro_rules! export_plugin {
                 schema_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 setting_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 status_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
-                accumulated_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 host_views_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 host_view_dataset_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
             }
@@ -20,7 +19,6 @@ macro_rules! export_plugin {
                         schema_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         setting_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         status_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
-                        accumulated_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         host_views_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         host_view_dataset_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                     }
@@ -120,6 +118,17 @@ macro_rules! export_plugin {
                         .unwrap_or($crate::PluginInput::FrameOnly)
                 })
                 .unwrap_or($crate::PluginInput::FrameOnly)
+            }
+
+            unsafe extern "C" fn __capabilities(
+                instance: *const ::std::ffi::c_void,
+            ) -> $crate::PluginCapabilities {
+                ::std::panic::catch_unwind(|| {
+                    __instance_ref(instance)
+                        .map(|plugin| plugin.plugin.capabilities())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
             }
 
             unsafe extern "C" fn __num_dependencies(instance: *const ::std::ffi::c_void) -> usize {
@@ -286,45 +295,6 @@ macro_rules! export_plugin {
                 }
             }
 
-            unsafe extern "C" fn __accumulated_localizations(
-                instance: *const ::std::ffi::c_void,
-                out_ptr: *mut *const u8,
-                out_len: *mut usize,
-            ) -> bool {
-                let result = ::std::panic::catch_unwind(|| {
-                    let Some(plugin) = __instance_ref(instance) else {
-                        unsafe {
-                            $crate::__private::clear_out_bytes(out_ptr, out_len);
-                        }
-                        return false;
-                    };
-                    let Some(json) = plugin.plugin.accumulated_localizations() else {
-                        unsafe {
-                            $crate::__private::clear_out_bytes(out_ptr, out_len);
-                        }
-                        return false;
-                    };
-                    unsafe {
-                        $crate::__private::write_bytes(
-                            &plugin.accumulated_json,
-                            json,
-                            out_ptr,
-                            out_len,
-                        );
-                    }
-                    true
-                });
-                match result {
-                    Ok(has_data) => has_data,
-                    Err(_) => {
-                        unsafe {
-                            $crate::__private::clear_out_bytes(out_ptr, out_len);
-                        }
-                        false
-                    }
-                }
-            }
-
             unsafe extern "C" fn __host_views(
                 instance: *const ::std::ffi::c_void,
                 out_ptr: *mut *const u8,
@@ -424,6 +394,7 @@ macro_rules! export_plugin {
                 set_enabled: __set_enabled,
                 reset: __reset,
                 input_kind: __input_kind,
+                capabilities: __capabilities,
                 num_dependencies: __num_dependencies,
                 dependency: __dependency,
                 process_frame: __process_frame,
@@ -431,7 +402,6 @@ macro_rules! export_plugin {
                 get_setting: __get_setting,
                 set_setting: __set_setting,
                 status_entries: __status_entries,
-                accumulated_localizations: __accumulated_localizations,
                 host_views: __host_views,
                 host_view_dataset: __host_view_dataset,
                 host_view_dataset_generation: __host_view_dataset_generation,

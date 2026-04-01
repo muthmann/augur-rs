@@ -51,6 +51,9 @@ impl Default for EventStore {
 
 impl EventStore {
     pub fn push_frame(&mut self, events: &[FfiCdEvent], window_start_us: u64, window_end_us: u64) {
+        if events.is_empty() {
+            return;
+        }
         let frame = StoredFrame::new(events, window_start_us, window_end_us);
         self.memory_usage_bytes += frame.byte_len;
         self.frames.push_back(frame);
@@ -285,5 +288,15 @@ mod tests {
             unsafe { store.frame(0).expect("remaining frame").as_slice() },
             &[event(10, 1), event(20, 2)]
         );
+    }
+
+    #[test]
+    fn push_frame_ignores_empty_event_batches() {
+        let mut store = EventStore::default();
+        store.push_frame(&[], 10, 20);
+
+        assert_eq!(store.frame_count(), 0);
+        assert_eq!(store.memory_usage_bytes(), 0);
+        assert_eq!(store.oldest_timestamp_us(), None);
     }
 }

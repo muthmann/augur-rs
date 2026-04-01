@@ -1,33 +1,47 @@
-# Reconstruction Window
+# Reconstruction Views
 
 ## Summary
 
-`augur-gui` can open a dedicated reconstruction window that renders accumulated localization tables as a host-side super-resolution image and exports the underlying data as ThunderSTORM-style CSV plus PNG or TIFF images.
+`augur-gui` no longer owns a dedicated reconstruction window or reconstruction-specific runtime
+path.
 
-## Runtime Contract
+Reconstruction is now modeled as a generic host-view composition:
 
-The reconstruction window now reads the host-view dataset exposed by the active reconstruction
-provider. It does not probe optional plugin hooks or manifest capabilities anymore.
-
-The external reconstruction viewport owns its own repaint cadence while preview or replay is
-active, and reconstruction-side actions wake the root viewport immediately. This keeps the image
-refreshing even when the main window is unfocused and prevents play/pause, clear, and export
-actions from waiting on incidental root-window input.
-
-To avoid UI stalls, `augur-gui` only refreshes the accumulated reconstruction table after analysis
-work or reconstruction-setting changes instead of re-polling the full table on every GUI repaint.
+- a plugin publishes a table dataset of points or measurements
+- the host renders that dataset through generic host views
+- export stays generic and host-owned
 
 ## Expected Producer
 
-The intended table producer is the external `Localization Reconstruction` runtime plugin from [augur-plugins](https://github.com/muthmann/augur-plugins). That plugin accumulates `augur.localization.results` from upstream localization/fitting plugins and exposes the full table through the dynamic-plugin API.
+The intended producer remains the external `Localization Reconstruction` runtime plugin from
+[augur-plugins](https://github.com/muthmann/augur-plugins).
 
-If no reconstruction provider is enabled, the window still opens but reports that no accumulated
-localizations are available yet.
+That plugin can accumulate
+`augur_plugin_types::localization::CTX_LOCALIZATION_RESULTS` from upstream localization/fitting
+plugins and expose the result as a normal host-view dataset.
 
-## Plugin Author Note
+## Recommended View Recipe
 
-New plugins that want to feed the reconstruction window should:
+For reconstruction-like workflows, a plugin should usually publish:
 
-1. declare a table dataset through `host_views()`
-2. expose the dataset bytes through `host_view_dataset()`
-3. register a density view that points at the dataset
+1. one `HostDatasetKind::TableV1` dataset for the accumulated point table
+2. one `HostViewKind::CompactTable` or `HostViewKind::TableWindow` for inspection/export
+3. one `HostViewKind::Scatter2dFromTable` for direct point visualization
+4. one `HostViewKind::Density2dFromTable` for rendered reconstruction density
+
+This keeps the host generic and makes the same dataset reusable across multiple analyses.
+
+## Export Behavior
+
+The host now exposes only generic exports:
+
+- CSV export for table-backed views
+- PNG/TIFF export for rendered density or image views
+
+There is no reconstruction-specific CSV writer or reconstruction-specific image exporter in
+`augur-gui`.
+
+## Consequence
+
+If no reconstruction provider is enabled, there is no special empty reconstruction window anymore.
+Only the plugin-declared host views appear.

@@ -8,7 +8,6 @@ mod plugin_settings_ui;
 mod plugins;
 mod point_cloud;
 mod preview;
-mod reconstruction;
 mod settings;
 mod viewer_tools;
 mod viewer_widget;

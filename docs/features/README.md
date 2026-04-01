@@ -25,11 +25,13 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, idle launch shortcuts, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the bundled Augur Bridge handoff path for ImageJ/Fiji
-- [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window, popup host, and future reconstruction wrapping
+- [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window and popup host
+- [Generic Plugin Interface Cleanup](./generic-plugin-interface-cleanup.md) — companion payload crate, capability-driven history retention, and fully generic host-view rendering
 - [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
 - [Plugin API v0.2](./plugin-api-v0-2.md) — flat runtime ABI, EventStore history, persistent plugin context, and repo split cleanup
 - [Plugin API v0.3 Migration](./plugin-api-v0-3-migration.md) — segmented EventStore access, host-view dataset generations, raw context publishing, and rebuild requirements
-- [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables and density views
+- [Plugin API v0.4 Migration](./plugin-api-v0-4-migration.md) — companion type crates, explicit history capabilities, and removal of reconstruction-specific hooks
+- [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables, plots, and images
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection
 - [Output File Timestamps](./output-file-timestamps.md) — overwrite protection and automatic timestamp suffixes for recordings

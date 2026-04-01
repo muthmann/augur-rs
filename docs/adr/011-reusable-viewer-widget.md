@@ -15,8 +15,8 @@ mixed heading text, toolbars, canvas logic, replay controls, lower control panel
 and host-side side effects. The popup still rendered a reduced texture-only fallback, so new
 viewer features had to be implemented twice or were simply unavailable in the popup.
 
-The reconstruction-window follow-up also needs the same viewer surface without copying the entire
-center panel again.
+Additional host-owned viewers may still need the same surface without copying the entire center
+panel again.
 
 ## Decision
 
@@ -40,8 +40,8 @@ Extract the full central viewer panel into `augur-gui/src/viewer_widget.rs`.
 
 - the popup now exposes the same viewer surface as the main window, including replay controls and
   lower viewer controls
-- future hosts such as the reconstruction window can wrap the same viewer component instead of
-  copying central-panel code again
+- future popup-style hosts can wrap the same viewer component instead of copying central-panel code
+  again
 - `app.rs` regains a cleaner boundary: it orchestrates side effects while `viewer_widget.rs` owns
   the viewer UI tree
 - viewer-local state transfer between hosts preserves zoom, active tools, annotations, contrast,

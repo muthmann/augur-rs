@@ -10,7 +10,7 @@ The `Focus Metrics` plugin estimates focus quality from either localization resu
 
 Primary localization-driven metric.
 
-- consumes `LocalizationResults`
+- consumes `augur_plugin_types::localization::LocalizationResults`
 - averages fitted `sigma_x` and `sigma_y`
 - lower mean sigma indicates sharper focus
 
@@ -27,7 +27,7 @@ Standalone sharpness metric.
 
 Directional metric for future 3D SMLM work.
 
-- consumes `LocalizationResults`
+- consumes `augur_plugin_types::localization::LocalizationResults`
 - tracks `sigma_x / sigma_y`
 - values near `1.0` indicate symmetric focus
 
