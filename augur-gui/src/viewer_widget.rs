@@ -56,15 +56,29 @@ pub(crate) enum AppMode {
     Replaying,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewCropTarget {
+    None,
+    HardwareRoi,
+    Annotation(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnotationDragState {
+    id: usize,
+    last_sensor: (u16, u16),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PreviewWorkspaceState {
     pub(crate) tool: PreviewTool,
     pub(crate) zoom: f32,
     pub(crate) pan: egui::Vec2,
-    pub(crate) crop_to_roi: bool,
+    pub(crate) crop_target: PreviewCropTarget,
     pub(crate) hover_sensor: Option<(u16, u16)>,
     selection_anchor: Option<egui::Pos2>,
     pending_roi: Option<egui::Rect>,
+    annotation_drag: Option<AnnotationDragState>,
     pub(crate) point_cloud: PointCloudState,
 }
 
@@ -74,10 +88,11 @@ impl Default for PreviewWorkspaceState {
             tool: PreviewTool::None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
-            crop_to_roi: false,
+            crop_target: PreviewCropTarget::None,
             hover_sensor: None,
             selection_anchor: None,
             pending_roi: None,
+            annotation_drag: None,
             point_cloud: PointCloudState::default(),
         }
     }
@@ -87,6 +102,7 @@ impl PreviewWorkspaceState {
     pub(crate) fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.pending_roi = None;
+        self.annotation_drag = None;
         self.tool = PreviewTool::None;
     }
 
@@ -94,12 +110,33 @@ impl PreviewWorkspaceState {
         self.hover_sensor = None;
         self.selection_anchor = None;
         self.pending_roi = None;
+        self.annotation_drag = None;
         self.point_cloud.clear();
     }
 
     pub(crate) fn reset_zoom(&mut self) {
         self.zoom = 1.0;
         self.pan = egui::Vec2::ZERO;
+    }
+
+    pub(crate) fn crop_active(&self) -> bool {
+        self.crop_target != PreviewCropTarget::None
+    }
+
+    pub(crate) fn toggle_crop_target(&mut self, selected_annotation: Option<usize>) {
+        self.crop_target = if self.crop_active() {
+            PreviewCropTarget::None
+        } else if let Some(id) = selected_annotation {
+            PreviewCropTarget::Annotation(id)
+        } else {
+            PreviewCropTarget::HardwareRoi
+        };
+    }
+
+    pub(crate) fn clear_crop_target_if_annotation(&mut self, id: usize) {
+        if self.crop_target == PreviewCropTarget::Annotation(id) {
+            self.crop_target = PreviewCropTarget::None;
+        }
     }
 }
 
@@ -499,6 +536,42 @@ fn draw_viewer_controls(
                 }
             }
 
+            if !state.annotation_manager.annotations().is_empty() {
+                egui::CollapsingHeader::new("Annotations")
+                    .id_source((input.viewer_id, "annotations"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let mut clicked_annotation = None;
+                        for (index, annotation) in
+                            state.annotation_manager.annotations().iter().enumerate()
+                        {
+                            let selected =
+                                state.annotation_manager.selected_id() == Some(annotation.id);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("\u{25A0}").color(annotation.color));
+                                let response =
+                                    ui.selectable_label(selected, format!("ROI {}", index + 1));
+                                if response.clicked() {
+                                    clicked_annotation = Some(annotation.id);
+                                }
+                            });
+                        }
+                        if let Some(annotation_id) = clicked_annotation {
+                            state.annotation_manager.select(annotation_id);
+                            activate_pointer_tool(state);
+                        }
+                        if ui
+                            .add_enabled(
+                                state.annotation_manager.selected_id().is_some(),
+                                egui::Button::new("Delete selected"),
+                            )
+                            .clicked()
+                        {
+                            delete_selected_annotation(state);
+                        }
+                    });
+            }
+
             if let Some(stats) = input
                 .frame
                 .and_then(|frame| state.annotation_manager.statistics_for_selected(frame))
@@ -514,28 +587,6 @@ fn draw_viewer_controls(
                     stats.combined.mean,
                     stats.combined.stddev,
                 ));
-            }
-
-            if !state.annotation_manager.annotations().is_empty() {
-                egui::CollapsingHeader::new("Annotations")
-                    .id_source((input.viewer_id, "annotations"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for annotation in state.annotation_manager.annotations() {
-                            let selected =
-                                state.annotation_manager.selected_id() == Some(annotation.id);
-                            let _ = ui.selectable_label(selected, &annotation.label);
-                        }
-                        if ui
-                            .add_enabled(
-                                state.annotation_manager.selected_id().is_some(),
-                                egui::Button::new("Delete selected"),
-                            )
-                            .clicked()
-                        {
-                            state.annotation_manager.delete_selected();
-                        }
-                    });
             }
         }
         ViewMode::PointCloud3d => {
@@ -635,6 +686,7 @@ fn draw_preview_toolbar(
     popup_active: bool,
     input: &ViewerInput<'_>,
 ) -> bool {
+    let selected_annotation = state.annotation_manager.selected_id();
     let workspace = &mut state.workspace;
     let line_profile_tool = &mut state.line_profile_tool;
     let ruler_tool = &mut state.ruler_tool;
@@ -650,8 +702,10 @@ fn draw_preview_toolbar(
             .on_hover_text("Pointer")
             .clicked()
         {
-            workspace.tool = PreviewTool::None;
             workspace.clear_selection();
+            line_profile_tool.clear();
+            ruler_tool.clear();
+            state.annotation_manager.cancel_drawing();
         }
 
         let mut select_roi_button = ui.add_enabled(
@@ -675,6 +729,7 @@ fn draw_preview_toolbar(
                 workspace.tool = PreviewTool::SelectRoi;
                 workspace.selection_anchor = None;
                 workspace.pending_roi = None;
+                workspace.annotation_drag = None;
             }
         }
 
@@ -739,13 +794,13 @@ fn draw_preview_toolbar(
 
         if ui
             .add(egui::SelectableLabel::new(
-                workspace.crop_to_roi,
+                workspace.crop_active(),
                 toolbar_icon(phosphor::CROP),
             ))
             .on_hover_text("Crop to ROI")
             .clicked()
         {
-            workspace.crop_to_roi = !workspace.crop_to_roi;
+            workspace.toggle_crop_target(selected_annotation);
         }
 
         ui.separator();
@@ -825,6 +880,25 @@ fn draw_preview_toolbar(
     });
 
     popup_toggled
+}
+
+fn activate_pointer_tool(state: &mut ViewerState) {
+    state.workspace.clear_selection();
+    state.line_profile_tool.clear();
+    state.ruler_tool.clear();
+    state.annotation_manager.cancel_drawing();
+}
+
+fn delete_selected_annotation(state: &mut ViewerState) -> bool {
+    let deleted = state.annotation_manager.delete_selected();
+    if let Some(annotation_id) = deleted {
+        state
+            .workspace
+            .clear_crop_target_if_annotation(annotation_id);
+        true
+    } else {
+        false
+    }
 }
 
 fn preview_tool_button(
@@ -956,7 +1030,7 @@ fn draw_preview_canvas(
         max_height,
     } = options;
 
-    let viewport = build_preview_viewport(frame, config, workspace);
+    let viewport = build_preview_viewport(frame, config, annotation_manager, workspace);
     let canvas_size = egui::vec2(ui.available_width().max(1.0), max_height.max(1.0));
     let (canvas_rect, response) =
         ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
@@ -1024,7 +1098,7 @@ fn draw_preview_canvas(
                 if let Some(roi) = sensor_rect_to_roi_config(pending_roi, frame) {
                     result.new_roi = Some(roi);
                     result.roi_committed = true;
-                    if workspace.crop_to_roi {
+                    if workspace.crop_target == PreviewCropTarget::HardwareRoi {
                         workspace.reset_zoom();
                     }
                 }
@@ -1096,15 +1170,56 @@ fn draw_preview_canvas(
         if response.drag_stopped() {
             annotation_manager.finish_drawing();
         }
-    } else if response.dragged() && workspace.zoom > PREVIEW_ZOOM_MIN {
-        let delta = ui.ctx().input(|input| input.pointer.delta());
-        workspace.pan += egui::vec2(
-            -delta.x * viewport.visible_sensor_rect.width() / image_rect.width().max(1.0),
-            -delta.y * viewport.visible_sensor_rect.height() / image_rect.height().max(1.0),
-        );
-    } else if response.clicked() {
-        if let Some(pointer_pos) = pointer_sensor {
-            annotation_manager.select_at(pointer_pos);
+    } else {
+        if response.drag_started() {
+            if let Some(pointer_pos) = pointer_sensor {
+                if let Some(annotation_id) = annotation_manager.annotation_id_at(pointer_pos) {
+                    annotation_manager.select(annotation_id);
+                    workspace.annotation_drag = Some(AnnotationDragState {
+                        id: annotation_id,
+                        last_sensor: pointer_pos,
+                    });
+                } else {
+                    annotation_manager.clear_selection();
+                    workspace.annotation_drag = None;
+                }
+            }
+        }
+        if response.dragged() {
+            if let (Some(drag), Some(pointer_pos)) = (workspace.annotation_drag, pointer_sensor) {
+                let dx = i32::from(pointer_pos.0) - i32::from(drag.last_sensor.0);
+                let dy = i32::from(pointer_pos.1) - i32::from(drag.last_sensor.1);
+                if annotation_manager.translate_annotation(
+                    drag.id,
+                    dx,
+                    dy,
+                    frame.width,
+                    frame.height,
+                ) {
+                    workspace.annotation_drag = Some(AnnotationDragState {
+                        id: drag.id,
+                        last_sensor: pointer_pos,
+                    });
+                }
+            } else if workspace.zoom > PREVIEW_ZOOM_MIN {
+                let delta = ui.ctx().input(|input| input.pointer.delta());
+                workspace.pan += egui::vec2(
+                    -delta.x * viewport.visible_sensor_rect.width() / image_rect.width().max(1.0),
+                    -delta.y * viewport.visible_sensor_rect.height() / image_rect.height().max(1.0),
+                );
+            }
+        }
+        if response.drag_stopped() {
+            workspace.annotation_drag = None;
+        }
+        if response.clicked() {
+            if let Some(pointer_pos) = pointer_sensor {
+                if !annotation_manager.select_at(pointer_pos) {
+                    annotation_manager.clear_selection();
+                }
+            } else {
+                annotation_manager.clear_selection();
+            }
         }
     }
 
@@ -1112,7 +1227,7 @@ fn draw_preview_canvas(
         .painter()
         .with_clip_rect(image_rect.intersect(ui.clip_rect()));
     if let Some(current_roi) = viewport.roi_rect {
-        if !workspace.crop_to_roi {
+        if !workspace.crop_active() {
             paint_sensor_rect(
                 &painter,
                 image_rect,
@@ -1269,6 +1384,7 @@ impl PreviewViewport {
 fn build_preview_viewport(
     frame: &PreviewFrame,
     config: &CameraConfig,
+    annotation_manager: &AnnotationManager,
     workspace: &mut PreviewWorkspaceState,
 ) -> PreviewViewport {
     workspace.zoom = workspace.zoom.clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
@@ -1278,11 +1394,8 @@ fn build_preview_viewport(
         egui::vec2(frame.width as f32, frame.height as f32),
     );
     let roi_rect = roi_sensor_rect(config, frame);
-    let base_sensor_rect = if workspace.crop_to_roi {
-        roi_rect.unwrap_or(full_sensor_rect)
-    } else {
-        full_sensor_rect
-    };
+    let base_sensor_rect = crop_target_sensor_rect(config, frame, annotation_manager, workspace)
+        .unwrap_or(full_sensor_rect);
 
     let visible_size = egui::vec2(
         (base_sensor_rect.width() / workspace.zoom).max(1.0),
@@ -1314,6 +1427,25 @@ fn build_preview_viewport(
     }
 }
 
+fn crop_target_sensor_rect(
+    config: &CameraConfig,
+    frame: &PreviewFrame,
+    annotation_manager: &AnnotationManager,
+    workspace: &mut PreviewWorkspaceState,
+) -> Option<egui::Rect> {
+    match workspace.crop_target {
+        PreviewCropTarget::None => None,
+        PreviewCropTarget::HardwareRoi => roi_sensor_rect(config, frame),
+        PreviewCropTarget::Annotation(id) => {
+            let Some(annotation) = annotation_manager.annotation(id) else {
+                workspace.crop_target = PreviewCropTarget::None;
+                return None;
+            };
+            sensor_rect_from_annotation_shape(&annotation.shape, frame)
+        }
+    }
+}
+
 fn roi_sensor_rect(config: &CameraConfig, frame: &PreviewFrame) -> Option<egui::Rect> {
     if frame.width == 0 || frame.height == 0 {
         return None;
@@ -1325,6 +1457,41 @@ fn roi_sensor_rect(config: &CameraConfig, frame: &PreviewFrame) -> Option<egui::
         (u32::from(config.roi.x) + u32::from(config.roi.width)).min(u32::from(frame.width)) as f32;
     let max_y = (u32::from(config.roi.y) + u32::from(config.roi.height))
         .min(u32::from(frame.height)) as f32;
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    Some(egui::Rect::from_min_max(
+        egui::pos2(min_x, min_y),
+        egui::pos2(max_x, max_y),
+    ))
+}
+
+fn sensor_rect_from_annotation_shape(
+    shape: &AnnotationShape,
+    frame: &PreviewFrame,
+) -> Option<egui::Rect> {
+    if frame.width == 0 || frame.height == 0 {
+        return None;
+    }
+
+    let bounds = shape.bounds_rect();
+    let min_x = f32::from(bounds.min.0.min(frame.width.saturating_sub(1)));
+    let min_y = f32::from(bounds.min.1.min(frame.height.saturating_sub(1)));
+    let max_x = f32::from(
+        bounds
+            .max
+            .0
+            .min(frame.width.saturating_sub(1))
+            .saturating_add(1),
+    );
+    let max_y = f32::from(
+        bounds
+            .max
+            .1
+            .min(frame.height.saturating_sub(1))
+            .saturating_add(1),
+    );
     if max_x <= min_x || max_y <= min_y {
         return None;
     }
@@ -1730,8 +1897,10 @@ fn format_replay_time(duration_us: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_viewport, sensor_rect_to_roi_config, PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
+        build_preview_viewport, sensor_rect_to_roi_config, PreviewCropTarget,
+        PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
     };
+    use crate::viewer_tools::{AnnotationManager, AnnotationShapeKind};
     use augur_core::{config::CameraConfig, pipeline::PreviewFrame};
 
     fn test_frame() -> PreviewFrame {
@@ -1749,20 +1918,37 @@ mod tests {
         }
     }
 
+    fn annotation_manager_with_rectangle() -> AnnotationManager {
+        let mut annotations = AnnotationManager::default();
+        annotations.start_drawing(AnnotationShapeKind::Rectangle, (100, 120));
+        annotations.update_drawing((220, 260));
+        annotations.finish_drawing();
+        annotations
+    }
+
+    fn annotation_manager_with_ellipse() -> AnnotationManager {
+        let mut annotations = AnnotationManager::default();
+        annotations.start_drawing(AnnotationShapeKind::Ellipse, (200, 150));
+        annotations.update_drawing((320, 270));
+        annotations.finish_drawing();
+        annotations
+    }
+
     #[test]
-    fn preview_viewport_uses_roi_when_crop_is_enabled() {
+    fn preview_viewport_uses_hardware_roi_when_crop_is_enabled() {
         let frame = test_frame();
         let mut config = CameraConfig::default();
         config.roi.x = 120;
         config.roi.y = 90;
         config.roi.width = 320;
         config.roi.height = 180;
+        let annotations = AnnotationManager::default();
 
         let mut workspace = PreviewWorkspaceState {
-            crop_to_roi: true,
+            crop_target: PreviewCropTarget::HardwareRoi,
             ..Default::default()
         };
-        let viewport = build_preview_viewport(&frame, &config, &mut workspace);
+        let viewport = build_preview_viewport(&frame, &config, &annotations, &mut workspace);
 
         assert_eq!(viewport.base_sensor_rect.min, egui::pos2(120.0, 90.0));
         assert_eq!(viewport.base_sensor_rect.size(), egui::vec2(320.0, 180.0));
@@ -1772,18 +1958,71 @@ mod tests {
     fn preview_viewport_clamps_pan_inside_base_rect() {
         let frame = test_frame();
         let config = CameraConfig::default();
+        let annotations = AnnotationManager::default();
         let mut workspace = PreviewWorkspaceState {
             zoom: PREVIEW_ZOOM_MAX,
             pan: egui::vec2(10_000.0, -10_000.0),
             ..Default::default()
         };
 
-        let viewport = build_preview_viewport(&frame, &config, &mut workspace);
+        let viewport = build_preview_viewport(&frame, &config, &annotations, &mut workspace);
 
         assert!(viewport.visible_sensor_rect.min.x >= 0.0);
         assert!(viewport.visible_sensor_rect.min.y >= 0.0);
         assert!(viewport.visible_sensor_rect.max.x <= frame.width as f32);
         assert!(viewport.visible_sensor_rect.max.y <= frame.height as f32);
+    }
+
+    #[test]
+    fn preview_viewport_uses_selected_rectangle_annotation_crop_target() {
+        let frame = test_frame();
+        let config = CameraConfig::default();
+        let annotations = annotation_manager_with_rectangle();
+        let mut workspace = PreviewWorkspaceState {
+            crop_target: PreviewCropTarget::Annotation(0),
+            ..Default::default()
+        };
+
+        let viewport = build_preview_viewport(&frame, &config, &annotations, &mut workspace);
+
+        assert_eq!(viewport.base_sensor_rect.min, egui::pos2(100.0, 120.0));
+        assert_eq!(viewport.base_sensor_rect.max, egui::pos2(221.0, 261.0));
+    }
+
+    #[test]
+    fn preview_viewport_uses_ellipse_bounding_box_for_crop_target() {
+        let frame = test_frame();
+        let config = CameraConfig::default();
+        let annotations = annotation_manager_with_ellipse();
+        let mut workspace = PreviewWorkspaceState {
+            crop_target: PreviewCropTarget::Annotation(0),
+            ..Default::default()
+        };
+
+        let viewport = build_preview_viewport(&frame, &config, &annotations, &mut workspace);
+
+        assert_eq!(viewport.base_sensor_rect.min, egui::pos2(199.0, 149.0));
+        assert_eq!(viewport.base_sensor_rect.max, egui::pos2(322.0, 272.0));
+    }
+
+    #[test]
+    fn missing_annotation_crop_target_resets_to_full_frame() {
+        let frame = test_frame();
+        let config = CameraConfig::default();
+        let annotations = AnnotationManager::default();
+        let mut workspace = PreviewWorkspaceState {
+            crop_target: PreviewCropTarget::Annotation(99),
+            ..Default::default()
+        };
+
+        let viewport = build_preview_viewport(&frame, &config, &annotations, &mut workspace);
+
+        assert_eq!(workspace.crop_target, PreviewCropTarget::None);
+        assert_eq!(viewport.base_sensor_rect.min, egui::Pos2::ZERO);
+        assert_eq!(
+            viewport.base_sensor_rect.size(),
+            egui::vec2(frame.width as f32, frame.height as f32)
+        );
     }
 
     #[test]

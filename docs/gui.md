@@ -109,10 +109,12 @@ The center panel is now an interactive preview workspace shared by the embedded 
 - `Line Profile` samples ON and OFF intensity along a dragged line, opens after the drag completes, and includes labeled axes plus an optional ON+OFF sum trace
 - `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
 - `Rect` and `Ellipse` add host-side software annotations; selecting one shows ROI statistics for ON, OFF, and combined channels
+- the `Annotations` list is directly interactive: each row shows the ROI color, clicking a row selects it immediately, switches back to pointer/edit mode, and keeps visible ROI numbering contiguous after deletes
+- in pointer mode, drag an existing rectangle or ellipse to move it
 - `Esc` clears the active ROI/line/ruler/annotation draft, while `Delete` / `Backspace` removes the selected annotation
 - zoom-out, zoom-in, and fit-to-window icon buttons control zoom
 - when zoomed in, dragging the image pans the viewport
-- `Crop to ROI` switches between full-frame and ROI-only rendering without changing the allocated canvas size
+- `Crop to ROI` switches between full-frame and ROI-only rendering without changing the allocated canvas size; with a selected software annotation it crops to that ROI, otherwise it falls back to the hardware ROI, and ellipse crop uses the ellipse bounding box
 - a scale-bar overlay can be toggled from `View` or from the preview controls and positioned in any corner
 - `Enlarge` opens a larger resizable popup that reuses the same zoom/crop/ROI state as the main preview
 

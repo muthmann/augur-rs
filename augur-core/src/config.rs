@@ -74,7 +74,7 @@ pub struct GlobalSettingsConfig {
 impl Default for GlobalSettingsConfig {
     fn default() -> Self {
         Self {
-            nm_per_pixel: 65.0,
+            nm_per_pixel: 4_860.0,
             sensor_width: 1280,
             sensor_height: 720,
             acq_time_ms: 50,

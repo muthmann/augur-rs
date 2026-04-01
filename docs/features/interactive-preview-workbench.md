@@ -10,9 +10,11 @@
 - the toolbar uses compact icon buttons with hover tooltips for ROI, histogram, line-profile, ruler, annotation, zoom, and popup actions, and it keeps the hover readout on the same row instead of wrapping
 - `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`
 - zoom-out, zoom-in, and fit-to-window icon buttons control preview zoom, while drag-panning is available whenever the view is zoomed in
-- `Crop to ROI` switches the 2D preview between full-sensor rendering and ROI-only rendering without changing the allocated canvas size
+- `Crop to ROI` switches the 2D preview between full-sensor rendering and ROI-only rendering without changing the allocated canvas size; it crops to the selected software annotation when one is selected, otherwise it uses the hardware ROI
 - the toolbar also owns the histogram toggle plus line-profile, ruler, and software-annotation tool modes
 - `Esc` clears the active viewer-tool drawing state, and `Delete` / `Backspace` removes the selected annotation
+- annotation list clicks now select the ROI immediately, switch back to pointer/edit mode, keep visible ROI numbering contiguous after deletes, and show the same per-ROI color used on the canvas
+- in pointer mode, existing rectangle and ellipse annotations can be repositioned by dragging them directly on the preview
 - histogram and line-profile tools can open in separate OS windows via deferred viewports, with embedded fallbacks on unsupported backends; the line-profile window opens after the drag completes
 - `Enlarge` opens a native OS popup window (via `show_viewport_deferred`) that reuses the same preview state and includes replay controls; the main window shows a placeholder while the popup is open
 
