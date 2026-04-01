@@ -52,11 +52,10 @@ Only one viewer is active at a time.
 This replaces the old popup-specific mini-renderer with the same viewer component used in the main
 window.
 
-## Reconstruction Follow-Up
+## Future Hosts
 
-This extraction is the prerequisite for the reconstruction-window branch work: the follow-up can
-wrap the shared viewer with reconstruction-specific data preparation and export controls instead of
-forking another copy of the central panel UI.
+This extraction keeps the viewer reusable for any future popup-style host without copying the
+central panel UI again.
 
 ## Files
 

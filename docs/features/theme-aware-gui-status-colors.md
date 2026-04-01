@@ -24,7 +24,6 @@ This change only affects free-floating GUI text in `augur-gui`. Overlay colors r
 |---|---|
 | `augur-gui/src/app.rs` | Theme-aware warning/error text plus contrast-safe success/info colors |
 | `docs/gui.md` | User-facing GUI guide |
-| `book/src/gui.md` | mdBook GUI guide |
 
 ## Verification
 

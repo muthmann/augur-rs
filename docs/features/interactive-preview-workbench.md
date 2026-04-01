@@ -89,11 +89,10 @@ analysis side panel is present or resizing.
 | `augur-gui/src/app.rs` | shared preview workspace state, 2D preview controls, popup integration, panel arrows, toolbar layout |
 | `augur-gui/src/point_cloud.rs` | recent-event history, orbit-camera math, and point-cloud painter rendering |
 | `docs/gui.md` | user-facing GUI workflow documentation |
-| `book/src/gui.md` | mdBook GUI guide |
 
 ## Verification
 
 - `cargo fmt --all`
 - `cargo build -p augur-gui`
 - `cargo test -p augur-gui`
-- `mdbook build`
+- `cargo check -p augur-gui`

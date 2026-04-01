@@ -17,8 +17,8 @@ use augur_core::{
 use augur_plugin_api::{
     AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
     FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-    FfiSubpixelMarker, HostViewRegistry, LocalizationTable, PluginEntry, PluginInput, PluginVTable,
-    SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
+    FfiSubpixelMarker, HostViewRegistry, PluginCapabilities, PluginEntry, PluginInput,
+    PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -72,6 +72,7 @@ pub struct DynPlugin {
     cached_schema: SettingsSchema,
     cached_dependencies: Vec<String>,
     input_kind: PluginInput,
+    capabilities: PluginCapabilities,
     cached_setting_values: HashMap<String, CachedSettingValue>,
     cached_status_entries: Option<CachedStatusEntries>,
 }
@@ -113,6 +114,7 @@ impl DynPlugin {
             cached_schema: SettingsSchema::default(),
             cached_dependencies: Vec::new(),
             input_kind: PluginInput::FrameOnly,
+            capabilities: PluginCapabilities::default(),
             cached_setting_values: HashMap::new(),
             cached_status_entries: None,
         };
@@ -136,6 +138,7 @@ impl DynPlugin {
             .unwrap_or_default();
         let schema = self.read_json(self.vtable.settings_schema)?;
         let input_kind = unsafe { (self.vtable.input_kind)(self.instance) };
+        let capabilities = unsafe { (self.vtable.capabilities)(self.instance) };
         let dependency_count = unsafe { (self.vtable.num_dependencies)(self.instance) };
         let mut dependencies = Vec::with_capacity(dependency_count);
         for index in 0..dependency_count {
@@ -149,6 +152,7 @@ impl DynPlugin {
         self.cached_schema = schema;
         self.cached_dependencies = dependencies;
         self.input_kind = input_kind;
+        self.capabilities = capabilities;
         self.invalidate_ui_cache();
         Ok(())
     }
@@ -193,6 +197,10 @@ impl DynPlugin {
 
     pub fn input_kind(&self) -> PluginInput {
         self.input_kind
+    }
+
+    pub fn capabilities(&self) -> PluginCapabilities {
+        self.capabilities
     }
 
     pub fn dependencies(&self) -> &[String] {
@@ -278,18 +286,6 @@ impl DynPlugin {
 
     pub fn status_entries(&self) -> Result<Vec<StatusEntry>, String> {
         self.read_json(self.vtable.status_entries)
-    }
-
-    pub fn accumulated_localizations(&self) -> Result<Option<LocalizationTable>, String> {
-        let bytes = self.call_optional_bytes(|inst, ptr, len| unsafe {
-            (self.vtable.accumulated_localizations)(inst, ptr, len)
-        });
-        match bytes {
-            Some(bytes) => serde_json::from_slice(bytes)
-                .map(Some)
-                .map_err(|err| format!("accumulated localizations JSON invalid: {err}")),
-            None => Ok(None),
-        }
     }
 
     pub fn status_entries_cached(&mut self) -> Result<Vec<StatusEntry>, String> {

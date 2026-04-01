@@ -25,3 +25,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 009: Host-Owned Global Settings Contract](./009-host-global-settings-contract.md)
 - [ADR 010: Host-Owned Viewer Tools And External Preview Bridges](./010-host-owned-viewer-tools-and-external-bridges.md)
 - [ADR 011: Reusable Viewer Widget For Embedded And Popup Hosts](./011-reusable-viewer-widget.md)
+- [ADR 012: Generic Plugin Boundary With Companion Domain-Type Crates](./012-generic-plugin-boundary-and-companion-types.md)

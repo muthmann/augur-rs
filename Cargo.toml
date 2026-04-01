@@ -5,6 +5,7 @@ members = [
   "augur-cli",
   "augur-gui",
   "augur-plugin-api",
+  "augur-plugin-types",
 ]
 resolver = "2"
 

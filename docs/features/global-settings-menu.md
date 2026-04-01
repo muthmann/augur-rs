@@ -113,4 +113,4 @@ without rebuilding the replay session.
 - `cargo test -p augur-core`
 - `cargo test -p augur-gui`
 - `cargo clippy --workspace`
-- `mdbook build`
+- `cargo check -p augur-gui`

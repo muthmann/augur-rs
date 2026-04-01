@@ -1,5 +1,5 @@
 use augur_core::{analysis::AnalysisOutput, config::CameraConfig, pipeline::PreviewFrame};
-use augur_plugin_api::{HostViewRegistry, PluginInput};
+use augur_plugin_api::{HostViewRegistry, PluginCapabilities, PluginInput};
 
 pub trait AnalysisPlugin {
     fn name(&self) -> &str;
@@ -26,6 +26,10 @@ pub trait AnalysisPlugin {
 
     fn input_kind(&self) -> PluginInput {
         PluginInput::FrameOnly
+    }
+
+    fn capabilities(&self) -> PluginCapabilities {
+        PluginCapabilities::default()
     }
 
     fn dependencies(&self) -> &[&str] {

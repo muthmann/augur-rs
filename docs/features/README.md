@@ -8,7 +8,7 @@ This repository defines the plugin API, runtime loader, host-side analysis UI, a
 ROI-grid tool. The broader runtime plugin registry lives in
 **[augur-plugins](https://github.com/muthmann/augur-plugins)**.
 
-See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dynamic Plugin Loading](./dynamic-plugins.md) for the install/reload workflow.
+See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface spec and [Dynamic Plugin Loading](./dynamic-plugins.md) for the install/reload workflow.
 
 ---
 
@@ -26,16 +26,13 @@ See [Plugin Architecture](./analysis-plugins.md) for the interface spec and [Dyn
 - [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, idle launch shortcuts, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the bundled Augur Bridge handoff path for ImageJ/Fiji
-- [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window, popup host, and future reconstruction wrapping
-- [Plugin Architecture](./analysis-plugins.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
-- [Plugin API v0.2](./plugin-api-v0-2.md) — flat runtime ABI, EventStore history, persistent plugin context, and repo split cleanup
-- [Plugin API v0.3 Migration](./plugin-api-v0-3-migration.md) — segmented EventStore access, host-view dataset generations, raw context publishing, and rebuild requirements
-- [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables and density views
+- [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window and popup host
+- [Generic Plugin Interface Cleanup](./generic-plugin-interface-cleanup.md) — companion payload crate, capability-driven history retention, and fully generic host-view rendering
+- [Plugin Authoring Guide](./plugin-authoring-guide.md) — mixed built-in/runtime plugin host, FFI API, phased execution, shared context types
+- [Plugin API Migration History](./plugin-api-migration-history.md) — ABI evolution from v0.2 through v0.4: EventStore, dataset generations, companion type crates, and capabilities
+- [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables, plots, and images
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [ROI Grid Computation](./roi-grid.md) — grid partitioning around masked hotpixels and maximal-rectangle selection
 - [Output File Timestamps](./output-file-timestamps.md) — overwrite protection and automatic timestamp suffixes for recordings
 
-The following notes document plugins that ship in [augur-plugins](https://github.com/muthmann/augur-plugins):
-
-- [Molecule Localization Plugin](./molecule-localization.md) — wavelet denoising, Gaussian fitting, localization result publishing
-- [Focus Metrics Plugin](./focus-metrics.md) — localization-based and FFT-based focus estimation
+Scientific runtime plugins (molecule localization, focus metrics, reconstruction, etc.) are documented in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.

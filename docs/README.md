@@ -1,6 +1,6 @@
 # Documentation
 
-This repository keeps user-facing documentation separate from deeper technical notes. The same user-facing material is mirrored into `book/src/` so GitHub Pages can publish it as an mdBook.
+This repository keeps user-facing documentation separate from deeper technical notes.
 
 ## User Guides
 

@@ -622,6 +622,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "augur-plugin-types"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "augur-prophesee"
 version = "0.2.0"
 dependencies = [

@@ -7,10 +7,11 @@ use std::{
 };
 
 use augur_plugin_api::{
-    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewPlacement,
-    HostViewRegistry, TableDatasetV1, TableSchema,
+    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, Image2dV1, Series1dV1, TableDatasetV1, TableSchema,
 };
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
+use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 use image::{ImageFormat, RgbaImage};
 
 use crate::colormap::Colormap;
@@ -84,6 +85,34 @@ impl ResolvedHostViewRegistry {
         self.views
             .iter()
             .filter(|view| view.descriptor.placement == HostViewPlacement::Window)
+    }
+}
+
+fn host_view_kind_matches_dataset(
+    view_kind: &HostViewKind,
+    dataset_kind: &HostDatasetKind,
+) -> bool {
+    matches!(
+        (view_kind, dataset_kind),
+        (
+            HostViewKind::CompactTable
+                | HostViewKind::TableWindow
+                | HostViewKind::Density2dFromTable { .. }
+                | HostViewKind::Scatter2dFromTable { .. },
+            HostDatasetKind::TableV1(_)
+        ) | (HostViewKind::ImageWindow, HostDatasetKind::Image2dV1)
+            | (HostViewKind::LineSeriesWindow, HostDatasetKind::Series1dV1)
+    )
+}
+
+fn host_view_kind_label(kind: &HostViewKind) -> &'static str {
+    match kind {
+        HostViewKind::CompactTable => "compact table",
+        HostViewKind::TableWindow => "table",
+        HostViewKind::Density2dFromTable { .. } => "density",
+        HostViewKind::Scatter2dFromTable { .. } => "scatter",
+        HostViewKind::ImageWindow => "image",
+        HostViewKind::LineSeriesWindow => "line-series",
     }
 }
 
@@ -174,16 +203,30 @@ pub fn resolve_host_view_registry(
     let mut filtered_views = Vec::with_capacity(resolved.views.len());
     let mut filtered_indices = HashMap::new();
     for view in resolved.views.drain(..) {
-        if resolved
+        let Some(dataset_index) = resolved
             .dataset_indices
-            .contains_key(&view.descriptor.dataset_id)
-        {
+            .get(&view.descriptor.dataset_id)
+            .copied()
+        else {
+            resolved.warnings.push(format!(
+                "Ignoring view id {} from {} because dataset {} is not resolved.",
+                view.descriptor.id, view.provider_name, view.descriptor.dataset_id
+            ));
+            continue;
+        };
+
+        let dataset = &resolved.datasets[dataset_index];
+        if host_view_kind_matches_dataset(&view.descriptor.kind, &dataset.descriptor.kind) {
             filtered_indices.insert(view.descriptor.id.clone(), filtered_views.len());
             filtered_views.push(view);
         } else {
             resolved.warnings.push(format!(
-                "Ignoring view id {} from {} because dataset {} is not resolved.",
-                view.descriptor.id, view.provider_name, view.descriptor.dataset_id
+                "Ignoring view id {} from {} because {} views do not match dataset {} ({:?}).",
+                view.descriptor.id,
+                view.provider_name,
+                host_view_kind_label(&view.descriptor.kind),
+                view.descriptor.dataset_id,
+                dataset.descriptor.kind
             ));
         }
     }
@@ -195,6 +238,8 @@ pub fn resolve_host_view_registry(
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostDatasetSnapshot {
     Table(Arc<TableDatasetV1>),
+    Image2d(Arc<Image2dV1>),
+    Series1d(Arc<Series1dV1>),
 }
 
 pub fn decode_dataset_snapshot(
@@ -207,6 +252,16 @@ pub fn decode_dataset_snapshot(
                 .map_err(|err| format!("table dataset JSON is invalid: {err}"))?;
             dataset.validate_against_schema(schema)?;
             Ok(HostDatasetSnapshot::Table(Arc::new(dataset)))
+        }
+        HostDatasetKind::Image2dV1 => {
+            let dataset: Image2dV1 = serde_json::from_slice(bytes)
+                .map_err(|err| format!("image dataset JSON is invalid: {err}"))?;
+            Ok(HostDatasetSnapshot::Image2d(Arc::new(dataset)))
+        }
+        HostDatasetKind::Series1dV1 => {
+            let dataset: Series1dV1 = serde_json::from_slice(bytes)
+                .map_err(|err| format!("series dataset JSON is invalid: {err}"))?;
+            Ok(HostDatasetSnapshot::Series1d(Arc::new(dataset)))
         }
     }
 }
@@ -238,6 +293,23 @@ impl Default for Density2dRenderSettings {
     fn default() -> Self {
         Self {
             pixel_size: 10.0,
+            contrast_percentile: 99.5,
+            colormap: Colormap::Fire,
+            zoom: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Image2dRenderSettings {
+    pub contrast_percentile: f32,
+    pub colormap: Colormap,
+    pub zoom: f32,
+}
+
+impl Default for Image2dRenderSettings {
+    fn default() -> Self {
+        Self {
             contrast_percentile: 99.5,
             colormap: Colormap::Fire,
             zoom: 1.0,
@@ -336,10 +408,91 @@ impl Density2dViewState {
 }
 
 #[derive(Default)]
+pub struct Image2dViewState {
+    image: Option<ColorImage>,
+    texture: Option<TextureHandle>,
+    rendered_size: [usize; 2],
+    rendered_generation: Option<u64>,
+    dirty: bool,
+    settings: Image2dRenderSettings,
+}
+
+impl Image2dViewState {
+    pub fn clear(&mut self) {
+        self.image = None;
+        self.texture = None;
+        self.rendered_size = [0, 0];
+        self.rendered_generation = None;
+        self.dirty = false;
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn settings(&self) -> Image2dRenderSettings {
+        self.settings
+    }
+
+    pub fn image(&self) -> Option<&ColorImage> {
+        self.image.as_ref()
+    }
+
+    pub fn texture(&self) -> Option<&TextureHandle> {
+        self.texture.as_ref()
+    }
+
+    pub fn rendered_size(&self) -> [usize; 2] {
+        self.rendered_size
+    }
+
+    pub fn set_settings(&mut self, settings: Image2dRenderSettings) {
+        if self.settings != settings {
+            self.settings = settings;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn render_if_needed(
+        &mut self,
+        ctx: &egui::Context,
+        dataset: Option<&Image2dV1>,
+        dataset_generation: u64,
+    ) -> Result<(), String> {
+        if !self.dirty && self.rendered_generation == Some(dataset_generation) {
+            return Ok(());
+        }
+
+        let Some(dataset) = dataset else {
+            self.clear();
+            return Ok(());
+        };
+
+        let image = render_image2d_dataset(
+            dataset,
+            self.settings.contrast_percentile,
+            self.settings.colormap,
+        )?;
+        self.rendered_size = image.size;
+        if let Some(texture) = &mut self.texture {
+            texture.set(image.clone(), TextureOptions::LINEAR);
+        } else {
+            self.texture =
+                Some(ctx.load_texture("host_view_image", image.clone(), TextureOptions::LINEAR));
+        }
+        self.image = Some(image);
+        self.rendered_generation = Some(dataset_generation);
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 pub enum HostViewRenderState {
     #[default]
     None,
     Density2d(Density2dViewState),
+    Image2d(Image2dViewState),
 }
 
 impl HostViewRenderState {
@@ -354,12 +507,29 @@ impl HostViewRenderState {
         match self {
             Self::Density2d(state) => state,
             Self::None => unreachable!(),
+            Self::Image2d(_) => unreachable!(),
+        }
+    }
+
+    pub fn image_state(&mut self) -> &mut Image2dViewState {
+        if !matches!(self, Self::Image2d(_)) {
+            *self = Self::Image2d(Image2dViewState {
+                dirty: true,
+                ..Default::default()
+            });
+        }
+
+        match self {
+            Self::Image2d(state) => state,
+            Self::None | Self::Density2d(_) => unreachable!(),
         }
     }
 
     pub fn mark_dirty(&mut self) {
-        if let Self::Density2d(state) = self {
-            state.mark_dirty();
+        match self {
+            Self::Density2d(state) => state.mark_dirty(),
+            Self::Image2d(state) => state.mark_dirty(),
+            Self::None => {}
         }
     }
 }
@@ -369,6 +539,14 @@ pub struct HostViewUiActions {
     pub export_csv: bool,
     pub export_image: Option<HostViewImageFormat>,
     pub clear_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Scatter2dViewOptions<'a> {
+    pub view_id: &'a str,
+    pub x_column: &'a str,
+    pub y_column: &'a str,
+    pub allow_clear: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +728,189 @@ pub fn render_density2d_view(
     actions
 }
 
+pub fn render_image2d_view(
+    ui: &mut egui::Ui,
+    view_id: &str,
+    state: &mut Image2dViewState,
+    dataset: Option<&Image2dV1>,
+    empty_message: &str,
+    allow_clear: bool,
+) -> HostViewUiActions {
+    let mut actions = HostViewUiActions::default();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.menu_button("Export Image", |ui| {
+            if ui.button("PNG").clicked() {
+                actions.export_image = Some(HostViewImageFormat::Png);
+                ui.close_menu();
+            }
+            if ui.button("TIFF").clicked() {
+                actions.export_image = Some(HostViewImageFormat::Tiff);
+                ui.close_menu();
+            }
+        });
+        if allow_clear && ui.button("Clear").clicked() {
+            actions.clear_requested = true;
+        }
+        ui.separator();
+
+        let mut settings = state.settings();
+        ui.label("Contrast");
+        ui.add(egui::Slider::new(
+            &mut settings.contrast_percentile,
+            90.0..=100.0,
+        ));
+        egui::ComboBox::from_id_source(format!("{view_id}_image_colormap"))
+            .selected_text(settings.colormap.label())
+            .show_ui(ui, |ui| {
+                for colormap in Colormap::ALL {
+                    ui.selectable_value(&mut settings.colormap, colormap, colormap.label());
+                }
+            });
+        ui.label("Zoom");
+        ui.add(egui::Slider::new(&mut settings.zoom, 0.5..=8.0).logarithmic(true));
+        let zoom = settings.zoom;
+        settings.zoom = state.settings.zoom;
+        state.set_settings(settings);
+        state.settings.zoom = zoom;
+    });
+
+    ui.separator();
+
+    let Some(dataset) = dataset else {
+        ui.label(empty_message);
+        return actions;
+    };
+
+    if let Some(texture) = &state.texture {
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let size = texture.size_vec2() * state.settings.zoom;
+                ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+            });
+    } else {
+        ui.label(empty_message);
+    }
+
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Pixels: {}", dataset.pixels.len()));
+        ui.separator();
+        ui.label(format!(
+            "Image: {} x {} px",
+            state.rendered_size[0], state.rendered_size[1]
+        ));
+        ui.separator();
+        ui.label(format!(
+            "Contrast: {:.1}th percentile",
+            state.settings.contrast_percentile
+        ));
+        ui.separator();
+        ui.label(format!("Colormap: {}", state.settings.colormap.label()));
+    });
+
+    actions
+}
+
+pub fn render_scatter2d_view(
+    ui: &mut egui::Ui,
+    schema: &TableSchema,
+    dataset: Option<&TableDatasetV1>,
+    empty_message: &str,
+    options: Scatter2dViewOptions<'_>,
+) -> HostViewUiActions {
+    let mut actions = HostViewUiActions::default();
+
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Export CSV").clicked() {
+            actions.export_csv = true;
+        }
+        if options.allow_clear && ui.button("Clear").clicked() {
+            actions.clear_requested = true;
+        }
+        ui.separator();
+        ui.label(format!(
+            "Rows: {}",
+            dataset.map(TableDatasetV1::row_count).unwrap_or(0)
+        ));
+        ui.separator();
+        ui.label(format!(
+            "Axes: {} vs {}",
+            options.x_column, options.y_column
+        ));
+    });
+    ui.separator();
+
+    let Some(dataset) = dataset else {
+        ui.label(empty_message);
+        return actions;
+    };
+
+    let points = match scatter_plot_points(dataset, options.x_column, options.y_column) {
+        Ok(points) => points,
+        Err(err) => {
+            ui.colored_label(ui.visuals().error_fg_color, err);
+            return actions;
+        }
+    };
+
+    let plot = scatter_plot_builder(options.view_id, schema, options.x_column, options.y_column);
+    plot.show(ui, |plot_ui| {
+        plot_ui.points(
+            Points::new(points)
+                .radius(2.0)
+                .name(format!("{} vs {}", options.x_column, options.y_column)),
+        );
+    });
+
+    actions
+}
+
+pub fn render_line_series_view(
+    ui: &mut egui::Ui,
+    view_id: &str,
+    dataset: Option<&Series1dV1>,
+    empty_message: &str,
+) {
+    let Some(dataset) = dataset else {
+        ui.label(empty_message);
+        return;
+    };
+    if dataset.is_empty() {
+        ui.label(empty_message);
+        return;
+    }
+
+    Plot::new(format!("{view_id}_series"))
+        .legend(Legend::default())
+        .height(280.0)
+        .x_axis_label(&dataset.x_label)
+        .y_axis_label(&dataset.y_label)
+        .show(ui, |plot_ui| {
+            for (index, series) in dataset.lines.iter().enumerate() {
+                if series.points.is_empty() {
+                    continue;
+                }
+                let points =
+                    PlotPoints::from_iter(series.points.iter().map(|point| [point.x, point.y]));
+                let name = if series.name.trim().is_empty() {
+                    format!("Series {}", index + 1)
+                } else {
+                    series.name.clone()
+                };
+                plot_ui.line(Line::new(points).name(name));
+            }
+        });
+
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Lines: {}", dataset.lines.len()));
+        ui.separator();
+        ui.label(format!("Points: {}", dataset.total_points()));
+    });
+}
+
 #[derive(Clone, Default)]
 pub struct TableWindowViewportData {
     pub schema: TableSchema,
@@ -573,6 +934,40 @@ pub struct DensityWindowViewportData {
     pub export_csv_requested: bool,
     pub export_image_requested: Option<HostViewImageFormat>,
     pub clear_requested: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct ImageWindowViewportData {
+    pub texture: Option<TextureHandle>,
+    pub rendered_width: usize,
+    pub rendered_height: usize,
+    pub settings: Image2dRenderSettings,
+    pub empty_message: String,
+    pub error_message: Option<String>,
+    pub close_requested: bool,
+    pub export_image_requested: Option<HostViewImageFormat>,
+    pub clear_requested: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct ScatterWindowViewportData {
+    pub schema: TableSchema,
+    pub dataset: Option<Arc<TableDatasetV1>>,
+    pub x_column: String,
+    pub y_column: String,
+    pub empty_message: String,
+    pub error_message: Option<String>,
+    pub close_requested: bool,
+    pub export_csv_requested: bool,
+    pub clear_requested: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct SeriesWindowViewportData {
+    pub dataset: Option<Arc<Series1dV1>>,
+    pub empty_message: String,
+    pub error_message: Option<String>,
+    pub close_requested: bool,
 }
 
 pub fn render_table_window_viewport(
@@ -708,6 +1103,153 @@ pub fn render_density_window_viewport(
     });
 }
 
+pub fn render_image_window_viewport(
+    ui: &mut egui::Ui,
+    view_id: &str,
+    shared: &Arc<Mutex<ImageWindowViewportData>>,
+) {
+    let (texture, rendered_width, rendered_height, settings, empty_message, error_message) = {
+        let mut data = shared.lock().expect("image viewport mutex poisoned");
+
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Export Image", |ui| {
+                if ui.button("PNG").clicked() {
+                    data.export_image_requested = Some(HostViewImageFormat::Png);
+                    ui.close_menu();
+                }
+                if ui.button("TIFF").clicked() {
+                    data.export_image_requested = Some(HostViewImageFormat::Tiff);
+                    ui.close_menu();
+                }
+            });
+            if ui.button("Clear").clicked() {
+                data.clear_requested = true;
+            }
+            ui.separator();
+            ui.label("Contrast");
+            ui.add(egui::Slider::new(
+                &mut data.settings.contrast_percentile,
+                90.0..=100.0,
+            ));
+            egui::ComboBox::from_id_source(format!("{view_id}_image_viewport_colormap"))
+                .selected_text(data.settings.colormap.label())
+                .show_ui(ui, |ui| {
+                    for colormap in Colormap::ALL {
+                        ui.selectable_value(
+                            &mut data.settings.colormap,
+                            colormap,
+                            colormap.label(),
+                        );
+                    }
+                });
+            ui.label("Zoom");
+            ui.add(egui::Slider::new(&mut data.settings.zoom, 0.5..=8.0).logarithmic(true));
+        });
+
+        (
+            data.texture.clone(),
+            data.rendered_width,
+            data.rendered_height,
+            data.settings,
+            data.empty_message.clone(),
+            data.error_message.clone(),
+        )
+    };
+
+    ui.separator();
+
+    if let Some(error) = error_message {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+        return;
+    }
+
+    if let Some(texture) = texture {
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let size = texture.size_vec2() * settings.zoom;
+                ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
+            });
+    } else {
+        ui.centered_and_justified(|ui| {
+            ui.label(empty_message);
+        });
+    }
+
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Image: {rendered_width} x {rendered_height} px"));
+        ui.separator();
+        ui.label(format!(
+            "Contrast: {:.1}th percentile",
+            settings.contrast_percentile
+        ));
+        ui.separator();
+        ui.label(format!("Colormap: {}", settings.colormap.label()));
+    });
+}
+
+pub fn render_scatter_window_viewport(
+    ui: &mut egui::Ui,
+    view_id: &str,
+    shared: &Arc<Mutex<ScatterWindowViewportData>>,
+) {
+    let (schema, dataset, x_column, y_column, empty_message, error_message) = {
+        let data = shared.lock().expect("scatter viewport mutex poisoned");
+        (
+            data.schema.clone(),
+            data.dataset.clone(),
+            data.x_column.clone(),
+            data.y_column.clone(),
+            data.empty_message.clone(),
+            data.error_message.clone(),
+        )
+    };
+
+    if let Some(error) = error_message {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+        return;
+    }
+
+    let actions = render_scatter2d_view(
+        ui,
+        &schema,
+        dataset.as_deref(),
+        &empty_message,
+        Scatter2dViewOptions {
+            view_id,
+            x_column: &x_column,
+            y_column: &y_column,
+            allow_clear: true,
+        },
+    );
+    let mut data = shared.lock().expect("scatter viewport mutex poisoned");
+    data.export_csv_requested |= actions.export_csv;
+    data.clear_requested |= actions.clear_requested;
+}
+
+pub fn render_series_window_viewport(
+    ui: &mut egui::Ui,
+    view_id: &str,
+    shared: &Arc<Mutex<SeriesWindowViewportData>>,
+) {
+    let (dataset, empty_message, error_message) = {
+        let data = shared.lock().expect("series viewport mutex poisoned");
+        (
+            data.dataset.clone(),
+            data.empty_message.clone(),
+            data.error_message.clone(),
+        )
+    };
+
+    if let Some(error) = error_message {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+        return;
+    }
+
+    render_line_series_view(ui, view_id, dataset.as_deref(), &empty_message);
+}
+
 pub fn export_table_csv_to_path(
     path: &Path,
     schema: &TableSchema,
@@ -799,6 +1341,40 @@ fn write_table_csv(
 struct RenderedDensityImage {
     image: ColorImage,
     size: [usize; 2],
+}
+
+fn render_image2d_dataset(
+    dataset: &Image2dV1,
+    contrast_percentile: f32,
+    colormap: Colormap,
+) -> Result<ColorImage, String> {
+    dataset.validate()?;
+
+    let min_value = dataset
+        .pixels
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .reduce(f32::min)
+        .unwrap_or(0.0);
+    let max_value = percentile_finite(&dataset.pixels, contrast_percentile).max(min_value + 1e-6);
+    let scale = (max_value - min_value).max(1e-6);
+    let pixels = dataset
+        .pixels
+        .iter()
+        .map(|value| {
+            let normalized = if value.is_finite() {
+                ((value - min_value) / scale).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            colormap.lookup(normalized)
+        })
+        .collect();
+    Ok(ColorImage {
+        size: dataset.size(),
+        pixels,
+    })
 }
 
 fn render_density_image(
@@ -914,13 +1490,74 @@ fn percentile_nonzero(values: &[u32], percentile: f32) -> f32 {
     values[index.min(last)] as f32
 }
 
+fn percentile_finite(values: &[f32], percentile: f32) -> f32 {
+    let mut values: Vec<f32> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if values.is_empty() {
+        return 1.0;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let last = values.len().saturating_sub(1);
+    let index = ((last as f32) * percentile.clamp(0.0, 100.0) / 100.0).round() as usize;
+    values[index.min(last)]
+}
+
+fn scatter_plot_builder(
+    view_id: &str,
+    schema: &TableSchema,
+    x_column: &str,
+    y_column: &str,
+) -> Plot {
+    let plot = Plot::new(format!("{view_id}_scatter"))
+        .legend(Legend::default())
+        .height(280.0)
+        .x_axis_label(x_column)
+        .y_axis_label(y_column);
+    if schema
+        .coordinate_space_2d
+        .as_ref()
+        .is_some_and(|space| space.x_column == x_column && space.y_column == y_column)
+    {
+        plot.data_aspect(1.0)
+    } else {
+        plot
+    }
+}
+
+fn scatter_plot_points(
+    dataset: &TableDatasetV1,
+    x_column: &str,
+    y_column: &str,
+) -> Result<PlotPoints, String> {
+    let x_values = dataset
+        .column(x_column)
+        .ok_or_else(|| format!("dataset is missing x column {x_column}"))?;
+    let y_values = dataset
+        .column(y_column)
+        .ok_or_else(|| format!("dataset is missing y column {y_column}"))?;
+    let mut points = Vec::with_capacity(dataset.row_count());
+    for row in 0..dataset.row_count() {
+        let Some(x) = x_values.values.numeric_value(row) else {
+            return Err(format!("column {x_column} is not numeric"));
+        };
+        let Some(y) = y_values.values.numeric_value(row) else {
+            return Err(format!("column {y_column} is not numeric"));
+        };
+        points.push([x, y]);
+    }
+    Ok(PlotPoints::new(points))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use augur_plugin_api::{
         HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
-        HostViewPlacement, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1,
-        TableSchema, TableValueType,
+        HostViewPlacement, Image2dV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn,
+        TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
     };
 
     fn table_schema() -> TableSchema {
@@ -953,6 +1590,24 @@ mod tests {
             },
         ])
         .expect("dataset must validate")
+    }
+
+    fn image_dataset() -> Image2dV1 {
+        Image2dV1::new(2, 2, vec![0.0, 1.0, 2.0, 3.0]).expect("image must validate")
+    }
+
+    fn series_dataset() -> Series1dV1 {
+        Series1dV1 {
+            x_label: "Frame".into(),
+            y_label: "Score".into(),
+            lines: vec![Series1dLine {
+                name: "Focus".into(),
+                points: vec![
+                    Series1dPoint { x: 0.0, y: 1.0 },
+                    Series1dPoint { x: 1.0, y: 1.5 },
+                ],
+            }],
+        }
     }
 
     fn contribution(
@@ -1095,6 +1750,37 @@ mod tests {
     }
 
     #[test]
+    fn decode_dataset_snapshot_supports_image_and_series_datasets() {
+        let image_descriptor = HostDatasetDescriptor {
+            id: "dataset.image".into(),
+            title: "Image".into(),
+            kind: HostDatasetKind::Image2dV1,
+            empty_message: "No image".into(),
+        };
+        let image_bytes = serde_json::to_vec(&image_dataset()).expect("image json");
+        let image_snapshot =
+            decode_dataset_snapshot(&image_descriptor, &image_bytes).expect("image snapshot");
+        assert_eq!(
+            image_snapshot,
+            HostDatasetSnapshot::Image2d(Arc::new(image_dataset()))
+        );
+
+        let series_descriptor = HostDatasetDescriptor {
+            id: "dataset.series".into(),
+            title: "Series".into(),
+            kind: HostDatasetKind::Series1dV1,
+            empty_message: "No series".into(),
+        };
+        let series_bytes = serde_json::to_vec(&series_dataset()).expect("series json");
+        let series_snapshot =
+            decode_dataset_snapshot(&series_descriptor, &series_bytes).expect("series snapshot");
+        assert_eq!(
+            series_snapshot,
+            HostDatasetSnapshot::Series1d(Arc::new(series_dataset()))
+        );
+    }
+
+    #[test]
     fn window_views_appear_only_for_window_placements() {
         let dataset = HostDatasetDescriptor {
             id: "dataset.localization".into(),
@@ -1137,6 +1823,31 @@ mod tests {
 
         let empty = resolve_host_view_registry(std::iter::empty::<HostRegistryContribution>());
         assert_eq!(empty.window_views().count(), 0);
+    }
+
+    #[test]
+    fn incompatible_view_dataset_pairs_are_filtered_with_warning() {
+        let resolved = resolve_host_view_registry([contribution(
+            HostViewProviderKey::Runtime(0),
+            "Provider",
+            HostDatasetDescriptor {
+                id: "dataset.image".into(),
+                title: "Image".into(),
+                kind: HostDatasetKind::Image2dV1,
+                empty_message: "No image".into(),
+            },
+            HostViewDescriptor {
+                id: "view.table".into(),
+                title: "Table".into(),
+                dataset_id: "dataset.image".into(),
+                placement: HostViewPlacement::Window,
+                kind: HostViewKind::TableWindow,
+            },
+        )]);
+
+        assert!(resolved.window_views().next().is_none());
+        assert_eq!(resolved.warnings().len(), 1);
+        assert!(resolved.warnings()[0].contains("do not match dataset"));
     }
 
     #[test]
