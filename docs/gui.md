@@ -46,7 +46,7 @@ Camera-only controls are shown in the left panel.
 - the left camera settings panel becomes read-only
 - if a companion `<capture>.toml` sidecar exists, both the panel and the top-bar `Settings` menu use it as replay reference data
 - `Acq time [ms]` in the top-bar `Settings` menu stays editable during replay and applies on the next replay frame boundary
-- if no sidecar exists, the GUI shows a default geometry-matched reference config instead
+- if no sidecar exists, the GUI shows a default geometry-matched reference config instead and reuses the raw header's recorded pixel pitch when present
 
 ### Camera sections
 
@@ -139,6 +139,7 @@ Opening a replay file starts a preview-only pipeline:
 - decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` files use `DecodedEventFileCamera`
 - all formats share the same transport controls, plugin path, and preview rendering
 - the same replay session can be viewed in either 2D or 3D via the toolbar `View` toggle
+- raw EVT3 replay also restores recorded device identity, firmware, serial, and pixel-pitch metadata from the file header
 
 Decoded replay files carry geometry differently:
 

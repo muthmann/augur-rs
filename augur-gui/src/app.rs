@@ -11,6 +11,7 @@ use augur_core::{
     analysis::{AnalysisOutput, AnalysisWarning, Overlay},
     camera::{DeviceInfo, EventCamera},
     config::{CameraConfig, GlobalSettingsConfig},
+    metadata::{RecordingAnnotations, RecordingMetadata},
     pipeline::{
         spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
         PipelineStatsSnapshot, PreviewFrame,
@@ -2206,7 +2207,7 @@ impl CameraApp {
             decoded_events,
         } = opened;
         let (display_config, display_mask_file, replay_notice) =
-            self.load_replay_display_settings(&path, info.width, info.height);
+            self.load_replay_display_settings(&path, &info);
 
         self.set_replay_paused_internal(&controls, false);
         self.set_replay_speed_internal(&controls, 1.0);
@@ -2361,14 +2362,9 @@ impl CameraApp {
     fn load_replay_display_settings(
         &self,
         raw_path: &Path,
-        width: u16,
-        height: u16,
+        info: &ReplayFileInfo,
     ) -> (CameraConfig, String, Option<String>) {
-        let mut default_config = CameraConfig::default();
-        default_config.roi.width = width;
-        default_config.roi.height = height;
-        default_config.global.sensor_width = width;
-        default_config.global.sensor_height = height;
+        let default_config = replay_pipeline_config(info);
 
         let Some(config_path) = replay_config_path(raw_path) else {
             return (
@@ -2389,8 +2385,11 @@ impl CameraApp {
         match CameraConfig::load_from_path(&config_path) {
             Ok(mut config) => {
                 if config.global == GlobalSettingsConfig::default() {
-                    config.global.sensor_width = width;
-                    config.global.sensor_height = height;
+                    config.global.sensor_width = info.width;
+                    config.global.sensor_height = info.height;
+                    if let Some(pixel_pitch_nm) = info.metadata.pixel_pitch_nm {
+                        config.global.nm_per_pixel = pixel_pitch_nm;
+                    }
                 }
                 let mask_file = config
                     .pixel_mask
@@ -2431,7 +2430,15 @@ impl CameraApp {
         };
 
         let camera = Evk4Camera::open_imx636().map_err(|e| format!("open camera failed: {e}"))?;
-        self.camera_info = Some(camera.device_info());
+        let camera_info = camera.device_info();
+        self.camera_info = Some(camera_info.clone());
+        let mut options = options;
+        if !preview_only {
+            options.metadata = Some(
+                RecordingMetadata::from_context(&camera_info, &self.config)
+                    .with_annotations(RecordingAnnotations::default()),
+            );
+        }
 
         let controller = spawn_pipeline(
             camera,
@@ -4227,6 +4234,9 @@ fn replay_pipeline_config(info: &ReplayFileInfo) -> CameraConfig {
     config.roi.height = info.height;
     config.global.sensor_width = info.width;
     config.global.sensor_height = info.height;
+    if let Some(pixel_pitch_nm) = info.metadata.pixel_pitch_nm {
+        config.global.nm_per_pixel = pixel_pitch_nm;
+    }
     config
 }
 

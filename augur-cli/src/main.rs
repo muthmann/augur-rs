@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use augur_core::{
     camera::EventCamera,
     config::{CameraConfig, RoiConfig},
+    metadata::{RecordingAnnotations, RecordingMetadata},
     pipeline::{spawn_pipeline, Evt3CorePreviewDecoder, PipelineOptions},
 };
 use augur_prophesee::evk4::Evk4Camera;
@@ -40,6 +41,12 @@ enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         duration_s: Option<u64>,
+        #[arg(long)]
+        experiment_id: Option<String>,
+        #[arg(long)]
+        operator: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
     },
     Config {
         #[command(subcommand)]
@@ -84,7 +91,20 @@ fn main() -> Result<()> {
             output,
             config,
             duration_s,
-        } => record(output, config, duration_s),
+            experiment_id,
+            operator,
+            notes,
+        } => record(
+            output,
+            config,
+            duration_s,
+            RecordingAnnotations {
+                experiment_id,
+                operator,
+                notes,
+            }
+            .normalized(),
+        ),
         Command::Config { cmd } => config_cmd(cmd),
     }
 }
@@ -94,7 +114,11 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
     let camera = Evk4Camera::open_imx636().context("failed opening EVK4")?;
     let info = camera.device_info();
 
-    println!("[{} / {}]", info.model, info.compatible.unwrap_or_default());
+    println!(
+        "[{} / {}]",
+        info.model,
+        info.compatible.as_deref().unwrap_or_default()
+    );
     println!("vendor: {}", info.vendor);
     if let Some(serial) = info.serial {
         println!("serial: {serial}");
@@ -115,15 +139,26 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn record(output: PathBuf, config_path: Option<PathBuf>, duration_s: Option<u64>) -> Result<()> {
+fn record(
+    output: PathBuf,
+    config_path: Option<PathBuf>,
+    duration_s: Option<u64>,
+    annotations: RecordingAnnotations,
+) -> Result<()> {
     let cfg = load_config(config_path.as_deref())?;
 
     let camera = Evk4Camera::open_imx636().context("failed opening EVK4")?;
     let info = camera.device_info();
-    println!("[{} / {}]", info.model, info.compatible.unwrap_or_default());
+    println!(
+        "[{} / {}]",
+        info.model,
+        info.compatible.as_deref().unwrap_or_default()
+    );
     println!("Recording -> {}", output.display());
 
-    let options = PipelineOptions::new(&output);
+    let mut options = PipelineOptions::new(&output);
+    options.metadata =
+        Some(RecordingMetadata::from_context(&info, &cfg).with_annotations(annotations));
     let controller = spawn_pipeline(camera, Evt3CorePreviewDecoder::default(), cfg, options)
         .context("failed starting streaming pipeline")?;
 

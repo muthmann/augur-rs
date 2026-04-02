@@ -15,6 +15,7 @@ use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3Trigger
 use crate::{
     camera::{DeviceInfo, EventCamera, PacketStreamCamera},
     config::CameraConfig,
+    metadata::RecordingMetadata,
     CameraError, Result,
 };
 
@@ -32,6 +33,7 @@ pub struct ReplayFileInfo {
     pub data_offset: u64,
     pub width: u16,
     pub height: u16,
+    pub metadata: RecordingMetadata,
     pub total_duration_us: u64,
     pub first_timestamp_us: u64,
     pub nominal_bytes_per_sec: Option<f64>,
@@ -93,7 +95,7 @@ impl RawFileCamera {
         let path = path.as_ref();
         let file = File::open(path)?;
         let file_size = file.metadata()?.len();
-        let (data_offset, width, height) = parse_evt3_header(&file)?;
+        let (data_offset, width, height, metadata) = parse_evt3_header(&file)?;
         if data_offset > file_size {
             return Err(CameraError::Config(format!(
                 "raw file header offset {data_offset} exceeds file size {file_size}"
@@ -113,6 +115,7 @@ impl RawFileCamera {
             data_offset,
             width,
             height,
+            metadata,
             total_duration_us,
             first_timestamp_us: first_timestamp_us.unwrap_or(0),
             nominal_bytes_per_sec,
@@ -134,7 +137,7 @@ impl RawFileCamera {
         file.seek(SeekFrom::Start(aligned_start))?;
 
         let controls = ReplayControls::new(info, start_data_bytes);
-        let device_info = build_device_info(path);
+        let device_info = build_device_info(path, &info.metadata);
 
         Ok((
             Self {
@@ -267,25 +270,29 @@ impl PacketStreamCamera for RawFileCamera {
     }
 }
 
-fn build_device_info(path: &Path) -> DeviceInfo {
+fn build_device_info(path: &Path, metadata: &RecordingMetadata) -> DeviceInfo {
+    let fallback_model = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
     DeviceInfo {
-        vendor: "AugurRS".into(),
-        model: "RAW File Replay".into(),
-        serial: None,
-        firmware: None,
-        compatible: Some(
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string()),
-        ),
+        vendor: metadata
+            .system_id
+            .clone()
+            .unwrap_or_else(|| "AugurRS".into()),
+        model: metadata.system_id.clone().unwrap_or(fallback_model),
+        serial: metadata.serial_number.clone(),
+        firmware: metadata.firmware_version.clone(),
+        compatible: metadata.sensor_compatible.clone(),
     }
 }
 
-fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16)> {
+fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16, RecordingMetadata)> {
     let mut reader = BufReader::new(file.try_clone()?);
     let mut buf = Vec::new();
     let mut geometry = None;
     let mut format_geometry = None;
+    let mut metadata_pairs = Vec::new();
     // If a % format line is present it must declare EVT3; if absent we assume EVT3.
     let mut format_rejected = false;
 
@@ -308,6 +315,8 @@ fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16)> {
             }
         } else if let Some(rest) = trimmed.strip_prefix("% geometry ") {
             geometry = Some(parse_geometry_line(rest)?);
+        } else if trimmed.starts_with("% evt ") {
+            continue;
         } else if trimmed == HEADER_END {
             let data_offset = reader.stream_position()?;
             if format_rejected {
@@ -318,9 +327,27 @@ fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16)> {
             let (width, height) = geometry
                 .or(format_geometry)
                 .ok_or_else(|| CameraError::Config("raw file header is missing geometry".into()))?;
-            return Ok((data_offset, width, height));
+            return Ok((
+                data_offset,
+                width,
+                height,
+                RecordingMetadata::from_header_lines(metadata_pairs),
+            ));
+        } else if let Some((key, value)) = parse_metadata_header_line(trimmed) {
+            metadata_pairs.push((key, value));
         }
     }
+}
+
+fn parse_metadata_header_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("% ")?;
+    let split_at = rest.find(char::is_whitespace)?;
+    let key = rest[..split_at].trim();
+    let value = rest[split_at..].trim();
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((key.to_owned(), value.to_owned()))
 }
 
 fn parse_format_line(rest: &str) -> Result<(u16, u16)> {
@@ -546,7 +573,21 @@ mod tests {
 
     fn write_sample_raw(path: &Path) -> (u64, Vec<u8>) {
         let body = sample_raw_bytes();
-        let header = "% format EVT3;width=1280;height=720\n% geometry 1280x720\n% evt 3.0\n% end\n";
+        let header = concat!(
+            "% format EVT3;width=1280;height=720\n",
+            "% geometry 1280x720\n",
+            "% evt 3.0\n",
+            "% serial_number 00a1b2c3d4e5f678\n",
+            "% system_id Prophesee EVK4\n",
+            "% firmware_version 0x040200\n",
+            "% sensor_compatible imx636,ccam5_gen42\n",
+            "% augur_version 0.2.0\n",
+            "% recording_date 2026-04-01T14:30:00Z\n",
+            "% recording_hostname lab-workstation-03\n",
+            "% pixel_pitch_nm 4860\n",
+            "% custom_field retained\n",
+            "% end\n"
+        );
         let mut bytes = header.as_bytes().to_vec();
         bytes.extend_from_slice(&body);
         fs::write(path, bytes).expect("sample raw file must be written");
@@ -570,6 +611,16 @@ mod tests {
         assert_eq!(info.first_timestamp_us, 0x1010);
         assert_eq!(info.total_duration_us, 0x10);
         assert!(info.nominal_bytes_per_sec.is_some());
+        assert_eq!(
+            info.metadata.serial_number.as_deref(),
+            Some("00a1b2c3d4e5f678")
+        );
+        assert_eq!(info.metadata.system_id.as_deref(), Some("Prophesee EVK4"));
+        assert_eq!(info.metadata.pixel_pitch_nm, Some(4_860.0));
+        assert_eq!(
+            info.metadata.extra.get("custom_field").map(String::as_str),
+            Some("retained")
+        );
 
         fs::remove_file(path).expect("temp file must be removed");
     }
@@ -592,6 +643,25 @@ mod tests {
             .expect("read after seek must succeed");
         assert_eq!(controls.bytes_read.load(Ordering::Relaxed), 4 + n as u64);
         assert_eq!(&buf[..n], &body[4..]);
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn raw_replay_device_info_uses_header_metadata() {
+        let path = temp_path("device-info");
+        write_sample_raw(&path);
+
+        let (camera, _controls, _info) = RawFileCamera::open(&path).expect("raw file must open");
+        let device_info = camera.device_info();
+
+        assert_eq!(device_info.model, "Prophesee EVK4");
+        assert_eq!(device_info.serial.as_deref(), Some("00a1b2c3d4e5f678"));
+        assert_eq!(device_info.firmware.as_deref(), Some("0x040200"));
+        assert_eq!(
+            device_info.compatible.as_deref(),
+            Some("imx636,ccam5_gen42")
+        );
 
         fs::remove_file(path).expect("temp file must be removed");
     }

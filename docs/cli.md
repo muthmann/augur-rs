@@ -33,9 +33,16 @@ Record an EVT3 `.raw` stream to disk.
 ```bash
 cargo run --bin augur -- record captures/session.raw
 cargo run --bin augur -- record captures/session.raw --config augur.toml --duration-s 30
+cargo run --bin augur -- record captures/session.raw --experiment-id exp-42 --operator "Ada Lovelace"
 ```
 
 During recording the CLI prints current throughput and total written data once per second.
+
+Optional metadata flags:
+
+- `--experiment-id` stores a lab or notebook reference in the sidecar metadata
+- `--operator` stores who ran the recording in the sidecar metadata
+- `--notes` stores free-form recording notes in the sidecar metadata
 
 ## `config show`
 

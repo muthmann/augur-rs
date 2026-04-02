@@ -10,6 +10,7 @@ use std::{
 use crate::{
     camera::{DeviceInfo, EventCamera, PacketStreamCamera},
     config::CameraConfig,
+    metadata::RecordingMetadata,
     pipeline::{CdEvent, PreviewDecoder},
     replay::{ReplayControls, ReplayFileInfo},
     CameraError, Result,
@@ -92,6 +93,7 @@ impl DecodedEventFileCamera {
             data_offset: 0,
             width,
             height,
+            metadata: RecordingMetadata::default(),
             total_duration_us,
             first_timestamp_us,
             nominal_bytes_per_sec,

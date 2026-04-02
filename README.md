@@ -38,7 +38,7 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 
 - **Direct hardware path** — Treuzell USB transport + IMX636 register programming, no Metavision or OpenEB required
 - **Backpressured 3-thread pipeline** — USB reader → bounded disk writer → lossy preview decoder. Recording never blocks on the UI, never grows unbounded in memory
-- **Reproducible sessions** — every `.raw` file gets a `.toml` config sidecar written automatically
+- **Reproducible sessions** — every `.raw` file gets a self-describing EVT3 header plus a `.toml` sidecar with config, provenance, and timing metadata
 - **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
 - **Interactive preview workspace** — edge-collapsible side panels, pixel inspection, histogram-driven brightness/contrast, colormap switching, line/ruler/annotation tools, scale-bar overlay, enlarged popup preview, ImageJ streaming, and a toggleable 3D point-cloud view
 - **Global settings menu** — top-bar control over pixel scale, sensor geometry, acquisition time, retained event history, and advanced preview/disk tuning
@@ -152,8 +152,8 @@ Each capture produces two files:
 
 ```
 captures/
-  run.raw     ← EVT3 stream  (header reflects configured geometry; defaults to 1280x720)
-  run.toml    ← effective configuration snapshot for exact replay
+  run.raw     ← EVT3 stream with geometry, device identity, software provenance, and pixel pitch
+  run.toml    ← effective configuration plus recording metadata and timing for exact replay
 ```
 
 ---

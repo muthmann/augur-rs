@@ -39,8 +39,8 @@ Additional guarantees:
 ## Recording Output
 
 Each capture produces:
-- `<name>.raw` — EVT3 stream with a header that reflects the configured sensor geometry (default `1280x720`)
-- `<name>.toml` — effective configuration sidecar for reproducibility
+- `<name>.raw` — EVT3 stream with configured geometry plus recorded device identity, software provenance, and pixel pitch
+- `<name>.toml` — effective configuration sidecar with a `[metadata]` table for provenance, timing, and optional annotations
 
 ## Configuration
 

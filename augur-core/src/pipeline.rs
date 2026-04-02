@@ -16,7 +16,12 @@ use crossbeam_channel::{
 };
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
-use crate::{camera::PacketStreamCamera, config::CameraConfig, CameraError, Result};
+use crate::{
+    camera::PacketStreamCamera,
+    config::CameraConfig,
+    metadata::{RecordingMetadata, RecordingSidecar},
+    CameraError, Result,
+};
 
 pub const BUF_SIZE: usize = 65_536;
 pub const RAW_BUFFER_POOL_CAPACITY: usize = 8;
@@ -121,6 +126,7 @@ pub struct PipelineOptions {
     pub sensor_height: u16,
     pub write_evt3_header: bool,
     pub disk_writer_buffer_bytes: usize,
+    pub metadata: Option<RecordingMetadata>,
 }
 
 impl PipelineOptions {
@@ -131,6 +137,7 @@ impl PipelineOptions {
             sensor_height: 720,
             write_evt3_header: true,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
+            metadata: None,
         }
     }
 
@@ -141,6 +148,7 @@ impl PipelineOptions {
             sensor_height: height,
             write_evt3_header: false,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
+            metadata: None,
         }
     }
 }
@@ -150,6 +158,7 @@ pub struct PipelineStatsSnapshot {
     pub elapsed_s: f64,
     pub bytes_total: u64,
     pub events_total: u64,
+    pub recording_duration_us: Option<u64>,
     pub mb_per_s: f64,
     pub mev_per_s: f64,
     pub preview_packet_drops: u64,
@@ -166,6 +175,8 @@ struct PipelineStatsInner {
     started: Instant,
     bytes_total: u64,
     events_total: u64,
+    first_timestamp_us: Option<u64>,
+    last_timestamp_us: Option<u64>,
     preview_packet_drops: u64,
     preview_packet_queue_high_water: usize,
     preview_frame_drops: u64,
@@ -189,6 +200,8 @@ impl PipelineStatsInner {
             started: Instant::now(),
             bytes_total: 0,
             events_total: 0,
+            first_timestamp_us: None,
+            last_timestamp_us: None,
             preview_packet_drops: 0,
             preview_packet_queue_high_water: 0,
             preview_frame_drops: 0,
@@ -230,6 +243,10 @@ impl PipelineStatsInner {
             elapsed_s,
             bytes_total: self.bytes_total,
             events_total: self.events_total,
+            recording_duration_us: self
+                .last_timestamp_us
+                .zip(self.first_timestamp_us)
+                .and_then(|(last, first)| last.checked_sub(first)),
             mb_per_s: recent_bytes as f64 / current_window_s / (1024.0 * 1024.0),
             mev_per_s: recent_events as f64 / current_window_s / 1_000_000.0,
             preview_packet_drops: self.preview_packet_drops,
@@ -256,6 +273,11 @@ impl PipelineStatsInner {
     fn record_preview_packet_queue_depth(&mut self, queue_depth: usize) {
         self.preview_packet_queue_high_water =
             self.preview_packet_queue_high_water.max(queue_depth);
+    }
+
+    fn record_event_timestamps(&mut self, first_timestamp_us: u64, last_timestamp_us: u64) {
+        self.first_timestamp_us.get_or_insert(first_timestamp_us);
+        self.last_timestamp_us = Some(last_timestamp_us);
     }
 
     fn record_preview_frame_drop(&mut self) {
@@ -363,7 +385,14 @@ pub struct PipelineController {
     error_rx: Receiver<String>,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStatsInner>>,
+    recording_sidecar: Option<RecordingSidecarState>,
     threads: Vec<thread::JoinHandle<()>>,
+}
+
+struct RecordingSidecarState {
+    path: PathBuf,
+    config: CameraConfig,
+    metadata: RecordingMetadata,
 }
 
 impl PipelineController {
@@ -399,6 +428,18 @@ impl PipelineController {
                 "one or more pipeline threads panicked".into(),
             ));
         }
+        let stats_snapshot = self.stats_snapshot();
+        if let Some(recording_sidecar) = &mut self.recording_sidecar {
+            recording_sidecar.metadata.update_timing(
+                stats_snapshot.recording_duration_us,
+                stats_snapshot.events_total,
+            );
+            RecordingSidecar::new(
+                recording_sidecar.config.clone(),
+                recording_sidecar.metadata.clone(),
+            )
+            .save_to_path(&recording_sidecar.path)?;
+        }
         Ok(())
     }
 }
@@ -415,21 +456,38 @@ where
 {
     initial_config.validate(options.sensor_width, options.sensor_height)?;
 
-    let recording = options.output_path.is_some();
+    let PipelineOptions {
+        output_path,
+        sensor_width,
+        sensor_height,
+        write_evt3_header,
+        disk_writer_buffer_bytes,
+        metadata,
+    } = options;
+    let recording = output_path.is_some();
+    let mut recording_sidecar = None;
+    let recording_metadata = metadata.unwrap_or_default();
 
-    if let Some(ref output_path) = options.output_path {
+    if let Some(ref output_path) = output_path {
         if let Some(config_path) = recording_config_path(output_path) {
-            initial_config.save_to_path(config_path)?;
+            RecordingSidecar::new(initial_config.clone(), recording_metadata.clone())
+                .save_to_path(&config_path)?;
+            recording_sidecar = Some(RecordingSidecarState {
+                path: config_path,
+                config: initial_config.clone(),
+                metadata: recording_metadata.clone(),
+            });
         }
     }
 
-    let disk_writer = if let Some(ref output_path) = options.output_path {
+    let disk_writer = if let Some(ref output_path) = output_path {
         Some(prepare_output_writer(
             output_path,
-            options.write_evt3_header,
-            options.sensor_width,
-            options.sensor_height,
-            options.disk_writer_buffer_bytes,
+            write_evt3_header,
+            sensor_width,
+            sensor_height,
+            disk_writer_buffer_bytes,
+            Some(&recording_metadata),
         )?)
     } else {
         None
@@ -699,8 +757,8 @@ where
         threads.push(disk_thread);
     }
 
-    let width = options.sensor_width;
-    let height = options.sensor_height;
+    let width = sensor_width;
+    let height = sensor_height;
     let pixel_count = width as usize * height as usize;
     let preview_pool_tx_preview = preview_pool_tx.clone();
     let preview_thread = thread::spawn(move || {
@@ -728,6 +786,12 @@ where
                     }
                     if let Ok(mut s) = stats_preview.lock() {
                         s.record_packet(Instant::now(), 0, events.len() as u64);
+                        if let (Some(first), Some(last)) = (
+                            events.first().map(|event| event.timestamp),
+                            events.last().map(|event| event.timestamp),
+                        ) {
+                            s.record_event_timestamps(first, last);
+                        }
                     }
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
@@ -830,14 +894,25 @@ where
         error_rx,
         stop,
         stats,
+        recording_sidecar,
         threads,
     })
 }
 
-fn write_evt3_header_lines(mut writer: impl Write, width: u16, height: u16) -> Result<()> {
+fn write_evt3_header_lines(
+    mut writer: impl Write,
+    width: u16,
+    height: u16,
+    metadata: Option<&RecordingMetadata>,
+) -> Result<()> {
     writeln!(writer, "% format EVT3;width={};height={}", width, height)?;
     writeln!(writer, "% geometry {}x{}", width, height)?;
     writeln!(writer, "% evt 3.0")?;
+    if let Some(metadata) = metadata {
+        for line in metadata.to_header_lines() {
+            writeln!(writer, "{line}")?;
+        }
+    }
     writeln!(writer, "% end")?;
     Ok(())
 }
@@ -848,11 +923,12 @@ fn prepare_output_writer(
     width: u16,
     height: u16,
     disk_writer_buffer_bytes: usize,
+    metadata: Option<&RecordingMetadata>,
 ) -> Result<BufWriter<File>> {
     let file = File::create(output_path)?;
     let mut writer = BufWriter::with_capacity(disk_writer_buffer_bytes.max(1), file);
     if write_evt3_header {
-        write_evt3_header_lines(&mut writer, width, height)?;
+        write_evt3_header_lines(&mut writer, width, height, metadata)?;
     }
     Ok(writer)
 }
@@ -890,6 +966,7 @@ fn estimate_evt3_cd_events(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::RecordingMetadata;
 
     fn words_to_bytes(words: &[u16]) -> Vec<u8> {
         let mut out = Vec::with_capacity(words.len() * 2);
@@ -904,6 +981,8 @@ mod tests {
             started: start,
             bytes_total: 0,
             events_total: 0,
+            first_timestamp_us: None,
+            last_timestamp_us: None,
             preview_packet_drops: 0,
             preview_packet_queue_high_water: 0,
             preview_frame_drops: 0,
@@ -1088,6 +1167,37 @@ mod tests {
         assert_eq!(snapshot.disk_queue_high_water, 5);
         assert_eq!(snapshot.disk_send_wait_us, 120);
         assert_eq!(snapshot.disk_write_us, 340);
+    }
+
+    #[test]
+    fn snapshot_reports_recording_duration_from_timestamps() {
+        let start = Instant::now();
+        let mut stats = test_stats(start);
+        stats.record_event_timestamps(1_000, 26_000);
+
+        let snapshot = stats.snapshot_at(start + Duration::from_millis(10));
+        assert_eq!(snapshot.recording_duration_us, Some(25_000));
+    }
+
+    #[test]
+    fn evt3_header_writer_includes_metadata_lines() {
+        let metadata = RecordingMetadata {
+            system_id: Some("Prophesee EVK4".into()),
+            serial_number: Some("00a1b2c3d4e5f678".into()),
+            pixel_pitch_nm: Some(4_860.0),
+            ..RecordingMetadata::default()
+        };
+        let mut encoded = Vec::new();
+
+        write_evt3_header_lines(&mut encoded, 1280, 720, Some(&metadata))
+            .expect("header must encode");
+        let header = String::from_utf8(encoded).expect("header must stay utf8");
+
+        assert!(header.contains("% format EVT3;width=1280;height=720"));
+        assert!(header.contains("% system_id Prophesee EVK4"));
+        assert!(header.contains("% serial_number 00a1b2c3d4e5f678"));
+        assert!(header.contains("% pixel_pitch_nm 4860"));
+        assert!(header.ends_with("% end\n"));
     }
 
     #[test]

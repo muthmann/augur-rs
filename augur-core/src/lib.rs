@@ -3,6 +3,7 @@ pub mod camera;
 pub mod config;
 pub mod decoded_replay;
 pub mod error;
+pub mod metadata;
 pub mod pipeline;
 pub mod replay;
 

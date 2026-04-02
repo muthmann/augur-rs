@@ -2,14 +2,15 @@
 
 ## Summary
 
-AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, resets its pacing baseline cleanly when speed changes, and finalizes older `.raw` files without suppressing genuine preview errors.
+AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, restores recorded raw-file metadata when present, resets its pacing baseline cleanly when speed changes, and finalizes older `.raw` files without suppressing genuine preview errors.
 
 ## Core Design
 
 Replay lives in `augur-core` as two file-backed camera adapters, so the rest of the stack can treat file playback like any other packet-stream camera:
 
-- `RawFileCamera` parses the EVT3 header (`% format`, `% geometry`, `% end`), tolerates older files that omit `% format` or contain non-UTF-8 header bytes, scans only the first and last replay windows to estimate duration/byte rate, and reopens at arbitrary EVT3-aligned offsets through `RawFileCamera::open_at`
+- `RawFileCamera` parses the EVT3 header (`% format`, `% geometry`, `% evt`, metadata lines, `% end`), tolerates older files that omit `% format` or contain non-UTF-8 header bytes, scans only the first and last replay windows to estimate duration/byte rate, and reopens at arbitrary EVT3-aligned offsets through `RawFileCamera::open_at`
 - `DecodedEventFileCamera` parses decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files once, keeps the decoded `CdEvent` vector in shared memory for cheap seeks, and replays those events through an internal packed 14-byte transport consumed by `PackedEventPreviewDecoder`
+- `.raw` replay stores parsed header metadata in `ReplayFileInfo` and uses it to rebuild replay `DeviceInfo`
 - both cameras record geometry and replay timing in `ReplayFileInfo`
 - both return `CameraError::Timeout` while paused
 - both return `CameraError::Eof` at end-of-file so the pipeline can stop cleanly
@@ -54,6 +55,7 @@ HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `aug
 4. Enabled analysis plugins continue to run on replayed frames exactly as they do on live preview frames.
 
 If a `<capture>.toml` sidecar exists next to the selected replay file, the replay session uses it as read-only reference data for both the left camera settings panel and the top-bar global `Settings` menu.
+If the sidecar is missing, raw EVT3 replay still reuses any recorded `pixel_pitch_nm` header field so the default replay config and scale-bar math stay closer to the original capture.
 
 ## EOF Behavior
 
