@@ -21,6 +21,7 @@ Replay lives in `augur-core` as two file-backed camera adapters, so the rest of 
 - `speed_bits`
 - `speed_epoch`
 - `bytes_read`
+- `current_timestamp_us`
 - `file_size`
 - `data_offset`
 - `width`
@@ -28,7 +29,15 @@ Replay lives in `augur-core` as two file-backed camera adapters, so the rest of 
 - `total_duration_us`
 - `first_timestamp_us`
 
-The current replay pacing remains approximate: it uses a byte-rate model derived from the file's timestamp span, not per-event scheduling. When replay speed changes, the replay backends now reset their local pacing baseline from the current byte/event position so approximate throttling stays responsive instead of racing ahead or freezing.
+Replay pacing is now timestamp-driven instead of byte-rate-driven:
+
+- raw EVT3 replay uses `ReplayControls::current_timestamp_us`, which the preview thread updates
+  with the most recently decoded packet timestamp
+- decoded replay reads the current timestamp directly from its cached event vector
+- speed changes and seeks reset the local pacing baseline from the current timestamp rather than
+  from bytes read or event count
+
+That keeps `1x` much closer to recorded event time even when event density varies across the file.
 
 ## Decoded File Formats
 
@@ -78,6 +87,10 @@ Seeking reopens the replay camera at an aligned byte offset:
 
 This is intentionally lightweight and fast rather than perfectly timestamp-aware.
 
+Raw replay re-establishes its pacing baseline after a seek on the first decoded packet timestamp.
+Decoded replay can reset immediately from the reopened event index because the event vector is
+already in memory.
+
 ## Files
 
 | File | Role |
@@ -85,8 +98,8 @@ This is intentionally lightweight and fast rather than perfectly timestamp-aware
 | `augur-core/src/replay.rs` | `RawFileCamera`, `ReplayFileInfo`, fast metadata scan, reopen-at-offset support for `.raw` |
 | `augur-core/src/decoded_replay.rs` | `DecodedEventFileCamera`, `PackedEventPreviewDecoder`, decoded `.csv` / `.bin` / `.npy` / optional `.h5` parsers |
 | `augur-core/src/error.rs` | `CameraError::Eof` |
-| `augur-core/src/pipeline.rs` | Decoder-specific event-rate estimation, EOF finalization, preview-queue drain on shutdown |
-| `augur-gui/src/app.rs` | Replay mode, persisted EOF state, transport controls, decoded-event seek cache, restart |
+| `augur-core/src/pipeline.rs` | replay timestamp feedback, preview-frame queue drops, EOF finalization, preview-queue drain on shutdown |
+| `augur-gui/src/app.rs` | replay mode, persisted EOF state, transport controls, decoded-event seek cache, restart, replay display cadence |
 
 ## Older File Compatibility
 

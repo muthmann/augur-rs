@@ -45,8 +45,7 @@ pub struct DecodedEventFileCamera {
     event_idx: usize,
     info: DeviceInfo,
     controls: ReplayControls,
-    nominal_bytes_per_sec: Option<f64>,
-    session_start_idx: usize,
+    session_start_ts_us: u64,
     last_speed_epoch: u32,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
@@ -115,12 +114,15 @@ impl DecodedEventFileCamera {
 
         Ok((
             Self {
+                session_start_ts_us: events
+                    .get(start_event_idx)
+                    .or_else(|| events.last())
+                    .map(|event| event.timestamp)
+                    .unwrap_or(info.first_timestamp_us),
                 events,
                 event_idx: start_event_idx,
                 info: decoded_device_info(),
                 controls: controls.clone(),
-                nominal_bytes_per_sec: info.nominal_bytes_per_sec,
-                session_start_idx: start_event_idx,
                 last_speed_epoch: controls.speed_epoch.load(Ordering::Relaxed),
                 playback_started_at: None,
                 paused_at: None,
@@ -147,33 +149,48 @@ impl DecodedEventFileCamera {
         f32::from_bits(self.controls.speed_bits.load(Ordering::Relaxed))
     }
 
-    fn reset_throttle_baseline_if_needed(&mut self) {
+    fn current_event_timestamp_us(&self) -> u64 {
+        self.events
+            .get(self.event_idx)
+            .or_else(|| self.events.last())
+            .map(|event| event.timestamp)
+            .unwrap_or(self.controls.first_timestamp_us)
+    }
+
+    fn reset_timing_baseline(&mut self, now: Instant, current_ts: u64) {
+        self.session_start_ts_us = current_ts;
+        self.playback_started_at = Some(now);
+        self.total_paused = Duration::ZERO;
+        self.paused_at = None;
+    }
+
+    fn reset_throttle_baseline_if_needed(&mut self, now: Instant) {
         let epoch = self.controls.speed_epoch.load(Ordering::Relaxed);
         if epoch == self.last_speed_epoch {
             return;
         }
 
         self.last_speed_epoch = epoch;
-        self.session_start_idx = self.event_idx;
-        self.playback_started_at = Some(Instant::now());
-        self.total_paused = Duration::ZERO;
-        self.paused_at = None;
+        let current_ts = self.current_event_timestamp_us();
+        self.reset_timing_baseline(now, current_ts);
     }
 
     fn throttle_to_current_progress(&mut self) -> Result<()> {
-        self.reset_throttle_baseline_if_needed();
-
-        let Some(base_rate) = self.nominal_bytes_per_sec else {
-            return Ok(());
-        };
         let speed = self.speed_multiplier();
-        let session_bytes = self.event_idx.saturating_sub(self.session_start_idx) as u64
-            * PACKED_EVENT_RECORD_BYTES as u64;
-        if !speed.is_finite() || speed <= 0.0 || session_bytes == 0 {
+        if !speed.is_finite() || speed <= 0.0 {
             return Ok(());
         }
 
-        let started_at = *self.playback_started_at.get_or_insert_with(Instant::now);
+        let now = Instant::now();
+        self.reset_throttle_baseline_if_needed(now);
+
+        let current_ts = self.current_event_timestamp_us();
+        let event_elapsed_us = current_ts.saturating_sub(self.session_start_ts_us);
+        if event_elapsed_us == 0 {
+            return Ok(());
+        }
+
+        let started_at = *self.playback_started_at.get_or_insert(now);
         loop {
             let now = Instant::now();
             if self.controls.paused.load(Ordering::Relaxed) {
@@ -186,7 +203,7 @@ impl DecodedEventFileCamera {
             let active_elapsed = now
                 .saturating_duration_since(started_at)
                 .saturating_sub(self.total_paused);
-            let desired_elapsed_s = session_bytes as f64 / (base_rate * speed as f64);
+            let desired_elapsed_s = event_elapsed_us as f64 / (speed as f64 * 1_000_000.0);
             let remaining_s = desired_elapsed_s - active_elapsed.as_secs_f64();
             if remaining_s <= 0.0 {
                 break;
@@ -1087,9 +1104,8 @@ mod tests {
 
         let (mut camera, controls, _info, _shared_events) =
             DecodedEventFileCamera::open(&path).expect("csv replay must open");
-        camera.nominal_bytes_per_sec = Some(1_000_000.0);
         camera.event_idx = 2;
-        camera.session_start_idx = 0;
+        camera.session_start_ts_us = events[0].timestamp;
         camera.playback_started_at = Some(Instant::now() - Duration::from_secs(2));
         camera.paused_at = Some(Instant::now());
         camera.total_paused = Duration::from_millis(250);
@@ -1099,7 +1115,7 @@ mod tests {
             .throttle_to_current_progress()
             .expect("speed-change throttle reset must succeed");
 
-        assert_eq!(camera.session_start_idx, camera.event_idx);
+        assert_eq!(camera.session_start_ts_us, events[2].timestamp);
         assert_eq!(camera.last_speed_epoch, 1);
         assert_eq!(camera.total_paused, Duration::ZERO);
         assert!(camera.paused_at.is_none());

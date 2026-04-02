@@ -126,6 +126,15 @@ fn hz_to_interval_ms(hz: f64, hz_range: std::ops::RangeInclusive<f64>) -> u64 {
     (1000.0 / hz).round().max(1.0) as u64
 }
 
+fn derived_replay_preview_interval_ms(acq_time_ms: u64, speed: f32) -> u64 {
+    if speed.is_finite() && speed > 0.0 {
+        (acq_time_ms as f64 / speed as f64).round() as u64
+    } else {
+        10
+    }
+    .clamp(10, 200)
+}
+
 #[derive(Debug, Clone)]
 struct HostDatasetCacheEntry {
     generation: u64,
@@ -509,6 +518,14 @@ impl CameraApp {
         }
     }
 
+    fn effective_preview_interval_ms(&self) -> u64 {
+        if self.mode == AppMode::Replaying {
+            derived_replay_preview_interval_ms(self.acq_time_ms, self.replay_speed)
+        } else {
+            self.preview_interval_ms
+        }
+    }
+
     fn apply_global_config(&mut self, global: &GlobalSettingsConfig) {
         self.nm_per_pixel = global.nm_per_pixel.max(1.0);
         self.sensor_width = global.sensor_width.max(1);
@@ -628,7 +645,7 @@ impl CameraApp {
         data.last_error = self.last_error.clone();
         data.external_streaming = external_streaming;
         data.external_streaming_label = external_streaming_label.to_owned();
-        data.preview_interval_ms = self.preview_interval_ms;
+        data.preview_interval_ms = self.effective_preview_interval_ms();
         data.point_cloud_interval_ms = self.point_cloud_interval_ms;
     }
 
@@ -2122,11 +2139,14 @@ impl CameraApp {
             Some("raw") => match RawFileCamera::open(&path) {
                 Ok((camera, controls, info)) => {
                     let replay_info = camera.device_info();
+                    let mut options = PipelineOptions::preview_only(info.width, info.height);
+                    options.replay_timestamp_feedback =
+                        Some(Arc::clone(&controls.current_timestamp_us));
                     spawn_pipeline(
                         camera,
                         Evt3CorePreviewDecoder::default(),
                         replay_pipeline_config(&info),
-                        PipelineOptions::preview_only(info.width, info.height),
+                        options,
                     )
                     .map(|controller| OpenedReplay {
                         controller,
@@ -2146,11 +2166,15 @@ impl CameraApp {
                     let result = match DecodedEventFileCamera::open(&path_for_thread) {
                         Ok((camera, controls, info, decoded_events)) => {
                             let replay_info = camera.device_info();
+                            let mut options =
+                                PipelineOptions::preview_only(info.width, info.height);
+                            options.replay_timestamp_feedback =
+                                Some(Arc::clone(&controls.current_timestamp_us));
                             spawn_pipeline(
                                 camera,
                                 PackedEventPreviewDecoder::default(),
                                 replay_pipeline_config(&info),
-                                PipelineOptions::preview_only(info.width, info.height),
+                                options,
                             )
                             .map(|controller| OpenedReplay {
                                 controller,
@@ -2560,27 +2584,37 @@ impl CameraApp {
         let reopen_result = if let Some(decoded_events) = decoded_events {
             let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
             match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
-                Ok((camera, controls)) => spawn_pipeline(
-                    camera,
-                    PackedEventPreviewDecoder::default(),
-                    replay_pipeline_config(&info),
-                    PipelineOptions::preview_only(info.width, info.height),
-                )
-                .map(|controller| (controller, controls))
-                .map_err(|err| format!("seek pipeline start failed: {err}")),
+                Ok((camera, controls)) => {
+                    let mut options = PipelineOptions::preview_only(info.width, info.height);
+                    options.replay_timestamp_feedback =
+                        Some(Arc::clone(&controls.current_timestamp_us));
+                    spawn_pipeline(
+                        camera,
+                        PackedEventPreviewDecoder::default(),
+                        replay_pipeline_config(&info),
+                        options,
+                    )
+                    .map(|controller| (controller, controls))
+                    .map_err(|err| format!("seek pipeline start failed: {err}"))
+                }
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         } else {
             let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
             match RawFileCamera::open_at(&path, &info, target_byte) {
-                Ok((camera, controls)) => spawn_pipeline(
-                    camera,
-                    Evt3CorePreviewDecoder::default(),
-                    replay_pipeline_config(&info),
-                    PipelineOptions::preview_only(info.width, info.height),
-                )
-                .map(|controller| (controller, controls))
-                .map_err(|err| format!("seek pipeline start failed: {err}")),
+                Ok((camera, controls)) => {
+                    let mut options = PipelineOptions::preview_only(info.width, info.height);
+                    options.replay_timestamp_feedback =
+                        Some(Arc::clone(&controls.current_timestamp_us));
+                    spawn_pipeline(
+                        camera,
+                        Evt3CorePreviewDecoder::default(),
+                        replay_pipeline_config(&info),
+                        options,
+                    )
+                    .map(|controller| (controller, controls))
+                    .map_err(|err| format!("seek pipeline start failed: {err}"))
+                }
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         };
@@ -2948,7 +2982,7 @@ impl CameraApp {
     fn active_preview_process_interval(&self) -> Duration {
         process_interval_for_view_mode(
             self.active_view_mode(),
-            self.preview_interval_ms,
+            self.effective_preview_interval_ms(),
             self.point_cloud_interval_ms,
         )
     }
@@ -3339,6 +3373,12 @@ impl eframe::App for CameraApp {
                                 global_settings_changed = true;
                             }
                         });
+                        if mode == AppMode::Replaying {
+                            ui.small(format!(
+                                "Effective display rate: {:.1} Hz (auto from speed × acq time).",
+                                interval_ms_to_hz(self.effective_preview_interval_ms())
+                            ));
+                        }
                         ui.horizontal(|ui| {
                             let mut point_cloud_hz = interval_ms_to_hz(self.point_cloud_interval_ms);
                             ui.label("Point cloud update [Hz]")
@@ -4288,5 +4328,24 @@ fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
 impl Drop for CameraApp {
     fn drop(&mut self) {
         self.stop_pipeline();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derived_replay_preview_interval_ms;
+
+    #[test]
+    fn replay_preview_interval_scales_with_speed() {
+        assert_eq!(derived_replay_preview_interval_ms(50, 1.0), 50);
+        assert_eq!(derived_replay_preview_interval_ms(50, 2.0), 25);
+        assert_eq!(derived_replay_preview_interval_ms(50, 0.5), 100);
+    }
+
+    #[test]
+    fn replay_preview_interval_clamps_extremes() {
+        assert_eq!(derived_replay_preview_interval_ms(1, 4.0), 10);
+        assert_eq!(derived_replay_preview_interval_ms(1_000, 0.25), 200);
+        assert_eq!(derived_replay_preview_interval_ms(50, f32::INFINITY), 10);
     }
 }

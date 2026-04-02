@@ -46,6 +46,7 @@ Camera-only controls are shown in the left panel.
 - the left camera settings panel becomes read-only
 - if a companion `<capture>.toml` sidecar exists, both the panel and the top-bar `Settings` menu use it as replay reference data
 - `Acq time [ms]` in the top-bar `Settings` menu stays editable during replay and applies on the next replay frame boundary
+- `Preview update [Hz]` stays as the live-preview preference; during replay the GUI shows an auto-derived effective display rate from `speed × acq time`
 - if no sidecar exists, the GUI shows a default geometry-matched reference config instead and reuses the raw header's recorded pixel pitch when present
 
 ### Camera sections
@@ -159,8 +160,16 @@ The center panel switches to a `Replay` heading and shows a transport bar betwee
 
 Enabled plugins continue to process replayed frames through the normal `PreviewFrame` path.
 
+Finite replay speeds now follow recorded event timestamps instead of average file throughput, so
+`1x` stays close to real event time even when dense and sparse regions alternate. `Max` still
+removes replay throttling entirely.
+
 The top-bar `Settings -> Acq time [ms]` control remains active during replay. Changing it updates
 the replay preview accumulation window on the next frame boundary without restarting replay.
+
+During replay, the 2D preview cadence is auto-derived from the current speed and acquisition time
+and shown in `Settings -> Advanced` as `Effective display rate`. The manual `Preview update [Hz]`
+setting still applies to live preview instead of replay.
 
 `File -> Export TIFF Stack…` opens a modal batch-export dialog during replay. It lets you choose a
 time range, acquisition time, optional ROI crop, and output path, then writes one 16-bit grayscale
@@ -239,7 +248,7 @@ Status, warning, and error labels adapt to the active GUI theme.
 
 - acquisition time is adjustable during live preview, recording, and replay; replay applies changes on the next frame boundary
 - sensor geometry and disk-writer buffer are start-time controls, so they are only editable while idle
-- EventStore budget and preview/point-cloud cadence update immediately from the `Settings` menu, which now shows those cadences in Hz instead of milliseconds
+- EventStore budget and live preview/point-cloud cadence update immediately from the `Settings` menu, which now shows those cadences in Hz instead of milliseconds; replay auto-derives its active 2D display cadence from speed and acquisition time
 - preview histogram work stays bounded even when a frame contains very large per-pixel counts, and
   time-surface mode reuses one cached decay pass for both the image and histogram views
 - output path editing is disabled during active recording and replay

@@ -127,6 +127,7 @@ pub struct PipelineOptions {
     pub write_evt3_header: bool,
     pub disk_writer_buffer_bytes: usize,
     pub metadata: Option<RecordingMetadata>,
+    pub replay_timestamp_feedback: Option<Arc<AtomicU64>>,
 }
 
 impl PipelineOptions {
@@ -138,6 +139,7 @@ impl PipelineOptions {
             write_evt3_header: true,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
             metadata: None,
+            replay_timestamp_feedback: None,
         }
     }
 
@@ -149,6 +151,7 @@ impl PipelineOptions {
             write_evt3_header: false,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
             metadata: None,
+            replay_timestamp_feedback: None,
         }
     }
 }
@@ -351,6 +354,22 @@ fn recycle_preview_frame_buffers(buffers: PreviewFrameBuffers) {
     }
 }
 
+fn reset_preview_frame_accumulators(
+    frame_buffers: &mut PreviewFrameBuffers,
+    frame_events: &mut Vec<CdEvent>,
+    on_count: &mut u64,
+    off_count: &mut u64,
+    frame_start_ts: &mut Option<u64>,
+) {
+    frame_buffers.pixels.fill(0);
+    frame_buffers.pixels_on.fill(0);
+    frame_buffers.pixels_off.fill(0);
+    frame_events.clear();
+    *on_count = 0;
+    *off_count = 0;
+    *frame_start_ts = None;
+}
+
 #[cfg(test)]
 fn preview_frame_pool_len() -> usize {
     preview_frame_buffer_pool()
@@ -463,6 +482,7 @@ where
         write_evt3_header,
         disk_writer_buffer_bytes,
         metadata,
+        replay_timestamp_feedback,
     } = options;
     let recording = output_path.is_some();
     let mut recording_sidecar = None;
@@ -761,6 +781,7 @@ where
     let height = sensor_height;
     let pixel_count = width as usize * height as usize;
     let preview_pool_tx_preview = preview_pool_tx.clone();
+    let replay_timestamp_feedback_preview = replay_timestamp_feedback.clone();
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
@@ -793,6 +814,11 @@ where
                             s.record_event_timestamps(first, last);
                         }
                     }
+                    if let (Some(last), Some(feedback)) =
+                        (events.last(), replay_timestamp_feedback_preview.as_ref())
+                    {
+                        feedback.store(last.timestamp, Ordering::Relaxed);
+                    }
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
                             continue;
@@ -820,6 +846,19 @@ where
                         (frame_start_ts, events.last().map(|e| e.timestamp))
                     {
                         if last_ts.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed) {
+                            if frame_tx.is_full() {
+                                reset_preview_frame_accumulators(
+                                    &mut frame_buffers,
+                                    &mut frame_events,
+                                    &mut on_count,
+                                    &mut off_count,
+                                    &mut frame_start_ts,
+                                );
+                                if let Ok(mut s) = stats_preview.lock() {
+                                    s.record_preview_frame_drop();
+                                }
+                                continue;
+                            }
                             let raw_events = if raw_events_preview.load(Ordering::Relaxed) {
                                 let next_capacity = frame_events.capacity().max(8_192);
                                 Some(std::mem::replace(
