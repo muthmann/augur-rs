@@ -34,6 +34,10 @@ single-window overwrite workflow.
 - `Line Profile` samples ON and OFF values along a dragged line, opens its separate window after the drag completes, and can optionally overlay the ON+OFF sum trace
 - `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
 - `Rect` and `Ellipse` create host-side software annotations with live ROI statistics
+- the annotations list is now directly interactive: clicking a row selects that ROI, switches back to pointer/edit mode, and shows a color swatch that matches the overlay on the preview
+- pointer mode can move existing rectangle and ellipse annotations by dragging them directly on the preview
+- visible ROI numbering in the annotations list now stays contiguous after deletes even though the underlying annotation IDs remain stable for selection/crop state
+- `Crop to ROI` now crops to the selected software annotation when one is selected, otherwise it falls back to the current hardware ROI; toggling it again returns to the full frame, and ellipse crop uses the ellipse bounding box
 - `Scale bar` can be toggled from the UI and placed in any preview corner
 - ruler/scale-bar text and line overlays now use outline/shadow rendering so they remain legible on grayscale and fire-like backgrounds
 - the top-bar `Settings -> Advanced` controls now display preview and point-cloud update cadence in Hz instead of milliseconds

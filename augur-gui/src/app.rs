@@ -3229,7 +3229,7 @@ impl eframe::App for CameraApp {
 
                 // ── Settings ────────────────────────────────────────────────
                 ui.menu_button("Settings", |ui| {
-                    const PIXEL_SCALE_TOOLTIP: &str = "Physical size of one sensor pixel in nanometers. Shared with plugins for coordinate conversion (for example localization in nm). Typical values: 15 nm (high-mag TIRF), 65 nm (standard SMLM), 100+ nm (wide-field).";
+                    const PIXEL_SCALE_TOOLTIP: &str = "Physical size of one sensor pixel in nanometers. Default is the IMX636 sensor pitch: 4860 nm (4.86 µm). Shared with plugins for coordinate conversion and used by the ruler/scale bar. In optical setups with magnification, replace it with the effective sample-plane calibration.";
                     const SENSOR_DIMENSIONS_TOOLTIP: &str = "Sensor pixel dimensions. Must match the connected camera. Defaults to IMX636 (1280x720). Used for ROI validation and plugin coordinate systems. Only editable when idle.";
                     const ACQ_TIME_TOOLTIP: &str = "Duration of each preview frame's accumulation window. Lower values give finer temporal resolution but fewer events per frame. Higher values integrate more events for a brighter preview but reduce temporal detail.";
                     const EVENT_HISTORY_TOOLTIP: &str = "Maximum memory for retained decoded event history. Plugins can access past frames from this buffer. Increase for longer analysis windows; decrease to save RAM.";
@@ -3528,7 +3528,11 @@ impl eframe::App for CameraApp {
             input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
         }) {
             self.with_active_viewer_mut(|viewer| {
-                viewer.annotation_manager.delete_selected();
+                if let Some(annotation_id) = viewer.annotation_manager.delete_selected() {
+                    viewer
+                        .workspace
+                        .clear_crop_target_if_annotation(annotation_id);
+                }
             });
         }
 

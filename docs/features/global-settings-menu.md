@@ -27,7 +27,7 @@ frame uses the new accumulation window.
 
 ```toml
 [global]
-nm_per_pixel = 65.0
+nm_per_pixel = 4860.0
 sensor_width = 1280
 sensor_height = 720
 acq_time_ms = 50
@@ -50,7 +50,7 @@ The GUI synchronizes those values when it:
 
 | Parameter | Guidance |
 |---|---|
-| `nm_per_pixel` | Physical size of one sensor pixel in nanometers. Shared with plugins for coordinate conversion, such as reporting localization results in nm. Typical values: `15` for high-mag TIRF, `65` for standard SMLM, `100+` for wide-field imaging. |
+| `nm_per_pixel` | Physical size of one sensor pixel in nanometers. Default: IMX636 sensor pitch `4860` nm (`4.86 µm`). Shared with plugins for coordinate conversion and used by the ruler/scale bar. In optical setups with magnification, replace it with the effective sample-plane calibration. |
 | `sensor_width`, `sensor_height` | Sensor pixel dimensions. They must match the connected camera, default to IMX636 (`1280x720`), and are used for ROI validation plus plugin coordinate systems. These are idle-time settings because they describe the pipeline shape. |
 | `acq_time_ms` | Duration of each preview frame's accumulation window. Lower values give finer temporal resolution but fewer events per frame; higher values integrate more events for a brighter preview while reducing temporal detail. |
 | `event_store_budget_mib` | Maximum memory for retained decoded-event history. Runtime plugins can access past frames from this buffer, so increase it for longer analysis windows or reduce it to save RAM. |

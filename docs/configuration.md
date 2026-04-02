@@ -42,7 +42,7 @@ stc_threshold_us = 1000
 trail_enabled = false
 
 [global]
-nm_per_pixel = 65.0
+nm_per_pixel = 4860.0
 sensor_width = 1280
 sensor_height = 720
 acq_time_ms = 50
@@ -116,7 +116,7 @@ Use STC to suppress isolated noise bursts. Use Trail to keep the first event aft
 
 The `global` section persists host-owned GUI/runtime settings.
 
-- `nm_per_pixel`: physical size of one sensor pixel in nanometers. This value is shared with plugins for coordinate conversion, such as reporting localization results in nm instead of pixels. Typical values are around `15` for high-magnification TIRF, `65` for standard SMLM setups, and `100+` for wider-field imaging.
+- `nm_per_pixel`: physical size of one sensor pixel in nanometers. The default is the IMX636 sensor pitch, `4860` nm (`4.86 µm`). This value is shared with plugins for coordinate conversion and used by the ruler/scale bar. In optical setups with magnification, replace it with the effective sample-plane calibration instead of the raw sensor pitch.
 - `sensor_width`, `sensor_height`: sensor pixel dimensions used by the GUI, ROI validation, plugin coordinate systems, and RAW header metadata. They must match the connected camera and default to the IMX636's `1280 x 720`. These are effectively hardware-shape settings, so changing them only makes sense while idle or when switching camera models.
 - `acq_time_ms`: accumulation window for each preview frame. Lower values preserve finer temporal detail but produce dimmer frames with fewer events; higher values integrate more events into a brighter preview at the cost of temporal resolution.
 - `event_store_budget_mib`: maximum retained decoded-event history budget for runtime plugins. Increase it for longer look-back windows and multi-frame analysis; decrease it when you want to reduce RAM usage.
