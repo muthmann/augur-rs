@@ -6,9 +6,9 @@
 splitting them across the `Camera` menu and the left settings panel.
 
 This pass adds a persisted `[global]` config block, publishes shared `GlobalSettings` into the
-runtime plugin context bus, fixes replay-speed changes so they reset pacing baselines instead of
-causing jumps or long freezes, and keeps acquisition time editable during replay so the next replay
-frame uses the new accumulation window.
+runtime plugin context bus, keeps acquisition time editable during replay so the next replay frame
+uses the new accumulation window, and now auto-derives the replay display cadence from
+`speed × acq time` while replay pacing itself follows event timestamps instead of bytes read.
 
 ## User-Facing Changes
 
@@ -54,7 +54,7 @@ The GUI synchronizes those values when it:
 | `sensor_width`, `sensor_height` | Sensor pixel dimensions. They must match the connected camera, default to IMX636 (`1280x720`), and are used for ROI validation plus plugin coordinate systems. These are idle-time settings because they describe the pipeline shape. |
 | `acq_time_ms` | Duration of each preview frame's accumulation window. Lower values give finer temporal resolution but fewer events per frame; higher values integrate more events for a brighter preview while reducing temporal detail. |
 | `event_store_budget_mib` | Maximum memory for retained decoded-event history. Runtime plugins can access past frames from this buffer, so increase it for longer analysis windows or reduce it to save RAM. |
-| `preview_interval_ms` | Maximum redraw interval for the 2D preview. Lower values look smoother but cost more CPU/GPU work. This does not affect recording or replay timing. The default `33` ms is about `30` fps. |
+| `preview_interval_ms` | Maximum redraw interval for the live 2D preview. Lower values look smoother but cost more CPU/GPU work. Replay now overrides the active 2D cadence from `speed × acq time`, while still preserving this value as the live-mode preference. The default `33` ms is about `30` fps. |
 | `point_cloud_interval_ms` | Maximum redraw interval for the 3D point-cloud view. Lower values are smoother but more GPU-intensive. The default `67` ms is about `15` fps. |
 | `disk_writer_buffer_mib` | Write buffer size for the recording output file. Larger buffers reduce disk I/O pressure during high-bandwidth recordings but use more memory. This stays idle-only because the recording pipeline allocates it at startup. |
 
@@ -78,15 +78,19 @@ change was needed for the new contract.
 
 ## Replay Behavior
 
-`ReplayControls` now tracks a `speed_epoch` alongside `speed_bits`.
+`ReplayControls` now tracks a `speed_epoch` alongside `speed_bits` and a shared
+`current_timestamp_us` timing value.
 
-When replay speed changes, both replay backends reset their local pacing baseline:
+Replay speed changes now reset a timestamp-based pacing baseline:
 
-- raw replay resets from the current byte position
-- decoded replay resets from the current event index
+- raw replay resets from the latest packet-reader timestamp
+- decoded replay resets from the current cached event timestamp
 
-That keeps the approximate byte-rate throttle responsive without misinterpreting already-played
-data at the new speed.
+That makes `1x` map onto recorded event time instead of average bytes per second.
+
+Replay also auto-derives the effective 2D display cadence from `acq_time_ms / speed`, clamped to
+`10..=200` ms, and the `Settings -> Advanced` panel shows that effective replay rate as
+informational text. The `Preview update [Hz]` control still applies to live preview.
 
 Replay also now keeps `Acq time [ms]` enabled in the top-bar `Settings` menu. The GUI already
 stores the value through `PipelineController::acq_time_us`, and the preview pipeline samples that
@@ -99,10 +103,10 @@ without rebuilding the replay session.
 |---|---|
 | `augur-plugin-api/src/context.rs` | shared `GlobalSettings` payload and key |
 | `augur-core/src/config.rs` | persisted `[global]` config block with defaults |
-| `augur-core/src/pipeline.rs` | configurable disk-writer buffer |
-| `augur-core/src/replay.rs` | raw replay speed-epoch pacing reset |
-| `augur-core/src/decoded_replay.rs` | decoded replay speed-epoch pacing reset |
-| `augur-gui/src/app.rs` | top-bar `Settings` menu, save/load sync, plugin-context publication |
+| `augur-core/src/pipeline.rs` | configurable disk-writer buffer, queue-aware frame drops |
+| `augur-core/src/replay.rs` | raw replay timestamp pacing and speed-epoch baseline reset |
+| `augur-core/src/decoded_replay.rs` | decoded replay timestamp pacing and speed-epoch baseline reset |
+| `augur-gui/src/app.rs` | top-bar `Settings` menu, save/load sync, replay cadence override, plugin-context publication |
 | `augur-gui/src/settings.rs` | ROI/mask controls now use editable sensor geometry |
 | `augur-gui/src/plugins/roi_grid.rs` | ROI-grid recompute now uses app-provided geometry |
 

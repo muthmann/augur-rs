@@ -351,6 +351,22 @@ fn recycle_preview_frame_buffers(buffers: PreviewFrameBuffers) {
     }
 }
 
+fn reset_preview_frame_accumulators(
+    frame_buffers: &mut PreviewFrameBuffers,
+    frame_events: &mut Vec<CdEvent>,
+    on_count: &mut u64,
+    off_count: &mut u64,
+    frame_start_ts: &mut Option<u64>,
+) {
+    frame_buffers.pixels.fill(0);
+    frame_buffers.pixels_on.fill(0);
+    frame_buffers.pixels_off.fill(0);
+    frame_events.clear();
+    *on_count = 0;
+    *off_count = 0;
+    *frame_start_ts = None;
+}
+
 #[cfg(test)]
 fn preview_frame_pool_len() -> usize {
     preview_frame_buffer_pool()
@@ -820,6 +836,19 @@ where
                         (frame_start_ts, events.last().map(|e| e.timestamp))
                     {
                         if last_ts.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed) {
+                            if frame_tx.is_full() {
+                                reset_preview_frame_accumulators(
+                                    &mut frame_buffers,
+                                    &mut frame_events,
+                                    &mut on_count,
+                                    &mut off_count,
+                                    &mut frame_start_ts,
+                                );
+                                if let Ok(mut s) = stats_preview.lock() {
+                                    s.record_preview_frame_drop();
+                                }
+                                continue;
+                            }
                             let raw_events = if raw_events_preview.load(Ordering::Relaxed) {
                                 let next_capacity = frame_events.capacity().max(8_192);
                                 Some(std::mem::replace(
