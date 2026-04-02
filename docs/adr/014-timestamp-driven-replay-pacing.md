@@ -17,9 +17,9 @@ repaints or silently drop many produced frames.
 Adopt a timestamp-driven replay timing model:
 
 1. Replay backends pace against event timestamp deltas instead of bytes read.
-2. `ReplayControls` carries a shared `current_timestamp_us` feedback atomic so
-   the preview thread can publish the most recently decoded raw EVT3 timestamp
-   back to the raw replay reader thread.
+2. `ReplayControls` carries a shared `current_timestamp_us` atomic and raw
+   EVT3 replay updates it directly from the packet reader, so pacing is not
+   coupled to the lossy preview queue.
 3. Replay speed changes and seeks reset their pacing baseline from the current
    timestamp rather than the previously consumed byte/event count.
 4. `augur-gui` derives the effective replay display interval from
@@ -32,9 +32,8 @@ Adopt a timestamp-driven replay timing model:
 
 - `1x`, `2x`, and other finite replay speeds now track recorded event time much
   more closely, even for files with uneven event density.
-- Raw replay accepts a one-packet timestamp-feedback lag, which is negligible
-  compared with the replay frame window and avoids a heavier synchronization
-  design.
+- Raw replay still uses a one-packet timing lag, but that lag now comes from
+  its own packet-reader state instead of preview-thread feedback.
 - Replay no longer treats the user's manual preview-rate setting as authoritative
   for the 2D replay surface; the GUI instead shows the derived effective rate.
 - High-speed replay intentionally sacrifices some preview frames when the GUI is

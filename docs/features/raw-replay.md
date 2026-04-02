@@ -31,8 +31,7 @@ Replay lives in `augur-core` as two file-backed camera adapters, so the rest of 
 
 Replay pacing is now timestamp-driven instead of byte-rate-driven:
 
-- raw EVT3 replay uses `ReplayControls::current_timestamp_us`, which the preview thread updates
-  with the most recently decoded packet timestamp
+- raw EVT3 replay updates `ReplayControls::current_timestamp_us` directly from the packet reader
 - decoded replay reads the current timestamp directly from its cached event vector
 - speed changes and seeks reset the local pacing baseline from the current timestamp rather than
   from bytes read or event count
@@ -98,7 +97,7 @@ already in memory.
 | `augur-core/src/replay.rs` | `RawFileCamera`, `ReplayFileInfo`, fast metadata scan, reopen-at-offset support for `.raw` |
 | `augur-core/src/decoded_replay.rs` | `DecodedEventFileCamera`, `PackedEventPreviewDecoder`, decoded `.csv` / `.bin` / `.npy` / optional `.h5` parsers |
 | `augur-core/src/error.rs` | `CameraError::Eof` |
-| `augur-core/src/pipeline.rs` | replay timestamp feedback, preview-frame queue drops, EOF finalization, preview-queue drain on shutdown |
+| `augur-core/src/pipeline.rs` | preview-frame queue drops, EOF finalization, preview-queue drain on shutdown |
 | `augur-gui/src/app.rs` | replay mode, persisted EOF state, transport controls, decoded-event seek cache, restart, replay display cadence |
 
 ## Older File Compatibility

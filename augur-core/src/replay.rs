@@ -85,6 +85,9 @@ pub struct RawFileCamera {
     controls: ReplayControls,
     bytes_read: u64,
     session_start_ts_us: u64,
+    timing_decoder: Evt3Decoder,
+    timing_cd_scratch: Vec<Evt3CdEvent>,
+    timing_trigger_scratch: Vec<Evt3TriggerEvent>,
     last_speed_epoch: u32,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
@@ -147,6 +150,9 @@ impl RawFileCamera {
                 controls: controls.clone(),
                 bytes_read: start_data_bytes,
                 session_start_ts_us: 0,
+                timing_decoder: Evt3Decoder::default(),
+                timing_cd_scratch: Vec::with_capacity(4_096),
+                timing_trigger_scratch: Vec::with_capacity(256),
                 last_speed_epoch: controls.speed_epoch.load(Ordering::Relaxed),
                 playback_started_at: None,
                 paused_at: None,
@@ -238,6 +244,26 @@ impl RawFileCamera {
 
         Ok(())
     }
+
+    fn update_current_timestamp_from_packet(&mut self, bytes: &[u8]) -> Result<()> {
+        self.timing_cd_scratch.clear();
+        self.timing_trigger_scratch.clear();
+        self.timing_decoder
+            .decode_bytes(
+                bytes,
+                &mut self.timing_cd_scratch,
+                &mut self.timing_trigger_scratch,
+            )
+            .map_err(|e| CameraError::Other(format!("raw replay timing decode failed: {e}")))?;
+
+        if let Some(last) = self.timing_cd_scratch.last() {
+            self.controls
+                .current_timestamp_us
+                .fetch_max(last.timestamp, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
 }
 
 impl EventCamera for RawFileCamera {
@@ -276,6 +302,7 @@ impl PacketStreamCamera for RawFileCamera {
             return Err(CameraError::Eof);
         }
 
+        self.update_current_timestamp_from_packet(&buf[..n])?;
         self.bytes_read += n as u64;
         self.controls
             .bytes_read
@@ -675,6 +702,34 @@ mod tests {
         assert_eq!(
             device_info.compatible.as_deref(),
             Some("imx636,ccam5_gen42")
+        );
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn read_packet_updates_current_timestamp_feedback() {
+        let path = temp_path("timestamp-feedback");
+        write_sample_raw(&path);
+
+        let (mut camera, controls, _info) = RawFileCamera::open(&path).expect("raw file must open");
+        camera.start_streaming().expect("start must succeed");
+
+        let mut buf = [0_u8; 8];
+        camera
+            .read_packet(&mut buf)
+            .expect("first packet read must succeed");
+        assert_eq!(
+            controls.current_timestamp_us.load(Ordering::Relaxed),
+            0x1010
+        );
+
+        camera
+            .read_packet(&mut buf)
+            .expect("second packet read must succeed");
+        assert_eq!(
+            controls.current_timestamp_us.load(Ordering::Relaxed),
+            0x1020
         );
 
         fs::remove_file(path).expect("temp file must be removed");

@@ -78,12 +78,12 @@ change was needed for the new contract.
 
 ## Replay Behavior
 
-`ReplayControls` now tracks a `speed_epoch` alongside `speed_bits` and publishes a shared
-`current_timestamp_us` feedback value from the preview thread.
+`ReplayControls` now tracks a `speed_epoch` alongside `speed_bits` and a shared
+`current_timestamp_us` timing value.
 
 Replay speed changes now reset a timestamp-based pacing baseline:
 
-- raw replay resets from the latest decoded raw-event timestamp
+- raw replay resets from the latest packet-reader timestamp
 - decoded replay resets from the current cached event timestamp
 
 That makes `1x` map onto recorded event time instead of average bytes per second.
@@ -103,7 +103,7 @@ without rebuilding the replay session.
 |---|---|
 | `augur-plugin-api/src/context.rs` | shared `GlobalSettings` payload and key |
 | `augur-core/src/config.rs` | persisted `[global]` config block with defaults |
-| `augur-core/src/pipeline.rs` | configurable disk-writer buffer, replay timestamp feedback, queue-aware frame drops |
+| `augur-core/src/pipeline.rs` | configurable disk-writer buffer, queue-aware frame drops |
 | `augur-core/src/replay.rs` | raw replay timestamp pacing and speed-epoch baseline reset |
 | `augur-core/src/decoded_replay.rs` | decoded replay timestamp pacing and speed-epoch baseline reset |
 | `augur-gui/src/app.rs` | top-bar `Settings` menu, save/load sync, replay cadence override, plugin-context publication |

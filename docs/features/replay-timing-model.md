@@ -12,12 +12,10 @@ Replay speed now maps directly onto event timestamps:
 - `2x` replays the same data in about half the wall-clock time
 - `Max` still skips throttling entirely
 
-`RawFileCamera` reads its pacing timestamp from the preview pipeline through
-`ReplayControls::current_timestamp_us`. That feedback is one decoded packet
-behind the reader thread, which is acceptable because the packet window is
-small compared with the replay accumulation window. `DecodedEventFileCamera`
-can read the current event timestamp directly from its cached event vector, so
-it does not need the feedback loop for pacing itself.
+`RawFileCamera` updates `ReplayControls::current_timestamp_us` directly from the
+raw EVT3 packets it reads, so pacing is no longer coupled to the lossy preview
+queue. `DecodedEventFileCamera` reads the current event timestamp directly from
+its cached event vector.
 
 Speed changes and seeks reset the replay pacing baseline from the current
 timestamp instead of the previous byte/event position.
@@ -55,7 +53,7 @@ for work the GUI cannot consume anyway.
 |---|---|
 | `augur-core/src/replay.rs` | raw EVT3 timestamp-based replay pacing |
 | `augur-core/src/decoded_replay.rs` | decoded-event timestamp-based replay pacing |
-| `augur-core/src/pipeline.rs` | replay timestamp feedback and queue-aware preview-frame drops |
+| `augur-core/src/pipeline.rs` | queue-aware preview-frame drops |
 | `augur-gui/src/app.rs` | replay pipeline wiring, effective replay display cadence, settings UI note |
 
 ## Verification

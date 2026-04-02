@@ -2139,14 +2139,11 @@ impl CameraApp {
             Some("raw") => match RawFileCamera::open(&path) {
                 Ok((camera, controls, info)) => {
                     let replay_info = camera.device_info();
-                    let mut options = PipelineOptions::preview_only(info.width, info.height);
-                    options.replay_timestamp_feedback =
-                        Some(Arc::clone(&controls.current_timestamp_us));
                     spawn_pipeline(
                         camera,
                         Evt3CorePreviewDecoder::default(),
                         replay_pipeline_config(&info),
-                        options,
+                        PipelineOptions::preview_only(info.width, info.height),
                     )
                     .map(|controller| OpenedReplay {
                         controller,
@@ -2166,15 +2163,11 @@ impl CameraApp {
                     let result = match DecodedEventFileCamera::open(&path_for_thread) {
                         Ok((camera, controls, info, decoded_events)) => {
                             let replay_info = camera.device_info();
-                            let mut options =
-                                PipelineOptions::preview_only(info.width, info.height);
-                            options.replay_timestamp_feedback =
-                                Some(Arc::clone(&controls.current_timestamp_us));
                             spawn_pipeline(
                                 camera,
                                 PackedEventPreviewDecoder::default(),
                                 replay_pipeline_config(&info),
-                                options,
+                                PipelineOptions::preview_only(info.width, info.height),
                             )
                             .map(|controller| OpenedReplay {
                                 controller,
@@ -2584,37 +2577,27 @@ impl CameraApp {
         let reopen_result = if let Some(decoded_events) = decoded_events {
             let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
             match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
-                Ok((camera, controls)) => {
-                    let mut options = PipelineOptions::preview_only(info.width, info.height);
-                    options.replay_timestamp_feedback =
-                        Some(Arc::clone(&controls.current_timestamp_us));
-                    spawn_pipeline(
-                        camera,
-                        PackedEventPreviewDecoder::default(),
-                        replay_pipeline_config(&info),
-                        options,
-                    )
-                    .map(|controller| (controller, controls))
-                    .map_err(|err| format!("seek pipeline start failed: {err}"))
-                }
+                Ok((camera, controls)) => spawn_pipeline(
+                    camera,
+                    PackedEventPreviewDecoder::default(),
+                    replay_pipeline_config(&info),
+                    PipelineOptions::preview_only(info.width, info.height),
+                )
+                .map(|controller| (controller, controls))
+                .map_err(|err| format!("seek pipeline start failed: {err}")),
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         } else {
             let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
             match RawFileCamera::open_at(&path, &info, target_byte) {
-                Ok((camera, controls)) => {
-                    let mut options = PipelineOptions::preview_only(info.width, info.height);
-                    options.replay_timestamp_feedback =
-                        Some(Arc::clone(&controls.current_timestamp_us));
-                    spawn_pipeline(
-                        camera,
-                        Evt3CorePreviewDecoder::default(),
-                        replay_pipeline_config(&info),
-                        options,
-                    )
-                    .map(|controller| (controller, controls))
-                    .map_err(|err| format!("seek pipeline start failed: {err}"))
-                }
+                Ok((camera, controls)) => spawn_pipeline(
+                    camera,
+                    Evt3CorePreviewDecoder::default(),
+                    replay_pipeline_config(&info),
+                    PipelineOptions::preview_only(info.width, info.height),
+                )
+                .map(|controller| (controller, controls))
+                .map_err(|err| format!("seek pipeline start failed: {err}")),
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         };

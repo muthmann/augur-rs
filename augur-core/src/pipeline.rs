@@ -127,7 +127,6 @@ pub struct PipelineOptions {
     pub write_evt3_header: bool,
     pub disk_writer_buffer_bytes: usize,
     pub metadata: Option<RecordingMetadata>,
-    pub replay_timestamp_feedback: Option<Arc<AtomicU64>>,
 }
 
 impl PipelineOptions {
@@ -139,7 +138,6 @@ impl PipelineOptions {
             write_evt3_header: true,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
             metadata: None,
-            replay_timestamp_feedback: None,
         }
     }
 
@@ -151,7 +149,6 @@ impl PipelineOptions {
             write_evt3_header: false,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
             metadata: None,
-            replay_timestamp_feedback: None,
         }
     }
 }
@@ -482,7 +479,6 @@ where
         write_evt3_header,
         disk_writer_buffer_bytes,
         metadata,
-        replay_timestamp_feedback,
     } = options;
     let recording = output_path.is_some();
     let mut recording_sidecar = None;
@@ -781,7 +777,6 @@ where
     let height = sensor_height;
     let pixel_count = width as usize * height as usize;
     let preview_pool_tx_preview = preview_pool_tx.clone();
-    let replay_timestamp_feedback_preview = replay_timestamp_feedback.clone();
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
@@ -813,11 +808,6 @@ where
                         ) {
                             s.record_event_timestamps(first, last);
                         }
-                    }
-                    if let (Some(last), Some(feedback)) =
-                        (events.last(), replay_timestamp_feedback_preview.as_ref())
-                    {
-                        feedback.store(last.timestamp, Ordering::Relaxed);
                     }
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
