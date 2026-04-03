@@ -2,7 +2,7 @@
 
 ## Summary
 
-AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, restores recorded raw-file metadata when present, resets its pacing baseline cleanly when speed changes, and finalizes older `.raw` files without suppressing genuine preview errors.
+AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, restores recorded raw-file metadata when present, resets its pacing baseline cleanly when speed changes, supports keyboard play/pause and frame stepping, and finalizes older `.raw` files without suppressing genuine preview errors.
 
 ## Core Design
 
@@ -60,6 +60,7 @@ HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `aug
    - a timeline slider for seeking
    - current / total replay time
    - MB progress as secondary info
+   - keyboard shortcuts: `Space` toggles play/pause, while `←` / `→` pause replay if needed and step one acquisition-window frame backward / forward
 4. Enabled analysis plugins continue to run on replayed frames exactly as they do on live preview frames.
 
 If a `<capture>.toml` sidecar exists next to the selected replay file, the replay session uses it as read-only reference data for both the left camera settings panel and the top-bar global `Settings` menu.
@@ -98,7 +99,8 @@ already in memory.
 | `augur-core/src/decoded_replay.rs` | `DecodedEventFileCamera`, `PackedEventPreviewDecoder`, decoded `.csv` / `.bin` / `.npy` / optional `.h5` parsers |
 | `augur-core/src/error.rs` | `CameraError::Eof` |
 | `augur-core/src/pipeline.rs` | preview-frame queue drops, EOF finalization, preview-queue drain on shutdown |
-| `augur-gui/src/app.rs` | replay mode, persisted EOF state, transport controls, decoded-event seek cache, restart, replay display cadence |
+| `augur-gui/src/app.rs` | replay mode, persisted EOF state, transport controls, theme-aware viewport visuals, decoded-event seek cache, restart, replay display cadence |
+| `augur-gui/src/viewer_widget.rs` | shared replay transport UI, phosphor icon controls, and `Space` / arrow-key shortcuts |
 
 ## Older File Compatibility
 

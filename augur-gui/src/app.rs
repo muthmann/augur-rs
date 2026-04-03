@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use serde::{Deserialize, Serialize};
+
 use augur_core::{
     analysis::{AnalysisOutput, AnalysisWarning, Overlay},
     camera::{DeviceInfo, EventCamera},
@@ -61,6 +63,7 @@ use crate::{
 const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
 const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
+const UI_THEME_STORAGE_KEY: &str = "augur_gui.theme_preference";
 const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
     (0.25, "0.25x"),
     (0.5, "0.5x"),
@@ -71,6 +74,33 @@ const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
 ];
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum UiThemePreference {
+    Dark,
+    Light,
+}
+
+impl UiThemePreference {
+    fn from_dark_mode(dark_mode: bool) -> Self {
+        if dark_mode {
+            Self::Dark
+        } else {
+            Self::Light
+        }
+    }
+
+    fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    fn visuals(self) -> egui::Visuals {
+        match self {
+            Self::Dark => egui::Visuals::dark(),
+            Self::Light => egui::Visuals::light(),
+        }
+    }
+}
 
 fn process_interval_for_view_mode(
     view_mode: ViewMode,
@@ -388,6 +418,7 @@ pub struct CameraApp {
     acq_dirty: bool,
     config_dirty: bool,
     viewer: ViewerState,
+    theme_preference: UiThemePreference,
     popup_open: bool,
     lock_settings_while_recording: bool,
     settings_panel_open: bool,
@@ -417,6 +448,14 @@ impl CameraApp {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         cc.egui_ctx.set_fonts(fonts);
+        let theme_preference = cc
+            .storage
+            .and_then(|storage| storage.get_string(UI_THEME_STORAGE_KEY))
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_else(|| {
+                UiThemePreference::from_dark_mode(cc.egui_ctx.style().visuals.dark_mode)
+            });
+        cc.egui_ctx.set_visuals(theme_preference.visuals());
 
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
@@ -459,6 +498,7 @@ impl CameraApp {
             acq_dirty: false,
             config_dirty: false,
             viewer: ViewerState::default(),
+            theme_preference,
             popup_open: false,
             lock_settings_while_recording: true,
             settings_panel_open: true,
@@ -491,6 +531,18 @@ impl CameraApp {
 
     fn event_store_budget_mib(&self) -> u64 {
         (self.event_store.memory_budget_bytes() / EVENT_STORE_MEBIBYTE).max(1) as u64
+    }
+
+    fn apply_theme_to_ctx(&self, ctx: &egui::Context) {
+        ctx.set_visuals(self.theme_preference.visuals());
+    }
+
+    fn set_theme_preference(&mut self, ctx: &egui::Context, theme_preference: UiThemePreference) {
+        if self.theme_preference != theme_preference {
+            self.theme_preference = theme_preference;
+            self.apply_theme_to_ctx(ctx);
+            ctx.request_repaint();
+        }
     }
 
     fn sync_config_global_from_runtime(&mut self) {
@@ -596,6 +648,7 @@ impl CameraApp {
             fraction: self.current_replay_fraction(),
             duration_us,
             time_us: self.current_replay_time_us(),
+            frame_step_us: self.published_acq_time_ms().saturating_mul(1_000),
             bytes_read: self.current_replay_bytes_read(),
             data_len,
         }
@@ -1434,37 +1487,41 @@ impl CameraApp {
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let window_title = title.clone();
+                    let viewport_visuals = ctx.style().visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| match class {
-                            egui::viewport::ViewportClass::Deferred => {
-                                egui::CentralPanel::default().show(ctx, |ui| {
-                                    render_table_window_viewport(ui, &shared_for_viewport);
-                                });
-                                if ctx.input(|i| i.viewport().close_requested()) {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
-                                    }
-                                }
-                            }
-                            egui::viewport::ViewportClass::Embedded => {
-                                let mut open = true;
-                                egui::Window::new(&window_title)
-                                    .open(&mut open)
-                                    .default_size([1100.0, 760.0])
-                                    .show(ctx, |ui| {
+                        move |ctx, class| {
+                            ctx.set_visuals(viewport_visuals.clone());
+                            match class {
+                                egui::viewport::ViewportClass::Deferred => {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
                                         render_table_window_viewport(ui, &shared_for_viewport);
                                     });
-                                if !open {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
+                                    if ctx.input(|i| i.viewport().close_requested()) {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
                                     }
                                 }
+                                egui::viewport::ViewportClass::Embedded => {
+                                    let mut open = true;
+                                    egui::Window::new(&window_title)
+                                        .open(&mut open)
+                                        .default_size([1100.0, 760.0])
+                                        .show(ctx, |ui| {
+                                            render_table_window_viewport(ui, &shared_for_viewport);
+                                        });
+                                    if !open {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         },
                     );
 
@@ -1550,45 +1607,49 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
+                    let viewport_visuals = ctx.style().visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1200.0, 860.0]),
-                        move |ctx, class| match class {
-                            egui::viewport::ViewportClass::Deferred => {
-                                egui::CentralPanel::default().show(ctx, |ui| {
-                                    render_density_window_viewport(
-                                        ui,
-                                        &view_id,
-                                        &shared_for_viewport,
-                                    );
-                                });
-                                if ctx.input(|i| i.viewport().close_requested()) {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
-                                    }
-                                }
-                            }
-                            egui::viewport::ViewportClass::Embedded => {
-                                let mut open = true;
-                                egui::Window::new(&window_title)
-                                    .open(&mut open)
-                                    .default_size([1100.0, 760.0])
-                                    .show(ctx, |ui| {
+                        move |ctx, class| {
+                            ctx.set_visuals(viewport_visuals.clone());
+                            match class {
+                                egui::viewport::ViewportClass::Deferred => {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
                                         render_density_window_viewport(
                                             ui,
                                             &view_id,
                                             &shared_for_viewport,
                                         );
                                     });
-                                if !open {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
+                                    if ctx.input(|i| i.viewport().close_requested()) {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
                                     }
                                 }
+                                egui::viewport::ViewportClass::Embedded => {
+                                    let mut open = true;
+                                    egui::Window::new(&window_title)
+                                        .open(&mut open)
+                                        .default_size([1100.0, 760.0])
+                                        .show(ctx, |ui| {
+                                            render_density_window_viewport(
+                                                ui,
+                                                &view_id,
+                                                &shared_for_viewport,
+                                            );
+                                        });
+                                    if !open {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         },
                     );
 
@@ -1657,45 +1718,49 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
+                    let viewport_visuals = ctx.style().visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| match class {
-                            egui::viewport::ViewportClass::Deferred => {
-                                egui::CentralPanel::default().show(ctx, |ui| {
-                                    render_scatter_window_viewport(
-                                        ui,
-                                        &view_id,
-                                        &shared_for_viewport,
-                                    );
-                                });
-                                if ctx.input(|i| i.viewport().close_requested()) {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
-                                    }
-                                }
-                            }
-                            egui::viewport::ViewportClass::Embedded => {
-                                let mut open = true;
-                                egui::Window::new(&window_title)
-                                    .open(&mut open)
-                                    .default_size([1100.0, 760.0])
-                                    .show(ctx, |ui| {
+                        move |ctx, class| {
+                            ctx.set_visuals(viewport_visuals.clone());
+                            match class {
+                                egui::viewport::ViewportClass::Deferred => {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
                                         render_scatter_window_viewport(
                                             ui,
                                             &view_id,
                                             &shared_for_viewport,
                                         );
                                     });
-                                if !open {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
+                                    if ctx.input(|i| i.viewport().close_requested()) {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
                                     }
                                 }
+                                egui::viewport::ViewportClass::Embedded => {
+                                    let mut open = true;
+                                    egui::Window::new(&window_title)
+                                        .open(&mut open)
+                                        .default_size([1100.0, 760.0])
+                                        .show(ctx, |ui| {
+                                            render_scatter_window_viewport(
+                                                ui,
+                                                &view_id,
+                                                &shared_for_viewport,
+                                            );
+                                        });
+                                    if !open {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         },
                     );
 
@@ -1772,45 +1837,49 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
+                    let viewport_visuals = ctx.style().visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| match class {
-                            egui::viewport::ViewportClass::Deferred => {
-                                egui::CentralPanel::default().show(ctx, |ui| {
-                                    render_image_window_viewport(
-                                        ui,
-                                        &view_id,
-                                        &shared_for_viewport,
-                                    );
-                                });
-                                if ctx.input(|i| i.viewport().close_requested()) {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
-                                    }
-                                }
-                            }
-                            egui::viewport::ViewportClass::Embedded => {
-                                let mut open = true;
-                                egui::Window::new(&window_title)
-                                    .open(&mut open)
-                                    .default_size([1100.0, 760.0])
-                                    .show(ctx, |ui| {
+                        move |ctx, class| {
+                            ctx.set_visuals(viewport_visuals.clone());
+                            match class {
+                                egui::viewport::ViewportClass::Deferred => {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
                                         render_image_window_viewport(
                                             ui,
                                             &view_id,
                                             &shared_for_viewport,
                                         );
                                     });
-                                if !open {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
+                                    if ctx.input(|i| i.viewport().close_requested()) {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
                                     }
                                 }
+                                egui::viewport::ViewportClass::Embedded => {
+                                    let mut open = true;
+                                    egui::Window::new(&window_title)
+                                        .open(&mut open)
+                                        .default_size([1100.0, 760.0])
+                                        .show(ctx, |ui| {
+                                            render_image_window_viewport(
+                                                ui,
+                                                &view_id,
+                                                &shared_for_viewport,
+                                            );
+                                        });
+                                    if !open {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         },
                     );
 
@@ -1866,45 +1935,49 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
+                    let viewport_visuals = ctx.style().visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| match class {
-                            egui::viewport::ViewportClass::Deferred => {
-                                egui::CentralPanel::default().show(ctx, |ui| {
-                                    render_series_window_viewport(
-                                        ui,
-                                        &view_id,
-                                        &shared_for_viewport,
-                                    );
-                                });
-                                if ctx.input(|i| i.viewport().close_requested()) {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
-                                    }
-                                }
-                            }
-                            egui::viewport::ViewportClass::Embedded => {
-                                let mut open = true;
-                                egui::Window::new(&window_title)
-                                    .open(&mut open)
-                                    .default_size([1100.0, 760.0])
-                                    .show(ctx, |ui| {
+                        move |ctx, class| {
+                            ctx.set_visuals(viewport_visuals.clone());
+                            match class {
+                                egui::viewport::ViewportClass::Deferred => {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
                                         render_series_window_viewport(
                                             ui,
                                             &view_id,
                                             &shared_for_viewport,
                                         );
                                     });
-                                if !open {
-                                    if let Ok(mut data) = shared_for_viewport.lock() {
-                                        data.close_requested = true;
+                                    if ctx.input(|i| i.viewport().close_requested()) {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
                                     }
                                 }
+                                egui::viewport::ViewportClass::Embedded => {
+                                    let mut open = true;
+                                    egui::Window::new(&window_title)
+                                        .open(&mut open)
+                                        .default_size([1100.0, 760.0])
+                                        .show(ctx, |ui| {
+                                            render_series_window_viewport(
+                                                ui,
+                                                &view_id,
+                                                &shared_for_viewport,
+                                            );
+                                        });
+                                    if !open {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.close_requested = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         },
                     );
 
@@ -2955,6 +3028,7 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme_to_ctx(ctx);
         self.poll_replay_open_task();
         self.poll_tiff_stack_export_task();
         self.update_preview_texture(ctx);
@@ -3339,6 +3413,18 @@ impl eframe::App for CameraApp {
                             viewer.scale_bar_settings.show = scale_bar_show;
                         });
                     }
+                    let mut dark_mode = self.theme_preference.is_dark();
+                    if ui
+                        .checkbox(&mut dark_mode, "Dark Mode")
+                        .on_hover_text("Switch between the light and dark GUI themes.")
+                        .changed()
+                    {
+                        self.set_theme_preference(
+                            ctx,
+                            UiThemePreference::from_dark_mode(dark_mode),
+                        );
+                    }
+                    ui.separator();
                     let window_views: Vec<ResolvedHostView> =
                         self.host_view_registry.window_views().cloned().collect();
                     for view in window_views {
@@ -3919,110 +4005,20 @@ impl eframe::App for CameraApp {
 
         if self.popup_open {
             let shared = Arc::clone(&self.popup_shared);
+            let viewport_visuals = ctx.style().visuals.clone();
             ctx.show_viewport_deferred(
                 egui::ViewportId::from_hash_of("popup_preview"),
                 egui::ViewportBuilder::default()
                     .with_title("Preview \u{2014} AugurRS")
                     .with_inner_size([1280.0, 820.0]),
-                move |ctx, class| match class {
-                    egui::viewport::ViewportClass::Deferred => {
-                        let mut root_repaint_requested = false;
-                        let mut repaint_after = None;
-                        if let Ok(mut data) = shared.lock() {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                let PopupSharedData {
-                                    viewer,
-                                    texture,
-                                    frame,
-                                    overlays,
-                                    camera_info,
-                                    nm_per_pixel,
-                                    config,
-                                    mode,
-                                    settings_locked,
-                                    pipeline_stats,
-                                    replay,
-                                    analysis_warnings,
-                                    analysis_notice,
-                                    detected_hotpixels,
-                                    config_dirty,
-                                    acq_dirty,
-                                    replay_open_task_active,
-                                    replay_notice,
-                                    last_error,
-                                    external_streaming,
-                                    external_streaming_label,
-                                    preview_interval_ms,
-                                    point_cloud_interval_ms,
-                                    close_requested: _,
-                                    output,
-                                } = &mut *data;
-                                let input = ViewerInput {
-                                    texture: texture.as_ref(),
-                                    frame: frame.as_ref(),
-                                    overlays,
-                                    camera_info: camera_info.as_ref(),
-                                    nm_per_pixel: *nm_per_pixel,
-                                    config,
-                                    mode: *mode,
-                                    settings_locked: *settings_locked,
-                                    pipeline_stats: pipeline_stats.as_ref(),
-                                    replay: *replay,
-                                    analysis_warnings,
-                                    analysis_notice: analysis_notice.as_deref(),
-                                    detected_hotpixels,
-                                    config_dirty: *config_dirty,
-                                    acq_dirty: *acq_dirty,
-                                    replay_open_task_active: *replay_open_task_active,
-                                    replay_notice: replay_notice.as_deref(),
-                                    last_error: last_error.as_deref(),
-                                    external_streaming: *external_streaming,
-                                    external_streaming_label: external_streaming_label.as_str(),
-                                    popup_active: true,
-                                    popup_button_label: "Return to augur",
-                                    popup_button_tooltip: "Return viewer to main window",
-                                    viewer_id: "popup",
-                                };
-                                let mut popup_output = draw_viewer(ctx, ui, viewer, input);
-                                if viewer.show_aux_windows(ctx) {
-                                    popup_output.contrast_changed = true;
-                                }
-                                root_repaint_requested = popup_output.requests_root_update();
-                                output
-                                    .get_or_insert_with(Default::default)
-                                    .merge(popup_output);
-                                repaint_after = child_viewport_repaint_after(
-                                    viewport_stream_active(*mode, *replay),
-                                    *replay_open_task_active,
-                                    process_interval_for_view_mode(
-                                        viewer.view_mode,
-                                        *preview_interval_ms,
-                                        *point_cloud_interval_ms,
-                                    ),
-                                    *preview_interval_ms,
-                                );
-                            });
-                        }
-                        if let Some(duration) = repaint_after {
-                            ctx.request_repaint_after(duration);
-                        }
-                        if root_repaint_requested {
-                            request_root_repaint(ctx);
-                        }
-                        if ctx.input(|i| i.viewport().close_requested()) {
-                            if let Ok(mut d) = shared.lock() {
-                                d.close_requested = true;
-                            }
-                            request_root_repaint(ctx);
-                        }
-                    }
-                    egui::viewport::ViewportClass::Embedded => {
-                        let mut open = true;
-                        egui::Window::new("Preview \u{2014} AugurRS")
-                            .open(&mut open)
-                            .default_size([1100.0, 760.0])
-                            .show(ctx, |ui| {
-                                if let Ok(mut data) = shared.lock() {
+                move |ctx, class| {
+                    ctx.set_visuals(viewport_visuals.clone());
+                    match class {
+                        egui::viewport::ViewportClass::Deferred => {
+                            let mut root_repaint_requested = false;
+                            let mut repaint_after = None;
+                            if let Ok(mut data) = shared.lock() {
+                                egui::CentralPanel::default().show(ctx, |ui| {
                                     let PopupSharedData {
                                         viewer,
                                         texture,
@@ -4045,8 +4041,8 @@ impl eframe::App for CameraApp {
                                         last_error,
                                         external_streaming,
                                         external_streaming_label,
-                                        preview_interval_ms: _,
-                                        point_cloud_interval_ms: _,
+                                        preview_interval_ms,
+                                        point_cloud_interval_ms,
                                         close_requested: _,
                                         output,
                                     } = &mut *data;
@@ -4080,22 +4076,117 @@ impl eframe::App for CameraApp {
                                     if viewer.show_aux_windows(ctx) {
                                         popup_output.contrast_changed = true;
                                     }
-                                    if popup_output.requests_root_update() {
-                                        request_root_repaint(ctx);
-                                    }
+                                    root_repaint_requested = popup_output.requests_root_update();
                                     output
                                         .get_or_insert_with(Default::default)
                                         .merge(popup_output);
-                                }
-                            });
-                        if !open {
-                            if let Ok(mut d) = shared.lock() {
-                                d.close_requested = true;
+                                    repaint_after = child_viewport_repaint_after(
+                                        viewport_stream_active(*mode, *replay),
+                                        *replay_open_task_active,
+                                        process_interval_for_view_mode(
+                                            viewer.view_mode,
+                                            *preview_interval_ms,
+                                            *point_cloud_interval_ms,
+                                        ),
+                                        *preview_interval_ms,
+                                    );
+                                });
                             }
-                            request_root_repaint(ctx);
+                            if let Some(duration) = repaint_after {
+                                ctx.request_repaint_after(duration);
+                            }
+                            if root_repaint_requested {
+                                request_root_repaint(ctx);
+                            }
+                            if ctx.input(|i| i.viewport().close_requested()) {
+                                if let Ok(mut d) = shared.lock() {
+                                    d.close_requested = true;
+                                }
+                                request_root_repaint(ctx);
+                            }
                         }
+                        egui::viewport::ViewportClass::Embedded => {
+                            let mut open = true;
+                            egui::Window::new("Preview \u{2014} AugurRS")
+                                .open(&mut open)
+                                .default_size([1100.0, 760.0])
+                                .show(ctx, |ui| {
+                                    if let Ok(mut data) = shared.lock() {
+                                        let PopupSharedData {
+                                            viewer,
+                                            texture,
+                                            frame,
+                                            overlays,
+                                            camera_info,
+                                            nm_per_pixel,
+                                            config,
+                                            mode,
+                                            settings_locked,
+                                            pipeline_stats,
+                                            replay,
+                                            analysis_warnings,
+                                            analysis_notice,
+                                            detected_hotpixels,
+                                            config_dirty,
+                                            acq_dirty,
+                                            replay_open_task_active,
+                                            replay_notice,
+                                            last_error,
+                                            external_streaming,
+                                            external_streaming_label,
+                                            preview_interval_ms: _,
+                                            point_cloud_interval_ms: _,
+                                            close_requested: _,
+                                            output,
+                                        } = &mut *data;
+                                        let input = ViewerInput {
+                                            texture: texture.as_ref(),
+                                            frame: frame.as_ref(),
+                                            overlays,
+                                            camera_info: camera_info.as_ref(),
+                                            nm_per_pixel: *nm_per_pixel,
+                                            config,
+                                            mode: *mode,
+                                            settings_locked: *settings_locked,
+                                            pipeline_stats: pipeline_stats.as_ref(),
+                                            replay: *replay,
+                                            analysis_warnings,
+                                            analysis_notice: analysis_notice.as_deref(),
+                                            detected_hotpixels,
+                                            config_dirty: *config_dirty,
+                                            acq_dirty: *acq_dirty,
+                                            replay_open_task_active: *replay_open_task_active,
+                                            replay_notice: replay_notice.as_deref(),
+                                            last_error: last_error.as_deref(),
+                                            external_streaming: *external_streaming,
+                                            external_streaming_label: external_streaming_label
+                                                .as_str(),
+                                            popup_active: true,
+                                            popup_button_label: "Return to augur",
+                                            popup_button_tooltip: "Return viewer to main window",
+                                            viewer_id: "popup",
+                                        };
+                                        let mut popup_output = draw_viewer(ctx, ui, viewer, input);
+                                        if viewer.show_aux_windows(ctx) {
+                                            popup_output.contrast_changed = true;
+                                        }
+                                        if popup_output.requests_root_update() {
+                                            request_root_repaint(ctx);
+                                        }
+                                        output
+                                            .get_or_insert_with(Default::default)
+                                            .merge(popup_output);
+                                    }
+                                });
+                            if !open {
+                                if let Ok(mut d) = shared.lock() {
+                                    d.close_requested = true;
+                                }
+                                request_root_repaint(ctx);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 },
             );
 
@@ -4125,6 +4216,16 @@ impl eframe::App for CameraApp {
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);
         }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(value) = serde_json::to_string(&self.theme_preference) {
+            storage.set_string(UI_THEME_STORAGE_KEY, value);
+        }
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 
