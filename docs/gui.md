@@ -160,6 +160,7 @@ The center panel switches to a `Replay` heading and shows a transport bar betwee
 - a Speed combo box (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
 - a full-width timeline slider for seeking within the recording
 - current / total replay time
+- after a seek or single-step, the transport snaps to the actual decoded frame position once that replacement frame arrives; the previous frame stays visible until then instead of dropping to the empty placeholder
 
 Enabled plugins continue to process replayed frames through the normal `PreviewFrame` path.
 

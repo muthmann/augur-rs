@@ -91,6 +91,10 @@ Raw replay re-establishes its pacing baseline after a seek on the first decoded 
 Decoded replay can reset immediately from the reopened event index because the event vector is
 already in memory.
 
+On the GUI side, the transport reflects the requested seek position immediately, then snaps to the
+actual decoded frame position once the replacement frame arrives. The previous rendered frame stays
+visible during that handoff instead of dropping to the empty replay placeholder.
+
 ## Files
 
 | File | Role |

@@ -164,6 +164,48 @@ fn derived_replay_preview_interval_ms(acq_time_ms: u64, speed: f32) -> u64 {
     .clamp(10, 200)
 }
 
+fn replay_time_from_fraction(fraction: f32, total_duration_us: u64) -> u64 {
+    ((total_duration_us as f64 * fraction.clamp(0.0, 1.0) as f64).round() as u64)
+        .min(total_duration_us)
+}
+
+fn replay_fraction_from_time(time_us: u64, total_duration_us: u64) -> f32 {
+    if total_duration_us == 0 {
+        0.0
+    } else {
+        (time_us as f64 / total_duration_us as f64) as f32
+    }
+    .clamp(0.0, 1.0)
+}
+
+fn replay_time_from_position_sources(
+    finished: bool,
+    pending_fraction: Option<f32>,
+    displayed_window_end_us: Option<u64>,
+    current_timestamp_us: u64,
+    first_timestamp_us: u64,
+    total_duration_us: u64,
+    byte_fraction: f32,
+) -> u64 {
+    if finished {
+        return total_duration_us;
+    }
+    if let Some(fraction) = pending_fraction {
+        return replay_time_from_fraction(fraction, total_duration_us);
+    }
+    if let Some(window_end_us) = displayed_window_end_us {
+        return window_end_us
+            .saturating_sub(first_timestamp_us)
+            .min(total_duration_us);
+    }
+    if current_timestamp_us > 0 {
+        return current_timestamp_us
+            .saturating_sub(first_timestamp_us)
+            .min(total_duration_us);
+    }
+    replay_time_from_fraction(byte_fraction, total_duration_us)
+}
+
 #[derive(Debug, Clone)]
 struct HostDatasetCacheEntry {
     generation: u64,
@@ -397,6 +439,7 @@ pub struct CameraApp {
     replay_paused: bool,
     replay_finished: bool,
     replay_pause_after_seek_frame: bool,
+    replay_pending_fraction: Option<f32>,
     replay_speed: f32,
     replay_notice: Option<String>,
     replay_open_task: Option<ReplayOpenTask>,
@@ -477,6 +520,7 @@ impl CameraApp {
             replay_paused: false,
             replay_finished: false,
             replay_pause_after_seek_frame: false,
+            replay_pending_fraction: None,
             replay_speed: 1.0,
             replay_notice: None,
             replay_open_task: None,
@@ -2264,6 +2308,7 @@ impl CameraApp {
         self.replay_paused = false;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
+        self.replay_pending_fraction = None;
         self.replay_speed = 1.0;
         self.saved_live_state = Some(saved_live_state);
         self.reset_analysis();
@@ -2624,6 +2669,7 @@ impl CameraApp {
             Err(err) => {
                 self.replay_finished = true;
                 self.replay_paused = true;
+                self.replay_pending_fraction = None;
                 self.last_error = Some(err);
                 if let Some(existing_controls) = &self.replay_controls {
                     existing_controls.paused.store(true, Ordering::Relaxed);
@@ -2643,6 +2689,7 @@ impl CameraApp {
         self.replay_paused = desired_paused;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = pause_after_first_frame;
+        self.replay_pending_fraction = Some(fraction);
         self.last_error = None;
         self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.camera_status = format!(
@@ -2651,9 +2698,7 @@ impl CameraApp {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string())
         );
-        self.latest_frame = None;
         reset_preview_render_cache();
-        self.reset_analysis();
     }
 
     fn restart_replay(&mut self) {
@@ -2677,6 +2722,7 @@ impl CameraApp {
         self.replay_paused = false;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
+        self.replay_pending_fraction = None;
         self.replay_speed = 1.0;
         self.replay_notice = None;
         self.replay_path = None;
@@ -2730,6 +2776,7 @@ impl CameraApp {
         self.replay_finished = true;
         self.replay_paused = true;
         self.replay_pause_after_seek_frame = false;
+        self.replay_pending_fraction = None;
         if self.last_error.is_none() {
             self.camera_status = "Replay finished.".into();
         }
@@ -2894,6 +2941,9 @@ impl CameraApp {
             self.replay_pause_after_seek_frame = false;
             self.replay_paused = true;
         }
+        if self.mode == AppMode::Replaying && self.replay_pending_fraction.is_some() {
+            self.replay_pending_fraction = None;
+        }
 
         self.run_analysis(&frame);
 
@@ -2941,7 +2991,7 @@ impl CameraApp {
             || (self.mode == AppMode::Recording && self.lock_settings_while_recording)
     }
 
-    fn current_replay_fraction(&self) -> f32 {
+    fn current_replay_byte_fraction(&self) -> f32 {
         let Some(controls) = &self.replay_controls else {
             return 0.0;
         };
@@ -2951,6 +3001,45 @@ impl CameraApp {
         }
 
         (controls.bytes_read.load(Ordering::Relaxed) as f32 / total_bytes as f32).clamp(0.0, 1.0)
+    }
+
+    fn replay_displayed_time_us(&self) -> Option<u64> {
+        let info = self.replay_file_info.as_ref()?;
+        if let Some(frame) = &self.latest_frame {
+            return Some(
+                frame
+                    .window_end_us
+                    .saturating_sub(info.first_timestamp_us)
+                    .min(info.total_duration_us),
+            );
+        }
+
+        let current_timestamp_us = self
+            .replay_controls
+            .as_ref()
+            .map(|controls| controls.current_timestamp_us.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        (current_timestamp_us > 0).then_some(
+            current_timestamp_us
+                .saturating_sub(info.first_timestamp_us)
+                .min(info.total_duration_us),
+        )
+    }
+
+    fn current_replay_fraction(&self) -> f32 {
+        let Some(info) = &self.replay_file_info else {
+            return 0.0;
+        };
+        if self.replay_finished {
+            return 1.0;
+        }
+        if let Some(fraction) = self.replay_pending_fraction {
+            return fraction.clamp(0.0, 1.0);
+        }
+        if let Some(time_us) = self.replay_displayed_time_us() {
+            return replay_fraction_from_time(time_us, info.total_duration_us);
+        }
+        self.current_replay_byte_fraction()
     }
 
     fn current_replay_bytes_read(&self) -> u64 {
@@ -2964,18 +3053,18 @@ impl CameraApp {
         let Some(info) = &self.replay_file_info else {
             return 0;
         };
-        if self.replay_finished {
-            return info.total_duration_us;
-        }
-        if let Some(frame) = &self.latest_frame {
-            return frame
-                .window_end_us
-                .saturating_sub(info.first_timestamp_us)
-                .min(info.total_duration_us);
-        }
-
-        ((self.current_replay_fraction() as f64 * info.total_duration_us as f64).round() as u64)
-            .min(info.total_duration_us)
+        replay_time_from_position_sources(
+            self.replay_finished,
+            self.replay_pending_fraction,
+            self.latest_frame.as_ref().map(|frame| frame.window_end_us),
+            self.replay_controls
+                .as_ref()
+                .map(|controls| controls.current_timestamp_us.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            info.first_timestamp_us,
+            info.total_duration_us,
+            self.current_replay_byte_fraction(),
+        )
     }
 
     fn active_preview_process_interval(&self) -> Duration {
@@ -4302,7 +4391,10 @@ impl Drop for CameraApp {
 
 #[cfg(test)]
 mod tests {
-    use super::derived_replay_preview_interval_ms;
+    use super::{
+        derived_replay_preview_interval_ms, replay_fraction_from_time,
+        replay_time_from_position_sources,
+    };
 
     #[test]
     fn replay_preview_interval_scales_with_speed() {
@@ -4316,5 +4408,22 @@ mod tests {
         assert_eq!(derived_replay_preview_interval_ms(1, 4.0), 10);
         assert_eq!(derived_replay_preview_interval_ms(1_000, 0.25), 200);
         assert_eq!(derived_replay_preview_interval_ms(50, f32::INFINITY), 10);
+    }
+
+    #[test]
+    fn replay_time_source_prefers_pending_fraction_over_stale_frame() {
+        assert_eq!(
+            replay_time_from_position_sources(false, Some(0.6), Some(350), 420, 100, 1_000, 0.2,),
+            600
+        );
+    }
+
+    #[test]
+    fn replay_time_source_prefers_displayed_frame_over_byte_fraction() {
+        let time_us =
+            replay_time_from_position_sources(false, None, Some(850), 920, 100, 1_000, 0.2);
+
+        assert_eq!(time_us, 750);
+        assert!((replay_fraction_from_time(time_us, 1_000) - 0.75).abs() < 1e-6);
     }
 }
