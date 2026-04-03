@@ -28,3 +28,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 012: Generic Plugin Boundary With Companion Domain-Type Crates](./012-generic-plugin-boundary-and-companion-types.md)
 - [ADR 013: Self-Describing Recording Metadata](./013-self-describing-recording-metadata.md)
 - [ADR 014: Timestamp-Driven Replay Pacing](./014-timestamp-driven-replay-pacing.md)
+- [ADR 015: Dual-Backend Preview Rendering With WGPU Presentation](./015-dual-backend-preview-rendering.md)

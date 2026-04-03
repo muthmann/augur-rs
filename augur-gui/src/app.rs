@@ -48,9 +48,12 @@ use crate::{
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
     preview::{
-        compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
+        compute_frame_histogram, reset_preview_render_cache, with_prepared_preview_frame,
         PreviewDisplaySettings,
     },
+    preview_perf::{PerfMetricSnapshot, PreviewPerfStats},
+    preview_renderer::{PreviewDisplayTexture, PreviewRenderer},
+    render_backend::ActiveRendererInfo,
     settings::draw_settings,
     viewer_widget::{
         draw_text_placeholder, draw_viewer, AppMode, PreviewTool, ViewMode, ViewerInput,
@@ -109,6 +112,25 @@ fn child_viewport_repaint_after(
 
 fn request_root_repaint(ctx: &egui::Context) {
     ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
+fn draw_preview_perf_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    tooltip: &str,
+    metric: PerfMetricSnapshot,
+) {
+    ui.label(label).on_hover_text(tooltip);
+    if metric.samples == 0 {
+        ui.weak("-");
+        ui.weak("-");
+        ui.weak("-");
+    } else {
+        ui.monospace(format!("{:.2}", metric.last_ms));
+        ui.monospace(format!("{:.2}", metric.avg_ms));
+        ui.monospace(format!("{:.2}", metric.max_ms));
+    }
+    ui.end_row();
 }
 
 fn mib_to_bytes(mib: u64) -> usize {
@@ -231,7 +253,7 @@ struct TiffStackExportTask {
 
 struct PopupSharedData {
     viewer: ViewerState,
-    texture: Option<egui::TextureHandle>,
+    texture: Option<PreviewDisplayTexture>,
     frame: Option<PreviewFrame>,
     overlays: Vec<Overlay>,
     camera_info: Option<DeviceInfo>,
@@ -358,7 +380,11 @@ pub struct CameraApp {
     replay_path: Option<String>,
     mode: AppMode,
     controller: Option<PipelineController>,
-    texture: Option<egui::TextureHandle>,
+    texture: Option<PreviewDisplayTexture>,
+    preview_renderer: PreviewRenderer,
+    preview_perf: PreviewPerfStats,
+    renderer_info: ActiveRendererInfo,
+    preview_renderer_notice: Option<String>,
     latest_frame: Option<PreviewFrame>,
     last_preview_process_at: Option<Instant>,
     replay_controls: Option<ReplayControls>,
@@ -421,6 +447,16 @@ impl CameraApp {
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
         let global_defaults = GlobalSettingsConfig::default();
+        let renderer_info = ActiveRendererInfo::from_creation_context(cc);
+        let (preview_renderer, preview_renderer_notice) = PreviewRenderer::new(cc);
+        eprintln!(
+            "Augur renderer requested={} active={} backend={} adapter={} preview={}",
+            renderer_info.requested.label(),
+            renderer_info.active_renderer,
+            renderer_info.backend,
+            renderer_info.adapter,
+            preview_renderer.label(),
+        );
 
         let mut app = Self {
             config: CameraConfig::default(),
@@ -430,6 +466,10 @@ impl CameraApp {
             mode: AppMode::Idle,
             controller: None,
             texture: None,
+            preview_renderer,
+            preview_perf: PreviewPerfStats::default(),
+            renderer_info,
+            preview_renderer_notice,
             latest_frame: None,
             last_preview_process_at: None,
             replay_controls: None,
@@ -2442,27 +2482,65 @@ impl CameraApp {
         self.with_active_viewer(ViewerState::preview_display_settings)
     }
 
-    fn render_preview_image(&self, frame: &PreviewFrame) -> egui::ColorImage {
+    fn preview_histogram_needed(&self) -> bool {
+        self.with_active_viewer(ViewerState::needs_preview_histogram)
+    }
+
+    fn apply_aux_window_changes(
+        &mut self,
+        ctx: &egui::Context,
+        contrast_changed: bool,
+        histogram_visibility_changed: bool,
+    ) {
+        if contrast_changed || histogram_visibility_changed {
+            self.refresh_preview_if_needed(ctx, true);
+        }
+    }
+
+    fn render_preview_texture_payload(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &PreviewFrame,
+    ) -> Result<PreviewDisplayTexture, String> {
         let (preview_mode, time_surface_tau_us) =
             self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
-        frame_to_color_image(
-            frame,
-            &self.analysis_output.overlays,
-            self.preview_display_settings(),
-            preview_mode,
-            time_surface_tau_us,
-        )
+        let settings = self.preview_display_settings();
+        let preview_renderer = &mut self.preview_renderer;
+        let preview_perf = &mut self.preview_perf;
+        with_prepared_preview_frame(frame, preview_mode, time_surface_tau_us, |prepared| {
+            preview_renderer.render(ctx, prepared, settings, preview_mode, preview_perf)
+        })
+    }
+
+    fn render_preview_texture_from_frame(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &PreviewFrame,
+    ) -> Result<(), String> {
+        match self.render_preview_texture_payload(ctx, frame) {
+            Ok(texture) => {
+                self.texture = Some(texture);
+                Ok(())
+            }
+            Err(err) if self.preview_renderer.is_wgpu() => {
+                self.preview_renderer = PreviewRenderer::cpu_fallback();
+                self.preview_renderer_notice = Some(format!(
+                    "WGPU preview renderer failed at runtime and was replaced with the CPU fallback: {err}"
+                ));
+                let texture = self.render_preview_texture_payload(ctx, frame)?;
+                self.texture = Some(texture);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn refresh_preview_texture_from_latest_frame(&mut self, ctx: &egui::Context) {
-        let Some(frame) = self.latest_frame.as_ref() else {
+        let Some(frame) = self.latest_frame.clone() else {
             return;
         };
-        let image = self.render_preview_image(frame);
-        if let Some(texture) = &mut self.texture {
-            texture.set(image, egui::TextureOptions::LINEAR);
-        } else {
-            self.texture = Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
+        if let Err(err) = self.render_preview_texture_from_frame(ctx, &frame) {
+            self.last_error = Some(format!("preview render failed: {err}"));
         }
     }
 
@@ -2474,14 +2552,19 @@ impl CameraApp {
         if !settings_changed || self.active_view_mode() != ViewMode::Preview2d {
             return;
         }
-        let Some(frame) = self.latest_frame.as_ref() else {
+        let Some(frame) = self.latest_frame.clone() else {
             return;
         };
-        let (preview_mode, time_surface_tau_us) =
-            self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
-        let histogram = compute_frame_histogram(frame, preview_mode, time_surface_tau_us);
-        self.apply_preview_histogram(histogram);
-        if self.mode != AppMode::Idle {
+        if self.preview_histogram_needed() {
+            let histogram_started = Instant::now();
+            let (preview_mode, time_surface_tau_us) =
+                self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
+            let histogram = compute_frame_histogram(&frame, preview_mode, time_surface_tau_us);
+            self.preview_perf
+                .record_histogram(histogram_started.elapsed());
+            self.apply_preview_histogram(histogram);
+        }
+        if self.mode != AppMode::Idle && !self.external_tool_status().is_streaming() {
             self.refresh_preview_texture_from_latest_frame(ctx);
         }
     }
@@ -2625,6 +2708,8 @@ impl CameraApp {
             self.clear_replay_state();
         }
         self.texture = None;
+        self.preview_renderer.reset();
+        self.preview_perf.reset();
         self.latest_frame = None;
         reset_preview_render_cache();
         self.last_preview_process_at = None;
@@ -2792,6 +2877,7 @@ impl CameraApp {
             return;
         };
 
+        let dequeue_started = Instant::now();
         let mut newest_frame = None;
         while let Ok(frame) = ctrl.frame_rx.try_recv() {
             newest_frame = Some(frame);
@@ -2800,6 +2886,7 @@ impl CameraApp {
         let Some(frame) = newest_frame else {
             return;
         };
+        self.preview_perf.record_dequeue(dequeue_started.elapsed());
 
         let external_streaming = self.external_tool_status().is_streaming();
         let needs_texture = !external_streaming && self.active_view_mode() == ViewMode::Preview2d;
@@ -2822,21 +2909,40 @@ impl CameraApp {
             self.replay_paused = true;
         }
 
+        let frame_total_started = Instant::now();
+        let analysis_started = Instant::now();
         self.run_analysis(&frame);
+        self.preview_perf
+            .record_analysis(analysis_started.elapsed());
 
-        let (preview_mode, time_surface_tau_us) =
-            self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
-        let histogram = compute_frame_histogram(&frame, preview_mode, time_surface_tau_us);
-        self.apply_preview_histogram(histogram);
+        if self.preview_histogram_needed() {
+            let histogram_started = Instant::now();
+            let (preview_mode, time_surface_tau_us) =
+                self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
+            let histogram = compute_frame_histogram(&frame, preview_mode, time_surface_tau_us);
+            self.preview_perf
+                .record_histogram(histogram_started.elapsed());
+            self.apply_preview_histogram(histogram);
+        }
 
+        let mut line_profile_elapsed = None;
         self.with_active_viewer_mut(|viewer| {
-            if viewer.line_profile_tool.has_line() {
+            if viewer.needs_line_profile_refresh() {
+                let line_profile_started = Instant::now();
                 viewer.line_profile_tool.recompute(&frame);
+                line_profile_elapsed = Some(line_profile_started.elapsed());
             }
         });
+        if let Some(duration) = line_profile_elapsed {
+            self.preview_perf.record_line_profile(duration);
+        }
 
         let external_tool_error = if let Some(tool) = &mut self.external_tool {
-            tool.send_frame(&frame, self.nm_per_pixel)
+            let bridge_started = Instant::now();
+            let result = tool.send_frame(&frame, self.nm_per_pixel);
+            self.preview_perf
+                .record_external_bridge(bridge_started.elapsed());
+            result
                 .err()
                 .map(|err| format!("{} bridge failed: {err}", tool.name()))
         } else {
@@ -2848,12 +2954,8 @@ impl CameraApp {
         }
 
         if needs_texture {
-            let image = self.render_preview_image(&frame);
-            if let Some(texture) = &mut self.texture {
-                texture.set(image, egui::TextureOptions::LINEAR);
-            } else {
-                self.texture =
-                    Some(ctx.load_texture("preview", image, egui::TextureOptions::LINEAR));
+            if let Err(err) = self.render_preview_texture_from_frame(ctx, &frame) {
+                self.last_error = Some(format!("preview render failed: {err}"));
             }
         }
         if let Some(events) = frame.events.as_deref() {
@@ -2861,6 +2963,8 @@ impl CameraApp {
         }
         self.latest_frame = Some(frame);
         self.last_preview_process_at = Some(Instant::now());
+        self.preview_perf
+            .record_frame_total(frame_total_started.elapsed());
     }
 
     fn settings_are_locked(&self) -> bool {
@@ -3188,6 +3292,25 @@ impl eframe::App for CameraApp {
                     const PREVIEW_UPDATE_TOOLTIP: &str = "Maximum redraw interval for the 2D preview. Lower values give a smoother display but higher CPU/GPU load. Does not affect recording or replay timing. Default 33 ms is about 30 fps.";
                     const POINT_CLOUD_UPDATE_TOOLTIP: &str = "Maximum redraw interval for the 3D point cloud view. Lower values are smoother but more GPU-intensive. Default 67 ms is about 15 fps.";
                     const DISK_WRITER_BUFFER_TOOLTIP: &str = "Write buffer size for the recording output file. Larger buffers reduce disk I/O pressure during high-bandwidth recordings. Only editable when idle.";
+                    const PREVIEW_RENDERER_TOOLTIP: &str = "Developer-facing diagnostics for the active graphics backend and preview timings. For glow versus wgpu, compare the same replay or live workload with matching preview mode, zoom, and window size.";
+                    const REQUESTED_RENDERER_TOOLTIP: &str = "The renderer preference requested through AUGUR_RENDERER. In auto mode this is the preferred backend, not necessarily the one that ended up active.";
+                    const ACTIVE_APP_RENDERER_TOOLTIP: &str = "The renderer backend currently used by eframe for the app window. This is the high-level GUI backend, for example glow or wgpu.";
+                    const ACTIVE_PREVIEW_RENDERER_TOOLTIP: &str = "The renderer currently generating preview textures. On a wgpu app run this can still fall back to the CPU path if the preview shader pipeline fails.";
+                    const BACKEND_TOOLTIP: &str = "The low-level graphics API backend selected by wgpu, such as Metal, Vulkan, D3D12, or the OpenGL compatibility path.";
+                    const ADAPTER_TOOLTIP: &str = "The GPU adapter string reported by wgpu for the active device and driver.";
+                    const PERF_STAGE_TOOLTIP: &str = "Rolling timings for the accepted preview-frame hot path. Use Frame total as the main glow versus wgpu comparison, then use the rows below it to explain where time goes.";
+                    const PERF_LAST_TOOLTIP: &str = "Duration of the most recent sample for this stage in milliseconds.";
+                    const PERF_AVG_TOOLTIP: &str = "Rolling arithmetic mean for this stage since app start or the last timing reset.";
+                    const PERF_MAX_TOOLTIP: &str = "Slowest observed sample for this stage since app start or the last timing reset.";
+                    const FRAME_TOTAL_TOOLTIP: &str = "Primary apples-to-apples comparison metric for glow versus wgpu. This measures the end-to-end CPU-side work for one accepted preview frame after throttling has allowed it through, including analysis, optional derived work, bridge send, and preview rendering when the 2D viewer is active.";
+                    const DEQUEUE_TOOLTIP: &str = "Time spent draining pending preview frames and keeping only the newest one. Useful for backlog diagnosis, but not the main glow versus wgpu comparison metric because queue pressure can vary with workload.";
+                    const ANALYSIS_TOOLTIP: &str = "Time spent in host-side frame analysis, including built-in analysis and enabled plugin processing.";
+                    const HISTOGRAM_TOOLTIP: &str = "Time spent computing the preview histogram when auto-contrast or the histogram window requires it.";
+                    const LINE_PROFILE_TOOLTIP: &str = "Time spent recomputing the ON/OFF line profile for the active measurement line.";
+                    const CPU_FALLBACK_RENDER_TOOLTIP: &str = "CPU time to convert prepared preview payloads into an egui ColorImage. This is specific to the glow path and CPU fallback path, so treat it as a supporting diagnostic rather than the cross-backend headline number.";
+                    const UPLOAD_SUBMIT_TOOLTIP: &str = "CPU-side time to stage preview image or payload data and submit render work to the active backend. This does not wait for GPU completion, so it is useful for pipeline breakdowns but not as the main renderer A/B metric.";
+                    const EXTERNAL_BRIDGE_TOOLTIP: &str = "Time spent forwarding the current frame to an external bridge such as ImageJ.";
+                    const RESET_PREVIEW_TIMINGS_TOOLTIP: &str = "Clear the rolling preview timing history so the next samples reflect the current replay, mode, zoom, and window size.";
                     let mut global_settings_changed = false;
 
                     ui.horizontal(|ui| {
@@ -3321,6 +3444,109 @@ impl eframe::App for CameraApp {
                                 global_settings_changed = true;
                             }
                         });
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Preview renderer")
+                                .on_hover_text(PREVIEW_RENDERER_TOOLTIP);
+                            if ui
+                                .small_button("Reset timings")
+                                .on_hover_text(RESET_PREVIEW_TIMINGS_TOOLTIP)
+                                .clicked()
+                            {
+                                self.preview_perf.reset();
+                            }
+                        });
+                        egui::Grid::new("preview_renderer_info_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.small("Requested renderer")
+                                    .on_hover_text(REQUESTED_RENDERER_TOOLTIP);
+                                ui.monospace(self.renderer_info.requested.label());
+                                ui.end_row();
+
+                                ui.small("App renderer")
+                                    .on_hover_text(ACTIVE_APP_RENDERER_TOOLTIP);
+                                ui.monospace(&self.renderer_info.active_renderer);
+                                ui.end_row();
+
+                                ui.small("Preview renderer")
+                                    .on_hover_text(ACTIVE_PREVIEW_RENDERER_TOOLTIP);
+                                ui.monospace(self.preview_renderer.label());
+                                ui.end_row();
+
+                                ui.small("Backend").on_hover_text(BACKEND_TOOLTIP);
+                                ui.monospace(&self.renderer_info.backend);
+                                ui.end_row();
+
+                                ui.small("Adapter").on_hover_text(ADAPTER_TOOLTIP);
+                                ui.monospace(&self.renderer_info.adapter);
+                                ui.end_row();
+                            });
+                        if let Some(notice) = &self.preview_renderer_notice {
+                            ui.colored_label(ui.visuals().warn_fg_color, notice);
+                        }
+
+                        let perf = self.preview_perf.snapshot();
+                        egui::Grid::new("preview_perf_grid")
+                            .num_columns(4)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("Stage").on_hover_text(PERF_STAGE_TOOLTIP);
+                                ui.strong("Last [ms]").on_hover_text(PERF_LAST_TOOLTIP);
+                                ui.strong("Avg [ms]").on_hover_text(PERF_AVG_TOOLTIP);
+                                ui.strong("Max [ms]").on_hover_text(PERF_MAX_TOOLTIP);
+                                ui.end_row();
+                                draw_preview_perf_row(
+                                    ui,
+                                    "Frame total",
+                                    FRAME_TOTAL_TOOLTIP,
+                                    perf.frame_total,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "Dequeue",
+                                    DEQUEUE_TOOLTIP,
+                                    perf.dequeue,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "Analysis",
+                                    ANALYSIS_TOOLTIP,
+                                    perf.analysis,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "Histogram",
+                                    HISTOGRAM_TOOLTIP,
+                                    perf.histogram,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "Line profile",
+                                    LINE_PROFILE_TOOLTIP,
+                                    perf.line_profile,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "CPU fallback render",
+                                    CPU_FALLBACK_RENDER_TOOLTIP,
+                                    perf.cpu_fallback_render,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "Texture stage/submit",
+                                    UPLOAD_SUBMIT_TOOLTIP,
+                                    perf.upload_submit,
+                                );
+                                draw_preview_perf_row(
+                                    ui,
+                                    "External bridge",
+                                    EXTERNAL_BRIDGE_TOOLTIP,
+                                    perf.external_bridge,
+                                );
+                            });
                     });
 
                     if global_settings_changed {
@@ -3904,10 +4130,12 @@ impl eframe::App for CameraApp {
             self.handle_viewer_output(ctx, output, false);
         }
         if !self.popup_open {
-            let contrast_changed = self.viewer.show_aux_windows(ctx);
-            if contrast_changed {
-                self.refresh_preview_if_needed(ctx, true);
-            }
+            let aux = self.viewer.show_aux_windows(ctx);
+            self.apply_aux_window_changes(
+                ctx,
+                aux.contrast_changed,
+                aux.histogram_visibility_changed,
+            );
         }
         self.show_imagej_dialog(ctx);
         if let Some(action) = self.export_dialog.show(ctx) {
@@ -3984,9 +4212,10 @@ impl eframe::App for CameraApp {
                                     viewer_id: "popup",
                                 };
                                 let mut popup_output = draw_viewer(ctx, ui, viewer, input);
-                                if viewer.show_aux_windows(ctx) {
-                                    popup_output.contrast_changed = true;
-                                }
+                                let aux = viewer.show_aux_windows(ctx);
+                                popup_output.contrast_changed |= aux.contrast_changed;
+                                popup_output.histogram_visibility_changed |=
+                                    aux.histogram_visibility_changed;
                                 root_repaint_requested = popup_output.requests_root_update();
                                 output
                                     .get_or_insert_with(Default::default)
@@ -4077,9 +4306,10 @@ impl eframe::App for CameraApp {
                                         viewer_id: "popup",
                                     };
                                     let mut popup_output = draw_viewer(ctx, ui, viewer, input);
-                                    if viewer.show_aux_windows(ctx) {
-                                        popup_output.contrast_changed = true;
-                                    }
+                                    let aux = viewer.show_aux_windows(ctx);
+                                    popup_output.contrast_changed |= aux.contrast_changed;
+                                    popup_output.histogram_visibility_changed |=
+                                        aux.histogram_visibility_changed;
                                     if popup_output.requests_root_update() {
                                         request_root_repaint(ctx);
                                     }

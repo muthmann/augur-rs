@@ -17,6 +17,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
 - [Performance Safeguards](./performance-safeguards.md) — capture-path fail-fast setup, stop-time drain behavior, preview throttling, and UI-side load shedding
 - [Performance Overhaul](./performance-overhaul.md) — split pipeline telemetry, direct `Color32` preview rendering, async decoded replay opening, and generation-aware host caching
+- [WGPU Preview Rendering](./wgpu-preview-rendering.md) — dual-backend startup, shader-driven preview textures, shared overlay painting, and preview perf telemetry
 - [Global Settings Menu and Replay Pacing](./global-settings-menu.md) — top-bar settings controls, hover/reference guidance, persisted `[global]` config, plugin `GlobalSettings`, replay-editable acquisition time, and speed-change replay resets
 - [Replay Timing Model](./replay-timing-model.md) — timestamp-driven replay pacing, auto-derived replay display cadence, and preview-frame load shedding
 - [TIFF Stack Export](./tiff-stack-export.md) — File-menu batch export of replay accumulations to multi-page 16-bit TIFF with time-window and ROI controls

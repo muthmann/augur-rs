@@ -13,6 +13,7 @@ use crate::{
     preview::{
         query_time_surface_value, reset_preview_render_cache, PreviewDisplaySettings, PreviewMode,
     },
+    preview_renderer::PreviewDisplayTexture,
     viewer_tools::{
         compute_scale_bar, AnnotationManager, AnnotationShape, AnnotationShapeKind, ContrastMode,
         ContrastSettings, HistogramWindow, LineProfileTool, RulerTool, ScaleBarPosition,
@@ -146,6 +147,7 @@ pub(crate) struct ViewerOutput {
     pub(crate) new_roi: Option<RoiConfig>,
     pub(crate) preview_mode_changed: bool,
     pub(crate) contrast_changed: bool,
+    pub(crate) histogram_visibility_changed: bool,
     pub(crate) time_surface_tau_changed: bool,
     pub(crate) popup_toggled: bool,
     pub(crate) return_from_external: bool,
@@ -159,7 +161,10 @@ pub(crate) struct ViewerOutput {
 
 impl ViewerOutput {
     pub(crate) fn needs_preview_refresh(&self) -> bool {
-        self.preview_mode_changed || self.contrast_changed || self.time_surface_tau_changed
+        self.preview_mode_changed
+            || self.contrast_changed
+            || self.histogram_visibility_changed
+            || self.time_surface_tau_changed
     }
 
     pub(crate) fn requests_root_update(&self) -> bool {
@@ -182,6 +187,7 @@ impl ViewerOutput {
         }
         self.preview_mode_changed |= other.preview_mode_changed;
         self.contrast_changed |= other.contrast_changed;
+        self.histogram_visibility_changed |= other.histogram_visibility_changed;
         self.time_surface_tau_changed |= other.time_surface_tau_changed;
         self.popup_toggled |= other.popup_toggled;
         self.return_from_external |= other.return_from_external;
@@ -270,14 +276,34 @@ impl ViewerState {
         self.histogram_window.set_histogram(histogram);
     }
 
-    pub(crate) fn show_aux_windows(&mut self, ctx: &egui::Context) -> bool {
+    pub(crate) fn show_aux_windows(&mut self, ctx: &egui::Context) -> ViewerAuxChanges {
         let previous_contrast = self.contrast_settings.clone();
+        let histogram_was_open = self.histogram_window.open;
         self.histogram_window
             .show(ctx, &mut self.contrast_settings, self.preview_mode);
         let contrast_changed = self.contrast_settings != previous_contrast;
         self.line_profile_tool.show_window(ctx);
-        contrast_changed
+        ViewerAuxChanges {
+            contrast_changed,
+            histogram_visibility_changed: self.histogram_window.open != histogram_was_open,
+        }
     }
+
+    pub(crate) fn needs_preview_histogram(&self) -> bool {
+        self.contrast_settings.mode == ContrastMode::Auto || self.histogram_window.open
+    }
+
+    pub(crate) fn needs_line_profile_refresh(&self) -> bool {
+        self.line_profile_tool.has_line()
+            && (self.line_profile_tool.window_open
+                || self.workspace.tool == PreviewTool::LineProfile)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ViewerAuxChanges {
+    pub(crate) contrast_changed: bool,
+    pub(crate) histogram_visibility_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -294,7 +320,7 @@ pub(crate) struct ViewerReplayState {
 }
 
 pub(crate) struct ViewerInput<'a> {
-    pub(crate) texture: Option<&'a egui::TextureHandle>,
+    pub(crate) texture: Option<&'a PreviewDisplayTexture>,
     pub(crate) frame: Option<&'a PreviewFrame>,
     pub(crate) overlays: &'a [Overlay],
     pub(crate) camera_info: Option<&'a DeviceInfo>,
@@ -326,7 +352,6 @@ pub(crate) fn draw_viewer(
     state: &mut ViewerState,
     input: ViewerInput<'_>,
 ) -> ViewerOutput {
-    let _ = input.overlays;
     let mut output = ViewerOutput::default();
     let mut pc_metrics: Option<PointCloudMetrics> = None;
 
@@ -345,7 +370,7 @@ pub(crate) fn draw_viewer(
     let controls_reserve = 190.0;
 
     if input.external_streaming {
-        output.popup_toggled |= draw_preview_toolbar(ui, state, input.popup_active, &input);
+        output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
         let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
         draw_text_placeholder(ui, max_image_height, input.external_streaming_label);
         ui.add_space(8.0);
@@ -355,7 +380,7 @@ pub(crate) fn draw_viewer(
     } else {
         match state.view_mode {
             ViewMode::Preview2d => {
-                output.popup_toggled |= draw_preview_toolbar(ui, state, input.popup_active, &input);
+                output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
                 let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
                 if let (Some(texture), Some(frame)) = (input.texture, input.frame) {
                     let scale_bar_settings = state.scale_bar_settings.clone();
@@ -363,6 +388,7 @@ pub(crate) fn draw_viewer(
                         ui,
                         texture,
                         frame,
+                        input.overlays,
                         input.config,
                         state,
                         PreviewCanvasOptions {
@@ -685,14 +711,14 @@ fn draw_preview_toolbar(
     state: &mut ViewerState,
     popup_active: bool,
     input: &ViewerInput<'_>,
-) -> bool {
+) -> ViewerOutput {
     let selected_annotation = state.annotation_manager.selected_id();
     let workspace = &mut state.workspace;
     let line_profile_tool = &mut state.line_profile_tool;
     let ruler_tool = &mut state.ruler_tool;
     let histogram_open = &mut state.histogram_window.open;
 
-    let mut popup_toggled = false;
+    let mut output = ViewerOutput::default();
     ui.horizontal(|ui| {
         if ui
             .add(egui::SelectableLabel::new(
@@ -813,6 +839,7 @@ fn draw_preview_toolbar(
             .clicked()
         {
             *histogram_open = !*histogram_open;
+            output.histogram_visibility_changed = true;
         }
 
         if ui
@@ -823,7 +850,7 @@ fn draw_preview_toolbar(
             .on_hover_text(input.popup_button_tooltip)
             .clicked()
         {
-            popup_toggled = true;
+            output.popup_toggled = true;
         }
 
         ui.separator();
@@ -879,7 +906,7 @@ fn draw_preview_toolbar(
         }
     });
 
-    popup_toggled
+    output
 }
 
 fn activate_pointer_tool(state: &mut ViewerState) {
@@ -1013,8 +1040,9 @@ struct PreviewCanvasOptions {
 
 fn draw_preview_canvas(
     ui: &mut egui::Ui,
-    texture: &egui::TextureHandle,
+    texture: &PreviewDisplayTexture,
     frame: &PreviewFrame,
+    overlays: &[Overlay],
     config: &CameraConfig,
     state: &mut ViewerState,
     options: PreviewCanvasOptions,
@@ -1038,9 +1066,7 @@ fn draw_preview_canvas(
     let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(display_size, canvas_rect);
     ui.painter()
         .rect_filled(canvas_rect, 4.0, ui.visuals().faint_bg_color);
-    egui::Image::new(texture)
-        .uv(viewport.uv_rect(frame))
-        .paint_at(ui, image_rect);
+    texture.paint_at(ui, image_rect, viewport.uv_rect(frame));
 
     workspace.hover_sensor = response
         .hover_pos()
@@ -1226,6 +1252,7 @@ fn draw_preview_canvas(
     let painter = ui
         .painter()
         .with_clip_rect(image_rect.intersect(ui.clip_rect()));
+    paint_analysis_overlays(&painter, image_rect, viewport, overlays);
     if let Some(current_roi) = viewport.roi_rect {
         if !workspace.crop_active() {
             paint_sensor_rect(
@@ -1558,6 +1585,65 @@ fn paint_sensor_rect(
         viewport.sensor_to_screen(image_rect, sensor_rect.max),
     );
     painter.rect_stroke(screen_rect, 0.0, stroke);
+}
+
+fn paint_analysis_overlays(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    overlays: &[Overlay],
+) {
+    for overlay in overlays {
+        match overlay {
+            Overlay::HighlightPixels { pixels, color } => {
+                let fill =
+                    egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                for pixel in pixels {
+                    let min = viewport.sensor_to_screen(
+                        image_rect,
+                        egui::pos2(f32::from(pixel.x), f32::from(pixel.y)),
+                    );
+                    let max = viewport.sensor_to_screen(
+                        image_rect,
+                        egui::pos2(
+                            f32::from(pixel.x.saturating_add(1)),
+                            f32::from(pixel.y.saturating_add(1)),
+                        ),
+                    );
+                    painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, fill);
+                }
+            }
+            Overlay::CrosshairMarkers {
+                markers,
+                color,
+                arm_len,
+            } => {
+                let overlay_color =
+                    egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+                let shadow = egui::Color32::from_rgba_premultiplied(0, 0, 0, color[3].min(180));
+                for marker in markers {
+                    let center =
+                        viewport.sensor_to_screen(image_rect, egui::pos2(marker.x, marker.y));
+                    let arm_x = image_rect.width()
+                        * (f32::from(*arm_len) / viewport.visible_sensor_rect.width().max(1.0));
+                    let arm_y = image_rect.height()
+                        * (f32::from(*arm_len) / viewport.visible_sensor_rect.height().max(1.0));
+                    let horizontal = [
+                        egui::pos2(center.x - arm_x, center.y),
+                        egui::pos2(center.x + arm_x, center.y),
+                    ];
+                    let vertical = [
+                        egui::pos2(center.x, center.y - arm_y),
+                        egui::pos2(center.x, center.y + arm_y),
+                    ];
+                    painter.line_segment(horizontal, egui::Stroke::new(3.0, shadow));
+                    painter.line_segment(vertical, egui::Stroke::new(3.0, shadow));
+                    painter.line_segment(horizontal, egui::Stroke::new(1.5, overlay_color));
+                    painter.line_segment(vertical, egui::Stroke::new(1.5, overlay_color));
+                }
+            }
+        }
+    }
 }
 
 fn paint_sensor_line(
