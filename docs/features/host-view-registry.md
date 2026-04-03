@@ -33,8 +33,8 @@ Current view kinds:
 
 ## Resolution Rules
 
-The host walks enabled built-in plugins first, then enabled runtime plugins, in the same order used
-for frame processing.
+The host walks enabled runtime plugins in the same order used for frame
+processing.
 
 - later providers override earlier ones only when the descriptor metadata matches exactly
 - conflicting duplicate ids are ignored and logged

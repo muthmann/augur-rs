@@ -44,10 +44,9 @@ use crate::{
         Scatter2dViewOptions, ScatterWindowViewportData, SeriesWindowViewportData,
         TableWindowViewportData,
     },
-    plugin::AnalysisPlugin,
+    hotpixel::BuiltInHotpixelDetection,
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
-    plugins::create_all_plugins,
     preview::{
         compute_frame_histogram, frame_to_color_image, reset_preview_render_cache,
         PreviewDisplaySettings,
@@ -363,7 +362,7 @@ pub struct CameraApp {
     replay_notice: Option<String>,
     replay_open_task: Option<ReplayOpenTask>,
     saved_live_state: Option<SavedLiveState>,
-    builtin_plugins: Vec<Box<dyn AnalysisPlugin>>,
+    hotpixel_detection: BuiltInHotpixelDetection,
     plugin_manager: PluginManager,
     plugin_context_data: HashMap<String, Vec<u8>>,
     persistent_context_data: HashMap<String, Vec<u8>>,
@@ -434,7 +433,7 @@ impl CameraApp {
             replay_notice: None,
             replay_open_task: None,
             saved_live_state: None,
-            builtin_plugins: create_all_plugins(),
+            hotpixel_detection: BuiltInHotpixelDetection::default(),
             plugin_manager,
             plugin_context_data: HashMap::new(),
             persistent_context_data: HashMap::new(),
@@ -899,9 +898,7 @@ impl CameraApp {
     }
 
     fn reset_analysis(&mut self) {
-        for plugin in &mut self.builtin_plugins {
-            plugin.reset();
-        }
+        self.hotpixel_detection.reset();
         for record in self.plugin_manager.records_mut() {
             if let Some(plugin) = record.plugin_mut() {
                 plugin.reset();
@@ -934,18 +931,6 @@ impl CameraApp {
         self.host_view_registry_dirty = false;
         let mut contributions = Vec::new();
         let mut warnings = Vec::new();
-
-        for (index, plugin) in self.builtin_plugins.iter().enumerate() {
-            if !plugin.enabled() {
-                continue;
-            }
-
-            contributions.push(HostRegistryContribution {
-                provider: HostViewProviderKey::Builtin(index),
-                provider_name: plugin.name().to_owned(),
-                registry: plugin.host_views(),
-            });
-        }
 
         for (index, record) in self.plugin_manager.records().iter().enumerate() {
             let Some(plugin) = record.plugin() else {
@@ -992,15 +977,6 @@ impl CameraApp {
         };
 
         let bytes = match dataset.provider {
-            HostViewProviderKey::Builtin(index) => self
-                .builtin_plugins
-                .get(index)
-                .and_then(|plugin| {
-                    plugin
-                        .enabled()
-                        .then(|| plugin.host_view_dataset(dataset_id))
-                })
-                .flatten(),
             HostViewProviderKey::Runtime(index) => {
                 let Some(record) = self.plugin_manager.records().get(index) else {
                     return Err(format!(
@@ -1029,15 +1005,6 @@ impl CameraApp {
         };
 
         Ok(match dataset.provider {
-            HostViewProviderKey::Builtin(index) => self
-                .builtin_plugins
-                .get(index)
-                .and_then(|plugin| {
-                    plugin
-                        .enabled()
-                        .then(|| plugin.host_view_dataset_generation(dataset_id))
-                })
-                .unwrap_or(0),
             HostViewProviderKey::Runtime(index) => {
                 let Some(record) = self.plugin_manager.records().get(index) else {
                     return Err(format!(
@@ -1173,24 +1140,16 @@ impl CameraApp {
             return;
         };
 
-        reset_provider_for_dataset(
-            &dataset,
-            |index| {
-                if let Some(plugin) = self.builtin_plugins.get_mut(index) {
-                    plugin.reset();
-                }
-            },
-            |index| {
-                if let Some(plugin) = self
-                    .plugin_manager
-                    .records_mut()
-                    .get_mut(index)
-                    .and_then(|record| record.plugin_mut())
-                {
-                    plugin.reset();
-                }
-            },
-        );
+        reset_provider_for_dataset(&dataset, |index| {
+            if let Some(plugin) = self
+                .plugin_manager
+                .records_mut()
+                .get_mut(index)
+                .and_then(|record| record.plugin_mut())
+            {
+                plugin.reset();
+            }
+        });
 
         self.mark_host_view_datasets_stale();
         self.refresh_host_view_registry();
@@ -1951,25 +1910,19 @@ impl CameraApp {
     }
 
     fn plugins_need_raw_events(&self) -> bool {
-        self.builtin_plugins
-            .iter()
-            .any(|plugin| plugin.enabled() && plugin.input_kind() == PluginInput::RawEvents)
-            || self.plugin_manager.records().iter().any(|record| {
-                record.plugin().is_some_and(|plugin| {
-                    plugin.enabled() && plugin.input_kind() == PluginInput::RawEvents
-                })
+        self.plugin_manager.records().iter().any(|record| {
+            record.plugin().is_some_and(|plugin| {
+                plugin.enabled() && plugin.input_kind() == PluginInput::RawEvents
             })
+        })
     }
 
     fn plugins_need_retained_event_history(&self) -> bool {
-        self.builtin_plugins
-            .iter()
-            .any(|plugin| plugin.enabled() && plugin.capabilities().retained_event_history)
-            || self.plugin_manager.records().iter().any(|record| {
-                record.plugin().is_some_and(|plugin| {
-                    plugin.enabled() && plugin.capabilities().retained_event_history
-                })
+        self.plugin_manager.records().iter().any(|record| {
+            record.plugin().is_some_and(|plugin| {
+                plugin.enabled() && plugin.capabilities().retained_event_history
             })
+        })
     }
 
     fn raw_events_required(&self) -> bool {
@@ -1992,21 +1945,13 @@ impl CameraApp {
     }
 
     fn enabled_plugin_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .builtin_plugins
+        self.plugin_manager
+            .records()
             .iter()
+            .filter_map(|record| record.plugin())
             .filter(|plugin| plugin.enabled())
             .map(|plugin| plugin.name().to_owned())
-            .collect();
-        names.extend(
-            self.plugin_manager
-                .records()
-                .iter()
-                .filter_map(|record| record.plugin())
-                .filter(|plugin| plugin.enabled())
-                .map(|plugin| plugin.name().to_owned()),
-        );
-        names
+            .collect()
     }
 
     fn validated_output_path(&self) -> Result<PathBuf, String> {
@@ -2750,9 +2695,13 @@ impl CameraApp {
         self.last_error = None;
     }
 
-    fn run_analysis_plugins(&mut self, frame: &PreviewFrame) {
+    fn run_analysis(&mut self, frame: &PreviewFrame) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
+        if self.hotpixel_detection.enabled() {
+            self.hotpixel_detection
+                .process_frame(frame, &mut self.analysis_output);
+        }
         let global_settings = GlobalSettings {
             nm_per_pixel: self.nm_per_pixel,
             sensor_width: self.sensor_width,
@@ -2803,12 +2752,6 @@ impl CameraApp {
             PluginInput::RawEvents,
             PluginInput::DerivedData,
         ] {
-            for plugin in &mut self.builtin_plugins {
-                if plugin.enabled() && plugin.input_kind() == phase {
-                    plugin.process_frame(frame, &mut self.analysis_output);
-                }
-            }
-
             for record in self.plugin_manager.records_mut() {
                 let Some(plugin) = record.plugin_mut() else {
                     continue;
@@ -2862,7 +2805,7 @@ impl CameraApp {
             self.replay_paused = true;
         }
 
-        self.run_analysis_plugins(&frame);
+        self.run_analysis(&frame);
 
         let (preview_mode, time_surface_tau_us) =
             self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
@@ -2954,22 +2897,7 @@ impl CameraApp {
     }
 
     fn latest_detected_hotpixels(&self) -> Vec<(u16, u16)> {
-        let mut pixels = Vec::new();
-        for overlay in &self.analysis_output.overlays {
-            if let Overlay::HighlightPixels {
-                pixels: highlighted,
-                ..
-            } = overlay
-            {
-                for pixel in highlighted {
-                    let coords = (pixel.x, pixel.y);
-                    if !pixels.contains(&coords) {
-                        pixels.push(coords);
-                    }
-                }
-            }
-        }
-        pixels
+        self.hotpixel_detection.detected_pixels().to_vec()
     }
 
     fn copy_detected_hotpixels_to_mask(&mut self) {
@@ -3018,7 +2946,7 @@ impl eframe::App for CameraApp {
 
         let mode = self.mode;
         let settings_locked = self.settings_are_locked();
-        let mut plugin_toggle_changed = false;
+        let mut analysis_toggle_changed = false;
         let mut view_mode_changed = false;
         let mut plugin_scan_requested = false;
         let mut open_plugins_dir_requested = false;
@@ -3450,21 +3378,22 @@ impl eframe::App for CameraApp {
                 });
 
                 // ── Analysis ──────────────────────────────────────────────────
-                let has_plugins = !self.builtin_plugins.is_empty()
-                    || self
-                        .plugin_manager
-                        .records()
-                        .iter()
-                        .any(|r| r.plugin().is_some());
-                if has_plugins {
+                let has_runtime_plugins = self
+                    .plugin_manager
+                    .records()
+                    .iter()
+                    .any(|record| record.plugin().is_some());
+                if self.hotpixel_detection.enabled() || has_runtime_plugins {
                     ui.menu_button("Analysis", |ui| {
-                        for plugin in &mut self.builtin_plugins {
-                            let mut enabled = plugin.enabled();
-                            if ui.checkbox(&mut enabled, plugin.name()).changed() {
-                                plugin.set_enabled(enabled);
-                                plugin_toggle_changed = true;
-                            }
+                        let mut hotpixel_enabled = self.hotpixel_detection.enabled();
+                        if ui
+                            .checkbox(&mut hotpixel_enabled, "Hotpixel Detection")
+                            .changed()
+                        {
+                            self.hotpixel_detection.set_enabled(hotpixel_enabled);
+                            analysis_toggle_changed = true;
                         }
+
                         for record in self.plugin_manager.records_mut() {
                             let Some(plugin) = record.plugin_mut() else {
                                 continue;
@@ -3472,7 +3401,7 @@ impl eframe::App for CameraApp {
                             let mut enabled = plugin.enabled();
                             if ui.checkbox(&mut enabled, plugin.name()).changed() {
                                 plugin.set_enabled(enabled);
-                                plugin_toggle_changed = true;
+                                analysis_toggle_changed = true;
                             }
                         }
                     });
@@ -3511,7 +3440,7 @@ impl eframe::App for CameraApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.reset_analysis();
-                    plugin_toggle_changed = true;
+                    analysis_toggle_changed = true;
                 }
                 Err(err) => self.last_error = Some(err),
             }
@@ -3527,7 +3456,7 @@ impl eframe::App for CameraApp {
             self.disconnect_external_tool();
         }
 
-        if plugin_toggle_changed {
+        if analysis_toggle_changed {
             self.reset_analysis();
         }
 
@@ -3654,8 +3583,9 @@ impl eframe::App for CameraApp {
         }
 
         let enabled_plugin_names = self.enabled_plugin_names();
-        let mut builtin_plugin_config_changed = false;
-        if self.analysis_panel_open && !enabled_plugin_names.is_empty() {
+        let hotpixel_enabled = self.hotpixel_detection.enabled();
+        let has_analysis_tools = hotpixel_enabled || !enabled_plugin_names.is_empty();
+        if self.analysis_panel_open && has_analysis_tools {
             egui::SidePanel::right("analysis")
                 .min_width(360.0)
                 .show_separator_line(true)
@@ -3682,50 +3612,9 @@ impl eframe::App for CameraApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for index in 0..self.builtin_plugins.len() {
-                                let rendered = {
-                                    let plugin = &mut self.builtin_plugins[index];
-                                    if !plugin.enabled() {
-                                        continue;
-                                    }
-
-                                    let missing_dependencies: Vec<&str> = plugin
-                                        .dependencies()
-                                        .iter()
-                                        .copied()
-                                        .filter(|dependency| {
-                                            !enabled_plugin_names
-                                                .iter()
-                                                .any(|name| name == dependency)
-                                        })
-                                        .collect();
-                                    if !missing_dependencies.is_empty() {
-                                        ui.colored_label(
-                                            ui.visuals().warn_fg_color,
-                                            format!(
-                                                "Missing dependency: {}",
-                                                missing_dependencies.join(", ")
-                                            ),
-                                        );
-                                    }
-
-                                    if plugin.ui_settings(
-                                        ui,
-                                        &mut self.config,
-                                        self.sensor_width,
-                                        self.sensor_height,
-                                    ) {
-                                        builtin_plugin_config_changed = true;
-                                    }
-                                    true
-                                };
-
-                                if rendered {
-                                    self.render_provider_host_views(
-                                        ctx,
-                                        ui,
-                                        HostViewProviderKey::Builtin(index),
-                                    );
+                            if hotpixel_enabled {
+                                self.hotpixel_detection.render_ui(ui);
+                                if !enabled_plugin_names.is_empty() {
                                     ui.separator();
                                 }
                             }
@@ -3781,7 +3670,7 @@ impl eframe::App for CameraApp {
                             }
                         });
                 });
-        } else if !enabled_plugin_names.is_empty() {
+        } else if has_analysis_tools {
             egui::SidePanel::right("analysis-collapsed")
                 .exact_width(COLLAPSED_PANEL_WIDTH)
                 .resizable(false)
@@ -3803,10 +3692,6 @@ impl eframe::App for CameraApp {
                         }
                     });
                 });
-        }
-
-        if builtin_plugin_config_changed && mode != AppMode::Replaying {
-            self.config_dirty = true;
         }
 
         let mut reload_requested = None;
@@ -3869,7 +3754,7 @@ impl eframe::App for CameraApp {
                                 let mut enabled = plugin.enabled();
                                 if ui.checkbox(&mut enabled, "").changed() {
                                     plugin.set_enabled(enabled);
-                                    plugin_toggle_changed = true;
+                                    analysis_toggle_changed = true;
                                 }
                             } else {
                                 ui.label("-");
@@ -3899,7 +3784,7 @@ impl eframe::App for CameraApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.reset_analysis();
-                    plugin_toggle_changed = true;
+                    analysis_toggle_changed = true;
                 }
                 Err(err) => self.last_error = Some(err),
             }
@@ -3910,7 +3795,7 @@ impl eframe::App for CameraApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.reset_analysis();
-                    plugin_toggle_changed = true;
+                    analysis_toggle_changed = true;
                 }
                 Err(err) => self.last_error = Some(err),
             }
@@ -3922,7 +3807,7 @@ impl eframe::App for CameraApp {
             }
         }
 
-        if plugin_toggle_changed {
+        if analysis_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
             self.analysis_notice = None;
             self.host_view_registry_dirty = true;

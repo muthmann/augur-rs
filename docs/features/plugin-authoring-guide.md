@@ -2,10 +2,9 @@
 
 ## Summary
 
-`augur-gui` hosts analysis through a mixed plugin model:
-
-- `ROI Grid` stays built in because it mutates `CameraConfig` directly
-- scientific/domain plugins load at runtime from `~/.augur/plugins/`
+`augur-gui` now uses a runtime-only plugin model for plugin implementations.
+Scientific/domain plugins load from `~/.augur/plugins/`, while host-owned core
+tools such as hotpixel detection stay in `augur-gui` and are not plugins.
 
 The plugin boundary is now intentionally generic and pre-v1 breaking:
 
@@ -224,8 +223,7 @@ If the plugin can degrade gracefully, prefer a runtime warning over a hard depen
 | `augur-gui/src/plugin_loader.rs` | manifest parsing, library loading, callback bridges |
 | `augur-gui/src/host_views.rs` | registry resolution, dataset decoding, host-side rendering/export |
 | `augur-gui/src/plugin_settings_ui.rs` | declarative settings and status renderer |
-| `augur-gui/src/plugin.rs` | built-in ROI Grid trait surface |
-| `augur-gui/src/plugins/roi_grid.rs` | built-in ROI Grid implementation |
+| `augur-gui/src/hotpixel.rs` | host-owned built-in hotpixel tool (not part of the runtime plugin ABI) |
 
 ## Verification
 

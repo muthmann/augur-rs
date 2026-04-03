@@ -10,9 +10,9 @@ The first dynamic plugin integration added one reconstruction-specific host hook
 `Plugin::accumulated_localizations()`. That solved the immediate reconstruction window use case,
 but it tightly coupled the GUI shell to a single scientific payload and view.
 
-The GUI now needs a more general way for built-in and runtime plugins to expose structured,
-host-rendered datasets without pushing domain-specific UI into `augur-gui` or extending the legacy
-FFI surface one ad hoc field at a time.
+The GUI now needs a more general way for runtime plugins to expose structured,
+host-rendered datasets without pushing domain-specific UI into `augur-gui` or
+extending the legacy FFI surface one ad hoc field at a time.
 
 ## Decision
 
@@ -38,8 +38,7 @@ Descriptor conflicts are resolved in existing plugin execution order:
 ### Positive
 
 - `augur-gui` can host generic tables and density views without plugin-specific UI code
-- built-in and runtime plugins now share one host-view path
-- built-in and runtime plugins now share one host-view path
+- runtime plugins now share one generic host-view path
 - plugin outputs stay machine-readable and easier to migrate across repositories
 
 ### Negative

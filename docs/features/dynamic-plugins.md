@@ -16,9 +16,9 @@ Each plugin gets its own subdirectory:
 
 ```text
 ~/.augur/plugins/
-  hotpixel/
+  example/
     plugin.toml
-    libaugur_plugin_hotpixel.dylib   # macOS
+    libaugur_plugin_example.dylib   # macOS
 ```
 
 Library extensions vary by platform:
@@ -32,11 +32,11 @@ Library extensions vary by platform:
 Each plugin directory must contain a `plugin.toml`:
 
 ```toml
-name = "Hotpixel Detection"
+name = "Example Plugin"
 version = "0.2.0"
-description = "Detects persistently noisy pixels."
+description = "Demonstrates the runtime plugin manifest format."
 domain = "general"
-library = "augur_plugin_hotpixel"
+library = "augur_plugin_example"
 ```
 
 Fields:
@@ -49,7 +49,7 @@ Fields:
 | `domain` | yes | Category tag (`general`, `smlm`, `biophotonics`, …) |
 | `library` | no | Base name of the dynamic library, **without** the `lib` prefix and without the platform extension (`.dylib`, `.so`, `.dll`). If omitted, the loader auto-discovers a single library file in the directory. |
 
-For example, `library = "augur_plugin_hotpixel"` resolves to `libaugur_plugin_hotpixel.dylib` on macOS, `libaugur_plugin_hotpixel.so` on Linux, and `augur_plugin_hotpixel.dll` on Windows.
+For example, `library = "augur_plugin_example"` resolves to `libaugur_plugin_example.dylib` on macOS, `libaugur_plugin_example.so` on Linux, and `augur_plugin_example.dll` on Windows.
 
 ## Plugin Manager Workflow
 
@@ -65,8 +65,9 @@ Load failures are recorded per plugin instead of aborting the app.
 ## Runtime Plugin Sources
 
 Maintained scientific runtime plugins now live in
-[augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin there, then copy its
-`plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
+[augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin
+there, then copy its `plugin.toml` plus release library into
+`~/.augur/plugins/<plugin-name>/`.
 
 ## Troubleshooting
 

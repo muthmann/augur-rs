@@ -89,6 +89,6 @@ Suggested first run:
 
 - Use [Configuration reference](./configuration.md) to create a reusable TOML file
 - Use [CLI usage](./cli.md) for headless operation and scripting
-- Use [GUI usage](./gui.md) for hotpixel workflows and ROI-grid assistance
+- Use [GUI usage](./gui.md) for hotpixel workflows and runtime plugin usage
 - Use [HDF5 file support](./features/hdf5-file-support.md) when replaying `.h5` / `.hdf5` files
 - Read [Performance](./performance.md) for architecture and design rationale

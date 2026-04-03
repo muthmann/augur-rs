@@ -22,8 +22,10 @@ compatibility hooks, or manifest fallbacks.
 - `HostContext` now has both per-frame `publish()` / `get()` and persistent
   `publish_persistent()` / `get_persistent()` helpers.
 - `augur-gui` requires a valid `plugin.toml` before attempting to load a runtime plugin.
-- `roi-grid` remains the only built-in analysis plugin; scientific runtime
-  plugins now live in [augur-plugins](https://github.com/muthmann/augur-plugins).
+- `augur-rs` now keeps only the runtime host/API infrastructure in-tree;
+  scientific runtime plugins live in
+  [augur-plugins](https://github.com/muthmann/augur-plugins), while
+  hotpixel detection is a host-owned GUI feature.
 
 ### Operational Notes
 
