@@ -73,19 +73,20 @@ The CLI and GUI share the same config types. A TOML file saved from the GUI work
 
 ## Architecture
 
-Four crates with explicit, enforced boundaries:
+Six crates with explicit, enforced boundaries:
 
 ```
 augur-cli ─────────────┐
                         ├──► augur-core
-augur-gui ─────────────┤      camera traits · TOML config · streaming pipeline
-         │              │      EVT3 preview · analysis plugin API
-         │              └──► augur-prophesee
-         │                    EVK4 Treuzell transport · IMX636 ISSD registers
-         └──► plugin host  ← plugins live here, not in augur-core
+augur-gui ─────────────┼──► augur-prophesee
+                        ├──► augur-plugin-api
+runtime plugins ───────┼──► augur-plugin-types
+                        └──► host-owned analysis UI in augur-gui
 ```
 
-**`augur-core` is a pure camera SDK.** The plugin host in `augur-gui` is the only place analysis logic runs.
+**`augur-core` is a pure camera SDK.** `augur-gui` owns the built-in hotpixel
+tool plus the runtime plugin host, while plugin implementations live outside
+this repository.
 
 ### Streaming Pipeline
 
@@ -164,7 +165,12 @@ AugurRS ships a generic, FFI-based plugin system that turns the live preview int
 
 Drop a compiled plugin into `~/.augur/plugins/`, and the GUI's **Plugin Manager** picks it up. Enable, disable, reload — no recompilation of the host required.
 
-The only built-in plugin is **ROI Grid** (sensor partitioning and hotpixel-aware ROI selection). Everything else loads at runtime. Scientific plugins for SMLM, biophotonics, and other domains are maintained in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
+This repository keeps the runtime plugin host and API crates, but no longer
+ships plugin implementations. Scientific plugins for SMLM, biophotonics, and
+other domains are maintained in the companion
+[**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
+`augur-gui` itself includes a built-in **Hotpixel Detection** tool as part of
+the core application rather than as a plugin.
 
 **Want to write a plugin?** See the [**Plugin Authoring Guide**](./docs/features/plugin-authoring-guide.md).
 
@@ -195,7 +201,7 @@ Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned mac
 | [HDF5 File Support](./docs/features/hdf5-file-support.md) | Native HDF5 + ECF plugin setup for `.h5` / `.hdf5` replay |
 | [Plugin Authoring Guide](./docs/features/plugin-authoring-guide.md) | Write your own plugin: FFI host, phases, context bus, host views |
 | [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
-| [Technical Notes](./docs/features/README.md) | SDK internals, ROI grid, and feature details |
+| [Technical Notes](./docs/features/README.md) | SDK internals, hotpixel detection, and feature details |
 | [Architecture Decisions](./docs/adr/README.md) | ADRs |
 
 ---

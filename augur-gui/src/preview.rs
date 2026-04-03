@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use augur_core::{
-    analysis::{roi_grid::RoiGrid, Overlay},
+    analysis::Overlay,
     pipeline::{CdEvent, PreviewFrame},
 };
 use egui::{Color32, ColorImage};
@@ -17,11 +17,6 @@ const TIME_SURFACE_BINS: usize = 256;
 
 #[derive(Default)]
 struct PreviewRenderScratch {
-    grid_col_map: Vec<usize>,
-    grid_row_map: Vec<usize>,
-    grid_x_line: Vec<bool>,
-    grid_y_line: Vec<bool>,
-    grid_cell_highlight: Vec<bool>,
     time_surface: Vec<u64>,
     time_surface_size: [usize; 2],
     time_surface_frame_end_us: Option<u64>,
@@ -119,14 +114,6 @@ impl PreviewMode {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PixelRect {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-}
-
 pub fn reset_preview_render_cache() {
     PREVIEW_SCRATCH.with(|scratch| {
         *scratch.borrow_mut() = PreviewRenderScratch::default();
@@ -156,39 +143,16 @@ pub fn frame_to_color_image(
     let normalizer = DisplayNormalizer::new(settings);
     let mut image = ColorImage::new([w, h], Color32::TRANSPARENT);
 
-    // Look for a ROI grid overlay to merge into the base rendering pass.
-    let roi = overlays.iter().find_map(|o| match o {
-        Overlay::RoiGrid {
-            grid,
-            highlight_top_n,
-        } => Some((grid.as_ref(), *highlight_top_n)),
-        _ => None,
-    });
-
     PREVIEW_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        if let Some((grid, top_n)) = roi {
-            render_base_with_grid(
-                frame,
-                grid,
-                top_n,
-                normalizer,
-                mode,
-                time_surface_tau_us,
-                [w, h],
-                &mut image.pixels[..],
-                &mut scratch,
-            );
-        } else {
-            render_base(
-                frame,
-                normalizer,
-                mode,
-                time_surface_tau_us,
-                &mut image.pixels,
-                &mut scratch,
-            );
-        }
+        render_base(
+            frame,
+            normalizer,
+            mode,
+            time_surface_tau_us,
+            &mut image.pixels,
+            &mut scratch,
+        );
     });
 
     render_overlays(frame, overlays, &mut image.pixels, w, h);
@@ -233,136 +197,6 @@ fn render_base(
     prepare_time_surface(frame, mode, time_surface_tau_us, scratch);
     for (index, pixel) in pixels.iter_mut().enumerate() {
         *pixel = preview_pixel_color(frame, index, normalizer, mode, time_surface_tau_us, scratch);
-    }
-}
-
-/// Single-pass base frame + ROI grid overlay rendering.
-///
-/// Merges cell tinting, grid lines, and highlight fills into one sequential
-/// scan over the pixel buffer, replacing the previous multi-pass approach that
-/// called `fill_rect` per grid cell, `draw_vline`/`draw_hline` per boundary,
-/// and `fill_rect` again per highlight rect.
-#[allow(clippy::too_many_arguments)]
-fn render_base_with_grid(
-    frame: &PreviewFrame,
-    grid: &RoiGrid,
-    top_n: usize,
-    normalizer: DisplayNormalizer,
-    mode: PreviewMode,
-    time_surface_tau_us: u64,
-    size: [usize; 2],
-    pixels: &mut [Color32],
-    scratch: &mut PreviewRenderScratch,
-) {
-    let [w, h] = size;
-    let grid_cols = grid.cols();
-    let grid_rows = grid.rows();
-
-    // O(W + H): map each pixel coordinate to its grid cell index.
-    build_pixel_to_grid_map(&grid.x_bounds, w, &mut scratch.grid_col_map);
-    build_pixel_to_grid_map(&grid.y_bounds, h, &mut scratch.grid_row_map);
-
-    // O(W + H): boolean flags for grid line positions.
-    scratch.grid_x_line.resize(w, false);
-    scratch.grid_x_line.fill(false);
-    for &xb in &grid.x_bounds {
-        let xb = xb as usize;
-        if xb > 0 && xb < w {
-            scratch.grid_x_line[xb] = true;
-        }
-    }
-    scratch.grid_y_line.resize(h, false);
-    scratch.grid_y_line.fill(false);
-    for &yb in &grid.y_bounds {
-        let yb = yb as usize;
-        if yb > 0 && yb < h {
-            scratch.grid_y_line[yb] = true;
-        }
-    }
-
-    // Mark grid cells inside top-N highlight rectangles.
-    let n = top_n.min(grid.largest_rects.len());
-    scratch
-        .grid_cell_highlight
-        .resize(grid_rows * grid_cols, false);
-    scratch.grid_cell_highlight.fill(false);
-    for rect in &grid.largest_rects[..n] {
-        let c0 = grid_bound_index(&grid.x_bounds, rect.x);
-        let c1 = grid_bound_index(&grid.x_bounds, rect.x + rect.width).min(grid_cols);
-        let r0 = grid_bound_index(&grid.y_bounds, rect.y);
-        let r1 = grid_bound_index(&grid.y_bounds, rect.y + rect.height).min(grid_rows);
-        for row in r0..r1 {
-            for col in c0..c1 {
-                scratch.grid_cell_highlight[row * grid_cols + col] = true;
-            }
-        }
-    }
-
-    prepare_time_surface(frame, mode, time_surface_tau_us, scratch);
-
-    // Tint colors as u32 arrays for arithmetic.
-    const LINE: [u32; 4] = [0, 220, 220, 100];
-    const HIGHLIGHT: [u32; 4] = [80, 255, 120, 72];
-    const FREE: [u32; 4] = [40, 220, 80, 36];
-    const BLOCKED: [u32; 4] = [255, 40, 40, 80];
-
-    // Single sequential pass - perfect cache locality, no per-cell function calls.
-    for py in 0..h {
-        let grid_row = scratch.grid_row_map[py];
-        let on_hline = scratch.grid_y_line[py];
-        let row_offset = py * w;
-
-        for px in 0..w {
-            let [base_r, base_g, base_b, _] = preview_pixel_color(
-                frame,
-                row_offset + px,
-                normalizer,
-                mode,
-                time_surface_tau_us,
-                scratch,
-            )
-            .to_array();
-            let base_r = u32::from(base_r);
-            let base_g = u32::from(base_g);
-            let base_b = u32::from(base_b);
-
-            let grid_col = scratch.grid_col_map[px];
-            let cell = grid_row * grid_cols + grid_col;
-
-            let tint = if on_hline || scratch.grid_x_line[px] {
-                LINE
-            } else if scratch.grid_cell_highlight[cell] {
-                HIGHLIGHT
-            } else if grid.blocked[cell] {
-                BLOCKED
-            } else {
-                FREE
-            };
-
-            let alpha = tint[3];
-            let inv_alpha = 255 - alpha;
-            let r = ((base_r * inv_alpha + tint[0] * alpha) / 255) as u8;
-            let g = ((base_g * inv_alpha + tint[1] * alpha) / 255) as u8;
-            let b = ((base_b * inv_alpha + tint[2] * alpha) / 255) as u8;
-            pixels[row_offset + px] = Color32::from_rgb(r, g, b);
-        }
-    }
-
-    // Yellow borders for highlight rects - thin lines, negligible cost.
-    let border_color = [255u8, 220, 0, 200];
-    for rect in &grid.largest_rects[..n] {
-        draw_rect_border(
-            pixels,
-            [w, h],
-            PixelRect {
-                x: rect.x as usize,
-                y: rect.y as usize,
-                width: rect.width as usize,
-                height: rect.height as usize,
-            },
-            2,
-            border_color,
-        );
     }
 }
 
@@ -565,24 +399,6 @@ fn channel_to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Linear sweep mapping each pixel coordinate to its grid cell index.
-fn build_pixel_to_grid_map(bounds: &[u16], size: usize, out: &mut Vec<usize>) {
-    out.resize(size, 0);
-    let max_idx = bounds.len().saturating_sub(2);
-    let mut grid_index = 0;
-    for (pixel, slot) in out.iter_mut().enumerate() {
-        while grid_index < max_idx && (pixel as u16) >= bounds[grid_index + 1] {
-            grid_index += 1;
-        }
-        *slot = grid_index;
-    }
-}
-
-/// Find the boundary index for a grid-aligned value.
-fn grid_bound_index(bounds: &[u16], val: u16) -> usize {
-    bounds.partition_point(|&bound| bound < val)
-}
-
 fn blend_color(dst: &mut Color32, src: [u8; 4]) {
     let [dr, dg, db, _] = dst.to_array();
     let alpha = u32::from(src[3]);
@@ -637,51 +453,6 @@ fn blend_pixel(
     blend_color(&mut pixels[index], color);
 }
 
-fn draw_rect_border(
-    pixels: &mut [Color32],
-    size: [usize; 2],
-    rect: PixelRect,
-    thickness: usize,
-    color: [u8; 4],
-) {
-    let [width, height] = size;
-    let x_end = (rect.x + rect.width).min(width);
-    let y_end = (rect.y + rect.height).min(height);
-
-    // Top and bottom edges.
-    for offset in 0..thickness {
-        if rect.y + offset < y_end {
-            for px in rect.x..x_end {
-                let index = (rect.y + offset) * width + px;
-                blend_color(&mut pixels[index], color);
-            }
-        }
-        if y_end > offset && y_end - 1 - offset >= rect.y {
-            let by = y_end - 1 - offset;
-            for px in rect.x..x_end {
-                let index = by * width + px;
-                blend_color(&mut pixels[index], color);
-            }
-        }
-    }
-    // Left and right edges - skip rows already covered by the top/bottom passes.
-    let inner_y = (rect.y + thickness).min(y_end);
-    let inner_y_end = y_end.saturating_sub(thickness).max(inner_y);
-    for py in inner_y..inner_y_end {
-        for offset in 0..thickness {
-            if rect.x + offset < x_end {
-                let index = py * width + rect.x + offset;
-                blend_color(&mut pixels[index], color);
-            }
-            if x_end > offset && x_end - 1 - offset >= rect.x {
-                let rx = x_end - 1 - offset;
-                let index = py * width + rx;
-                blend_color(&mut pixels[index], color);
-            }
-        }
-    }
-}
-
 fn render_overlays(
     frame: &PreviewFrame,
     overlays: &[Overlay],
@@ -720,7 +491,6 @@ fn render_overlays(
                     );
                 }
             }
-            Overlay::RoiGrid { .. } => {}
         }
     }
 }
@@ -734,10 +504,9 @@ mod tests {
     };
     use crate::colormap::Colormap;
     use augur_core::{
-        analysis::{roi_grid::compute_roi_grid, Overlay, Pixel, SubpixelMarker},
+        analysis::{Overlay, Pixel, SubpixelMarker},
         pipeline::{CdEvent, PreviewFrame},
     };
-    use std::sync::Arc;
 
     #[test]
     fn histogram_counts_combined_pixels() {
@@ -796,38 +565,6 @@ mod tests {
         assert_eq!(image.pixels.len(), 2);
         assert!(image.pixels[1].to_array()[0] >= image.pixels[0].to_array()[0]);
         assert_eq!(image.pixels[0].to_array()[1], 255);
-    }
-
-    #[test]
-    fn roi_grid_overlay_renders_without_allocating_rgba_intermediates() {
-        let grid = compute_roi_grid(&[(0, 0)], 2, 2, 1);
-        let frame = PreviewFrame {
-            width: 2,
-            height: 2,
-            pixels: vec![1, 2, 3, 4],
-            pixels_on: vec![1, 2, 3, 4],
-            pixels_off: vec![1, 2, 3, 4],
-            on_count: 0,
-            off_count: 0,
-            events: None,
-            window_start_us: 0,
-            window_end_us: 1,
-        };
-        let overlays = vec![Overlay::RoiGrid {
-            grid: Arc::new(grid),
-            highlight_top_n: 1,
-        }];
-
-        let image = frame_to_color_image(
-            &frame,
-            &overlays,
-            PreviewDisplaySettings::default(),
-            PreviewMode::RedBlue,
-            30_000,
-        );
-
-        assert_eq!(image.size, [2, 2]);
-        assert_eq!(image.pixels.len(), 4);
     }
 
     #[test]

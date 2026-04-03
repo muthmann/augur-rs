@@ -20,7 +20,6 @@ pub const COMPACT_TABLE_PREVIEW_ROWS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostViewProviderKey {
-    Builtin(usize),
     Runtime(usize),
 }
 
@@ -118,11 +117,9 @@ fn host_view_kind_label(kind: &HostViewKind) -> &'static str {
 
 pub fn reset_provider_for_dataset(
     dataset: &ResolvedHostDataset,
-    mut reset_builtin: impl FnMut(usize),
     mut reset_runtime: impl FnMut(usize),
 ) {
     match dataset.provider {
-        HostViewProviderKey::Builtin(index) => reset_builtin(index),
         HostViewProviderKey::Runtime(index) => reset_runtime(index),
     }
 }
@@ -1863,15 +1860,9 @@ mod tests {
             provider_name: "Runtime".into(),
         };
 
-        let mut builtin_calls = Vec::new();
         let mut runtime_calls = Vec::new();
-        reset_provider_for_dataset(
-            &dataset,
-            |index| builtin_calls.push(index),
-            |index| runtime_calls.push(index),
-        );
+        reset_provider_for_dataset(&dataset, |index| runtime_calls.push(index));
 
-        assert!(builtin_calls.is_empty());
         assert_eq!(runtime_calls, vec![2]);
     }
 }

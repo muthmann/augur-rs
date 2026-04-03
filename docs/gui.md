@@ -60,20 +60,21 @@ Camera-only controls are shown in the left panel.
 
 ## Analysis Panel (Right)
 
-When at least one analysis plugin is enabled, a right-side **Analysis Tools** panel appears.
+When built-in hotpixel detection or at least one runtime plugin is enabled, a
+right-side **Analysis Tools** panel appears.
 
-- each enabled plugin gets a section in the panel
-- built-in ROI Grid settings still edit `CameraConfig` directly
+- built-in **Hotpixel Detection** gets its own host-owned section in the panel
+- each enabled runtime plugin gets its own section below that
 - runtime-loaded plugins expose declarative settings and status entries through the FFI host
 - plugins can exchange per-frame derived data through the shared context bus
 - hiding the panel does not disable plugin execution
-- disabling all plugins hides the panel automatically
+- disabling hotpixel detection and all runtime plugins hides the panel automatically
 - the full panel body is scrollable
 - collapse and expand happen from the panel edge, not the top toolbar
 
-### Available plugin types
+### Available analysis tools
 
-- **ROI Grid** — built-in sensor partitioning and hotpixel-aware ROI selection
+- **Hotpixel Detection** — built-in persistent hotpixel detection plus one-click DEM-mask copy
 - **Runtime plugins** — any plugin loaded from `~/.augur/plugins/`, including scientific plugins from the [augur-plugins](https://github.com/muthmann/augur-plugins) repository
 
 See the [Plugin Authoring Guide](./features/plugin-authoring-guide.md) for the plugin host model.

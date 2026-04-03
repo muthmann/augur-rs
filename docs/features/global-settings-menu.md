@@ -108,7 +108,6 @@ without rebuilding the replay session.
 | `augur-core/src/decoded_replay.rs` | decoded replay timestamp pacing and speed-epoch baseline reset |
 | `augur-gui/src/app.rs` | top-bar `Settings` menu, save/load sync, replay cadence override, plugin-context publication |
 | `augur-gui/src/settings.rs` | ROI/mask controls now use editable sensor geometry |
-| `augur-gui/src/plugins/roi_grid.rs` | ROI-grid recompute now uses app-provided geometry |
 
 ## Verification
 
