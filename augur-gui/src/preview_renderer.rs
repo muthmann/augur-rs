@@ -1674,13 +1674,7 @@ impl WgpuPreviewRenderer {
         queue.write_buffer(
             &self.uniform_buffer,
             0,
-            bytemuck::bytes_of(&preview_uniforms(
-                mode,
-                size,
-                settings,
-                payload,
-                time_surface_tau_us,
-            )),
+            bytemuck::bytes_of(&preview_uniforms(mode, size, settings, time_surface_tau_us)),
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2474,32 +2468,46 @@ impl Drop for WgpuPreviewRenderer {
     }
 }
 
-fn preview_uniforms(
-    mode: PreviewMode,
-    size: [usize; 2],
-    settings: PreviewDisplaySettings,
-    _payload: PackedPreviewPayload<'_>,
-    time_surface_tau_us: u64,
-) -> PreviewUniforms {
+fn mode_id_and_colormap(mode: PreviewMode) -> (u32, u32) {
+    match mode {
+        PreviewMode::Intensity(colormap) => (MODE_INTENSITY, colormap.index()),
+        PreviewMode::RedBlue => (MODE_RED_BLUE, Colormap::Grays.index()),
+        PreviewMode::SignedCount => (MODE_SIGNED_COUNT, Colormap::BlueWhiteRed.index()),
+        PreviewMode::TimeSurface => (MODE_TIME_SURFACE, Colormap::Grays.index()),
+    }
+}
+
+/// Compute clamped display range parameters from preview display settings.
+/// Returns `(display_min, inverse_range, gamma)` ready for shader uniforms.
+fn display_range_params(settings: PreviewDisplaySettings) -> (f32, f32, f32) {
     let display_min = settings
         .display_min
         .min(settings.display_max.saturating_sub(1));
     let display_max = settings.display_max.max(display_min.saturating_add(1));
     let range = f32::from(display_max.saturating_sub(display_min).max(1));
-    let (mode_id, colormap_row) = match mode {
-        PreviewMode::Intensity(colormap) => (MODE_INTENSITY, colormap.index()),
-        PreviewMode::RedBlue => (MODE_RED_BLUE, Colormap::Grays.index()),
-        PreviewMode::SignedCount => (MODE_SIGNED_COUNT, Colormap::BlueWhiteRed.index()),
-        PreviewMode::TimeSurface => (MODE_TIME_SURFACE, Colormap::Grays.index()),
-    };
+    (
+        f32::from(display_min),
+        1.0 / range.max(1.0),
+        settings.gamma.max(0.01),
+    )
+}
+
+fn preview_uniforms(
+    mode: PreviewMode,
+    size: [usize; 2],
+    settings: PreviewDisplaySettings,
+    time_surface_tau_us: u64,
+) -> PreviewUniforms {
+    let (display_min, inverse_range, gamma) = display_range_params(settings);
+    let (mode_id, colormap_row) = mode_id_and_colormap(mode);
     PreviewUniforms {
         mode: mode_id,
         colormap_row,
         width: size[0].max(1) as u32,
         height: size[1].max(1) as u32,
-        display_min: f32::from(display_min),
-        inverse_range: 1.0 / range.max(1.0),
-        gamma: settings.gamma.max(0.01),
+        display_min,
+        inverse_range,
+        gamma,
         time_surface_tau_us: time_surface_tau_us.max(1) as f32,
         time_surface_frame_end_tick: 0,
         time_surface_tick_us: 1,
@@ -2514,25 +2522,16 @@ fn count_preview_uniforms(
     settings: PreviewDisplaySettings,
     event_count: usize,
 ) -> CountPreviewUniforms {
-    let display_min = settings
-        .display_min
-        .min(settings.display_max.saturating_sub(1));
-    let display_max = settings.display_max.max(display_min.saturating_add(1));
-    let range = f32::from(display_max.saturating_sub(display_min).max(1));
-    let (mode_id, colormap_row) = match mode {
-        PreviewMode::Intensity(colormap) => (MODE_INTENSITY, colormap.index()),
-        PreviewMode::RedBlue => (MODE_RED_BLUE, Colormap::Grays.index()),
-        PreviewMode::SignedCount => (MODE_SIGNED_COUNT, Colormap::BlueWhiteRed.index()),
-        PreviewMode::TimeSurface => (MODE_TIME_SURFACE, Colormap::Grays.index()),
-    };
+    let (display_min, inverse_range, gamma) = display_range_params(settings);
+    let (mode_id, colormap_row) = mode_id_and_colormap(mode);
     CountPreviewUniforms {
         mode: mode_id,
         colormap_row,
         width: size[0].max(1) as u32,
         height: size[1].max(1) as u32,
-        display_min: f32::from(display_min),
-        inverse_range: 1.0 / range.max(1.0),
-        gamma: settings.gamma.max(0.01),
+        display_min,
+        inverse_range,
+        gamma,
         event_count: event_count.min(u32::MAX as usize) as u32,
     }
 }
@@ -2555,19 +2554,15 @@ fn time_surface_render_uniforms(
     frame_end_us: u64,
     time_surface_tau_us: u64,
 ) -> TimeSurfaceRenderUniforms {
-    let display_min = settings
-        .display_min
-        .min(settings.display_max.saturating_sub(1));
-    let display_max = settings.display_max.max(display_min.saturating_add(1));
-    let range = f32::from(display_max.saturating_sub(display_min).max(1));
+    let (display_min, inverse_range, gamma) = display_range_params(settings);
     TimeSurfaceRenderUniforms {
         width: size[0].max(1) as u32,
         height: size[1].max(1) as u32,
         colormap_row: Colormap::Grays.index(),
         _pad0: 0,
-        display_min: f32::from(display_min),
-        inverse_range: 1.0 / range.max(1.0),
-        gamma: settings.gamma.max(0.01),
+        display_min,
+        inverse_range,
+        gamma,
         time_surface_tau_us: time_surface_tau_us.max(1) as f32,
         frame_end_tick: encode_time_surface_tick(frame_end_us),
         tick_period_us: TIME_SURFACE_TICK_US as u32,
@@ -2914,30 +2909,19 @@ mod tests {
 
     #[test]
     fn preview_uniforms_use_mode_specific_rows() {
-        let zeros = [0_u16; 2];
-        let intensity_payload = super::PackedPreviewPayload::Intensity(super::IntensityR16 {
-            size: [2, 1],
-            values: &zeros,
-        });
         let intensity = preview_uniforms(
             PreviewMode::Intensity(Colormap::Green),
             [2, 1],
             PreviewDisplaySettings::default(),
-            intensity_payload,
             30_000,
         );
         assert_eq!(intensity.mode, MODE_INTENSITY);
         assert_eq!(intensity.colormap_row, Colormap::Green.index());
 
-        let signed_payload = super::PackedPreviewPayload::Intensity(super::IntensityR16 {
-            size: [2, 1],
-            values: &zeros,
-        });
         let signed = preview_uniforms(
             PreviewMode::SignedCount,
             [2, 1],
             PreviewDisplaySettings::default(),
-            signed_payload,
             30_000,
         );
         assert_eq!(signed.mode, MODE_SIGNED_COUNT);
