@@ -101,37 +101,41 @@ impl LineProfileTool {
 
         let shared = Arc::clone(&self.shared);
         let viewport_id = egui::ViewportId::from_hash_of("viewer_line_profile_window");
+        let viewport_visuals = ctx.style().visuals.clone();
         ctx.show_viewport_deferred(
             viewport_id,
             egui::ViewportBuilder::default()
                 .with_title(LINE_PROFILE_VIEWPORT_TITLE)
                 .with_inner_size([560.0, 360.0]),
-            move |ctx, class| match class {
-                egui::viewport::ViewportClass::Deferred => {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        render_line_profile_viewport(ui, &shared);
-                    });
-                    if ctx.input(|input| input.viewport().close_requested()) {
-                        if let Ok(mut data) = shared.lock() {
-                            data.close_requested = true;
-                        }
-                    }
-                }
-                egui::viewport::ViewportClass::Embedded => {
-                    let mut open = true;
-                    egui::Window::new(LINE_PROFILE_VIEWPORT_TITLE)
-                        .open(&mut open)
-                        .default_size([560.0, 360.0])
-                        .show(ctx, |ui| {
+            move |ctx, class| {
+                ctx.set_visuals(viewport_visuals.clone());
+                match class {
+                    egui::viewport::ViewportClass::Deferred => {
+                        egui::CentralPanel::default().show(ctx, |ui| {
                             render_line_profile_viewport(ui, &shared);
                         });
-                    if !open {
-                        if let Ok(mut data) = shared.lock() {
-                            data.close_requested = true;
+                        if ctx.input(|input| input.viewport().close_requested()) {
+                            if let Ok(mut data) = shared.lock() {
+                                data.close_requested = true;
+                            }
                         }
                     }
+                    egui::viewport::ViewportClass::Embedded => {
+                        let mut open = true;
+                        egui::Window::new(LINE_PROFILE_VIEWPORT_TITLE)
+                            .open(&mut open)
+                            .default_size([560.0, 360.0])
+                            .show(ctx, |ui| {
+                                render_line_profile_viewport(ui, &shared);
+                            });
+                        if !open {
+                            if let Ok(mut data) = shared.lock() {
+                                data.close_requested = true;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             },
         );
 

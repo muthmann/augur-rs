@@ -111,6 +111,14 @@ impl DecodedEventFileCamera {
             .min(events.len() as u64) as usize;
         let start_bytes = start_event_idx as u64 * PACKED_EVENT_RECORD_BYTES as u64;
         let controls = ReplayControls::new(info, start_bytes);
+        controls.current_timestamp_us.store(
+            events
+                .get(start_event_idx)
+                .or_else(|| events.last())
+                .map(|event| event.timestamp)
+                .unwrap_or(info.first_timestamp_us),
+            Ordering::Relaxed,
+        );
 
         Ok((
             Self {
@@ -271,6 +279,13 @@ impl PacketStreamCamera for DecodedEventFileCamera {
         }
 
         self.event_idx += events_to_write;
+        self.controls.current_timestamp_us.store(
+            remaining
+                .get(events_to_write.saturating_sub(1))
+                .map(|event| event.timestamp)
+                .unwrap_or(self.controls.first_timestamp_us),
+            Ordering::Relaxed,
+        );
         self.controls.bytes_read.store(
             self.event_idx as u64 * PACKED_EVENT_RECORD_BYTES as u64,
             Ordering::Relaxed,
