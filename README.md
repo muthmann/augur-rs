@@ -7,7 +7,7 @@
 
 **A fast, direct event camera recorder and live preview tool for Prophesee EVK4 / IMX636 — written entirely in Rust.**
 
-*No vendor runtime. No opaque SDK stack. Clean raw capture, full runtime sensor control, and a plugin system that lets you build any live analysis you need.*
+*No vendor runtime. No opaque SDK stack. Clean raw capture, GPU-accelerated live preview, full runtime sensor control, and a plugin system that lets you build any live analysis you need.*
 
 [![CI](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/muthmann/augur-rs/actions/workflows/release.yml/badge.svg)](https://github.com/muthmann/augur-rs/releases)
@@ -40,9 +40,10 @@ AugurRS without any plugins is a complete, standalone event camera recorder and 
 - **Backpressured 3-thread pipeline** — USB reader → bounded disk writer → lossy preview decoder. Recording never blocks on the UI, never grows unbounded in memory
 - **Reproducible sessions** — every `.raw` file gets a self-describing EVT3 header plus a `.toml` sidecar with config, provenance, and timing metadata
 - **Replay in the GUI** — open recorded `.raw` captures or decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files, scrub them with a timeline, and run plugins through the same path used for live sessions
+- **GPU-accelerated preview** — dual-backend renderer with wgpu (Metal, Vulkan, D3D12) and automatic OpenGL fallback. Shader-based colorization, gamma, and LUT mapping keep display-only changes off the CPU. Count-based preview modes can accumulate frames and build histograms on the GPU. Selectable via `AUGUR_RENDERER=auto|wgpu|glow`
 - **Interactive preview workspace** — edge-collapsible side panels, pixel inspection, histogram-driven brightness/contrast, colormap switching, line/ruler/annotation tools, scale-bar overlay, enlarged popup preview, ImageJ streaming, and a toggleable 3D point-cloud view
 - **Global settings menu** — top-bar control over pixel scale, sensor geometry, acquisition time, retained event history, and advanced preview/disk tuning
-- **Live preview stats** — 1-second sliding window for Mev/s and MB/s, plus per-frame ON/OFF polarity percentages in the GUI
+- **Live preview stats** — 1-second sliding window for Mev/s and MB/s, plus per-frame ON/OFF polarity percentages and per-stage renderer timings in the GUI
 
 ### Sensor Control
 
@@ -201,6 +202,7 @@ Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned mac
 | [HDF5 File Support](./docs/features/hdf5-file-support.md) | Native HDF5 + ECF plugin setup for `.h5` / `.hdf5` replay |
 | [Plugin Authoring Guide](./docs/features/plugin-authoring-guide.md) | Write your own plugin: FFI host, phases, context bus, host views |
 | [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
+| [GPU Preview Rendering](./docs/features/wgpu-preview-rendering.md) | Dual-backend wgpu/glow preview architecture and benchmark baseline |
 | [Technical Notes](./docs/features/README.md) | SDK internals, hotpixel detection, and feature details |
 | [Architecture Decisions](./docs/adr/README.md) | ADRs |
 

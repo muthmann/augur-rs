@@ -178,6 +178,8 @@ mod tests {
             pixels,
             pixels_on: vec![0; n],
             pixels_off: vec![0; n],
+            cached_total_histogram: Vec::new(),
+            cached_signed_histogram: Vec::new(),
             on_count: 0,
             off_count: 0,
             events: None,

@@ -81,6 +81,8 @@ fn synthetic_frame(width: u16, height: u16, density: FixtureDensity) -> PreviewF
         pixels_on,
         pixels_off,
         pixels,
+        cached_total_histogram: Vec::new(),
+        cached_signed_histogram: Vec::new(),
         on_count: 0,
         off_count: 0,
         events: Some(events),
