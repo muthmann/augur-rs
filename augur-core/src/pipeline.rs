@@ -938,28 +938,28 @@ where
                         }
                         let idx = ev.y as usize * width as usize + ev.x as usize;
                         let old_total = frame_buffers.pixels[idx];
-                        let old_on = frame_buffers.pixels_on[idx];
-                        let old_off = frame_buffers.pixels_off[idx];
-                        frame_buffers.pixels[idx] = old_total.saturating_add(1);
+                        let new_total = old_total.saturating_add(1);
+                        frame_buffers.pixels[idx] = new_total;
                         transition_histogram_bin(
                             &mut frame_buffers.total_histogram,
                             old_total,
-                            frame_buffers.pixels[idx],
+                            new_total,
                         );
-                        let old_signed = old_on.abs_diff(old_off);
+                        let old_on = frame_buffers.pixels_on[idx];
+                        let old_off = frame_buffers.pixels_off[idx];
                         if ev.polarity {
-                            frame_buffers.pixels_on[idx] =
-                                frame_buffers.pixels_on[idx].saturating_add(1);
+                            frame_buffers.pixels_on[idx] = old_on.saturating_add(1);
                             on_count += 1;
                         } else {
-                            frame_buffers.pixels_off[idx] =
-                                frame_buffers.pixels_off[idx].saturating_add(1);
+                            frame_buffers.pixels_off[idx] = old_off.saturating_add(1);
                             off_count += 1;
                         }
+                        let new_on = frame_buffers.pixels_on[idx];
+                        let new_off = frame_buffers.pixels_off[idx];
                         transition_histogram_bin(
                             &mut frame_buffers.signed_histogram,
-                            old_signed,
-                            frame_buffers.pixels_on[idx].abs_diff(frame_buffers.pixels_off[idx]),
+                            old_on.abs_diff(old_off),
+                            new_on.abs_diff(new_off),
                         );
                         frame_start_ts.get_or_insert(ev.timestamp);
                     }

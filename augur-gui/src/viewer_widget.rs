@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
+pub(crate) const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
     (0.25, "0.25x"),
     (0.5, "0.5x"),
     (1.0, "1x"),

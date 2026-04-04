@@ -25,6 +25,8 @@ enum FixtureDensity {
 }
 
 impl FixtureDensity {
+    const ALL: [Self; 3] = [Self::Sparse, Self::Medium, Self::Dense];
+
     fn label(self) -> &'static str {
         match self {
             Self::Sparse => "sparse",
@@ -100,11 +102,7 @@ fn bench_frame_to_color_image(c: &mut Criterion) {
     };
 
     for &(width, height) in &[(320_u16, 240_u16), (1280_u16, 720_u16)] {
-        for density in [
-            FixtureDensity::Sparse,
-            FixtureDensity::Medium,
-            FixtureDensity::Dense,
-        ] {
+        for density in FixtureDensity::ALL {
             let frame = synthetic_frame(width, height, density);
             group.bench_with_input(
                 BenchmarkId::new(format!("{width}x{height}"), density.label()),
@@ -127,11 +125,7 @@ fn bench_frame_to_color_image(c: &mut Criterion) {
 
 fn bench_histogram(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_preview/histogram");
-    for density in [
-        FixtureDensity::Sparse,
-        FixtureDensity::Medium,
-        FixtureDensity::Dense,
-    ] {
+    for density in FixtureDensity::ALL {
         let frame = synthetic_frame(1280, 720, density);
         group.bench_with_input(
             BenchmarkId::new("1280x720", density.label()),
@@ -152,11 +146,7 @@ fn bench_histogram(c: &mut Criterion) {
 
 fn bench_time_surface_prepare(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_preview/time_surface_prepare");
-    for density in [
-        FixtureDensity::Sparse,
-        FixtureDensity::Medium,
-        FixtureDensity::Dense,
-    ] {
+    for density in FixtureDensity::ALL {
         let frame = synthetic_frame(1280, 720, density);
         group.bench_with_input(
             BenchmarkId::new("1280x720", density.label()),
@@ -189,11 +179,7 @@ fn bench_time_surface_prepare(c: &mut Criterion) {
 
 fn bench_line_profile_recompute(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_preview/line_profile");
-    for density in [
-        FixtureDensity::Sparse,
-        FixtureDensity::Medium,
-        FixtureDensity::Dense,
-    ] {
+    for density in FixtureDensity::ALL {
         let frame = synthetic_frame(1280, 720, density);
         group.bench_with_input(
             BenchmarkId::new("1280x720", density.label()),

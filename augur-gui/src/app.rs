@@ -57,21 +57,14 @@ use crate::{
     settings::draw_settings,
     viewer_widget::{
         draw_text_placeholder, draw_viewer, replay_speed_matches, AppMode, PreviewHistogramRequest,
-        PreviewTool, ViewMode, ViewerInput, ViewerOutput, ViewerReplayState, ViewerState,
+        PreviewTool, ViewMode, ViewerAuxChanges, ViewerInput, ViewerOutput, ViewerReplayState,
+        ViewerState, REPLAY_SPEED_OPTIONS,
     },
 };
 
 const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
 const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
-const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
-    (0.25, "0.25x"),
-    (0.5, "0.5x"),
-    (1.0, "1x"),
-    (2.0, "2x"),
-    (4.0, "4x"),
-    (f32::INFINITY, "Max"),
-];
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
@@ -2525,13 +2518,8 @@ impl CameraApp {
         self.with_active_viewer(ViewerState::preview_histogram_request)
     }
 
-    fn apply_aux_window_changes(
-        &mut self,
-        ctx: &egui::Context,
-        contrast_changed: bool,
-        histogram_visibility_changed: bool,
-    ) {
-        if contrast_changed || histogram_visibility_changed {
+    fn apply_aux_window_changes(&mut self, ctx: &egui::Context, aux: ViewerAuxChanges) {
+        if aux.contrast_changed || aux.histogram_visibility_changed {
             self.refresh_preview_if_needed(ctx, true);
         }
     }
@@ -2544,9 +2532,7 @@ impl CameraApp {
         let (preview_mode, time_surface_tau_us) =
             self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
         let settings = self.preview_display_settings();
-        let preview_renderer = &mut self.preview_renderer;
-        let preview_perf = &mut self.preview_perf;
-        preview_renderer.render(
+        self.preview_renderer.render(
             PreviewRenderRequest {
                 ctx,
                 frame,
@@ -2554,7 +2540,7 @@ impl CameraApp {
                 mode: preview_mode,
                 time_surface_tau_us,
             },
-            preview_perf,
+            &mut self.preview_perf,
         )
     }
 
@@ -2609,7 +2595,7 @@ impl CameraApp {
             self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
 
         match request {
-            PreviewHistogramRequest::None => {}
+            PreviewHistogramRequest::None => unreachable!("handled by early return above"),
             PreviewHistogramRequest::AutoContrast => {
                 let gpu_histogram = match self.preview_renderer.compute_histogram(
                     frame,
@@ -4241,11 +4227,7 @@ impl eframe::App for CameraApp {
         }
         if !self.popup_open {
             let aux = self.viewer.show_aux_windows(ctx);
-            self.apply_aux_window_changes(
-                ctx,
-                aux.contrast_changed,
-                aux.histogram_visibility_changed,
-            );
+            self.apply_aux_window_changes(ctx, aux);
         }
         self.show_imagej_dialog(ctx);
         if let Some(action) = self.export_dialog.show(ctx) {

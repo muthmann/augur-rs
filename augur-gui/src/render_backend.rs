@@ -72,13 +72,10 @@ pub fn run_camera_app() -> eframe::Result<()> {
     match RendererPreference::from_env() {
         RendererPreference::Glow => run_with_renderer(Renderer::Glow),
         RendererPreference::Wgpu => run_with_renderer(Renderer::Wgpu),
-        RendererPreference::Auto => match run_with_renderer(Renderer::Wgpu) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                eprintln!("WGPU startup failed, retrying with glow compatibility backend: {err}");
-                run_with_renderer(Renderer::Glow)
-            }
-        },
+        RendererPreference::Auto => run_with_renderer(Renderer::Wgpu).or_else(|err| {
+            eprintln!("WGPU startup failed, retrying with glow compatibility backend: {err}");
+            run_with_renderer(Renderer::Glow)
+        }),
     }
 }
 

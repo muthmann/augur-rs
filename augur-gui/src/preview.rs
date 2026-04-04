@@ -263,11 +263,7 @@ pub(crate) fn query_time_surface_value(
             tau_us: time_surface_tau_us.max(1),
         };
         if scratch.time_surface_decay_key == Some(key) {
-            return scratch
-                .time_surface_values
-                .get(index)
-                .copied()
-                .filter(|_| scratch.time_surface_decay_key == Some(key));
+            return scratch.time_surface_values.get(index).copied();
         }
 
         let tick = *scratch.time_surface_ticks.get(index)?;
@@ -355,10 +351,7 @@ pub fn cached_frame_histogram(frame: &PreviewFrame, mode: PreviewMode) -> Option
     (!histogram.is_empty()).then_some(histogram.as_slice())
 }
 
-pub fn compute_prepared_histogram(
-    prepared: PreparedPreviewFrame<'_>,
-    mode: PreviewMode,
-) -> Vec<u64> {
+fn compute_prepared_histogram(prepared: PreparedPreviewFrame<'_>, mode: PreviewMode) -> Vec<u64> {
     match prepared {
         PreparedPreviewFrame::IntensityR16 { values, .. } => {
             histogram_from_values(values.iter().copied())
@@ -513,11 +506,7 @@ fn histogram_from_values(values: impl IntoIterator<Item = u16>) -> Vec<u64> {
         max_bin = max_bin.max(index);
         saw_value = true;
     }
-    if !saw_value {
-        histogram.push(0);
-    } else {
-        histogram.truncate(max_bin + 1);
-    }
+    histogram.truncate(if saw_value { max_bin + 1 } else { 1 });
     histogram
 }
 

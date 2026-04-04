@@ -887,6 +887,55 @@ pub struct WgpuPreviewRenderer {
 }
 
 impl WgpuPreviewRenderer {
+    fn device(&self) -> &wgpu::Device {
+        &self.render_state.device
+    }
+
+    fn queue(&self) -> &wgpu::Queue {
+        &self.render_state.queue
+    }
+
+    fn display_texture_result(&self, size: [usize; 2]) -> Result<PreviewDisplayTexture, String> {
+        self.display_texture_id
+            .map(|id| PreviewDisplayTexture::Native { id, size })
+            .ok_or_else(|| "missing preview texture id".to_owned())
+    }
+
+    fn encode_and_submit_render_pass(
+        &self,
+        label: &str,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+    ) -> Result<(), String> {
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: self
+                        .display_view
+                        .as_ref()
+                        .ok_or_else(|| "missing preview display view".to_owned())?,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(pipeline);
+            render_pass.set_bind_group(0, bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+        self.queue().submit(Some(encoder.finish()));
+        Ok(())
+    }
+
     fn new(render_state: egui_wgpu::RenderState) -> Result<Self, String> {
         let device = Arc::clone(&render_state.device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1404,8 +1453,7 @@ impl WgpuPreviewRenderer {
         let size = [frame.width as usize, frame.height as usize];
         self.ensure_textures(size)?;
         self.ensure_time_surface_render_bind_group()?;
-        let queue = Arc::clone(&self.render_state.queue);
-        queue.write_buffer(
+        self.queue().write_buffer(
             &self.time_surface_render_uniform_buffer,
             0,
             bytemuck::bytes_of(&time_surface_render_uniforms(
@@ -1416,45 +1464,19 @@ impl WgpuPreviewRenderer {
             )),
         );
 
-        let device = Arc::clone(&self.render_state.device);
         let submit_started = Instant::now();
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_time_surface_render_encoder"),
-        });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("augur_time_surface_render_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self
-                        .display_view
-                        .as_ref()
-                        .ok_or_else(|| "missing preview display view".to_owned())?,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render_pass.set_pipeline(&self.time_surface_render_pipeline);
-            render_pass.set_bind_group(
-                0,
-                self.time_surface_render_bind_group
-                    .as_ref()
-                    .ok_or_else(|| "missing time-surface render bind group".to_owned())?,
-                &[],
-            );
-            render_pass.draw(0..3, 0..1);
-        }
-        queue.submit(Some(encoder.finish()));
+        let bind_group = self
+            .time_surface_render_bind_group
+            .as_ref()
+            .ok_or_else(|| "missing time-surface render bind group".to_owned())?;
+        self.encode_and_submit_render_pass(
+            "augur_time_surface_render",
+            &self.time_surface_render_pipeline,
+            bind_group,
+        )?;
         perf.record_upload_submit(submit_started.elapsed());
 
-        self.display_texture_id
-            .map(|id| PreviewDisplayTexture::Native { id, size })
-            .ok_or_else(|| "missing preview texture id".to_owned())
+        self.display_texture_result(size)
     }
 
     fn compute_time_surface_histogram(
@@ -1475,9 +1497,7 @@ impl WgpuPreviewRenderer {
             PreviewHistogramRequest::Full | PreviewHistogramRequest::None => 1,
         };
 
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
-        queue.write_buffer(
+        self.queue().write_buffer(
             &self.time_surface_histogram_uniform_buffer,
             0,
             bytemuck::bytes_of(&time_surface_histogram_uniforms(
@@ -1489,9 +1509,11 @@ impl WgpuPreviewRenderer {
         );
 
         let histogram_bytes = (TIME_SURFACE_BINS * std::mem::size_of::<u32>()) as u64;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_time_surface_histogram_encoder"),
-        });
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("augur_time_surface_histogram_encoder"),
+            });
         encoder.clear_buffer(&self.time_surface_histogram_buffer, 0, None);
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1516,10 +1538,10 @@ impl WgpuPreviewRenderer {
             0,
             histogram_bytes,
         );
-        queue.submit(Some(encoder.finish()));
+        self.queue().submit(Some(encoder.finish()));
 
         read_histogram_buffer(
-            &device,
+            self.device(),
             &self.time_surface_histogram_readback,
             TIME_SURFACE_BINS,
         )
@@ -1536,9 +1558,7 @@ impl WgpuPreviewRenderer {
 
         let size = [frame.width as usize, frame.height as usize];
         self.ensure_textures(size)?;
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
-        queue.write_buffer(
+        self.queue().write_buffer(
             &self.count_uniform_buffer,
             0,
             bytemuck::bytes_of(&count_preview_uniforms(
@@ -1551,45 +1571,18 @@ impl WgpuPreviewRenderer {
         self.ensure_count_render_bind_group()?;
 
         let submit_started = Instant::now();
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_count_preview_encoder"),
-        });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("augur_count_preview_render_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self
-                        .display_view
-                        .as_ref()
-                        .ok_or_else(|| "missing preview display view".to_owned())?,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render_pass.set_pipeline(&self.count_render_pipeline);
-            render_pass.set_bind_group(
-                0,
-                self.count_render_bind_group
-                    .as_ref()
-                    .ok_or_else(|| "missing count render bind group".to_owned())?,
-                &[],
-            );
-            render_pass.draw(0..3, 0..1);
-        }
-        queue.submit(Some(encoder.finish()));
+        let bind_group = self
+            .count_render_bind_group
+            .as_ref()
+            .ok_or_else(|| "missing count render bind group".to_owned())?;
+        self.encode_and_submit_render_pass(
+            "augur_count_preview_render",
+            &self.count_render_pipeline,
+            bind_group,
+        )?;
         perf.record_upload_submit(submit_started.elapsed());
 
-        let texture = self
-            .display_texture_id
-            .map(|id| PreviewDisplayTexture::Native { id, size })
-            .ok_or_else(|| "missing preview texture id".to_owned())?;
-        Ok(texture)
+        self.display_texture_result(size)
     }
 
     fn compute_count_histogram(
@@ -1599,9 +1592,7 @@ impl WgpuPreviewRenderer {
     ) -> Result<Vec<u64>, String> {
         self.ensure_count_accumulation(frame, mode)?;
         let size = [frame.width as usize, frame.height as usize];
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
-        queue.write_buffer(
+        self.queue().write_buffer(
             &self.count_uniform_buffer,
             0,
             bytemuck::bytes_of(&count_preview_uniforms(
@@ -1613,9 +1604,11 @@ impl WgpuPreviewRenderer {
         );
 
         let histogram_bytes = (PREVIEW_HISTOGRAM_BINS * std::mem::size_of::<u32>()) as u64;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_count_histogram_encoder"),
-        });
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("augur_count_histogram_encoder"),
+            });
         encoder.clear_buffer(&self.count_histogram_buffer, 0, None);
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1643,10 +1636,10 @@ impl WgpuPreviewRenderer {
             0,
             histogram_bytes,
         );
-        queue.submit(Some(encoder.finish()));
+        self.queue().submit(Some(encoder.finish()));
 
         read_histogram_buffer(
-            &device,
+            self.device(),
             &self.count_histogram_readback,
             histogram_bytes as usize / std::mem::size_of::<u32>(),
         )
@@ -1667,53 +1660,22 @@ impl WgpuPreviewRenderer {
         self.ensure_textures(size)?;
         self.ensure_bind_group();
 
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
         let submit_started = Instant::now();
-        self.upload_payload(&queue, payload);
-        queue.write_buffer(
+        self.upload_payload(payload);
+        self.queue().write_buffer(
             &self.uniform_buffer,
             0,
             bytemuck::bytes_of(&preview_uniforms(mode, size, settings, time_surface_tau_us)),
         );
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_preview_encoder"),
-        });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("augur_preview_render_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self
-                        .display_view
-                        .as_ref()
-                        .ok_or_else(|| "missing preview display view".to_owned())?,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(
-                0,
-                self.bind_group
-                    .as_ref()
-                    .ok_or_else(|| "missing preview bind group".to_owned())?,
-                &[],
-            );
-            render_pass.draw(0..3, 0..1);
-        }
-        queue.submit(Some(encoder.finish()));
+        let bind_group = self
+            .bind_group
+            .as_ref()
+            .ok_or_else(|| "missing preview bind group".to_owned())?;
+        self.encode_and_submit_render_pass("augur_preview_render", &self.pipeline, bind_group)?;
         perf.record_upload_submit(submit_started.elapsed());
 
-        self.display_texture_id
-            .map(|id| PreviewDisplayTexture::Native { id, size })
-            .ok_or_else(|| "missing preview texture id".to_owned())
+        self.display_texture_result(size)
     }
 
     fn ensure_count_accumulation(
@@ -1744,18 +1706,16 @@ impl WgpuPreviewRenderer {
         self.count_packed_events
             .extend(events.iter().map(pack_count_event));
 
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
         let event_buffer = self
             .count_event_buffer
             .as_ref()
             .ok_or_else(|| "missing count event buffer".to_owned())?;
-        queue.write_buffer(
+        self.queue().write_buffer(
             event_buffer,
             0,
             bytemuck::cast_slice(&self.count_packed_events),
         );
-        queue.write_buffer(
+        self.queue().write_buffer(
             &self.count_uniform_buffer,
             0,
             bytemuck::bytes_of(&count_preview_uniforms(
@@ -1766,9 +1726,11 @@ impl WgpuPreviewRenderer {
             )),
         );
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_count_accumulate_encoder"),
-        });
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("augur_count_accumulate_encoder"),
+            });
         encoder.clear_buffer(
             self.count_total_buffer
                 .as_ref()
@@ -1805,7 +1767,7 @@ impl WgpuPreviewRenderer {
             );
             compute_pass.dispatch_workgroups(dispatch_workgroups(events.len() as u32), 1, 1);
         }
-        queue.submit(Some(encoder.finish()));
+        self.queue().submit(Some(encoder.finish()));
         self.count_accumulation_key = Some(key);
         Ok(())
     }
@@ -1815,7 +1777,6 @@ impl WgpuPreviewRenderer {
         size: [usize; 2],
         event_capacity: usize,
     ) -> Result<(), String> {
-        let device = Arc::clone(&self.render_state.device);
         let pixel_count = size[0].saturating_mul(size[1]).max(1);
         let count_buffer_size = (pixel_count * std::mem::size_of::<u32>()) as u64;
         let needs_count_buffers = self.size != Some(size)
@@ -1823,20 +1784,24 @@ impl WgpuPreviewRenderer {
             || self.count_on_buffer.is_none()
             || self.count_off_buffer.is_none();
         if needs_count_buffers {
-            self.count_total_buffer = Some(create_count_buffer(
-                &device,
+            let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            self.count_total_buffer = Some(create_storage_buffer(
+                &self.render_state.device,
                 count_buffer_size,
                 "augur_count_total",
+                usage,
             ));
-            self.count_on_buffer = Some(create_count_buffer(
-                &device,
+            self.count_on_buffer = Some(create_storage_buffer(
+                &self.render_state.device,
                 count_buffer_size,
                 "augur_count_on",
+                usage,
             ));
-            self.count_off_buffer = Some(create_count_buffer(
-                &device,
+            self.count_off_buffer = Some(create_storage_buffer(
+                &self.render_state.device,
                 count_buffer_size,
                 "augur_count_off",
+                usage,
             ));
             self.count_render_bind_group = None;
             self.count_compute_bind_group = None;
@@ -1845,12 +1810,14 @@ impl WgpuPreviewRenderer {
 
         if event_capacity > self.count_event_capacity || self.count_event_buffer.is_none() {
             let capacity = event_capacity.max(1).next_power_of_two();
-            self.count_event_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("augur_count_events"),
-                size: (capacity * std::mem::size_of::<u32>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
+            self.count_event_buffer = Some(self.render_state.device.create_buffer(
+                &wgpu::BufferDescriptor {
+                    label: Some("augur_count_events"),
+                    size: (capacity * std::mem::size_of::<u32>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            ));
             self.count_event_capacity = capacity;
             self.count_compute_bind_group = None;
             self.count_accumulation_key = None;
@@ -1864,9 +1831,8 @@ impl WgpuPreviewRenderer {
         if self.count_compute_bind_group.is_some() {
             return Ok(());
         }
-        let device = Arc::clone(&self.render_state.device);
         self.count_compute_bind_group = Some(
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("augur_count_compute_bind_group"),
                 layout: &self.count_compute_bind_group_layout,
                 entries: &[
@@ -1920,9 +1886,8 @@ impl WgpuPreviewRenderer {
         if self.count_render_bind_group.is_some() {
             return Ok(());
         }
-        let device = Arc::clone(&self.render_state.device);
         self.count_render_bind_group = Some(
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("augur_count_render_bind_group"),
                 layout: &self.count_render_bind_group_layout,
                 entries: &[
@@ -1986,11 +1951,11 @@ impl WgpuPreviewRenderer {
                 || accumulation_key.frame_end_us < key.frame_end_us
         });
         if reset_needed {
-            let device = Arc::clone(&self.render_state.device);
-            let queue = Arc::clone(&self.render_state.queue);
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("augur_time_surface_reset_encoder"),
-            });
+            let mut encoder =
+                self.device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("augur_time_surface_reset_encoder"),
+                    });
             encoder.clear_buffer(
                 self.time_surface_tick_buffer
                     .as_ref()
@@ -1998,7 +1963,7 @@ impl WgpuPreviewRenderer {
                 0,
                 None,
             );
-            queue.submit(Some(encoder.finish()));
+            self.queue().submit(Some(encoder.finish()));
             self.time_surface_accumulation_key = None;
             self.time_surface_hover_cache = None;
         }
@@ -2012,24 +1977,24 @@ impl WgpuPreviewRenderer {
         self.time_surface_packed_events
             .extend(events.iter().flat_map(pack_time_surface_event));
 
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
-        queue.write_buffer(
+        self.queue().write_buffer(
             self.time_surface_event_buffer
                 .as_ref()
                 .ok_or_else(|| "missing time-surface event buffer".to_owned())?,
             0,
             bytemuck::cast_slice(&self.time_surface_packed_events),
         );
-        queue.write_buffer(
+        self.queue().write_buffer(
             &self.time_surface_accumulate_uniform_buffer,
             0,
             bytemuck::bytes_of(&time_surface_accumulate_uniforms(size, events.len())),
         );
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_time_surface_accumulate_encoder"),
-        });
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("augur_time_surface_accumulate_encoder"),
+            });
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("augur_time_surface_accumulate_pass"),
@@ -2045,7 +2010,7 @@ impl WgpuPreviewRenderer {
             );
             compute_pass.dispatch_workgroups(dispatch_workgroups(events.len() as u32), 1, 1);
         }
-        queue.submit(Some(encoder.finish()));
+        self.queue().submit(Some(encoder.finish()));
         self.time_surface_accumulation_key = Some(accumulation_key);
         self.time_surface_hover_cache = None;
         Ok(())
@@ -2056,14 +2021,16 @@ impl WgpuPreviewRenderer {
         size: [usize; 2],
         event_capacity: usize,
     ) -> Result<(), String> {
-        let device = Arc::clone(&self.render_state.device);
         let pixel_count = size[0].saturating_mul(size[1]).max(1);
         let tick_buffer_size = (pixel_count * std::mem::size_of::<u32>()) as u64;
         if self.size != Some(size) || self.time_surface_tick_buffer.is_none() {
-            self.time_surface_tick_buffer = Some(create_time_surface_tick_buffer(
-                &device,
+            self.time_surface_tick_buffer = Some(create_storage_buffer(
+                &self.render_state.device,
                 tick_buffer_size,
                 "augur_time_surface_ticks",
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
             ));
             self.time_surface_compute_bind_group = None;
             self.time_surface_histogram_bind_group = None;
@@ -2076,12 +2043,14 @@ impl WgpuPreviewRenderer {
             || self.time_surface_event_buffer.is_none()
         {
             let capacity = event_capacity.max(1).next_power_of_two();
-            self.time_surface_event_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("augur_time_surface_events"),
-                size: (capacity * 2 * std::mem::size_of::<u32>()) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
+            self.time_surface_event_buffer = Some(self.render_state.device.create_buffer(
+                &wgpu::BufferDescriptor {
+                    label: Some("augur_time_surface_events"),
+                    size: (capacity * 2 * std::mem::size_of::<u32>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                },
+            ));
             self.time_surface_event_capacity = capacity;
             self.time_surface_compute_bind_group = None;
             self.time_surface_accumulation_key = None;
@@ -2098,9 +2067,8 @@ impl WgpuPreviewRenderer {
         if self.time_surface_compute_bind_group.is_some() {
             return Ok(());
         }
-        let device = Arc::clone(&self.render_state.device);
         self.time_surface_compute_bind_group = Some(
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("augur_time_surface_compute_bind_group"),
                 layout: &self.time_surface_compute_bind_group_layout,
                 entries: &[
@@ -2136,9 +2104,8 @@ impl WgpuPreviewRenderer {
         if self.time_surface_histogram_bind_group.is_some() {
             return Ok(());
         }
-        let device = Arc::clone(&self.render_state.device);
         self.time_surface_histogram_bind_group = Some(
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("augur_time_surface_histogram_bind_group"),
                 layout: &self.time_surface_histogram_bind_group_layout,
                 entries: &[
@@ -2170,9 +2137,8 @@ impl WgpuPreviewRenderer {
         if self.time_surface_render_bind_group.is_some() {
             return Ok(());
         }
-        let device = Arc::clone(&self.render_state.device);
         self.time_surface_render_bind_group = Some(
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("augur_time_surface_render_bind_group"),
                 layout: &self.time_surface_render_bind_group_layout,
                 entries: &[
@@ -2218,11 +2184,11 @@ impl WgpuPreviewRenderer {
         }
 
         self.ensure_time_surface_accumulation(frame)?;
-        let device = Arc::clone(&self.render_state.device);
-        let queue = Arc::clone(&self.render_state.queue);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("augur_time_surface_hover_encoder"),
-        });
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("augur_time_surface_hover_encoder"),
+            });
         encoder.copy_buffer_to_buffer(
             self.time_surface_tick_buffer
                 .as_ref()
@@ -2232,8 +2198,8 @@ impl WgpuPreviewRenderer {
             0,
             std::mem::size_of::<u32>() as u64,
         );
-        queue.submit(Some(encoder.finish()));
-        let tick = read_single_u32_buffer(&device, &self.time_surface_hover_readback)?;
+        self.queue().submit(Some(encoder.finish()));
+        let tick = read_single_u32_buffer(self.device(), &self.time_surface_hover_readback)?;
         let value = time_surface_value_u8_from_tick(
             tick,
             encode_time_surface_tick(frame.window_end_us),
@@ -2320,21 +2286,21 @@ impl WgpuPreviewRenderer {
             return Ok(());
         }
 
-        let device = Arc::clone(&self.render_state.device);
+        let device = self.device();
         let intensity_texture = create_source_texture(
-            &device,
+            device,
             size,
             wgpu::TextureFormat::R16Uint,
             "augur_preview_intensity",
         );
         let polarity_texture = create_source_texture(
-            &device,
+            device,
             size,
             wgpu::TextureFormat::Rg16Uint,
             "augur_preview_polarity",
         );
         let timesurface_texture = create_source_texture(
-            &device,
+            device,
             size,
             wgpu::TextureFormat::R32Uint,
             "augur_preview_timesurface",
@@ -2358,14 +2324,14 @@ impl WgpuPreviewRenderer {
         let mut renderer = self.render_state.renderer.write();
         let display_texture_id = if let Some(existing) = self.display_texture_id {
             renderer.update_egui_texture_from_wgpu_texture(
-                &device,
+                device,
                 &display_view,
                 wgpu::FilterMode::Linear,
                 existing,
             );
             existing
         } else {
-            renderer.register_native_texture(&device, &display_view, wgpu::FilterMode::Linear)
+            renderer.register_native_texture(device, &display_view, wgpu::FilterMode::Linear)
         };
         drop(renderer);
 
@@ -2391,9 +2357,8 @@ impl WgpuPreviewRenderer {
             return;
         }
 
-        let device = Arc::clone(&self.render_state.device);
         self.bind_group = Some(
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("augur_preview_bind_group"),
                 layout: &self.bind_group_layout,
                 entries: &[
@@ -2434,7 +2399,8 @@ impl WgpuPreviewRenderer {
         );
     }
 
-    fn upload_payload(&self, queue: &wgpu::Queue, payload: PackedPreviewPayload<'_>) {
+    fn upload_payload(&self, payload: PackedPreviewPayload<'_>) {
+        let queue = self.queue();
         match payload {
             PackedPreviewPayload::Intensity(data) => {
                 if let Some(texture) = &self.intensity_texture {
@@ -2626,22 +2592,16 @@ fn storage_buffer_entry(
     }
 }
 
-fn create_count_buffer(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
+fn create_storage_buffer(
+    device: &wgpu::Device,
+    size: u64,
+    label: &str,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: size.max(std::mem::size_of::<u32>() as u64),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-fn create_time_surface_tick_buffer(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size.max(std::mem::size_of::<u32>() as u64),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_SRC
-            | wgpu::BufferUsages::COPY_DST,
+        usage,
         mapped_at_creation: false,
     })
 }
@@ -2661,62 +2621,53 @@ fn dispatch_workgroups(items: u32) -> u32 {
     items.max(1).div_ceil(COUNT_WORKGROUP_SIZE)
 }
 
+fn map_buffer_sync(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    byte_len: u64,
+    label: &str,
+) -> Result<Vec<u32>, String> {
+    let slice = buffer.slice(..byte_len);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|_| format!("{label} readback callback failed"))?
+        .map_err(|err| format!("{label} readback failed: {err}"))?;
+
+    let mapped = slice.get_mapped_range();
+    let values: Vec<u32> = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
+    drop(mapped);
+    buffer.unmap();
+    Ok(values)
+}
+
 fn read_histogram_buffer(
     device: &wgpu::Device,
     buffer: &wgpu::Buffer,
     len: usize,
 ) -> Result<Vec<u64>, String> {
-    let slice = buffer.slice(..(len * std::mem::size_of::<u32>()) as u64);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|_| "histogram readback callback failed".to_owned())?
-        .map_err(|err| format!("histogram readback failed: {err}"))?;
-
-    let mapped = slice.get_mapped_range();
-    let histogram: Vec<u64> = bytemuck::cast_slice::<u8, u32>(&mapped)
-        .iter()
-        .take(len)
-        .copied()
-        .map(u64::from)
-        .collect();
-    drop(mapped);
-    buffer.unmap();
-    Ok(trimmed_histogram_vec(histogram))
-}
-
-fn trimmed_histogram_vec(mut histogram: Vec<u64>) -> Vec<u64> {
-    let len = histogram
+    let values = map_buffer_sync(
+        device,
+        buffer,
+        (len * std::mem::size_of::<u32>()) as u64,
+        "histogram",
+    )?;
+    let mut histogram: Vec<u64> = values.into_iter().take(len).map(u64::from).collect();
+    let trimmed_len = histogram
         .iter()
         .rposition(|&count| count != 0)
         .map(|index| index + 1)
         .unwrap_or(1);
-    histogram.truncate(len);
-    histogram
+    histogram.truncate(trimmed_len);
+    Ok(histogram)
 }
 
 fn read_single_u32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<u32, String> {
-    let slice = buffer.slice(..std::mem::size_of::<u32>() as u64);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|_| "hover readback callback failed".to_owned())?
-        .map_err(|err| format!("hover readback failed: {err}"))?;
-
-    let mapped = slice.get_mapped_range();
-    let value = bytemuck::cast_slice::<u8, u32>(&mapped)
-        .first()
-        .copied()
-        .unwrap_or(0);
-    drop(mapped);
-    buffer.unmap();
-    Ok(value)
+    let values = map_buffer_sync(device, buffer, std::mem::size_of::<u32>() as u64, "hover")?;
+    Ok(values.first().copied().unwrap_or(0))
 }
 
 fn create_dummy_texture(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {
