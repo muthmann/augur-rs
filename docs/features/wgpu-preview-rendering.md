@@ -180,6 +180,10 @@ cargo bench -p augur-gui --bench preview_bench -- --warm-up-time 0.1 --measureme
 
 ## Follow-Up
 
+- A later maintenance pass removed obsolete prototype shader blobs from
+  `augur-gui/src/preview_renderer.rs` and consolidated the CPU histogram selection flow in
+  `augur-gui/src/preview.rs` so the active preview paths are easier to trace without changing
+  runtime behavior.
 - Upstream `augur-core` still keeps CPU frame planes and cached histograms because viewer tools,
   plugins, and external bridges consume `PreviewFrame` on the CPU.
 - `TimeSurface` is fully GPU-backed only when the WGPU renderer is active and raw preview events

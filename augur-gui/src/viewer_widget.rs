@@ -1999,7 +1999,7 @@ fn replay_speed_label(speed: f32) -> &'static str {
     "1x"
 }
 
-fn replay_speed_matches(current: f32, candidate: f32) -> bool {
+pub(crate) fn replay_speed_matches(current: f32, candidate: f32) -> bool {
     if current.is_infinite() || candidate.is_infinite() {
         current.is_infinite() && candidate.is_infinite()
     } else {

@@ -24,6 +24,13 @@ const MODE_TIME_SURFACE: u32 = 3;
 const COUNT_WORKGROUP_SIZE: u32 = 64;
 const TIME_SURFACE_AUTO_CONTRAST_TARGET_SAMPLES: usize = 65_536;
 
+fn uses_gpu_count_accumulation(mode: PreviewMode) -> bool {
+    matches!(
+        mode,
+        PreviewMode::Intensity(_) | PreviewMode::RedBlue | PreviewMode::SignedCount
+    )
+}
+
 const PREVIEW_SHADER: &str = r#"
 struct PreviewUniforms {
     mode: u32,
@@ -144,268 +151,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         decay_value = u32(round(clamp(decay, 0.0, 1.0) * 255.0));
     }
     return vec4<f32>(lut_color(uniforms.colormap_row, normalize_value(decay_value)), 1.0);
-}
-"#;
-
-#[allow(dead_code)]
-const PREVIEW_BUFFER_SHADER: &str = r#"
-struct PreviewUniforms {
-    mode: u32,
-    colormap_row: u32,
-    width: u32,
-    height: u32,
-    display_min: f32,
-    inverse_range: f32,
-    gamma: f32,
-    time_surface_tau_us: f32,
-    time_surface_frame_end_tick: u32,
-    time_surface_tick_us: u32,
-    _pad0: u32,
-    _pad1: u32,
-};
-
-struct Values {
-    data: array<u32>,
-};
-
-@group(0) @binding(0)
-var<uniform> uniforms: PreviewUniforms;
-@group(0) @binding(1)
-var<storage, read> total_buf: Values;
-@group(0) @binding(2)
-var<storage, read> on_buf: Values;
-@group(0) @binding(3)
-var<storage, read> off_buf: Values;
-@group(0) @binding(4)
-var<storage, read> tick_buf: Values;
-@group(0) @binding(5)
-var lut_tex: texture_2d<f32>;
-
-struct VsOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -3.0),
-        vec2<f32>(-1.0, 1.0),
-        vec2<f32>(3.0, 1.0),
-    );
-    var uvs = array<vec2<f32>, 3>(
-        vec2<f32>(0.0, 2.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(2.0, 0.0),
-    );
-    var out: VsOut;
-    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
-    out.uv = uvs[vertex_index];
-    return out;
-}
-
-fn clamp_coord(uv: vec2<f32>) -> vec2<i32> {
-    let width = max(uniforms.width, 1u);
-    let height = max(uniforms.height, 1u);
-    let x = min(u32(floor(clamp(uv.x, 0.0, 0.999999) * f32(width))), width - 1u);
-    let y = min(u32(floor(clamp(uv.y, 0.0, 0.999999) * f32(height))), height - 1u);
-    return vec2<i32>(i32(x), i32(y));
-}
-
-fn pixel_index(coord: vec2<i32>) -> u32 {
-    return u32(coord.y) * max(uniforms.width, 1u) + u32(coord.x);
-}
-
-fn normalize_value(value: u32) -> f32 {
-    let display_min = uniforms.display_min;
-    let normalized = clamp((f32(value) - display_min) * uniforms.inverse_range, 0.0, 1.0);
-    return pow(normalized, uniforms.gamma);
-}
-
-fn lut_color(row: u32, t: f32) -> vec3<f32> {
-    let idx = min(u32(round(clamp(t, 0.0, 1.0) * 255.0)), 255u);
-    return textureLoad(lut_tex, vec2<i32>(i32(idx), i32(row)), 0).rgb;
-}
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let coord = clamp_coord(in.uv);
-    let index = pixel_index(coord);
-    if uniforms.mode == 0u {
-        let value = total_buf.data[index];
-        return vec4<f32>(lut_color(uniforms.colormap_row, normalize_value(value)), 1.0);
-    }
-    if uniforms.mode == 1u {
-        let on = on_buf.data[index];
-        let off = off_buf.data[index];
-        let total = total_buf.data[index];
-        if total == 0u {
-            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        }
-        let brightness = normalize_value(total);
-        if on > off {
-            return vec4<f32>(brightness, 0.0, 0.0, 1.0);
-        }
-        if off > on {
-            return vec4<f32>(0.0, 0.0, brightness, 1.0);
-        }
-        return vec4<f32>(brightness, 0.0, brightness, 1.0);
-    }
-    if uniforms.mode == 2u {
-        let on = on_buf.data[index];
-        let off = off_buf.data[index];
-        let total = total_buf.data[index];
-        if total == 0u {
-            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        }
-        let magnitude = normalize_value(select(off - on, on - off, on >= off));
-        var signed_t = 0.5;
-        if on > off {
-            signed_t = 0.5 + 0.5 * magnitude;
-        } else if off > on {
-            signed_t = 0.5 - 0.5 * magnitude;
-        }
-        return vec4<f32>(lut_color(uniforms.colormap_row, signed_t), 1.0);
-    }
-
-    let last_tick = tick_buf.data[index];
-    var decay_value = 0u;
-    if last_tick > 0u {
-        let dt_ticks = uniforms.time_surface_frame_end_tick - last_tick;
-        let dt_us = f32(dt_ticks) * f32(uniforms.time_surface_tick_us);
-        let decay = exp(-dt_us / max(uniforms.time_surface_tau_us, 1.0));
-        decay_value = u32(round(clamp(decay, 0.0, 1.0) * 255.0));
-    }
-    return vec4<f32>(lut_color(uniforms.colormap_row, normalize_value(decay_value)), 1.0);
-}
-"#;
-
-#[allow(dead_code)]
-const PREVIEW_ACCUMULATE_SHADER: &str = r#"
-struct AccumulateUniforms {
-    width: u32,
-    height: u32,
-    event_count: u32,
-    _pad0: u32,
-};
-
-struct PreviewEvent {
-    x: u32,
-    y: u32,
-    polarity: u32,
-    tick: u32,
-};
-
-struct EventBuffer {
-    data: array<PreviewEvent>,
-};
-
-struct AtomicValues {
-    data: array<atomic<u32>>,
-};
-
-@group(0) @binding(0)
-var<uniform> uniforms: AccumulateUniforms;
-@group(0) @binding(1)
-var<storage, read> events: EventBuffer;
-@group(0) @binding(2)
-var<storage, read_write> total_buf: AtomicValues;
-@group(0) @binding(3)
-var<storage, read_write> on_buf: AtomicValues;
-@group(0) @binding(4)
-var<storage, read_write> off_buf: AtomicValues;
-@group(0) @binding(5)
-var<storage, read_write> tick_buf: AtomicValues;
-
-@compute @workgroup_size(256)
-fn accumulate_events(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= uniforms.event_count {
-        return;
-    }
-    let event = events.data[idx];
-    if event.x >= uniforms.width || event.y >= uniforms.height {
-        return;
-    }
-    let pixel = event.y * uniforms.width + event.x;
-    atomicAdd(&total_buf.data[pixel], 1u);
-    if event.polarity != 0u {
-        atomicAdd(&on_buf.data[pixel], 1u);
-    } else {
-        atomicAdd(&off_buf.data[pixel], 1u);
-    }
-    atomicMax(&tick_buf.data[pixel], event.tick);
-}
-"#;
-
-#[allow(dead_code)]
-const PREVIEW_HISTOGRAM_SHADER: &str = r#"
-struct HistogramUniforms {
-    width: u32,
-    height: u32,
-    histogram_mode: u32,
-    histogram_bin_count: u32,
-    sample_stride: u32,
-    frame_end_tick: u32,
-    time_surface_tick_us: u32,
-    _pad0: u32,
-    time_surface_tau_us: f32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
-};
-
-struct Values {
-    data: array<u32>,
-};
-
-struct AtomicValues {
-    data: array<atomic<u32>>,
-};
-
-@group(0) @binding(0)
-var<uniform> uniforms: HistogramUniforms;
-@group(0) @binding(1)
-var<storage, read> total_buf: Values;
-@group(0) @binding(2)
-var<storage, read> on_buf: Values;
-@group(0) @binding(3)
-var<storage, read> off_buf: Values;
-@group(0) @binding(4)
-var<storage, read> tick_buf: Values;
-@group(0) @binding(5)
-var<storage, read_write> histogram_buf: AtomicValues;
-
-fn histogram_value(index: u32) -> u32 {
-    if uniforms.histogram_mode == 2u {
-        let on = on_buf.data[index];
-        let off = off_buf.data[index];
-        return select(off - on, on - off, on >= off);
-    }
-    if uniforms.histogram_mode == 3u {
-        let last_tick = tick_buf.data[index];
-        if last_tick == 0u {
-            return 0u;
-        }
-        let dt_ticks = uniforms.frame_end_tick - last_tick;
-        let dt_us = f32(dt_ticks) * f32(uniforms.time_surface_tick_us);
-        let decay = exp(-dt_us / max(uniforms.time_surface_tau_us, 1.0));
-        return u32(round(clamp(decay, 0.0, 1.0) * 255.0));
-    }
-    return total_buf.data[index];
-}
-
-@compute @workgroup_size(256)
-fn build_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let stride = max(uniforms.sample_stride, 1u);
-    let index = gid.x * stride;
-    let pixel_count = uniforms.width * uniforms.height;
-    if index >= pixel_count {
-        return;
-    }
-    let bin_count = max(uniforms.histogram_bin_count, 1u);
-    let bin = min(histogram_value(index), bin_count - 1u);
-    atomicAdd(&histogram_buf.data[bin], 1u);
 }
 "#;
 
@@ -840,21 +585,16 @@ impl PreviewRenderer {
     pub fn render(
         &mut self,
         request: PreviewRenderRequest<'_>,
-        _histogram_request: PreviewHistogramRequest,
         perf: &mut PreviewPerfStats,
     ) -> Result<PreviewDisplayTexture, String> {
         match self {
-            Self::Cpu(renderer) => renderer.render(request, PreviewHistogramRequest::None, perf),
-            Self::Wgpu(renderer) => renderer.render(request, PreviewHistogramRequest::None, perf),
+            Self::Cpu(renderer) => renderer.render(request, perf),
+            Self::Wgpu(renderer) => renderer.render(request, perf),
         }
     }
 
     pub fn prefers_raw_events(&self, mode: PreviewMode) -> bool {
-        matches!(self, Self::Wgpu(_))
-            && matches!(
-                mode,
-                PreviewMode::Intensity(_) | PreviewMode::RedBlue | PreviewMode::SignedCount
-            )
+        matches!(self, Self::Wgpu(_)) && uses_gpu_count_accumulation(mode)
     }
 
     pub fn compute_histogram(
@@ -921,7 +661,6 @@ impl CpuPreviewRenderer {
     fn render(
         &mut self,
         request: PreviewRenderRequest<'_>,
-        _histogram_request: PreviewHistogramRequest,
         perf: &mut PreviewPerfStats,
     ) -> Result<PreviewDisplayTexture, String> {
         let PreviewRenderRequest {
@@ -1582,7 +1321,6 @@ impl WgpuPreviewRenderer {
     fn render(
         &mut self,
         request: PreviewRenderRequest<'_>,
-        _histogram_request: PreviewHistogramRequest,
         perf: &mut PreviewPerfStats,
     ) -> Result<PreviewDisplayTexture, String> {
         let PreviewRenderRequest {
@@ -1592,11 +1330,7 @@ impl WgpuPreviewRenderer {
             time_surface_tau_us,
             ..
         } = request;
-        if matches!(
-            mode,
-            PreviewMode::Intensity(_) | PreviewMode::RedBlue | PreviewMode::SignedCount
-        ) && frame.events.is_some()
-        {
+        if uses_gpu_count_accumulation(mode) && frame.events.is_some() {
             return self.render_count_accumulated(frame, settings, mode, perf);
         }
 
@@ -1637,11 +1371,7 @@ impl WgpuPreviewRenderer {
                 .compute_time_surface_histogram(frame, time_surface_tau_us, histogram_request)
                 .map(Some);
         }
-        if !matches!(
-            mode,
-            PreviewMode::Intensity(_) | PreviewMode::RedBlue | PreviewMode::SignedCount
-        ) || frame.events.is_none()
-        {
+        if !uses_gpu_count_accumulation(mode) || frame.events.is_none() {
             return Ok(None);
         }
 

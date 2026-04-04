@@ -332,24 +332,7 @@ pub fn compute_frame_histogram(
     mode: PreviewMode,
     time_surface_tau_us: u64,
 ) -> Vec<u64> {
-    if let Some(histogram) = cached_frame_histogram(frame, mode) {
-        return trimmed_histogram(histogram);
-    }
-
-    if matches!(mode, PreviewMode::TimeSurface) {
-        return PREVIEW_SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            if ensure_time_surface_render_cache(frame, time_surface_tau_us, &mut scratch) {
-                scratch.time_surface_histogram.clone()
-            } else {
-                histogram_from_values(frame.pixels.iter().copied())
-            }
-        });
-    }
-
-    with_prepared_preview_frame(frame, mode, time_surface_tau_us, |prepared| {
-        compute_prepared_histogram(prepared, mode)
-    })
+    with_frame_histogram(frame, mode, time_surface_tau_us, trimmed_histogram)
 }
 
 pub fn compute_auto_contrast_max(
@@ -358,26 +341,8 @@ pub fn compute_auto_contrast_max(
     time_surface_tau_us: u64,
     percentile: f32,
 ) -> u16 {
-    if let Some(histogram) = cached_frame_histogram(frame, mode) {
-        return percentile_bin(histogram, percentile);
-    }
-
-    if matches!(mode, PreviewMode::TimeSurface) {
-        return PREVIEW_SCRATCH.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            if ensure_time_surface_render_cache(frame, time_surface_tau_us, &mut scratch) {
-                percentile_bin(&scratch.time_surface_histogram, percentile)
-            } else {
-                percentile_bin(
-                    &histogram_from_values(frame.pixels.iter().copied()),
-                    percentile,
-                )
-            }
-        });
-    }
-
-    with_prepared_preview_frame(frame, mode, time_surface_tau_us, |prepared| {
-        percentile_bin(&compute_prepared_histogram(prepared, mode), percentile)
+    with_frame_histogram(frame, mode, time_surface_tau_us, |histogram| {
+        percentile_bin(histogram, percentile)
     })
 }
 
@@ -408,6 +373,34 @@ pub fn compute_prepared_histogram(
             histogram_from_values(values.iter().copied().map(u16::from))
         }
     }
+}
+
+fn with_frame_histogram<R>(
+    frame: &PreviewFrame,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+    f: impl FnOnce(&[u64]) -> R,
+) -> R {
+    if let Some(histogram) = cached_frame_histogram(frame, mode) {
+        return f(histogram);
+    }
+
+    if matches!(mode, PreviewMode::TimeSurface) {
+        return PREVIEW_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            if ensure_time_surface_render_cache(frame, time_surface_tau_us, &mut scratch) {
+                f(&scratch.time_surface_histogram)
+            } else {
+                let histogram = histogram_from_values(frame.pixels.iter().copied());
+                f(&histogram)
+            }
+        });
+    }
+
+    with_prepared_preview_frame(frame, mode, time_surface_tau_us, |prepared| {
+        let histogram = compute_prepared_histogram(prepared, mode);
+        f(&histogram)
+    })
 }
 
 fn ensure_time_surface_state(frame: &PreviewFrame, scratch: &mut PreviewRenderScratch) -> bool {

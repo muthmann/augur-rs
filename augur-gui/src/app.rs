@@ -56,8 +56,8 @@ use crate::{
     render_backend::ActiveRendererInfo,
     settings::draw_settings,
     viewer_widget::{
-        draw_text_placeholder, draw_viewer, AppMode, PreviewHistogramRequest, PreviewTool,
-        ViewMode, ViewerInput, ViewerOutput, ViewerReplayState, ViewerState,
+        draw_text_placeholder, draw_viewer, replay_speed_matches, AppMode, PreviewHistogramRequest,
+        PreviewTool, ViewMode, ViewerInput, ViewerOutput, ViewerReplayState, ViewerState,
     },
 };
 
@@ -2554,7 +2554,6 @@ impl CameraApp {
                 mode: preview_mode,
                 time_surface_tau_us,
             },
-            PreviewHistogramRequest::None,
             preview_perf,
         )
     }
@@ -4503,14 +4502,6 @@ fn replay_config_path(raw_path: &Path) -> Option<PathBuf> {
     let stem = raw_path.file_stem()?.to_string_lossy();
     let parent = raw_path.parent().unwrap_or_else(|| Path::new("."));
     Some(parent.join(format!("{stem}.toml")))
-}
-
-fn replay_speed_matches(current: f32, candidate: f32) -> bool {
-    if current.is_infinite() || candidate.is_infinite() {
-        current.is_infinite() && candidate.is_infinite()
-    } else {
-        (current - candidate).abs() < f32::EPSILON
-    }
 }
 
 fn sanitize_file_stem(title: &str) -> String {
