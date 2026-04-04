@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use augur_core::pipeline::{CdEvent, PreviewFrame};
+use augur_core::pipeline::{CdEvent, PreviewFrame, PREVIEW_HISTOGRAM_BINS};
 use egui::{Color32, ColorImage};
 
 use crate::colormap::Colormap;
@@ -9,12 +9,13 @@ thread_local! {
     static PREVIEW_SCRATCH: RefCell<PreviewRenderScratch> = RefCell::new(PreviewRenderScratch::default());
 }
 
-const MAX_HISTOGRAM_BINS: usize = 4096;
-const TIME_SURFACE_BINS: usize = 256;
+const MAX_HISTOGRAM_BINS: usize = PREVIEW_HISTOGRAM_BINS;
+pub(crate) const TIME_SURFACE_BINS: usize = 256;
+pub(crate) const TIME_SURFACE_TICK_US: u64 = 64;
 
 #[derive(Default)]
 struct PreviewRenderScratch {
-    time_surface: Vec<u64>,
+    time_surface_ticks: Vec<u32>,
     time_surface_size: [usize; 2],
     time_surface_frame_end_us: Option<u64>,
     time_surface_values: Vec<u8>,
@@ -246,14 +247,35 @@ pub fn reset_preview_render_cache() {
     });
 }
 
-pub fn query_time_surface_value(index: usize) -> Option<u8> {
+pub(crate) fn query_time_surface_value(
+    frame: &PreviewFrame,
+    time_surface_tau_us: u64,
+    index: usize,
+) -> Option<u8> {
     PREVIEW_SCRATCH.with(|scratch| {
-        let scratch = scratch.borrow();
-        scratch
-            .time_surface_values
-            .get(index)
-            .copied()
-            .filter(|_| scratch.time_surface_decay_key.is_some())
+        let mut scratch = scratch.borrow_mut();
+        if !ensure_time_surface_state(frame, &mut scratch) {
+            return None;
+        }
+
+        let key = TimeSurfaceDecayKey {
+            frame_end_us: frame.window_end_us,
+            tau_us: time_surface_tau_us.max(1),
+        };
+        if scratch.time_surface_decay_key == Some(key) {
+            return scratch
+                .time_surface_values
+                .get(index)
+                .copied()
+                .filter(|_| scratch.time_surface_decay_key == Some(key));
+        }
+
+        let tick = *scratch.time_surface_ticks.get(index)?;
+        Some(time_surface_value_u8_from_tick(
+            tick,
+            encode_time_surface_tick(key.frame_end_us),
+            key.tau_us,
+        ))
     })
 }
 
@@ -310,9 +332,62 @@ pub fn compute_frame_histogram(
     mode: PreviewMode,
     time_surface_tau_us: u64,
 ) -> Vec<u64> {
+    if let Some(histogram) = cached_frame_histogram(frame, mode) {
+        return trimmed_histogram(histogram);
+    }
+
+    if matches!(mode, PreviewMode::TimeSurface) {
+        return PREVIEW_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            if ensure_time_surface_render_cache(frame, time_surface_tau_us, &mut scratch) {
+                scratch.time_surface_histogram.clone()
+            } else {
+                histogram_from_values(frame.pixels.iter().copied())
+            }
+        });
+    }
+
     with_prepared_preview_frame(frame, mode, time_surface_tau_us, |prepared| {
         compute_prepared_histogram(prepared, mode)
     })
+}
+
+pub fn compute_auto_contrast_max(
+    frame: &PreviewFrame,
+    mode: PreviewMode,
+    time_surface_tau_us: u64,
+    percentile: f32,
+) -> u16 {
+    if let Some(histogram) = cached_frame_histogram(frame, mode) {
+        return percentile_bin(histogram, percentile);
+    }
+
+    if matches!(mode, PreviewMode::TimeSurface) {
+        return PREVIEW_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            if ensure_time_surface_render_cache(frame, time_surface_tau_us, &mut scratch) {
+                percentile_bin(&scratch.time_surface_histogram, percentile)
+            } else {
+                percentile_bin(
+                    &histogram_from_values(frame.pixels.iter().copied()),
+                    percentile,
+                )
+            }
+        });
+    }
+
+    with_prepared_preview_frame(frame, mode, time_surface_tau_us, |prepared| {
+        percentile_bin(&compute_prepared_histogram(prepared, mode), percentile)
+    })
+}
+
+pub fn cached_frame_histogram(frame: &PreviewFrame, mode: PreviewMode) -> Option<&[u64]> {
+    let histogram = match mode {
+        PreviewMode::Intensity(_) | PreviewMode::RedBlue => &frame.cached_total_histogram,
+        PreviewMode::SignedCount => &frame.cached_signed_histogram,
+        PreviewMode::TimeSurface => return None,
+    };
+    (!histogram.is_empty()).then_some(histogram.as_slice())
 }
 
 pub fn compute_prepared_histogram(
@@ -339,14 +414,14 @@ fn ensure_time_surface_state(frame: &PreviewFrame, scratch: &mut PreviewRenderSc
     let size = [frame.width as usize, frame.height as usize];
     let pixel_count = size[0].saturating_mul(size[1]);
     let geometry_changed =
-        scratch.time_surface_size != size || scratch.time_surface.len() != pixel_count;
+        scratch.time_surface_size != size || scratch.time_surface_ticks.len() != pixel_count;
     let timestamp_regressed = scratch
         .time_surface_frame_end_us
         .is_some_and(|last_end| frame.window_end_us < last_end);
 
     if geometry_changed || timestamp_regressed {
-        scratch.time_surface.resize(pixel_count, 0);
-        scratch.time_surface.fill(0);
+        scratch.time_surface_ticks.resize(pixel_count, 0);
+        scratch.time_surface_ticks.fill(0);
         scratch.time_surface_size = size;
         scratch.time_surface_frame_end_us = None;
         scratch.time_surface_values.resize(pixel_count, 0);
@@ -363,7 +438,12 @@ fn ensure_time_surface_state(frame: &PreviewFrame, scratch: &mut PreviewRenderSc
     let Some(events) = frame.events.as_deref() else {
         return false;
     };
-    update_time_surface(events, frame.width, frame.height, &mut scratch.time_surface);
+    update_time_surface(
+        events,
+        frame.width,
+        frame.height,
+        &mut scratch.time_surface_ticks,
+    );
     scratch.time_surface_frame_end_us = Some(frame.window_end_us);
     scratch.time_surface_decay_key = None;
     true
@@ -392,8 +472,9 @@ fn ensure_time_surface_render_cache(
     scratch.time_surface_values.resize(pixel_count, 0);
     scratch.time_surface_histogram.resize(TIME_SURFACE_BINS, 0);
     scratch.time_surface_histogram.fill(0);
-    for (index, &timestamp) in scratch.time_surface.iter().enumerate() {
-        let value = time_surface_value_u8(timestamp, frame.window_end_us, key.tau_us);
+    let reference_tick = encode_time_surface_tick(frame.window_end_us);
+    for (index, &tick) in scratch.time_surface_ticks.iter().enumerate() {
+        let value = time_surface_value_u8_from_tick(tick, reference_tick, key.tau_us);
         scratch.time_surface_values[index] = value;
         scratch.time_surface_histogram[usize::from(value)] += 1;
     }
@@ -401,42 +482,81 @@ fn ensure_time_surface_render_cache(
     true
 }
 
-fn update_time_surface(events: &[CdEvent], width: u16, height: u16, time_surface: &mut [u64]) {
+fn update_time_surface(events: &[CdEvent], width: u16, height: u16, time_surface: &mut [u32]) {
     for event in events {
         if event.x >= width || event.y >= height {
             continue;
         }
         let index = event.y as usize * width as usize + event.x as usize;
-        let encoded_timestamp = event.timestamp.saturating_add(1);
-        time_surface[index] = time_surface[index].max(encoded_timestamp);
+        let encoded_tick = encode_time_surface_tick(event.timestamp);
+        time_surface[index] = time_surface[index].max(encoded_tick);
     }
 }
 
-fn time_surface_value_u8(timestamp: u64, reference_us: u64, tau_us: u64) -> u8 {
-    if timestamp == 0 {
+pub(crate) fn encode_time_surface_tick(timestamp_us: u64) -> u32 {
+    let tick = (timestamp_us / TIME_SURFACE_TICK_US).min(u64::from(u32::MAX - 1));
+    tick as u32 + 1
+}
+
+pub(crate) fn time_surface_value_u8_from_tick(tick: u32, reference_tick: u32, tau_us: u64) -> u8 {
+    if tick == 0 {
         return 0;
     }
 
-    let last_event_us = timestamp.saturating_sub(1);
-    let dt = reference_us.saturating_sub(last_event_us);
+    let dt_ticks = u64::from(reference_tick.saturating_sub(tick));
+    let dt = dt_ticks.saturating_mul(TIME_SURFACE_TICK_US);
     let tau_us = tau_us.max(1) as f64;
     let value = (-(dt as f64) / tau_us).exp();
     (value * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 fn histogram_from_values(values: impl IntoIterator<Item = u16>) -> Vec<u64> {
-    let mut histogram = Vec::new();
+    let mut histogram = vec![0_u64; MAX_HISTOGRAM_BINS];
+    let mut max_bin = 0_usize;
+    let mut saw_value = false;
     for value in values {
         let index = (value as usize).min(MAX_HISTOGRAM_BINS - 1);
-        if histogram.len() <= index {
-            histogram.resize(index + 1, 0);
-        }
         histogram[index] += 1;
+        max_bin = max_bin.max(index);
+        saw_value = true;
     }
-    if histogram.is_empty() {
+    if !saw_value {
         histogram.push(0);
+    } else {
+        histogram.truncate(max_bin + 1);
     }
     histogram
+}
+
+fn trimmed_histogram(histogram: &[u64]) -> Vec<u64> {
+    let len = histogram
+        .iter()
+        .rposition(|&count| count != 0)
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    histogram[..len].to_vec()
+}
+
+fn percentile_bin(histogram: &[u64], percentile: f32) -> u16 {
+    if histogram.is_empty() {
+        return 1;
+    }
+
+    let total: u64 = histogram.iter().sum();
+    if total == 0 {
+        return 1;
+    }
+
+    let target =
+        ((total as f64 * percentile.clamp(0.0, 100.0) as f64 / 100.0).ceil() as u64).max(1);
+    let mut cumulative = 0_u64;
+    for (bin, count) in histogram.iter().copied().enumerate() {
+        cumulative = cumulative.saturating_add(count);
+        if cumulative >= target {
+            return bin.min(u16::MAX as usize) as u16;
+        }
+    }
+    histogram.len().saturating_sub(1).min(u16::MAX as usize) as u16
 }
 
 #[cfg(test)]
@@ -448,6 +568,25 @@ mod tests {
     };
     use crate::colormap::Colormap;
     use augur_core::pipeline::{CdEvent, PreviewFrame};
+
+    fn cached_histogram(values: &[u16]) -> Vec<u64> {
+        let mut histogram = vec![0_u64; MAX_HISTOGRAM_BINS];
+        for &value in values {
+            let index = usize::from(value).min(MAX_HISTOGRAM_BINS - 1);
+            histogram[index] += 1;
+        }
+        histogram
+    }
+
+    fn cached_signed_histogram(on: &[u16], off: &[u16]) -> Vec<u64> {
+        let mut histogram = vec![0_u64; MAX_HISTOGRAM_BINS];
+        for (&on, &off) in on.iter().zip(off) {
+            let index = usize::from(on.abs_diff(off)).min(MAX_HISTOGRAM_BINS - 1);
+            histogram[index] += 1;
+        }
+        histogram
+    }
+
     #[test]
     fn histogram_counts_combined_pixels() {
         let frame = PreviewFrame {
@@ -456,6 +595,8 @@ mod tests {
             pixels: vec![0, 2, 2],
             pixels_on: vec![0, 1, 2],
             pixels_off: vec![0, 1, 0],
+            cached_total_histogram: cached_histogram(&[0, 2, 2]),
+            cached_signed_histogram: cached_signed_histogram(&[0, 1, 2], &[0, 1, 0]),
             on_count: 0,
             off_count: 0,
             events: None,
@@ -475,6 +616,8 @@ mod tests {
             pixels: vec![1, 2, 3, 4],
             pixels_on: vec![0, 0, 0, 0],
             pixels_off: vec![0, 0, 0, 0],
+            cached_total_histogram: cached_histogram(&[1, 2, 3, 4]),
+            cached_signed_histogram: cached_signed_histogram(&[0, 0, 0, 0], &[0, 0, 0, 0]),
             on_count: 0,
             off_count: 0,
             events: None,
@@ -504,6 +647,8 @@ mod tests {
             pixels: vec![24, 24],
             pixels_on: vec![20, 3],
             pixels_off: vec![4, 21],
+            cached_total_histogram: cached_histogram(&[24, 24]),
+            cached_signed_histogram: cached_signed_histogram(&[20, 3], &[4, 21]),
             on_count: 0,
             off_count: 0,
             events: None,
@@ -535,6 +680,8 @@ mod tests {
             pixels: vec![1],
             pixels_on: vec![0],
             pixels_off: vec![0],
+            cached_total_histogram: cached_histogram(&[1]),
+            cached_signed_histogram: cached_signed_histogram(&[0], &[0]),
             on_count: 0,
             off_count: 0,
             events: None,
@@ -564,6 +711,8 @@ mod tests {
             pixels: vec![4, 6, 3],
             pixels_on: vec![4, 2, 1],
             pixels_off: vec![0, 5, 1],
+            cached_total_histogram: cached_histogram(&[4, 6, 3]),
+            cached_signed_histogram: cached_signed_histogram(&[4, 2, 1], &[0, 5, 1]),
             on_count: 0,
             off_count: 0,
             events: None,
@@ -584,6 +733,8 @@ mod tests {
             pixels: vec![1],
             pixels_on: vec![1],
             pixels_off: vec![0],
+            cached_total_histogram: cached_histogram(&[1]),
+            cached_signed_histogram: cached_signed_histogram(&[1], &[0]),
             on_count: 1,
             off_count: 0,
             events: Some(vec![CdEvent {
@@ -610,6 +761,8 @@ mod tests {
             pixels: vec![1],
             pixels_on: vec![1],
             pixels_off: vec![0],
+            cached_total_histogram: cached_histogram(&[1]),
+            cached_signed_histogram: cached_signed_histogram(&[1], &[0]),
             on_count: 1,
             off_count: 0,
             events: Some(vec![CdEvent {
@@ -634,6 +787,32 @@ mod tests {
     }
 
     #[test]
+    fn query_time_surface_value_uses_live_tick_state_when_decay_cache_is_missing() {
+        reset_preview_render_cache();
+        let frame = PreviewFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![1],
+            pixels_on: vec![1],
+            pixels_off: vec![0],
+            cached_total_histogram: cached_histogram(&[1]),
+            cached_signed_histogram: cached_signed_histogram(&[1], &[0]),
+            on_count: 1,
+            off_count: 0,
+            events: Some(vec![CdEvent {
+                x: 0,
+                y: 0,
+                timestamp: 25,
+                polarity: true,
+            }]),
+            window_start_us: 0,
+            window_end_us: 25,
+        };
+
+        assert_eq!(query_time_surface_value(&frame, 30_000, 0), Some(255));
+    }
+
+    #[test]
     fn query_time_surface_value_returns_cached_decay_values() {
         reset_preview_render_cache();
         let frame = PreviewFrame {
@@ -642,6 +821,8 @@ mod tests {
             pixels: vec![1],
             pixels_on: vec![1],
             pixels_off: vec![0],
+            cached_total_histogram: cached_histogram(&[1]),
+            cached_signed_histogram: cached_signed_histogram(&[1], &[0]),
             on_count: 1,
             off_count: 0,
             events: Some(vec![CdEvent {
@@ -654,12 +835,12 @@ mod tests {
             window_end_us: 10,
         };
 
-        assert_eq!(query_time_surface_value(0), None);
+        assert_eq!(query_time_surface_value(&frame, 30_000, 0), Some(255));
 
         let _ = compute_frame_histogram(&frame, PreviewMode::TimeSurface, 30_000);
 
-        assert_eq!(query_time_surface_value(0), Some(255));
-        assert_eq!(query_time_surface_value(1), None);
+        assert_eq!(query_time_surface_value(&frame, 30_000, 0), Some(255));
+        assert_eq!(query_time_surface_value(&frame, 30_000, 1), None);
     }
 
     #[test]
@@ -670,6 +851,8 @@ mod tests {
             pixels: vec![0, 4095, 5000],
             pixels_on: vec![0, 4095, 5000],
             pixels_off: vec![0, 0, 0],
+            cached_total_histogram: cached_histogram(&[0, 4095, 5000]),
+            cached_signed_histogram: cached_signed_histogram(&[0, 4095, 5000], &[0, 0, 0]),
             on_count: 0,
             off_count: 0,
             events: None,

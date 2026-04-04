@@ -10,9 +10,7 @@ use crate::{
     app::PANEL_ROUNDING,
     colormap::Colormap,
     point_cloud::{PointCloudMetrics, PointCloudState},
-    preview::{
-        query_time_surface_value, reset_preview_render_cache, PreviewDisplaySettings, PreviewMode,
-    },
+    preview::{reset_preview_render_cache, PreviewDisplaySettings, PreviewMode},
     preview_renderer::PreviewDisplayTexture,
     viewer_tools::{
         compute_scale_bar, AnnotationManager, AnnotationShape, AnnotationShapeKind, ContrastMode,
@@ -237,6 +235,13 @@ impl Default for ViewerState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewHistogramRequest {
+    None,
+    AutoContrast,
+    Full,
+}
+
 impl ViewerState {
     pub(crate) fn clear_session_state(&mut self) {
         self.workspace.clear_session_state();
@@ -259,10 +264,26 @@ impl ViewerState {
     }
 
     pub(crate) fn apply_histogram(&mut self, histogram: Vec<u64>) {
+        self.apply_auto_histogram(histogram.as_slice());
+        self.histogram_window.set_histogram(histogram);
+    }
+
+    pub(crate) fn apply_auto_histogram(&mut self, histogram: &[u64]) {
         if self.contrast_settings.mode == ContrastMode::Auto {
-            self.contrast_settings.update_auto_range(&histogram);
+            self.contrast_settings.update_auto_range(histogram);
         }
-        let histogram_max = histogram.len().saturating_sub(1).min(u16::MAX as usize) as u16;
+        self.clamp_histogram_range(histogram.len());
+    }
+
+    pub(crate) fn apply_auto_contrast_max(&mut self, display_max: u16) {
+        if self.contrast_settings.mode == ContrastMode::Auto {
+            self.contrast_settings.display_min = 0;
+            self.contrast_settings.display_max = display_max.max(1);
+        }
+    }
+
+    fn clamp_histogram_range(&mut self, histogram_len: usize) {
+        let histogram_max = histogram_len.saturating_sub(1).min(u16::MAX as usize) as u16;
         let clamped_min = self
             .contrast_settings
             .display_min
@@ -273,7 +294,6 @@ impl ViewerState {
             .clamp(clamped_min.saturating_add(1), histogram_max.max(1));
         self.contrast_settings.display_min = clamped_min;
         self.contrast_settings.display_max = clamped_max;
-        self.histogram_window.set_histogram(histogram);
     }
 
     pub(crate) fn show_aux_windows(&mut self, ctx: &egui::Context) -> ViewerAuxChanges {
@@ -289,8 +309,14 @@ impl ViewerState {
         }
     }
 
-    pub(crate) fn needs_preview_histogram(&self) -> bool {
-        self.contrast_settings.mode == ContrastMode::Auto || self.histogram_window.open
+    pub(crate) fn preview_histogram_request(&self) -> PreviewHistogramRequest {
+        if self.histogram_window.open {
+            PreviewHistogramRequest::Full
+        } else if self.contrast_settings.mode == ContrastMode::Auto {
+            PreviewHistogramRequest::AutoContrast
+        } else {
+            PreviewHistogramRequest::None
+        }
     }
 
     pub(crate) fn needs_line_profile_refresh(&self) -> bool {
@@ -322,6 +348,7 @@ pub(crate) struct ViewerReplayState {
 pub(crate) struct ViewerInput<'a> {
     pub(crate) texture: Option<&'a PreviewDisplayTexture>,
     pub(crate) frame: Option<&'a PreviewFrame>,
+    pub(crate) time_surface_hover_value: Option<u8>,
     pub(crate) overlays: &'a [Overlay],
     pub(crate) camera_info: Option<&'a DeviceInfo>,
     pub(crate) nm_per_pixel: f64,
@@ -641,6 +668,13 @@ fn draw_viewer_controls(
             stats.disk_send_wait_us as f64 / 1_000.0,
             stats.disk_write_us as f64 / 1_000.0,
         ));
+        ui.small(format!(
+            "Preview thread avg [ms]: decode {:.3}  |  accumulate {:.3}  |  raw-copy {:.3}  |  frame send {:.3}",
+            stats.preview_decode_avg_ms(),
+            stats.preview_accumulate_avg_ms(),
+            stats.preview_raw_event_copy_avg_ms(),
+            stats.preview_frame_send_avg_ms(),
+        ));
     }
 
     if let Some(frame) = input.frame {
@@ -860,7 +894,8 @@ fn draw_preview_toolbar(
             if idx < frame.pixels.len() {
                 let full = match state.preview_mode {
                     PreviewMode::TimeSurface => {
-                        let value = query_time_surface_value(idx)
+                        let value = input
+                            .time_surface_hover_value
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "n/a".to_owned());
                         format!("x {x}, y {y} | Value: {value} Total: {}", frame.pixels[idx])
@@ -1996,6 +2031,8 @@ mod tests {
             pixels: vec![0; 1280 * 720],
             pixels_on: vec![0; 1280 * 720],
             pixels_off: vec![0; 1280 * 720],
+            cached_total_histogram: Vec::new(),
+            cached_signed_histogram: Vec::new(),
             on_count: 0,
             off_count: 0,
             events: None,

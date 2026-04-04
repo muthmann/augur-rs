@@ -48,16 +48,16 @@ use crate::{
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
     preview::{
-        compute_frame_histogram, reset_preview_render_cache, with_prepared_preview_frame,
-        PreviewDisplaySettings,
+        cached_frame_histogram, compute_auto_contrast_max, compute_frame_histogram,
+        reset_preview_render_cache, PreviewDisplaySettings, PreviewMode,
     },
     preview_perf::{PerfMetricSnapshot, PreviewPerfStats},
-    preview_renderer::{PreviewDisplayTexture, PreviewRenderer},
+    preview_renderer::{PreviewDisplayTexture, PreviewRenderRequest, PreviewRenderer},
     render_backend::ActiveRendererInfo,
     settings::draw_settings,
     viewer_widget::{
-        draw_text_placeholder, draw_viewer, AppMode, PreviewTool, ViewMode, ViewerInput,
-        ViewerOutput, ViewerReplayState, ViewerState,
+        draw_text_placeholder, draw_viewer, AppMode, PreviewHistogramRequest, PreviewTool,
+        ViewMode, ViewerInput, ViewerOutput, ViewerReplayState, ViewerState,
     },
 };
 
@@ -255,6 +255,7 @@ struct PopupSharedData {
     viewer: ViewerState,
     texture: Option<PreviewDisplayTexture>,
     frame: Option<PreviewFrame>,
+    time_surface_hover_value: Option<u8>,
     overlays: Vec<Overlay>,
     camera_info: Option<DeviceInfo>,
     nm_per_pixel: f64,
@@ -286,6 +287,7 @@ impl Default for PopupSharedData {
             viewer: ViewerState::default(),
             texture: None,
             frame: None,
+            time_surface_hover_value: None,
             overlays: Vec::new(),
             camera_info: None,
             nm_per_pixel: 1.0,
@@ -641,6 +643,24 @@ impl CameraApp {
         }
     }
 
+    fn preview_time_surface_hover_value(
+        &mut self,
+        preview_mode: PreviewMode,
+        hover_sensor: Option<(u16, u16)>,
+        time_surface_tau_us: u64,
+        frame: Option<&PreviewFrame>,
+    ) -> Option<u8> {
+        if preview_mode != PreviewMode::TimeSurface {
+            return None;
+        }
+        let (x, y) = hover_sensor?;
+        let frame = frame?;
+        let width = usize::from(frame.width.max(1));
+        let index = usize::from(y) * width + usize::from(x);
+        self.preview_renderer
+            .query_time_surface_value(frame, time_surface_tau_us, index)
+    }
+
     fn current_external_streaming_label(&self) -> String {
         format!(
             "Streaming to ImageJ ({}:{})",
@@ -663,9 +683,25 @@ impl CameraApp {
             .as_ref()
             .map(PipelineController::stats_snapshot);
         let detected_hotpixels = self.latest_detected_hotpixels();
+        let latest_frame_for_hover = self.latest_frame.clone();
+        let (popup_preview_mode, popup_tau_us, popup_hover_sensor) = {
+            let data = self.popup_shared.lock().unwrap();
+            (
+                data.viewer.preview_mode,
+                data.viewer.time_surface_tau_us,
+                data.viewer.workspace.hover_sensor,
+            )
+        };
+        let popup_time_surface_hover_value = self.preview_time_surface_hover_value(
+            popup_preview_mode,
+            popup_hover_sensor,
+            popup_tau_us,
+            latest_frame_for_hover.as_ref(),
+        );
         let mut data = self.popup_shared.lock().unwrap();
         data.texture = self.texture.clone();
         data.frame = self.latest_frame.clone();
+        data.time_surface_hover_value = popup_time_surface_hover_value;
         data.overlays = self.analysis_output.overlays.clone();
         data.camera_info = self.camera_info.clone();
         data.nm_per_pixel = self.nm_per_pixel;
@@ -1983,8 +2019,11 @@ impl CameraApp {
     }
 
     fn raw_events_required(&self) -> bool {
+        let preview_mode = self.with_active_viewer(|viewer| viewer.preview_mode);
         self.active_view_mode() == ViewMode::PointCloud3d
-            || self.with_active_viewer(|viewer| viewer.preview_mode.requires_raw_events())
+            || preview_mode.requires_raw_events()
+            || (self.active_view_mode() == ViewMode::Preview2d
+                && self.preview_renderer.prefers_raw_events(preview_mode))
             || self.plugins_need_raw_events()
             || self.plugins_need_retained_event_history()
     }
@@ -2482,8 +2521,8 @@ impl CameraApp {
         self.with_active_viewer(ViewerState::preview_display_settings)
     }
 
-    fn preview_histogram_needed(&self) -> bool {
-        self.with_active_viewer(ViewerState::needs_preview_histogram)
+    fn preview_histogram_request(&self) -> PreviewHistogramRequest {
+        self.with_active_viewer(ViewerState::preview_histogram_request)
     }
 
     fn apply_aux_window_changes(
@@ -2507,9 +2546,17 @@ impl CameraApp {
         let settings = self.preview_display_settings();
         let preview_renderer = &mut self.preview_renderer;
         let preview_perf = &mut self.preview_perf;
-        with_prepared_preview_frame(frame, preview_mode, time_surface_tau_us, |prepared| {
-            preview_renderer.render(ctx, prepared, settings, preview_mode, preview_perf)
-        })
+        preview_renderer.render(
+            PreviewRenderRequest {
+                ctx,
+                frame,
+                settings,
+                mode: preview_mode,
+                time_surface_tau_us,
+            },
+            PreviewHistogramRequest::None,
+            preview_perf,
+        )
     }
 
     fn render_preview_texture_from_frame(
@@ -2548,6 +2595,78 @@ impl CameraApp {
         self.with_active_viewer_mut(|viewer| viewer.apply_histogram(histogram));
     }
 
+    fn apply_preview_auto_histogram(&mut self, histogram: &[u64]) {
+        self.with_active_viewer_mut(|viewer| viewer.apply_auto_histogram(histogram));
+    }
+
+    fn update_preview_histogram_from_frame(&mut self, frame: &PreviewFrame) {
+        let request = self.preview_histogram_request();
+        if request == PreviewHistogramRequest::None {
+            return;
+        }
+
+        let histogram_started = Instant::now();
+        let (preview_mode, time_surface_tau_us) =
+            self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
+
+        match request {
+            PreviewHistogramRequest::None => {}
+            PreviewHistogramRequest::AutoContrast => {
+                let gpu_histogram = match self.preview_renderer.compute_histogram(
+                    frame,
+                    preview_mode,
+                    time_surface_tau_us,
+                    request,
+                ) {
+                    Ok(histogram) => histogram,
+                    Err(err) => {
+                        self.preview_renderer_notice = Some(format!(
+                            "WGPU histogram computation failed; using the CPU histogram fallback instead: {err}"
+                        ));
+                        None
+                    }
+                };
+                if let Some(histogram) = gpu_histogram {
+                    self.apply_preview_auto_histogram(&histogram);
+                } else if let Some(histogram) = cached_frame_histogram(frame, preview_mode) {
+                    self.apply_preview_auto_histogram(histogram);
+                } else {
+                    let display_max = self.with_active_viewer(|viewer| {
+                        compute_auto_contrast_max(
+                            frame,
+                            preview_mode,
+                            time_surface_tau_us,
+                            viewer.contrast_settings.auto_percentile,
+                        )
+                    });
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer.apply_auto_contrast_max(display_max);
+                    });
+                }
+            }
+            PreviewHistogramRequest::Full => {
+                let histogram = match self.preview_renderer.compute_histogram(
+                    frame,
+                    preview_mode,
+                    time_surface_tau_us,
+                    request,
+                ) {
+                    Ok(Some(histogram)) => histogram,
+                    Ok(None) => compute_frame_histogram(frame, preview_mode, time_surface_tau_us),
+                    Err(err) => {
+                        self.preview_renderer_notice = Some(format!(
+                            "WGPU histogram computation failed; using the CPU histogram fallback instead: {err}"
+                        ));
+                        compute_frame_histogram(frame, preview_mode, time_surface_tau_us)
+                    }
+                };
+                self.apply_preview_histogram(histogram);
+            }
+        }
+        self.preview_perf
+            .record_histogram(histogram_started.elapsed());
+    }
+
     fn refresh_preview_if_needed(&mut self, ctx: &egui::Context, settings_changed: bool) {
         if !settings_changed || self.active_view_mode() != ViewMode::Preview2d {
             return;
@@ -2555,15 +2674,7 @@ impl CameraApp {
         let Some(frame) = self.latest_frame.clone() else {
             return;
         };
-        if self.preview_histogram_needed() {
-            let histogram_started = Instant::now();
-            let (preview_mode, time_surface_tau_us) =
-                self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
-            let histogram = compute_frame_histogram(&frame, preview_mode, time_surface_tau_us);
-            self.preview_perf
-                .record_histogram(histogram_started.elapsed());
-            self.apply_preview_histogram(histogram);
-        }
+        self.update_preview_histogram_from_frame(&frame);
         if self.mode != AppMode::Idle && !self.external_tool_status().is_streaming() {
             self.refresh_preview_texture_from_latest_frame(ctx);
         }
@@ -2915,15 +3026,7 @@ impl CameraApp {
         self.preview_perf
             .record_analysis(analysis_started.elapsed());
 
-        if self.preview_histogram_needed() {
-            let histogram_started = Instant::now();
-            let (preview_mode, time_surface_tau_us) =
-                self.with_active_viewer(|viewer| (viewer.preview_mode, viewer.time_surface_tau_us));
-            let histogram = compute_frame_histogram(&frame, preview_mode, time_surface_tau_us);
-            self.preview_perf
-                .record_histogram(histogram_started.elapsed());
-            self.apply_preview_histogram(histogram);
-        }
+        self.update_preview_histogram_from_frame(&frame);
 
         let mut line_profile_elapsed = None;
         self.with_active_viewer_mut(|viewer| {
@@ -4092,9 +4195,17 @@ impl eframe::App for CameraApp {
                     return_preview_to_main = true;
                 }
             } else {
+                let latest_frame_for_hover = self.latest_frame.clone();
+                let main_time_surface_hover_value = self.preview_time_surface_hover_value(
+                    self.viewer.preview_mode,
+                    self.viewer.workspace.hover_sensor,
+                    self.viewer.time_surface_tau_us,
+                    latest_frame_for_hover.as_ref(),
+                );
                 let input = ViewerInput {
                     texture: self.texture.as_ref(),
                     frame: self.latest_frame.as_ref(),
+                    time_surface_hover_value: main_time_surface_hover_value,
                     overlays: &self.analysis_output.overlays,
                     camera_info: self.camera_info.as_ref(),
                     nm_per_pixel: self.nm_per_pixel,
@@ -4162,6 +4273,7 @@ impl eframe::App for CameraApp {
                                     viewer,
                                     texture,
                                     frame,
+                                    time_surface_hover_value,
                                     overlays,
                                     camera_info,
                                     nm_per_pixel,
@@ -4188,6 +4300,7 @@ impl eframe::App for CameraApp {
                                 let input = ViewerInput {
                                     texture: texture.as_ref(),
                                     frame: frame.as_ref(),
+                                    time_surface_hover_value: *time_surface_hover_value,
                                     overlays,
                                     camera_info: camera_info.as_ref(),
                                     nm_per_pixel: *nm_per_pixel,
@@ -4256,6 +4369,7 @@ impl eframe::App for CameraApp {
                                         viewer,
                                         texture,
                                         frame,
+                                        time_surface_hover_value,
                                         overlays,
                                         camera_info,
                                         nm_per_pixel,
@@ -4282,6 +4396,7 @@ impl eframe::App for CameraApp {
                                     let input = ViewerInput {
                                         texture: texture.as_ref(),
                                         frame: frame.as_ref(),
+                                        time_surface_hover_value: *time_surface_hover_value,
                                         overlays,
                                         camera_info: camera_info.as_ref(),
                                         nm_per_pixel: *nm_per_pixel,
