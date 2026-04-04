@@ -19,7 +19,7 @@ A single menu bar row at the top of the window:
 | `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay, Export TIFF Stack during replay |
 | `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection |
 | `Settings` | Pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls |
-| `View` | Toggle Settings/Analysis panels, show/hide the scale bar, switch 2D/3D view mode |
+| `View` | Toggle Settings/Analysis panels, show/hide the scale bar, toggle Dark Mode, switch 2D/3D view mode |
 | `Tools` | Connect or disconnect the ImageJ/Fiji bridge |
 | `Plugins` | Plugin Manager, Scan for New Plugins, Open Plugins Folder |
 | `Analysis` | Per-plugin enable/disable checkboxes (shown only when plugins exist) |
@@ -155,9 +155,12 @@ HDF5 replay is optional at build time. Build or run `augur-gui` with `--features
 The center panel switches to a `Replay` heading and shows a transport bar between the canvas and the scrollable controls area:
 
 - play/pause, restart, and stop icon buttons
+- `Space` toggles play/pause
+- `←` / `→` pause replay if needed and step one acquisition-window frame backward / forward
 - a Speed combo box (`0.25x`, `0.5x`, `1x`, `2x`, `4x`, `Max`)
 - a full-width timeline slider for seeking within the recording
 - current / total replay time
+- after a seek or single-step, the transport snaps to the actual decoded frame position once that replacement frame arrives; the previous frame stays visible until then instead of dropping to the empty placeholder
 
 Enabled plugins continue to process replayed frames through the normal `PreviewFrame` path.
 
@@ -239,6 +242,7 @@ Histogram and line-profile tools also use deferred OS windows when the backend s
 
 Status, warning, and error labels adapt to the active GUI theme.
 
+- `View -> Dark Mode` lets you switch the whole GUI between light and dark appearance explicitly instead of relying only on the OS default
 - warning and error text uses egui's theme-aware foreground colors, so replay notices, missing-dependency warnings, load errors, and runtime error messages stay readable in both light and dark mode
 - replay and plugin success labels use a darker mid-green instead of a very bright light-green
 - analysis info messages use a darker blue for better contrast on light backgrounds
