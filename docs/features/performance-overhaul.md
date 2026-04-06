@@ -2,7 +2,7 @@
 
 ## Summary
 
-This pass extends the earlier performance safeguards with deeper hot-path and plugin-host changes:
+Hot-path and plugin-host performance optimizations across the capture, preview, and plugin pipeline:
 
 - split preview, disk, and raw buffer sizing in `augur-core`
 - add queue/drop and blocked-writer telemetry
@@ -10,7 +10,7 @@ This pass extends the earlier performance safeguards with deeper hot-path and pl
 - render preview images directly as `Color32` without an intermediate RGBA buffer
 - cache dynamic-plugin settings/status polling instead of re-reading JSON on every egui update
 - open decoded replay files asynchronously so large `.csv`, `.bin`, `.npy`, `.h5`, and `.hdf5`
-  files no longer freeze the GUI before playback starts
+  files do not freeze the GUI before playback starts
 - switch the plugin API `EventStore` to segmented frame-based access
 - add host-view dataset generations so the GUI can keep decoded datasets and density textures until
   the plugin says the data really changed
@@ -58,16 +58,6 @@ host-view, and plugin work may coalesce or drop; the disk path must remain bound
   and host-rendered density textures until the generation changes.
 - `HostContext::publish_raw` and `publish_persistent_raw` let plugins reuse their own serialized
   payloads instead of forcing host-side JSON serialization every frame.
-
-## Breaking Change
-
-This is a breaking runtime-plugin ABI change.
-
-- `PluginVTable` gained `host_view_dataset_generation`
-- `FfiEventStoreHandle` switched from contiguous event slices to frame-based callbacks
-- runtime plugins must rebuild against the current `augur-plugin-api`
-
-See the [Plugin API Migration History](./plugin-api-migration-history.md) for the exact adaptation notes.
 
 ## Verification
 

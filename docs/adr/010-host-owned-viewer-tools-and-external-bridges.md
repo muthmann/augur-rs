@@ -6,22 +6,14 @@ Accepted
 
 ## Context
 
-The shared preview workspace already gave `augur-gui` one coordinated place for zoom, crop, ROI
-selection, and 2D/3D view switching. Researchers still needed two more capabilities:
+The shared preview workspace already gives `augur-gui` one coordinated place for zoom, crop, ROI selection, and 2D/3D view switching. Two additional capabilities are needed:
 
-- richer host-side image inspection tools such as histogram-driven contrast, measurements, and
-  software annotations without leaving Augur
-- a lightweight way to hand the live preview off to external viewers such as ImageJ/Fiji without
-  turning those workflows into analysis plugins
+- richer host-side image inspection tools such as histogram-driven contrast, measurements, and software annotations without leaving Augur
+- a lightweight way to hand the live preview off to external viewers such as ImageJ/Fiji without turning those workflows into analysis plugins
 
-Treating these needs as analysis plugins would blur an important boundary. Histogram controls,
-measurements, and annotations are user-interaction features, not frame-processing outputs. Likewise,
-an external viewer bridge needs lossy background delivery and connection state, not a new
-`augur-core` contract.
+Treating these needs as analysis plugins would blur an important boundary. Histogram controls, measurements, and annotations are user-interaction features, not frame-processing outputs. Likewise, an external viewer bridge needs lossy background delivery and connection state, not a new `augur-core` contract.
 
-The initial ImageJ/Fiji implementation also hit an upstream compatibility limit: modern ImageJ no
-longer ships the historic raw TCP `SocketListener`, so a direct Rust socket client cannot talk to a
-stock ImageJ/Fiji install without an additional compatibility layer.
+The ImageJ/Fiji bridge uses a bundled compatibility plugin because stock ImageJ does not expose a direct TCP listener suitable for raw frame streaming.
 
 ## Decision
 
@@ -49,14 +41,13 @@ Keep viewer tools and external preview bridges host-owned inside `augur-gui`.
 
 ### Positive
 
-- Augur gains useful inspection tools without pushing microscopy-specific logic into `augur-core`
+- Augur gains useful inspection tools without pushing application-specific logic into `augur-core`
 - plugin overlays stay focused on analysis output rather than ad hoc GUI interaction state
 - the external-viewer handoff has a clear host-owned extension point for future backends
 - ImageJ/Fiji streaming can be enabled or disconnected without changing the capture pipeline split
 - the ImageJ/Fiji workaround stays small and isolated to one auxiliary plugin artifact rather than
   pulling Java-specific remoting code into the Rust bridge
-- researchers can now use native ImageJ stack tools such as scrubbing, temporal measurements, and
-  stack projections on recent preview history without writing intermediary TIFF files
+- users can use native ImageJ stack tools such as scrubbing, temporal measurements, and stack projections on recent preview history without writing intermediary TIFF files
 
 ### Negative
 

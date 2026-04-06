@@ -23,7 +23,7 @@
 
 AugurRS gives you direct, auditable control over an EVK4 event camera. Whether you are capturing raw event streams for computer vision research, running robotics experiments, doing high-speed measurements, or building a custom imaging workflow — the core tool does exactly what you need: reliable capture, live preview, recorded-file replay, and full sensor control. Nothing more, nothing less.
 
-If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything from signal processing to detection, localization, metrics, and custom overlays. Scientific plugins for SMLM microscopy and biophotonics ship separately in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
+If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything from signal processing to detection, tracking, metrics, and custom overlays. Community plugins ship separately in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
 
 <!-- TODO: Add screenshot of augur-gui live preview here -->
 <!-- ![Screenshot](resources/screenshot-gui.png) -->
@@ -166,12 +166,7 @@ AugurRS ships a generic, FFI-based plugin system that turns the live preview int
 
 Drop a compiled plugin into `~/.augur/plugins/`, and the GUI's **Plugin Manager** picks it up. Enable, disable, reload — no recompilation of the host required.
 
-This repository keeps the runtime plugin host and API crates, but no longer
-ships plugin implementations. Scientific plugins for SMLM, biophotonics, and
-other domains are maintained in the companion
-[**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
-`augur-gui` itself includes a built-in **Hotpixel Detection** tool as part of
-the core application rather than as a plugin.
+This repository ships the runtime plugin host and API crates. Plugin implementations are maintained in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository. `augur-gui` itself includes a built-in **Hotpixel Detection** tool as part of the core application rather than as a plugin.
 
 **Want to write a plugin?** See the [**Plugin Authoring Guide**](./docs/features/plugin-authoring-guide.md).
 

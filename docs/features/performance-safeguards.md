@@ -2,13 +2,13 @@
 
 ## Why This Exists
 
-The live GUI and replay preview are intentionally allowed to be lossy so the recording path can stay bounded and predictable. This note captures the runtime safeguards that were added after severe lag reports in live and replay mode.
+The live GUI and replay preview are intentionally lossy so the recording path can stay bounded and predictable. This note captures the runtime safeguards that keep live and replay mode responsive under load.
 
 ## Recording-Safety Changes
 
 - The output file and EVT3 header are prepared before the camera starts streaming. If file creation or header writing fails, the pipeline now fails fast instead of starting capture and erroring asynchronously later.
 - Once the USB reader has accepted a packet, shutdown now keeps trying to enqueue that packet to the disk writer instead of discarding it when stop and backpressure overlap.
-- The USB reader no longer scans every packet to estimate event counts for GUI/CLI stats. Ingress bytes remain authoritative on the capture path, while decoded-event stats are now measured on the lossy preview side.
+- The USB reader does not scan every packet to estimate event counts. Ingress bytes remain authoritative on the capture path, while decoded-event stats are measured on the lossy preview side.
 
 ## Preview / GUI Changes
 

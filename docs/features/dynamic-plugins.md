@@ -46,7 +46,7 @@ Fields:
 | `name` | yes | Display name shown in the Plugin Manager |
 | `version` | yes | Semantic version string |
 | `description` | yes | One-line summary |
-| `domain` | yes | Category tag (`general`, `smlm`, `biophotonics`, …) |
+| `domain` | yes | Category tag (e.g. `general`, `analysis`, `vision`, `robotics`) |
 | `library` | no | Base name of the dynamic library, **without** the `lib` prefix and without the platform extension (`.dylib`, `.so`, `.dll`). If omitted, the loader auto-discovers a single library file in the directory. |
 
 For example, `library = "augur_plugin_example"` resolves to `libaugur_plugin_example.dylib` on macOS, `libaugur_plugin_example.so` on Linux, and `augur_plugin_example.dll` on Windows.
@@ -64,16 +64,13 @@ Load failures are recorded per plugin instead of aborting the app.
 
 ## Runtime Plugin Sources
 
-Maintained scientific runtime plugins now live in
-[augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin
-there, then copy its `plugin.toml` plus release library into
-`~/.augur/plugins/<plugin-name>/`.
+Community runtime plugins are maintained in [augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin there, then copy its `plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
 
 ## Troubleshooting
 
 ### "missing field `name`"
 
-The `plugin.toml` still uses the old `[plugin]` section format:
+The `plugin.toml` uses the deprecated `[plugin]` section format:
 
 ```toml
 [plugin]
@@ -88,8 +85,7 @@ A source folder was copied instead of the built library. Build in `--release` mo
 
 ### "loading symbol augur_plugin_vtable failed"
 
-The library was built against an older runtime plugin API. Rebuild it against the current
-`augur-plugin-api` branch or release before loading it into this host.
+The library was built against a different version of the plugin API. Rebuild it against the current `augur-plugin-api` release before loading it into this host.
 
 ## Why C FFI + `libloading`
 

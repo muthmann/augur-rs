@@ -2,18 +2,13 @@
 
 ## Summary
 
-`augur-gui` now uses a runtime-only plugin model for plugin implementations.
-Scientific/domain plugins load from `~/.augur/plugins/`, while host-owned core
-tools such as hotpixel detection stay in `augur-gui` and are not plugins.
-
-The plugin boundary is now intentionally generic and pre-v1 breaking:
+`augur-gui` uses a runtime-only plugin model. Plugins load from `~/.augur/plugins/`, while host-owned core tools such as hotpixel detection stay in `augur-gui` and are not plugins.
 
 - `augur-plugin-api` owns the host/runtime contract
-- `augur-plugin-types` owns optional domain payload crates such as localization/SMLM types
+- `augur-plugin-types` owns optional companion payload crates for domain-specific data types
 - plugin-owned GUI output flows through declarative host views instead of plugin-specific host hooks
 
-This keeps `augur-core` free of research logic and keeps `augur-gui` a general-purpose recorder,
-preview shell, and plugin host.
+This keeps `augur-core` free of application-specific logic and keeps `augur-gui` a general-purpose recorder, preview shell, and plugin host.
 
 ## Runtime Model
 
@@ -37,7 +32,7 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 
 ## Core API Surface
 
-`augur-plugin-api` now defines only generic host/runtime contracts:
+`augur-plugin-api` defines the generic host/runtime contracts:
 
 - `Plugin`
 - `export_plugin!`
@@ -54,13 +49,7 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 - `Series1dV1`
 - `CTX_GLOBAL_SETTINGS`
 
-Domain payloads such as localization data moved out of `augur-plugin-api` into companion crates.
-For example, localization plugins should now share:
-
-- `augur_plugin_types::localization::Localization`
-- `augur_plugin_types::localization::LocalizationResults`
-- `augur_plugin_types::localization::LocalizationTable`
-- `augur_plugin_types::localization::CTX_LOCALIZATION_RESULTS`
+Domain-specific payloads live in companion crates rather than in `augur-plugin-api`. Plugins that share structured data with downstream consumers define their types in `augur-plugin-types` or their own companion crate.
 
 ## Host Views
 
@@ -136,8 +125,8 @@ fn capabilities(&self) -> PluginCapabilities {
 fn host_views(&self) -> HostViewRegistry {
     HostViewRegistry {
         datasets: vec![HostDatasetDescriptor {
-            id: "molecules.table".into(),
-            title: "Localized Molecules".into(),
+            id: "detections.table".into(),
+            title: "Detected Features".into(),
             kind: HostDatasetKind::TableV1(TableSchema {
                 columns: vec![
                     TableColumn {
@@ -146,53 +135,53 @@ fn host_views(&self) -> HostViewRegistry {
                         value_type: TableValueType::U64,
                     },
                     TableColumn {
-                        id: "x_nm".into(),
-                        title: "X [nm]".into(),
+                        id: "x_px".into(),
+                        title: "X [px]".into(),
                         value_type: TableValueType::F64,
                     },
                     TableColumn {
-                        id: "y_nm".into(),
-                        title: "Y [nm]".into(),
+                        id: "y_px".into(),
+                        title: "Y [px]".into(),
                         value_type: TableValueType::F64,
                     },
                 ],
                 coordinate_space_2d: Some(TableCoordinateSpace2d {
-                    x_column: "x_nm".into(),
-                    y_column: "y_nm".into(),
+                    x_column: "x_px".into(),
+                    y_column: "y_px".into(),
                     x_min: 0.0,
-                    x_max: 100_000.0,
+                    x_max: 1280.0,
                     y_min: 0.0,
-                    y_max: 100_000.0,
+                    y_max: 720.0,
                 }),
             }),
-            empty_message: "No localizations available yet.".into(),
+            empty_message: "No detections available yet.".into(),
         }],
         views: vec![
             HostViewDescriptor {
-                id: "molecules.panel".into(),
-                title: "Localization Preview".into(),
-                dataset_id: "molecules.table".into(),
+                id: "detections.panel".into(),
+                title: "Detection Preview".into(),
+                dataset_id: "detections.table".into(),
                 placement: HostViewPlacement::AnalysisPanel,
                 kind: HostViewKind::CompactTable,
             },
             HostViewDescriptor {
-                id: "molecules.scatter".into(),
-                title: "Localization Scatter".into(),
-                dataset_id: "molecules.table".into(),
+                id: "detections.scatter".into(),
+                title: "Detection Scatter".into(),
+                dataset_id: "detections.table".into(),
                 placement: HostViewPlacement::Window,
                 kind: HostViewKind::Scatter2dFromTable {
-                    x_column: "x_nm".into(),
-                    y_column: "y_nm".into(),
+                    x_column: "x_px".into(),
+                    y_column: "y_px".into(),
                 },
             },
             HostViewDescriptor {
-                id: "molecules.density".into(),
-                title: "Localization Density".into(),
-                dataset_id: "molecules.table".into(),
+                id: "detections.density".into(),
+                title: "Detection Density".into(),
+                dataset_id: "detections.table".into(),
                 placement: HostViewPlacement::Window,
                 kind: HostViewKind::Density2dFromTable {
-                    x_column: "x_nm".into(),
-                    y_column: "y_nm".into(),
+                    x_column: "x_px".into(),
+                    y_column: "y_px".into(),
                 },
             },
         ],
@@ -205,9 +194,7 @@ fn host_views(&self) -> HostViewRegistry {
 The `Plugin` trait still has an optional `dependencies()` method that returns plugin name strings.
 The Plugin Manager uses them to surface hard plugin relationships.
 
-If a plugin consumes an upstream payload such as
-`augur_plugin_types::localization::CTX_LOCALIZATION_RESULTS` and cannot operate without it, return
-the producer name from `dependencies()`.
+If a plugin consumes an upstream payload and cannot operate without it, return the producer name from `dependencies()`.
 
 If the plugin can degrade gracefully, prefer a runtime warning over a hard dependency declaration.
 
@@ -218,7 +205,7 @@ If the plugin can degrade gracefully, prefer a runtime warning over a hard depen
 | `augur-plugin-api/src/ffi.rs` | C ABI types, `PluginCapabilities`, and flat `PluginVTable` |
 | `augur-plugin-api/src/helpers.rs` | safe plugin-author trait and host wrappers |
 | `augur-plugin-api/src/context.rs` | generic host datasets/views and `GlobalSettings` |
-| `augur-plugin-types/src/localization.rs` | optional localization/SMLM payloads |
+| `augur-plugin-types/src/` | optional domain-specific companion payloads |
 | `augur-plugin-api/src/macros.rs` | `export_plugin!` |
 | `augur-gui/src/plugin_loader.rs` | manifest parsing, library loading, callback bridges |
 | `augur-gui/src/host_views.rs` | registry resolution, dataset decoding, host-side rendering/export |

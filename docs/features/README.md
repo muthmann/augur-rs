@@ -31,11 +31,9 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the bundled Augur Bridge handoff path for ImageJ/Fiji
 - [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window and popup host
 - [Built-In Hotpixel Detection](./built-in-hotpixel-detection.md) — host-owned hotpixel detection, overlays, and DEM-mask copy flow
-- [Generic Plugin Interface Cleanup](./generic-plugin-interface-cleanup.md) — companion payload crate, capability-driven history retention, and fully generic host-view rendering
 - [Plugin Authoring Guide](./plugin-authoring-guide.md) — runtime-only plugin host, FFI API, phased execution, and shared context types
-- [Plugin API Migration History](./plugin-api-migration-history.md) — ABI evolution from v0.2 through v0.4: EventStore, dataset generations, companion type crates, and capabilities
 - [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables, plots, and images
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [Output File Timestamps](./output-file-timestamps.md) — overwrite protection and automatic timestamp suffixes for recordings
 
-Scientific runtime plugins (molecule localization, focus metrics, reconstruction, etc.) are documented in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.
+Community runtime plugins are documented in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.

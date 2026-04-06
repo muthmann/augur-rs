@@ -2,7 +2,7 @@
 
 ## Summary
 
-This feature implements phases 1-4 of the preview-rendering plan for `augur-gui`.
+GPU-accelerated preview rendering for `augur-gui`.
 
 - add preview-stage timing so the GUI can report an end-to-end accepted-frame total plus dequeue,
   analysis, histogram, line-profile, CPU-fallback render, texture stage/submit, and
@@ -116,55 +116,17 @@ not depend on GPU presentation.
 - Preview tools still read from `PreviewFrame`; the GPU count-accumulation path is additive and
   does not remove the CPU frame planes or introduce full-frame GPU readback.
 
-## Benchmark Baseline
+## Benchmarking
 
-Benchmark command run on 2026-04-03:
+Run CPU-side preview microbenchmarks with:
 
 ```bash
 cargo bench -p augur-gui --bench preview_bench -- --warm-up-time 0.1 --measurement-time 0.1
 ```
 
-Reference machine:
+These fixtures are deterministic synthetic frames, not live camera captures. They are useful for tracking CPU-side regressions in preview preparation and fallback rendering, but they are not a valid glow-versus-wgpu renderer comparison by themselves.
 
-- model: `MacBookPro18,3`
-- CPU: `Apple M1 Pro`
-- arch: `arm64`
-- macOS: `15.6`
-
-These fixtures are deterministic synthetic replay-style frames, not live camera captures.
-They are CPU microbenchmarks only. They are useful for tracking CPU-side regressions in preview
-preparation and fallback rendering, but they are not a valid glow-versus-wgpu renderer A/B by
-themselves.
-
-| Benchmark | Fixture | Reported time |
-| --- | --- | --- |
-| `cpu_preview/frame_to_color_image` | `320x240 sparse` | `[265.35 µs, 323.44 µs, 392.93 µs]` |
-| `cpu_preview/frame_to_color_image` | `320x240 medium` | `[155.05 µs, 158.11 µs, 161.73 µs]` |
-| `cpu_preview/frame_to_color_image` | `320x240 dense` | `[167.39 µs, 174.13 µs, 183.87 µs]` |
-| `cpu_preview/frame_to_color_image` | `1280x720 sparse` | `[1.2753 ms, 1.3095 ms, 1.3469 ms]` |
-| `cpu_preview/frame_to_color_image` | `1280x720 medium` | `[1.3315 ms, 1.3778 ms, 1.4290 ms]` |
-| `cpu_preview/frame_to_color_image` | `1280x720 dense` | `[1.7978 ms, 2.1800 ms, 2.7714 ms]` |
-| `cpu_preview/histogram` | `1280x720 sparse` | `[776.91 µs, 799.00 µs, 826.06 µs]` |
-| `cpu_preview/histogram` | `1280x720 medium` | `[768.15 µs, 776.93 µs, 786.57 µs]` |
-| `cpu_preview/histogram` | `1280x720 dense` | `[820.61 µs, 920.67 µs, 1.0519 ms]` |
-| `cpu_preview/time_surface_prepare` | `1280x720 sparse` | `[2.7885 ms, 2.8487 ms, 2.9113 ms]` |
-| `cpu_preview/time_surface_prepare` | `1280x720 medium` | `[3.1061 ms, 3.3224 ms, 3.5667 ms]` |
-| `cpu_preview/time_surface_prepare` | `1280x720 dense` | `[5.8335 ms, 5.8976 ms, 5.9650 ms]` |
-| `cpu_preview/line_profile` | `1280x720 sparse` | `[5.2427 µs, 5.3982 µs, 5.5823 µs]` |
-| `cpu_preview/line_profile` | `1280x720 medium` | `[5.3689 µs, 5.5120 µs, 5.6926 µs]` |
-| `cpu_preview/line_profile` | `1280x720 dense` | `[5.2363 µs, 5.3866 µs, 5.5750 µs]` |
-
-The main takeaway from this baseline is that the hottest CPU-side steps before GPU accumulation are
-still full-frame synthesis, histogram work, and especially time-surface preparation on the CPU
-fallback path. The WGPU path now bypasses the old CPU-owned time-surface tick/decay preparation for
-normal preview rendering, histogram work, and hover-value queries, while count-based preview modes
-can additionally shift count accumulation plus full histogram generation onto the GPU when raw
-preview events are available. CPU-side time-surface preparation still exists for compatibility-mode
-and fallback behavior.
-
-For renderer A/B, use the same replay or live workload in `--release`, keep preview mode, zoom,
-window size, and preview cadence fixed, hit `Reset timings`, and compare `Frame total` between
-`AUGUR_RENDERER=glow` and `AUGUR_RENDERER=wgpu`.
+For a renderer A/B comparison, use the same replay or live workload in `--release`, keep preview mode, zoom, window size, and preview cadence fixed, hit `Reset timings`, and compare `Frame total` between `AUGUR_RENDERER=glow` and `AUGUR_RENDERER=wgpu`.
 
 ## Verification
 
@@ -178,19 +140,8 @@ cargo clippy -p augur-gui --all-targets -- -D warnings
 cargo bench -p augur-gui --bench preview_bench -- --warm-up-time 0.1 --measurement-time 0.1
 ```
 
-## Follow-Up
+## Notes
 
-- A later maintenance pass removed obsolete prototype shader blobs from
-  `augur-gui/src/preview_renderer.rs` and consolidated the CPU histogram selection flow in
-  `augur-gui/src/preview.rs` so the active preview paths are easier to trace without changing
-  runtime behavior.
-- Upstream `augur-core` still keeps CPU frame planes and cached histograms because viewer tools,
-  plugins, and external bridges consume `PreviewFrame` on the CPU.
-- `TimeSurface` is fully GPU-backed only when the WGPU renderer is active and raw preview events
-  are available; the CPU fallback path remains intentionally intact for `glow`, compatibility, and
-  runtime fallback.
-- Host-view density/image renderers still use their existing CPU texture path.
-- Manual smoke coverage is still worthwhile on:
-  - live Apple Silicon preview with `AUGUR_RENDERER=auto`
-  - forced `AUGUR_RENDERER=glow`
-  - replay popup preview on `wgpu`
+- `augur-core` keeps CPU frame planes and cached histograms because viewer tools, plugins, and external bridges consume `PreviewFrame` on the CPU.
+- `TimeSurface` is fully GPU-backed only when the WGPU renderer is active and raw preview events are available; the CPU fallback path remains intact for `glow` and runtime fallback.
+- Host-view density/image renderers use their own CPU texture path.

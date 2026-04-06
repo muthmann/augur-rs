@@ -32,9 +32,9 @@ Adopt one persisted host-owned global-settings contract:
 
 ### Positive
 
-- researchers get one obvious place to find pixel scale, geometry, acquisition time, retention
+- users get one obvious place to find pixel scale, geometry, acquisition time, retention
   budget, and cadence controls
-- runtime plugins can consume host-owned experiment settings without an ABI change
+- runtime plugins can consume host-owned settings without an ABI change
 - old TOML sidecars and configs remain readable because `[global]` is defaulted
 - replay speed changes become responsive without abandoning the existing byte-rate throttle model
 

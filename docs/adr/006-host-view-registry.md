@@ -6,13 +6,7 @@ Accepted
 
 ## Context
 
-The first dynamic plugin integration added one reconstruction-specific host hook:
-`Plugin::accumulated_localizations()`. That solved the immediate reconstruction window use case,
-but it tightly coupled the GUI shell to a single scientific payload and view.
-
-The GUI now needs a more general way for runtime plugins to expose structured,
-host-rendered datasets without pushing domain-specific UI into `augur-gui` or
-extending the legacy FFI surface one ad hoc field at a time.
+The GUI needs a general way for runtime plugins to expose structured, host-rendered datasets without pushing domain-specific UI into `augur-gui` or extending the FFI surface one ad hoc field at a time.
 
 ## Decision
 

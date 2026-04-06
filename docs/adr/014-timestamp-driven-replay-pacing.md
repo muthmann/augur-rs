@@ -5,12 +5,7 @@ Accepted
 
 ## Context
 
-Replay previously used one global byte-rate estimate derived from the file's
-overall timestamp span. That made `1x` speed drift away from recorded event
-time whenever event density varied across the file: dense regions replayed too
-slowly and sparse regions replayed too quickly. Replay display cadence was also
-fully independent from replay speed and acquisition time, which could waste
-repaints or silently drop many produced frames.
+A global byte-rate estimate for replay pacing causes `1x` speed to drift away from recorded event time whenever event density varies across the file: dense regions replay too slowly and sparse regions replay too quickly. Replay display cadence must also adapt to replay speed and acquisition time to avoid wasting repaints or silently dropping frames.
 
 ## Decision
 
@@ -21,7 +16,7 @@ Adopt a timestamp-driven replay timing model:
    EVT3 replay updates it directly from the packet reader, so pacing is not
    coupled to the lossy preview queue.
 3. Replay speed changes and seeks reset their pacing baseline from the current
-   timestamp rather than the previously consumed byte/event count.
+   timestamp rather than consumed byte/event count.
 4. `augur-gui` derives the effective replay display interval from
    `acq_time_ms / speed`, clamped to `10..=200` ms, while leaving the manual
    preview-rate control as a live-mode preference.

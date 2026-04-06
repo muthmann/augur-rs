@@ -75,7 +75,7 @@ right-side **Analysis Tools** panel appears.
 ### Available analysis tools
 
 - **Hotpixel Detection** — built-in persistent hotpixel detection plus one-click DEM-mask copy
-- **Runtime plugins** — any plugin loaded from `~/.augur/plugins/`, including scientific plugins from the [augur-plugins](https://github.com/muthmann/augur-plugins) repository
+- **Runtime plugins** — any plugin loaded from `~/.augur/plugins/`, including community plugins from the [augur-plugins](https://github.com/muthmann/augur-plugins) repository
 
 See the [Plugin Authoring Guide](./features/plugin-authoring-guide.md) for the plugin host model.
 
