@@ -22,7 +22,7 @@ body:
       label: Component
       options:
         - augur (CLI)
-        - augur-gui (GUI)
+        - AugurRS (GUI)
         - augur-core (library)
         - augur-prophesee (hardware layer)
     validations:

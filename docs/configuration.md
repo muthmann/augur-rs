@@ -15,7 +15,7 @@ An example file is available at [examples/augur.toml](../examples/augur.toml).
 - `augur status` and `augur record` use built-in defaults unless `--config <path>` is provided
 - `augur config show` prints the effective config
 - `augur config set-bias`, `set-roi`, and `set-mask` update `augur.toml` by default unless `--config <path>` is provided
-- `augur-gui` starts with defaults and can load or save TOML files from the toolbar
+- `AugurRS` starts with defaults and can load or save TOML files from the toolbar
 
 ## Example
 

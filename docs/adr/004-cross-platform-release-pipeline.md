@@ -14,7 +14,7 @@ The repository also lacked a standard release operator workflow for bumping the 
 
 Adopt a release pipeline with three platform-specific build jobs plus workspace-level `cargo-release` configuration:
 
-- macOS builds `augur` / `augur-gui`, assembles `AugurGUI.app`, stages it with an `Applications` symlink, creates `AugurGUI.dmg`, and also publishes `augur-macos.zip`
+- macOS builds `augur` / `augur-gui`, assembles `AugurRS.app`, stages it with an `Applications` symlink, creates `AugurRS.dmg`, and also publishes `augur-macos.zip`
 - Linux publishes `augur-linux.tar.gz`
 - Windows publishes `augur-windows.zip`
 - `release.toml` defines shared-version tagging as `v{{version}}` and the release commit/tag messaging

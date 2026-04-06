@@ -25,7 +25,7 @@ At startup or on rescan, `augur-gui`:
 2. parses each `plugin.toml`
 3. resolves the matching library file
 4. loads the exported `augur_plugin_vtable` symbol
-5. rejects stale plugins by comparing `PluginVTable::vtable_size`
+5. rejects stale plugins by comparing both `PluginVTable::vtable_size` and `PluginVTable::abi_version`
 6. instantiates the plugin and caches its declarative settings/status metadata
 
 Loader failures are non-fatal and stay visible in the Plugin Manager.

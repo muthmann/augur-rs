@@ -17,7 +17,7 @@ pub use ffi::{
     FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
     FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
     HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn, PluginEntry,
-    PluginInput, PluginVTable, PLUGIN_ENTRY_SYMBOL,
+    PluginInput, PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
 pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
@@ -77,7 +77,7 @@ mod tests {
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
         FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiPixel, FfiSlice, FfiString,
         FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
-        PluginInput, PluginVTable,
+        PluginInput, PluginVTable, PLUGIN_ABI_VERSION,
     };
 
     #[test]
@@ -90,7 +90,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
-        assert_eq!(std::mem::size_of::<PluginVTable>(), 160);
+        assert_eq!(std::mem::size_of::<PluginVTable>(), 168);
         assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
         assert_eq!(
             std::mem::size_of::<EventStoreFrameRangeForTimestampsFn>(),
@@ -98,6 +98,7 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
+        assert_eq!(PLUGIN_ABI_VERSION, 2);
     }
 
     #[test]

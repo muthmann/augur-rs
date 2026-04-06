@@ -1,11 +1,11 @@
 # GUI Usage
 
-The `augur-gui` desktop app wraps the same backend as the CLI with live preview, file replay, runtime controls, and plugin-driven analysis.
+The `AugurRS` desktop app wraps the same backend as the CLI with live preview, file replay, runtime controls, and plugin-driven analysis.
 
 ## Start the App
 
 ```bash
-cargo run --bin augur-gui
+cargo run -p augur-gui --bin AugurRS
 ```
 
 ---
@@ -150,7 +150,7 @@ Decoded replay files carry geometry differently:
 - `.npy` infers geometry from `max(x) + 1` / `max(y) + 1` with a minimum of `1280x720`
 - `.h5` / `.hdf5` read the file-level `geometry` attribute when present and otherwise infer geometry from event bounds with a minimum of `1280x720`
 
-HDF5 replay is optional at build time. Build or run `augur-gui` with `--features hdf5` on a machine with the HDF5 system library installed to enable `.h5` / `.hdf5` support.
+HDF5 replay is optional at build time. Build or run `AugurRS` with `--features hdf5` on a machine with the HDF5 system library installed to enable `.h5` / `.hdf5` support.
 
 The center panel switches to a `Replay` heading and shows a transport bar between the canvas and the scrollable controls area:
 

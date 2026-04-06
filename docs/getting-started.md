@@ -19,10 +19,10 @@ cargo build --workspace
 export HDF5_DIR="$(brew --prefix hdf5)"   # macOS / Homebrew
 ./scripts/install-ecf-plugin.sh
 export HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin"
-cargo build -p augur-gui --features hdf5
+cargo build -p augur-gui --bin AugurRS --features hdf5
 ```
 
-`HDF5_PLUGIN_PATH` must be set before launching `augur-gui` for ECF-compressed Prophesee files and, on macOS, should also be present for HDF5-enabled build/test commands. See [HDF5 file support](./features/hdf5-file-support.md) for the manual plugin fallback and environment details.
+`HDF5_PLUGIN_PATH` must be set before launching `AugurRS` for ECF-compressed Prophesee files and, on macOS, should also be present for HDF5-enabled build/test commands. See [HDF5 file support](./features/hdf5-file-support.md) for the manual plugin fallback and environment details.
 
 Optional local checks:
 
@@ -73,7 +73,7 @@ The `.toml` file stores the effective camera configuration used for the capture.
 Launch the desktop app:
 
 ```bash
-cargo run --bin augur-gui
+cargo run -p augur-gui --bin AugurRS
 ```
 
 Suggested first run:

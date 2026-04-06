@@ -12,7 +12,7 @@ HDF5 replay is a build-from-source feature. Tagged binary releases do **not** in
 
 | Channel | HDF5 available? | Why |
 |---|---|---|
-| GitHub release binaries / macOS app bundle | **No** | The release workflow builds `augur` and `augur-gui` without `--features hdf5`. Even if it did not, the resulting binaries would still depend on a separately installed `libhdf5` and the ECF plugin at runtime. |
+| GitHub release binaries / macOS app bundle | **No** | The release workflow builds `augur` and `AugurRS` without `--features hdf5`. Even if it did not, the resulting binaries would still depend on a separately installed `libhdf5` and the ECF plugin at runtime. |
 | Build from source | **Yes** | Install system HDF5, install the ECF plugin, export `HDF5_DIR` and `HDF5_PLUGIN_PATH`, then build `augur-gui` with `--features hdf5`. |
 
 ## Build And Runtime Requirements
@@ -66,8 +66,8 @@ export HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin"
 Use those exports before HDF5-enabled GUI commands:
 
 ```bash
-cargo build -p augur-gui --features hdf5
-cargo run --bin augur-gui --features hdf5
+cargo build -p augur-gui --bin AugurRS --features hdf5
+cargo run -p augur-gui --bin AugurRS --features hdf5
 ```
 
 If you do not want them globally, prefix the commands directly:
@@ -75,7 +75,7 @@ If you do not want them globally, prefix the commands directly:
 ```bash
 HDF5_DIR="$(brew --prefix hdf5)" \
 HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin" \
-cargo run --bin augur-gui --features hdf5
+cargo run -p augur-gui --bin AugurRS --features hdf5
 ```
 
 ## Verification
@@ -83,7 +83,7 @@ cargo run --bin augur-gui --features hdf5
 ```bash
 HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin" \
 HDF5_DIR="$(brew --prefix hdf5)" \
-cargo build --release -p augur-gui --features hdf5
+cargo build --release -p augur-gui --bin AugurRS --features hdf5
 ```
 
-After that build succeeds, launch `augur-gui` with the same environment and open the target `.h5` / `.hdf5` replay file.
+After that build succeeds, launch `AugurRS` with the same environment and open the target `.h5` / `.hdf5` replay file.

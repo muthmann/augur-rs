@@ -235,6 +235,8 @@ pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 
+pub const PLUGIN_ABI_VERSION: u64 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FfiEventStoreHandle {
@@ -262,6 +264,11 @@ pub struct PluginVTable {
     /// Size of this struct in bytes. The host uses this to detect plugins
     /// compiled against an older (smaller) API before copying the vtable.
     pub vtable_size: usize,
+    /// Version of the runtime plugin ABI layout.
+    ///
+    /// This guards against stale plugins whose `PluginVTable` happens to keep the
+    /// same total size even though fields were inserted or reordered.
+    pub abi_version: u64,
     pub create: unsafe extern "C" fn() -> *mut c_void,
     pub destroy: unsafe extern "C" fn(*mut c_void),
     pub name: unsafe extern "C" fn(*const c_void) -> FfiString,

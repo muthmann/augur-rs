@@ -24,29 +24,29 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release --locked --bin augur --bin augur-gui
+        run: cargo build --release --locked --bin augur --bin AugurRS
 
       - name: Assemble macOS app bundle
-        run: bash resources/macos-bundle.sh target/release/augur-gui dist
+        run: bash resources/macos-bundle.sh target/release/AugurRS dist
 
       - name: Create .dmg installer
         run: |
           STAGING_DIR="$RUNNER_TEMP/dmg-staging"
           rm -rf "$STAGING_DIR"
           mkdir -p "$STAGING_DIR"
-          cp -R dist/AugurGUI.app "$STAGING_DIR/"
+          cp -R dist/AugurRS.app "$STAGING_DIR/"
           ln -s /Applications "$STAGING_DIR/Applications"
           hdiutil create \
-            -volname "AugurGUI" \
+            -volname "AugurRS" \
             -srcfolder "$STAGING_DIR" \
             -ov -format UDZO \
-            AugurGUI.dmg
+            AugurRS.dmg
 
       - name: Package CLI archive
         run: |
           mkdir -p dist/augur-macos/bin
           cp target/release/augur dist/augur-macos/bin/
-          cp target/release/augur-gui dist/augur-macos/bin/
+          cp target/release/AugurRS dist/augur-macos/bin/
           cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md dist/augur-macos/
           mkdir -p dist/augur-macos/examples
           cp examples/augur.toml dist/augur-macos/examples/
@@ -58,14 +58,14 @@ jobs:
           name: augur-macos-assets
           path: |
             augur-macos.zip
-            AugurGUI.dmg
+            AugurRS.dmg
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             augur-macos.zip
-            AugurGUI.dmg
+            AugurRS.dmg
 
   linux-release:
     name: Build Linux release artifacts
@@ -90,13 +90,13 @@ jobs:
             pkg-config libhdf5-dev
 
       - name: Build release binaries
-        run: cargo build --release --locked --bin augur --bin augur-gui
+        run: cargo build --release --locked --bin augur --bin AugurRS
 
       - name: Package release archive
         run: |
           mkdir -p dist/augur-linux/bin
           cp target/release/augur dist/augur-linux/bin/
-          cp target/release/augur-gui dist/augur-linux/bin/
+          cp target/release/AugurRS dist/augur-linux/bin/
           cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md dist/augur-linux/
           mkdir -p dist/augur-linux/examples
           cp examples/augur.toml dist/augur-linux/examples/
@@ -128,14 +128,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release --locked --bin augur --bin augur-gui
+        run: cargo build --release --locked --bin augur --bin AugurRS
 
       - name: Package release archive
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/augur-windows/bin | Out-Null
           Copy-Item target/release/augur.exe dist/augur-windows/bin/
-          Copy-Item target/release/augur-gui.exe dist/augur-windows/bin/
+          Copy-Item target/release/AugurRS.exe dist/augur-windows/bin/
           Copy-Item README.md, LICENSE, CONTRIBUTING.md, CHANGELOG.md dist/augur-windows/
           New-Item -ItemType Directory -Force -Path dist/augur-windows/examples | Out-Null
           Copy-Item examples/augur.toml dist/augur-windows/examples/

@@ -5,7 +5,7 @@
 AugurRS tagged releases now produce four downloadable artifacts:
 
 - `augur-macos.zip` with the macOS CLI binaries and supporting files
-- `AugurGUI.dmg` with an unsigned macOS GUI installer
+- `AugurRS.dmg` with an unsigned macOS GUI installer
 - `augur-linux.tar.gz` with Linux binaries and supporting files
 - `augur-windows.zip` with Windows binaries and supporting files
 
@@ -13,11 +13,11 @@ This keeps tagged releases aligned with the repository's stated platform support
 
 ## macOS DMG Packaging
 
-The macOS release job assembles `AugurGUI.app`, stages it with an `Applications` symlink, and creates a distributable `.dmg`. The bundle script now derives `Contents/Resources/AugurGUI.icns` from `assets/logo.png` at packaging time and writes `CFBundleIconFile` into the generated `Info.plist`, so Finder and the running app use the same app-icon artwork. The plan file for this task explicitly skips Apple signing and notarization because no Apple Developer account is available for the repository right now.
+The macOS release job assembles `AugurRS.app`, stages it with an `Applications` symlink, and creates a distributable `AugurRS.dmg`. The bundle script derives `Contents/Resources/AugurRS.icns` from `assets/logo.png` at packaging time, copies the bundled executable as `Contents/MacOS/AugurRS`, and writes matching bundle metadata into `Info.plist`, so Finder, the Applications folder, and macOS crash reports all use the same product name and icon.
 
 ## Cross-Platform Release Archives
 
-Linux and Windows tagged releases now build the same `augur` and `augur-gui` binaries that portability CI already checks, then package each platform with:
+Linux and Windows tagged releases now build the same `augur` and `AugurRS` binaries that portability CI already checks, then package each platform with:
 
 - the platform binaries
 - `README.md`
