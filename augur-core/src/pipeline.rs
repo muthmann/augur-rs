@@ -102,6 +102,8 @@ pub struct PreviewFrame {
     pub pixels: Vec<u16>,
     pub pixels_on: Vec<u16>,
     pub pixels_off: Vec<u16>,
+    pub cached_total_histogram: Vec<u64>,
+    pub cached_signed_histogram: Vec<u64>,
     pub on_count: u64,
     pub off_count: u64,
     pub events: Option<Vec<CdEvent>>,
@@ -115,9 +117,13 @@ impl Drop for PreviewFrame {
             pixels: std::mem::take(&mut self.pixels),
             pixels_on: std::mem::take(&mut self.pixels_on),
             pixels_off: std::mem::take(&mut self.pixels_off),
+            total_histogram: std::mem::take(&mut self.cached_total_histogram),
+            signed_histogram: std::mem::take(&mut self.cached_signed_histogram),
         });
     }
 }
+
+pub const PREVIEW_HISTOGRAM_BINS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
@@ -168,6 +174,41 @@ pub struct PipelineStatsSnapshot {
     pub disk_queue_high_water: usize,
     pub disk_send_wait_us: u64,
     pub disk_write_us: u64,
+    pub preview_packets_processed: u64,
+    pub preview_frames_emitted: u64,
+    pub preview_decode_us: u64,
+    pub preview_accumulate_us: u64,
+    pub preview_raw_event_copy_us: u64,
+    pub preview_frame_send_us: u64,
+}
+
+impl PipelineStatsSnapshot {
+    pub fn preview_decode_avg_ms(self) -> f64 {
+        avg_stage_ms(self.preview_decode_us, self.preview_packets_processed)
+    }
+
+    pub fn preview_accumulate_avg_ms(self) -> f64 {
+        avg_stage_ms(self.preview_accumulate_us, self.preview_packets_processed)
+    }
+
+    pub fn preview_raw_event_copy_avg_ms(self) -> f64 {
+        avg_stage_ms(
+            self.preview_raw_event_copy_us,
+            self.preview_packets_processed,
+        )
+    }
+
+    pub fn preview_frame_send_avg_ms(self) -> f64 {
+        avg_stage_ms(self.preview_frame_send_us, self.preview_frames_emitted)
+    }
+}
+
+fn avg_stage_ms(total_us: u64, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        total_us as f64 / samples as f64 / 1_000.0
+    }
 }
 
 #[derive(Debug)]
@@ -184,6 +225,12 @@ struct PipelineStatsInner {
     disk_queue_high_water: usize,
     disk_send_wait_us: u64,
     disk_write_us: u64,
+    preview_packets_processed: u64,
+    preview_frames_emitted: u64,
+    preview_decode_us: u64,
+    preview_accumulate_us: u64,
+    preview_raw_event_copy_us: u64,
+    preview_frame_send_us: u64,
     recent_samples: VecDeque<PipelineStatsSample>,
 }
 
@@ -209,6 +256,12 @@ impl PipelineStatsInner {
             disk_queue_high_water: 0,
             disk_send_wait_us: 0,
             disk_write_us: 0,
+            preview_packets_processed: 0,
+            preview_frames_emitted: 0,
+            preview_decode_us: 0,
+            preview_accumulate_us: 0,
+            preview_raw_event_copy_us: 0,
+            preview_frame_send_us: 0,
             recent_samples: VecDeque::new(),
         }
     }
@@ -256,6 +309,12 @@ impl PipelineStatsInner {
             disk_queue_high_water: self.disk_queue_high_water,
             disk_send_wait_us: self.disk_send_wait_us,
             disk_write_us: self.disk_write_us,
+            preview_packets_processed: self.preview_packets_processed,
+            preview_frames_emitted: self.preview_frames_emitted,
+            preview_decode_us: self.preview_decode_us,
+            preview_accumulate_us: self.preview_accumulate_us,
+            preview_raw_event_copy_us: self.preview_raw_event_copy_us,
+            preview_frame_send_us: self.preview_frame_send_us,
         }
     }
 
@@ -303,6 +362,32 @@ impl PipelineStatsInner {
             .disk_write_us
             .saturating_add(write_time.as_micros() as u64);
     }
+
+    fn record_preview_decode_time(&mut self, duration: Duration) {
+        self.preview_packets_processed = self.preview_packets_processed.saturating_add(1);
+        self.preview_decode_us = self
+            .preview_decode_us
+            .saturating_add(duration.as_micros() as u64);
+    }
+
+    fn record_preview_accumulate_time(&mut self, duration: Duration) {
+        self.preview_accumulate_us = self
+            .preview_accumulate_us
+            .saturating_add(duration.as_micros() as u64);
+    }
+
+    fn record_preview_raw_event_copy_time(&mut self, duration: Duration) {
+        self.preview_raw_event_copy_us = self
+            .preview_raw_event_copy_us
+            .saturating_add(duration.as_micros() as u64);
+    }
+
+    fn record_preview_frame_send_time(&mut self, duration: Duration) {
+        self.preview_frames_emitted = self.preview_frames_emitted.saturating_add(1);
+        self.preview_frame_send_us = self
+            .preview_frame_send_us
+            .saturating_add(duration.as_micros() as u64);
+    }
 }
 
 type UsbBuffer = Box<[u8; BUF_SIZE]>;
@@ -312,6 +397,8 @@ struct PreviewFrameBuffers {
     pixels: Vec<u16>,
     pixels_on: Vec<u16>,
     pixels_off: Vec<u16>,
+    total_histogram: Vec<u64>,
+    signed_histogram: Vec<u64>,
 }
 
 static PREVIEW_FRAME_BUFFER_POOL: OnceLock<Mutex<Vec<PreviewFrameBuffers>>> = OnceLock::new();
@@ -332,12 +419,16 @@ fn take_preview_frame_buffers(pixel_count: usize) -> PreviewFrameBuffers {
         frame_buffers.pixels_on.resize(pixel_count, 0);
         frame_buffers.pixels_off.clear();
         frame_buffers.pixels_off.resize(pixel_count, 0);
+        reset_histogram_bins(&mut frame_buffers.total_histogram, pixel_count as u64);
+        reset_histogram_bins(&mut frame_buffers.signed_histogram, pixel_count as u64);
         frame_buffers
     } else {
         PreviewFrameBuffers {
             pixels: vec![0_u16; pixel_count],
             pixels_on: vec![0_u16; pixel_count],
             pixels_off: vec![0_u16; pixel_count],
+            total_histogram: histogram_bins_with_zero_count(pixel_count as u64),
+            signed_histogram: histogram_bins_with_zero_count(pixel_count as u64),
         }
     }
 }
@@ -361,10 +452,36 @@ fn reset_preview_frame_accumulators(
     frame_buffers.pixels.fill(0);
     frame_buffers.pixels_on.fill(0);
     frame_buffers.pixels_off.fill(0);
+    let pixel_count = frame_buffers.pixels.len() as u64;
+    reset_histogram_bins(&mut frame_buffers.total_histogram, pixel_count);
+    reset_histogram_bins(&mut frame_buffers.signed_histogram, pixel_count);
     frame_events.clear();
     *on_count = 0;
     *off_count = 0;
     *frame_start_ts = None;
+}
+
+fn histogram_index(value: u16) -> usize {
+    usize::from(value).min(PREVIEW_HISTOGRAM_BINS - 1)
+}
+
+fn histogram_bins_with_zero_count(pixel_count: u64) -> Vec<u64> {
+    let mut histogram = vec![0_u64; PREVIEW_HISTOGRAM_BINS];
+    histogram[0] = pixel_count;
+    histogram
+}
+
+fn reset_histogram_bins(histogram: &mut Vec<u64>, pixel_count: u64) {
+    histogram.clear();
+    histogram.resize(PREVIEW_HISTOGRAM_BINS, 0);
+    histogram[0] = pixel_count;
+}
+
+fn transition_histogram_bin(histogram: &mut [u64], old_value: u16, new_value: u16) {
+    let old_index = histogram_index(old_value);
+    let new_index = histogram_index(new_value);
+    histogram[old_index] = histogram[old_index].saturating_sub(1);
+    histogram[new_index] = histogram[new_index].saturating_add(1);
 }
 
 #[cfg(test)]
@@ -788,9 +905,14 @@ where
         loop {
             match preview_rx.recv_timeout(Duration::from_millis(2)) {
                 Ok(chunk) => {
+                    let decode_started = Instant::now();
                     let decode_result = decoder.decode_bytes(&chunk.buf[..chunk.len], &mut events);
+                    let decode_elapsed = decode_started.elapsed();
                     let _ = preview_pool_tx_preview.try_send(chunk.buf);
 
+                    if let Ok(mut s) = stats_preview.lock() {
+                        s.record_preview_decode_time(decode_elapsed);
+                    }
                     if let Err(e) = decode_result {
                         report_pipeline_error(
                             &error_preview,
@@ -809,27 +931,52 @@ where
                             s.record_event_timestamps(first, last);
                         }
                     }
+                    let accumulate_started = Instant::now();
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
                             continue;
                         }
                         let idx = ev.y as usize * width as usize + ev.x as usize;
-                        frame_buffers.pixels[idx] = frame_buffers.pixels[idx].saturating_add(1);
+                        let old_total = frame_buffers.pixels[idx];
+                        let new_total = old_total.saturating_add(1);
+                        frame_buffers.pixels[idx] = new_total;
+                        transition_histogram_bin(
+                            &mut frame_buffers.total_histogram,
+                            old_total,
+                            new_total,
+                        );
+                        let old_on = frame_buffers.pixels_on[idx];
+                        let old_off = frame_buffers.pixels_off[idx];
                         if ev.polarity {
-                            frame_buffers.pixels_on[idx] =
-                                frame_buffers.pixels_on[idx].saturating_add(1);
+                            frame_buffers.pixels_on[idx] = old_on.saturating_add(1);
                             on_count += 1;
                         } else {
-                            frame_buffers.pixels_off[idx] =
-                                frame_buffers.pixels_off[idx].saturating_add(1);
+                            frame_buffers.pixels_off[idx] = old_off.saturating_add(1);
                             off_count += 1;
                         }
+                        let new_on = frame_buffers.pixels_on[idx];
+                        let new_off = frame_buffers.pixels_off[idx];
+                        transition_histogram_bin(
+                            &mut frame_buffers.signed_histogram,
+                            old_on.abs_diff(old_off),
+                            new_on.abs_diff(new_off),
+                        );
                         frame_start_ts.get_or_insert(ev.timestamp);
                     }
+                    let accumulate_elapsed = accumulate_started.elapsed();
+                    let mut raw_event_copy_elapsed = Duration::ZERO;
                     if raw_events_preview.load(Ordering::Relaxed) {
+                        let raw_event_copy_started = Instant::now();
                         frame_events.extend_from_slice(&events);
+                        raw_event_copy_elapsed = raw_event_copy_started.elapsed();
                     } else if !frame_events.is_empty() {
                         frame_events.clear();
+                    }
+                    if let Ok(mut s) = stats_preview.lock() {
+                        s.record_preview_accumulate_time(accumulate_elapsed);
+                        if raw_event_copy_elapsed > Duration::ZERO {
+                            s.record_preview_raw_event_copy_time(raw_event_copy_elapsed);
+                        }
                     }
 
                     if let (Some(t0), Some(last_ts)) =
@@ -849,6 +996,7 @@ where
                                 }
                                 continue;
                             }
+                            let frame_send_started = Instant::now();
                             let raw_events = if raw_events_preview.load(Ordering::Relaxed) {
                                 let next_capacity = frame_events.capacity().max(8_192);
                                 Some(std::mem::replace(
@@ -869,6 +1017,8 @@ where
                                 pixels: frame_buffers.pixels,
                                 pixels_on: frame_buffers.pixels_on,
                                 pixels_off: frame_buffers.pixels_off,
+                                cached_total_histogram: frame_buffers.total_histogram,
+                                cached_signed_histogram: frame_buffers.signed_histogram,
                                 on_count,
                                 off_count,
                                 events: raw_events,
@@ -879,6 +1029,9 @@ where
                                 Ok(()) => {
                                     if let Ok(mut s) = stats_preview.lock() {
                                         s.record_preview_frame_queue_depth(frame_tx.len());
+                                        s.record_preview_frame_send_time(
+                                            frame_send_started.elapsed(),
+                                        );
                                     }
                                 }
                                 Err(err) => {
@@ -1019,6 +1172,12 @@ mod tests {
             disk_queue_high_water: 0,
             disk_send_wait_us: 0,
             disk_write_us: 0,
+            preview_packets_processed: 0,
+            preview_frames_emitted: 0,
+            preview_decode_us: 0,
+            preview_accumulate_us: 0,
+            preview_raw_event_copy_us: 0,
+            preview_frame_send_us: 0,
             recent_samples: VecDeque::new(),
         }
     }
@@ -1199,6 +1358,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_reports_preview_thread_stage_averages() {
+        let start = Instant::now();
+        let mut stats = test_stats(start);
+
+        stats.record_preview_decode_time(Duration::from_micros(300));
+        stats.record_preview_decode_time(Duration::from_micros(500));
+        stats.record_preview_accumulate_time(Duration::from_micros(700));
+        stats.record_preview_accumulate_time(Duration::from_micros(900));
+        stats.record_preview_raw_event_copy_time(Duration::from_micros(200));
+        stats.record_preview_raw_event_copy_time(Duration::from_micros(400));
+        stats.record_preview_frame_send_time(Duration::from_micros(1_200));
+        stats.record_preview_frame_send_time(Duration::from_micros(1_800));
+
+        let snapshot = stats.snapshot_at(start + Duration::from_millis(10));
+
+        assert_eq!(snapshot.preview_packets_processed, 2);
+        assert_eq!(snapshot.preview_frames_emitted, 2);
+        assert_eq!(snapshot.preview_decode_us, 800);
+        assert_eq!(snapshot.preview_accumulate_us, 1_600);
+        assert_eq!(snapshot.preview_raw_event_copy_us, 600);
+        assert_eq!(snapshot.preview_frame_send_us, 3_000);
+        assert!((snapshot.preview_decode_avg_ms() - 0.4).abs() < 1e-6);
+        assert!((snapshot.preview_accumulate_avg_ms() - 0.8).abs() < 1e-6);
+        assert!((snapshot.preview_raw_event_copy_avg_ms() - 0.3).abs() < 1e-6);
+        assert!((snapshot.preview_frame_send_avg_ms() - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
     fn snapshot_reports_recording_duration_from_timestamps() {
         let start = Instant::now();
         let mut stats = test_stats(start);
@@ -1240,6 +1427,8 @@ mod tests {
             pixels: vec![1, 2, 3, 4],
             pixels_on: vec![5, 6, 7, 8],
             pixels_off: vec![9, 10, 11, 12],
+            cached_total_histogram: histogram_bins_with_zero_count(4),
+            cached_signed_histogram: histogram_bins_with_zero_count(4),
             on_count: 2,
             off_count: 2,
             events: None,
@@ -1255,6 +1444,8 @@ mod tests {
         assert_eq!(buffers.pixels.len(), 4);
         assert_eq!(buffers.pixels_on.len(), 4);
         assert_eq!(buffers.pixels_off.len(), 4);
+        assert_eq!(buffers.total_histogram.len(), PREVIEW_HISTOGRAM_BINS);
+        assert_eq!(buffers.signed_histogram.len(), PREVIEW_HISTOGRAM_BINS);
         assert_eq!(preview_frame_pool_len(), 0);
     }
 }

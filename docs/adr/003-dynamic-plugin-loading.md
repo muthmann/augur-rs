@@ -6,9 +6,7 @@ Accepted
 
 ## Context
 
-The original GUI plugin host compiled every analysis plugin directly into `augur-gui`. That made the host easy to reason about, but it forced plugin authors to edit the GUI crate and rebuild the whole application for every plugin change.
-
-That model became a poor fit once scientific plugins such as hotpixel detection, molecule localization, and focus metrics started evolving independently from the recorder itself.
+The GUI plugin host originally compiled every analysis plugin directly into `augur-gui`. That forced plugin authors to edit the GUI crate and rebuild the whole application for every change. Plugins evolve independently from the recorder, so a runtime loading mechanism is needed.
 
 ## Decision
 
@@ -30,7 +28,7 @@ The new boundary is defined in `augur-plugin-api` and includes:
 
 - Plugin authors can rebuild and reload plugins without recompiling `augur-gui`
 - The host/runtime contract is explicit and lives in a standalone crate
-- `augur-core` stays free of science-specific logic
+- `augur-core` stays free of application-specific logic
 - Load failures become recoverable UI-visible errors instead of build-time coupling
 
 ### Negative

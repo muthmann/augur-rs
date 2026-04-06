@@ -79,10 +79,9 @@ Exports stay generic:
 
 ## Reconstruction Direction
 
-Reconstruction is no longer a dedicated host feature. A runtime plugin now publishes a generic
-table dataset, and the host can render that dataset through table, scatter, and density views.
+Reconstruction is modeled as a generic host-view composition. A runtime plugin publishes a table dataset, and the host renders it through table, scatter, and density views.
 
-That keeps `augur-gui` generic while still supporting localization/reconstruction workflows.
+This keeps `augur-gui` generic while supporting any analysis workflow that produces structured point data.
 
 ## Verification
 

@@ -6,15 +6,12 @@ Accepted
 
 ## Context
 
-The runtime plugin system had already moved to a flat `PluginVTable`, host-owned event history,
-host-owned global settings, and a host-view registry. Two problems still remained:
+The runtime plugin system uses a flat `PluginVTable`, host-owned event history, host-owned global settings, and a host-view registry. Two design goals drive this ADR:
 
-1. `augur-plugin-api` still carried domain-specific localization/SMLM payloads in its core API
-   crate.
-2. `augur-gui` still kept one reconstruction-specific host path alongside the generic host-view
-   system.
+1. `augur-plugin-api` should contain only generic host/runtime contracts, not domain-specific payload types.
+2. `augur-gui` should use the generic host-view system for all plugin output, without domain-specific host paths.
 
-That left the plugin surface partially generic in structure but still domain-specific in meaning.
+This keeps the plugin surface generic in both structure and meaning.
 
 ## Decision
 
@@ -24,11 +21,11 @@ Commit fully to a generic core plugin boundary.
 
 - keep `augur-plugin-api` focused on generic host/runtime contracts only
 - move optional domain payloads into companion crates such as `augur-plugin-types`
-- treat the current work as a pre-v1 breaking change with no compatibility shim
+- no compatibility shims for domain-specific types in the core crate
 
 ### Host-owned UI
 
-- remove the reconstruction-specific runtime hook and reconstruction-specific GUI pipeline
+- route all plugin analysis UI through the host-view registry
 - require plugin-owned analysis UI to flow through the host-view registry
 - keep views declarative and host-rendered instead of allowing plugin-owned `egui`
 
@@ -49,13 +46,13 @@ Commit fully to a generic core plugin boundary.
 
 ### Negative
 
-- the runtime ABI changes again and all external plugins must rebuild
+- external plugins must rebuild against the current `augur-plugin-api`
 - plugin authors now manage one more concept (`PluginCapabilities`)
-- some host features that were previously hard-coded must now be expressed as dataset/view recipes
+- host features must be expressed as dataset/view recipes rather than hard-coded paths
 
 ## Alternatives Considered
 
-### Keep Localization Types In `augur-plugin-api`
+### Keep Domain-Specific Types In `augur-plugin-api`
 
 Rejected because it keeps the core plugin boundary semantically tied to one analysis domain.
 

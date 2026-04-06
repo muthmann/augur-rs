@@ -106,9 +106,9 @@ visible during that handoff instead of dropping to the empty replay placeholder.
 | `augur-gui/src/app.rs` | replay mode, persisted EOF state, transport controls, theme-aware viewport visuals, decoded-event seek cache, restart, replay display cadence |
 | `augur-gui/src/viewer_widget.rs` | shared replay transport UI, phosphor icon controls, and `Space` / arrow-key shortcuts |
 
-## Older File Compatibility
+## File Compatibility
 
-Older Prophesee `.raw` files (e.g. recorded with earlier MetaVision SDK versions) may differ from the current header convention in three ways:
+Some `.raw` files may differ from the standard header convention in three ways:
 
 1. **Non-UTF-8 header bytes** — the header parser uses `read_until` + `from_utf8_lossy` so stray binary bytes are tolerated.
 2. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.

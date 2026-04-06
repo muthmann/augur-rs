@@ -43,7 +43,7 @@ impl Colormap {
         self.table()[lookup_index(value)]
     }
 
-    fn table(self) -> &'static [Color32; 256] {
+    pub(crate) fn table(self) -> &'static [Color32; 256] {
         match self {
             Self::Grays => &GRAYS_LUT,
             Self::Fire => &FIRE_LUT,
@@ -53,6 +53,19 @@ impl Colormap {
             Self::MagentaHot => &MAGENTA_HOT_LUT,
             Self::Ice => &ICE_LUT,
             Self::BlueWhiteRed => &BLUE_WHITE_RED_LUT,
+        }
+    }
+
+    pub(crate) fn index(self) -> u32 {
+        match self {
+            Self::Grays => 0,
+            Self::Fire => 1,
+            Self::RedHot => 2,
+            Self::Green => 3,
+            Self::CyanHot => 4,
+            Self::MagentaHot => 5,
+            Self::Ice => 6,
+            Self::BlueWhiteRed => 7,
         }
     }
 }

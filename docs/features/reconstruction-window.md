@@ -2,10 +2,7 @@
 
 ## Summary
 
-`augur-gui` no longer owns a dedicated reconstruction window or reconstruction-specific runtime
-path.
-
-Reconstruction is now modeled as a generic host-view composition:
+Reconstruction in `augur-gui` is modeled as a generic host-view composition:
 
 - a plugin publishes a table dataset of points or measurements
 - the host renders that dataset through generic host views
@@ -13,12 +10,7 @@ Reconstruction is now modeled as a generic host-view composition:
 
 ## Expected Producer
 
-The intended producer remains the external `Localization Reconstruction` runtime plugin from
-[augur-plugins](https://github.com/muthmann/augur-plugins).
-
-That plugin can accumulate
-`augur_plugin_types::localization::CTX_LOCALIZATION_RESULTS` from upstream localization/fitting
-plugins and expose the result as a normal host-view dataset.
+The expected producer is an external runtime plugin from [augur-plugins](https://github.com/muthmann/augur-plugins) that accumulates upstream results and exposes them as a host-view dataset.
 
 ## Recommended View Recipe
 
@@ -38,10 +30,8 @@ The host now exposes only generic exports:
 - CSV export for table-backed views
 - PNG/TIFF export for rendered density or image views
 
-There is no reconstruction-specific CSV writer or reconstruction-specific image exporter in
-`augur-gui`.
+There is no reconstruction-specific exporter in `augur-gui`.
 
 ## Consequence
 
-If no reconstruction provider is enabled, there is no special empty reconstruction window anymore.
-Only the plugin-declared host views appear.
+If no reconstruction provider is enabled, no reconstruction views appear. Only plugin-declared host views are shown.

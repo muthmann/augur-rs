@@ -5,10 +5,7 @@ Accepted
 
 ## Context
 
-Augur recordings previously wrote only minimal EVT3 header geometry and kept the rest of the
-capture context in a separate config sidecar. That made `.raw` files opaque on their own and
-forced replay to fall back to generic device labels even though the driver already knows the
-camera serial, firmware, vendor, model, and pixel scale.
+Augur recordings embed rich metadata directly in the EVT3 header so `.raw` files are self-describing. Without this, replay would fall back to generic device labels even though the driver knows the camera serial, firmware, vendor, model, and pixel scale.
 
 ## Decision
 
