@@ -60,7 +60,7 @@ HDF5 replay support is compiled behind the `hdf5` feature on `augur-core` / `aug
    - a timeline slider for seeking
    - current / total replay time
    - MB progress as secondary info
-   - keyboard shortcuts: `Space` toggles play/pause, while `←` / `→` pause replay if needed and step one acquisition-window frame backward / forward
+   - keyboard shortcuts: `Space` toggles play/pause, while `←` / `→` pause replay if needed and step one acquisition-window frame backward / forward from the currently displayed replay frame
 4. Enabled analysis plugins continue to run on replayed frames exactly as they do on live preview frames.
 
 If a `<capture>.toml` sidecar exists next to the selected replay file, the replay session uses it as read-only reference data for both the left camera settings panel and the top-bar global `Settings` menu.
@@ -94,6 +94,11 @@ already in memory.
 On the GUI side, the transport reflects the requested seek position immediately, then snaps to the
 actual decoded frame position once the replacement frame arrives. The previous rendered frame stays
 visible during that handoff instead of dropping to the empty replay placeholder.
+
+Arrow-key single-frame stepping now uses the displayed replay timestamp as the source of truth
+instead of routing through the timeline fraction. The GUI reopens replay from the start of the
+target acquisition window so `←` / `→` land on the previous or next frame much more
+deterministically, while timeline dragging keeps the existing lightweight fraction-based seek path.
 
 ## Files
 

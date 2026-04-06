@@ -13,12 +13,16 @@ use augur_core::{
     analysis::{AnalysisOutput, AnalysisWarning, Overlay},
     camera::{DeviceInfo, EventCamera},
     config::{CameraConfig, GlobalSettingsConfig},
+    decoded_replay::packed_event_offset_for_timestamp,
     metadata::{RecordingAnnotations, RecordingMetadata},
     pipeline::{
         spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
         PipelineStatsSnapshot, PreviewFrame,
     },
-    replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
+    replay::{
+        align_relative_evt3_word_offset, raw_replay_offset_for_timestamp, RawFileCamera,
+        ReplayControls, ReplayFileInfo,
+    },
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
 use augur_plugin_api::{
@@ -59,8 +63,8 @@ use crate::{
     settings::draw_settings,
     viewer_widget::{
         draw_text_placeholder, draw_viewer, replay_speed_matches, AppMode, PreviewHistogramRequest,
-        PreviewTool, ViewMode, ViewerAuxChanges, ViewerInput, ViewerOutput, ViewerReplayState,
-        ViewerState, REPLAY_SPEED_OPTIONS,
+        PreviewTool, ReplaySeekTarget, ViewMode, ViewerAuxChanges, ViewerInput, ViewerOutput,
+        ViewerReplayState, ViewerState, REPLAY_SPEED_OPTIONS,
     },
 };
 
@@ -191,6 +195,17 @@ fn replay_fraction_from_time(time_us: u64, total_duration_us: u64) -> f32 {
         (time_us as f64 / total_duration_us as f64) as f32
     }
     .clamp(0.0, 1.0)
+}
+
+fn replay_seek_pending_fraction(target: ReplaySeekTarget, total_duration_us: u64) -> f32 {
+    match target {
+        ReplaySeekTarget::Fraction(fraction) => fraction.clamp(0.0, 1.0),
+        ReplaySeekTarget::TimeUs(time_us) => replay_fraction_from_time(time_us, total_duration_us),
+    }
+}
+
+fn replay_step_window_start_time_us(target_time_us: u64, frame_step_us: u64) -> u64 {
+    target_time_us.saturating_sub(frame_step_us.max(1))
 }
 
 fn replay_time_from_position_sources(
@@ -850,8 +865,8 @@ impl CameraApp {
         if output.replay_stop {
             self.stop_pipeline();
         }
-        if let Some(fraction) = output.replay_seek_to {
-            self.seek_replay(fraction);
+        if let Some(target) = output.replay_seek_to {
+            self.seek_replay(target);
         }
         if let Some(speed) = output.replay_set_speed {
             self.set_replay_speed(speed);
@@ -2791,7 +2806,7 @@ impl CameraApp {
         self.replay_speed = speed;
     }
 
-    fn seek_replay(&mut self, fraction: f32) {
+    fn seek_replay(&mut self, target: ReplaySeekTarget) {
         if self.mode != AppMode::Replaying {
             return;
         }
@@ -2813,36 +2828,76 @@ impl CameraApp {
             }
         }
 
-        let data_len = info.data_len();
-        let fraction = fraction.clamp(0.0, 1.0);
-        let target_rel = ((data_len as f64 * fraction as f64) as u64).min(data_len);
-        let reopen_result = if let Some(decoded_events) = decoded_events {
-            let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
-            match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
-                Ok((camera, controls)) => spawn_pipeline(
-                    camera,
-                    PackedEventPreviewDecoder::default(),
-                    replay_pipeline_config(&info),
-                    PipelineOptions::preview_only(info.width, info.height),
-                )
-                .map(|controller| (controller, controls))
-                .map_err(|err| format!("seek pipeline start failed: {err}")),
-                Err(err) => Err(format!("seek failed: {err}")),
-            }
-        } else {
-            let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
-            match RawFileCamera::open_at(&path, &info, target_byte) {
-                Ok((camera, controls)) => spawn_pipeline(
-                    camera,
-                    Evt3CorePreviewDecoder::default(),
-                    replay_pipeline_config(&info),
-                    PipelineOptions::preview_only(info.width, info.height),
-                )
-                .map(|controller| (controller, controls))
-                .map_err(|err| format!("seek pipeline start failed: {err}")),
-                Err(err) => Err(format!("seek failed: {err}")),
-            }
-        };
+        let pending_fraction = replay_seek_pending_fraction(target, info.total_duration_us);
+        let frame_step_us = self.published_acq_time_ms().saturating_mul(1_000);
+        let reopen_result =
+            if let Some(decoded_events) = decoded_events {
+                let target_byte = match target {
+                    ReplaySeekTarget::Fraction(fraction) => {
+                        let data_len = info.data_len();
+                        let target_rel = ((data_len as f64 * fraction.clamp(0.0, 1.0) as f64)
+                            as u64)
+                            .min(data_len);
+                        target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64)
+                    }
+                    ReplaySeekTarget::TimeUs(target_time_us) => {
+                        let target_timestamp_us = info.first_timestamp_us.saturating_add(
+                            replay_step_window_start_time_us(target_time_us, frame_step_us),
+                        );
+                        packed_event_offset_for_timestamp(
+                            decoded_events.as_slice(),
+                            target_timestamp_us,
+                        )
+                    }
+                };
+                match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
+                    Ok((camera, controls)) => spawn_pipeline(
+                        camera,
+                        PackedEventPreviewDecoder::default(),
+                        replay_pipeline_config(&info),
+                        PipelineOptions::preview_only(info.width, info.height),
+                    )
+                    .map(|controller| (controller, controls))
+                    .map_err(|err| format!("seek pipeline start failed: {err}")),
+                    Err(err) => Err(format!("seek failed: {err}")),
+                }
+            } else {
+                let target_byte = match target {
+                    ReplaySeekTarget::Fraction(fraction) => Ok({
+                        let data_len = info.data_len();
+                        let target_rel = ((data_len as f64 * fraction.clamp(0.0, 1.0) as f64)
+                            as u64)
+                            .min(data_len);
+                        info.data_offset + align_relative_evt3_word_offset(target_rel)
+                    }),
+                    ReplaySeekTarget::TimeUs(target_time_us) => {
+                        let target_timestamp_us = info.first_timestamp_us.saturating_add(
+                            replay_step_window_start_time_us(target_time_us, frame_step_us),
+                        );
+                        raw_replay_offset_for_timestamp(
+                            path.as_path(),
+                            &info,
+                            target_timestamp_us,
+                            frame_step_us,
+                        )
+                        .map_err(|err| format!("seek failed: {err}"))
+                    }
+                };
+                match target_byte {
+                    Ok(target_byte) => match RawFileCamera::open_at(&path, &info, target_byte) {
+                        Ok((camera, controls)) => spawn_pipeline(
+                            camera,
+                            Evt3CorePreviewDecoder::default(),
+                            replay_pipeline_config(&info),
+                            PipelineOptions::preview_only(info.width, info.height),
+                        )
+                        .map(|controller| (controller, controls))
+                        .map_err(|err| format!("seek pipeline start failed: {err}")),
+                        Err(err) => Err(format!("seek failed: {err}")),
+                    },
+                    Err(err) => Err(err),
+                }
+            };
         let (controller, controls) = match reopen_result {
             Ok(result) => result,
             Err(err) => {
@@ -2868,7 +2923,7 @@ impl CameraApp {
         self.replay_paused = desired_paused;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = pause_after_first_frame;
-        self.replay_pending_fraction = Some(fraction);
+        self.replay_pending_fraction = Some(pending_fraction);
         self.last_error = None;
         self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.camera_status = format!(
@@ -2881,7 +2936,7 @@ impl CameraApp {
     }
 
     fn restart_replay(&mut self) {
-        self.seek_replay(0.0);
+        self.seek_replay(ReplaySeekTarget::Fraction(0.0));
     }
 
     fn restore_saved_live_state(&mut self) {

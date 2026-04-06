@@ -153,8 +153,14 @@ pub(crate) struct ViewerOutput {
     pub(crate) replay_toggle_pause: bool,
     pub(crate) replay_restart: bool,
     pub(crate) replay_stop: bool,
-    pub(crate) replay_seek_to: Option<f32>,
+    pub(crate) replay_seek_to: Option<ReplaySeekTarget>,
     pub(crate) replay_set_speed: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ReplaySeekTarget {
+    Fraction(f32),
+    TimeUs(u64),
 }
 
 impl ViewerOutput {
@@ -1999,7 +2005,7 @@ fn draw_replay_transport(
         }
         if response.drag_stopped() || (response.changed() && !response.dragged()) {
             state.replay_seek_drag = None;
-            output.replay_seek_to = Some(timeline_fraction);
+            output.replay_seek_to = Some(ReplaySeekTarget::Fraction(timeline_fraction));
         }
 
         ui.label(&time_text);
@@ -2038,7 +2044,10 @@ fn handle_replay_shortcuts(
         if !replay.paused {
             output.replay_toggle_pause = true;
         }
-        output.replay_seek_to = Some(replay_step_target_fraction(replay, frame_steps));
+        output.replay_seek_to = Some(ReplaySeekTarget::TimeUs(replay_step_target_time_us(
+            replay,
+            frame_steps,
+        )));
         return;
     }
 
@@ -2047,15 +2056,14 @@ fn handle_replay_shortcuts(
     }
 }
 
-fn replay_step_target_fraction(replay: ViewerReplayState, frame_steps: i64) -> f32 {
+fn replay_step_target_time_us(replay: ViewerReplayState, frame_steps: i64) -> u64 {
     if replay.duration_us == 0 {
-        return 0.0;
+        return 0;
     }
 
     let step_us = replay.frame_step_us.max(1) as i128;
-    let target_time_us = (replay.time_us as i128 + frame_steps as i128 * step_us)
-        .clamp(0, replay.duration_us as i128) as u64;
-    (target_time_us as f64 / replay.duration_us as f64) as f32
+    (replay.time_us as i128 + frame_steps as i128 * step_us).clamp(0, replay.duration_us as i128)
+        as u64
 }
 
 fn replay_speed_label(speed: f32) -> &'static str {
@@ -2086,7 +2094,7 @@ fn format_replay_time(duration_us: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_viewport, replay_step_target_fraction, sensor_rect_to_roi_config,
+        build_preview_viewport, replay_step_target_time_us, sensor_rect_to_roi_config,
         PreviewCropTarget, PreviewWorkspaceState, ViewerReplayState, PREVIEW_ZOOM_MAX,
     };
     use crate::viewer_tools::{AnnotationManager, AnnotationShapeKind};
@@ -2126,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_step_fraction_moves_by_one_frame_window() {
+    fn replay_step_target_moves_by_one_frame_window() {
         let replay = ViewerReplayState {
             duration_us: 1_000_000,
             time_us: 500_000,
@@ -2134,15 +2142,15 @@ mod tests {
             ..Default::default()
         };
 
-        let next = replay_step_target_fraction(replay, 1);
-        let previous = replay_step_target_fraction(replay, -1);
+        let next = replay_step_target_time_us(replay, 1);
+        let previous = replay_step_target_time_us(replay, -1);
 
-        assert!((next - 0.55).abs() < 1e-6);
-        assert!((previous - 0.45).abs() < 1e-6);
+        assert_eq!(next, 550_000);
+        assert_eq!(previous, 450_000);
     }
 
     #[test]
-    fn replay_step_fraction_clamps_to_replay_bounds() {
+    fn replay_step_target_clamps_to_replay_bounds() {
         let replay = ViewerReplayState {
             duration_us: 1_000,
             time_us: 980,
@@ -2150,16 +2158,16 @@ mod tests {
             ..Default::default()
         };
 
-        assert!((replay_step_target_fraction(replay, 1) - 1.0).abs() < 1e-6);
+        assert_eq!(replay_step_target_time_us(replay, 1), 1_000);
         assert_eq!(
-            replay_step_target_fraction(
+            replay_step_target_time_us(
                 ViewerReplayState {
                     time_us: 20,
                     ..replay
                 },
                 -1,
             ),
-            0.0
+            0
         );
     }
 
