@@ -87,11 +87,25 @@ fn run_with_renderer(renderer: Renderer) -> eframe::Result<()> {
     )
 }
 
+fn load_icon() -> egui::IconData {
+    let icon_bytes = include_bytes!("../../assets/logo.png");
+    let img = image::load_from_memory(icon_bytes)
+        .expect("failed to decode app icon")
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    }
+}
+
 fn build_native_options(renderer: Renderer) -> NativeOptions {
     let mut options = NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 860.0])
-            .with_resizable(true),
+            .with_resizable(true)
+            .with_icon(load_icon()),
         renderer,
         ..Default::default()
     };
