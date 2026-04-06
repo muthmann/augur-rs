@@ -29,6 +29,11 @@ const DEFAULT_NPY_WIDTH: u32 = 1280;
 const DEFAULT_NPY_HEIGHT: u32 = 720;
 pub const PACKED_EVENT_RECORD_BYTES: usize = 14;
 
+pub fn packed_event_offset_for_timestamp(events: &[CdEvent], target_timestamp_us: u64) -> u64 {
+    let event_idx = events.partition_point(|event| event.timestamp < target_timestamp_us);
+    event_idx as u64 * PACKED_EVENT_RECORD_BYTES as u64
+}
+
 #[cfg(feature = "hdf5")]
 #[derive(hdf5::H5Type, Clone)]
 #[repr(C)]
@@ -915,6 +920,22 @@ mod tests {
                 timestamp: 150,
             },
         ]
+    }
+
+    #[test]
+    fn packed_event_offset_targets_first_event_at_or_after_timestamp() {
+        let events = sample_events();
+
+        assert_eq!(packed_event_offset_for_timestamp(&events, 0), 0);
+        assert_eq!(packed_event_offset_for_timestamp(&events, 100), 0);
+        assert_eq!(
+            packed_event_offset_for_timestamp(&events, 121),
+            (PACKED_EVENT_RECORD_BYTES * 2) as u64
+        );
+        assert_eq!(
+            packed_event_offset_for_timestamp(&events, 999),
+            (PACKED_EVENT_RECORD_BYTES * events.len()) as u64
+        );
     }
 
     fn write_csv(path: &Path, width: u16, height: u16, events: &[CdEvent]) {

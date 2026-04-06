@@ -542,6 +542,199 @@ pub fn align_relative_evt3_word_offset(relative_offset: u64) -> u64 {
     relative_offset & !1
 }
 
+fn lift_evt3_timestamp_near(raw_timestamp_us: u64, expected_timestamp_us: u64) -> u64 {
+    let cycle = expected_timestamp_us / EVT3_TIMESTAMP_PERIOD_US;
+    [
+        cycle
+            .saturating_sub(1)
+            .saturating_mul(EVT3_TIMESTAMP_PERIOD_US)
+            .saturating_add(raw_timestamp_us),
+        cycle
+            .saturating_mul(EVT3_TIMESTAMP_PERIOD_US)
+            .saturating_add(raw_timestamp_us),
+        cycle
+            .saturating_add(1)
+            .saturating_mul(EVT3_TIMESTAMP_PERIOD_US)
+            .saturating_add(raw_timestamp_us),
+    ]
+    .into_iter()
+    .min_by_key(|candidate| candidate.abs_diff(expected_timestamp_us))
+    .unwrap_or(raw_timestamp_us)
+}
+
+fn scan_timestamp_window_near(
+    file: &File,
+    start: u64,
+    len: u64,
+    expected_timestamp_us: u64,
+) -> Result<Option<(u64, u64)>> {
+    let (Some(first_raw), Some(last_raw)) = scan_timestamp_window(file, start, len)? else {
+        return Ok(None);
+    };
+
+    let first_abs = lift_evt3_timestamp_near(first_raw, expected_timestamp_us);
+    let mut last_abs = lift_evt3_timestamp_near(last_raw, expected_timestamp_us);
+    while last_abs < first_abs {
+        last_abs = last_abs.saturating_add(EVT3_TIMESTAMP_PERIOD_US);
+    }
+    Ok(Some((first_abs, last_abs)))
+}
+
+fn replay_timestamp_interval_distance(
+    target_timestamp_us: u64,
+    first_us: u64,
+    last_us: u64,
+) -> u64 {
+    if target_timestamp_us < first_us {
+        first_us - target_timestamp_us
+    } else {
+        target_timestamp_us.saturating_sub(last_us)
+    }
+}
+
+fn clamp_raw_search_start(info: &ReplayFileInfo, start: u64, window_len: u64) -> u64 {
+    let max_start = info
+        .file_size
+        .saturating_sub(window_len)
+        .max(info.data_offset);
+    align_evt3_word_offset(info.data_offset, start.clamp(info.data_offset, max_start))
+}
+
+pub fn raw_replay_offset_for_timestamp(
+    path: impl AsRef<Path>,
+    info: &ReplayFileInfo,
+    target_timestamp_us: u64,
+    desired_window_us: u64,
+) -> Result<u64> {
+    let data_len = info.data_len();
+    if data_len < 2 {
+        return Ok(info.data_offset);
+    }
+
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let recording_end_ts = info
+        .first_timestamp_us
+        .saturating_add(info.total_duration_us);
+    let target_timestamp_us = target_timestamp_us.clamp(info.first_timestamp_us, recording_end_ts);
+
+    let mut window_len =
+        align_relative_evt3_word_offset(data_len.min(FAST_SCAN_WINDOW_BYTES)).max(2);
+    let desired_window_bytes = info
+        .nominal_bytes_per_sec
+        .map(|bytes_per_sec| {
+            ((bytes_per_sec * desired_window_us.max(1) as f64) / 1_000_000.0).round() as u64
+        })
+        .unwrap_or(window_len)
+        .min(window_len)
+        .max(window_len.min(4_096));
+    let min_window_len = align_relative_evt3_word_offset(desired_window_bytes)
+        .max(2)
+        .min(window_len);
+
+    let target_rel = target_timestamp_us.saturating_sub(info.first_timestamp_us);
+    let guess_rel = if info.total_duration_us == 0 {
+        0
+    } else {
+        ((data_len as u128 * target_rel as u128) / info.total_duration_us as u128) as u64
+    };
+    let mut best_start = clamp_raw_search_start(info, info.data_offset + guess_rel, window_len);
+
+    let coarse_steps = 8_u64;
+    for step in 0..=coarse_steps {
+        let coarse_rel = if coarse_steps == 0 {
+            0
+        } else {
+            data_len.saturating_mul(step) / coarse_steps
+        };
+        let candidate_start =
+            clamp_raw_search_start(info, info.data_offset + coarse_rel, window_len);
+        let score = match scan_timestamp_window_near(
+            &file,
+            candidate_start,
+            window_len,
+            target_timestamp_us,
+        )? {
+            Some((first_us, last_us)) => (
+                replay_timestamp_interval_distance(target_timestamp_us, first_us, last_us),
+                first_us
+                    .abs_diff(target_timestamp_us)
+                    .min(last_us.abs_diff(target_timestamp_us)),
+                candidate_start.abs_diff(best_start),
+            ),
+            None => (u64::MAX, u64::MAX, u64::MAX),
+        };
+        let best_score =
+            match scan_timestamp_window_near(&file, best_start, window_len, target_timestamp_us)? {
+                Some((first_us, last_us)) => (
+                    replay_timestamp_interval_distance(target_timestamp_us, first_us, last_us),
+                    first_us
+                        .abs_diff(target_timestamp_us)
+                        .min(last_us.abs_diff(target_timestamp_us)),
+                    0,
+                ),
+                None => (u64::MAX, u64::MAX, u64::MAX),
+            };
+        if score < best_score {
+            best_start = candidate_start;
+        }
+    }
+
+    loop {
+        let mut best_candidate = best_start;
+        let mut best_score =
+            match scan_timestamp_window_near(&file, best_start, window_len, target_timestamp_us)? {
+                Some((first_us, last_us)) => (
+                    replay_timestamp_interval_distance(target_timestamp_us, first_us, last_us),
+                    first_us
+                        .abs_diff(target_timestamp_us)
+                        .min(last_us.abs_diff(target_timestamp_us)),
+                    0,
+                ),
+                None => (u64::MAX, u64::MAX, u64::MAX),
+            };
+
+        for candidate_start in [
+            best_start.saturating_sub(window_len),
+            best_start,
+            best_start.saturating_add(window_len),
+        ] {
+            let candidate_start = clamp_raw_search_start(info, candidate_start, window_len);
+            let score = match scan_timestamp_window_near(
+                &file,
+                candidate_start,
+                window_len,
+                target_timestamp_us,
+            )? {
+                Some((first_us, last_us)) => (
+                    replay_timestamp_interval_distance(target_timestamp_us, first_us, last_us),
+                    first_us
+                        .abs_diff(target_timestamp_us)
+                        .min(last_us.abs_diff(target_timestamp_us)),
+                    candidate_start.abs_diff(best_start),
+                ),
+                None => (u64::MAX, u64::MAX, u64::MAX),
+            };
+            if score < best_score {
+                best_score = score;
+                best_candidate = candidate_start;
+            }
+        }
+
+        best_start = best_candidate;
+        if window_len <= min_window_len {
+            return Ok(best_start);
+        }
+
+        let next_window_len = align_relative_evt3_word_offset(window_len / 2).max(2);
+        if next_window_len == window_len {
+            return Ok(best_start);
+        }
+        window_len = next_window_len.max(min_window_len);
+        best_start = clamp_raw_search_start(info, best_start, window_len);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +826,34 @@ mod tests {
         bytes.extend_from_slice(&body);
         fs::write(path, bytes).expect("sample raw file must be written");
         (header.len() as u64, body)
+    }
+
+    fn raw_event_words(timestamp: u64, x: u16) -> [u16; 4] {
+        let time_high = ((timestamp >> 12) & 0x0fff) as u16;
+        let time_low = (timestamp & 0x0fff) as u16;
+        [
+            (0x8 << 12) | time_high,
+            (0x6 << 12) | time_low,
+            7,
+            (0x2 << 12) | x,
+        ]
+    }
+
+    fn write_raw_with_timestamps(path: &Path, timestamps: &[u64]) -> u64 {
+        let header = concat!(
+            "% format EVT3;width=1280;height=720\n",
+            "% geometry 1280x720\n",
+            "% evt 3.0\n",
+            "% end\n"
+        );
+        let mut bytes = header.as_bytes().to_vec();
+        for (idx, timestamp) in timestamps.iter().copied().enumerate() {
+            for word in raw_event_words(timestamp, 100 + idx as u16) {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        fs::write(path, bytes).expect("timestamped raw sample must be written");
+        header.len() as u64
     }
 
     #[test]
@@ -801,6 +1022,63 @@ mod tests {
                 .expect("baseline must be reset")
                 .elapsed()
                 < Duration::from_secs(1)
+        );
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn raw_time_seek_offset_beats_naive_time_fraction_in_dense_region() {
+        let path = temp_path("timestamp-target");
+        let mut timestamps: Vec<u64> = (0..700).map(|idx| 0x1100 + idx as u64).collect();
+        timestamps.extend((0..8).map(|idx| 0x5000 + idx as u64 * 0x10));
+        let data_offset = write_raw_with_timestamps(&path, &timestamps);
+        let (_camera, _controls, info) = RawFileCamera::open(&path).expect("raw file must open");
+        let target_timestamp_us = 0x1200_u64;
+        let target_rel = target_timestamp_us.saturating_sub(info.first_timestamp_us);
+        let naive_offset = data_offset
+            + align_relative_evt3_word_offset(
+                ((info.data_len() as u128 * target_rel as u128) / info.total_duration_us as u128)
+                    as u64,
+            );
+        let refined_offset =
+            raw_replay_offset_for_timestamp(&path, &info, target_timestamp_us, 128)
+                .expect("timestamp-targeted raw seek must work");
+
+        let (mut naive_camera, naive_controls) =
+            RawFileCamera::open_at(&path, &info, naive_offset).expect("naive seek must open");
+        naive_camera
+            .start_streaming()
+            .expect("naive seek must start");
+        naive_camera
+            .read_packet(&mut [0_u8; 8])
+            .expect("naive seek read must succeed");
+
+        let (mut refined_camera, refined_controls) =
+            RawFileCamera::open_at(&path, &info, refined_offset).expect("refined seek must open");
+        refined_camera
+            .start_streaming()
+            .expect("refined seek must start");
+        refined_camera
+            .read_packet(&mut [0_u8; 8])
+            .expect("refined seek read must succeed");
+
+        let naive_delta = naive_controls
+            .current_timestamp_us
+            .load(Ordering::Relaxed)
+            .abs_diff(target_timestamp_us);
+        let refined_delta = refined_controls
+            .current_timestamp_us
+            .load(Ordering::Relaxed)
+            .abs_diff(target_timestamp_us);
+
+        assert!(
+            refined_delta < naive_delta,
+            "expected refined raw seek ({refined_delta}) to beat naive byte-fraction seek ({naive_delta})"
+        );
+        assert!(
+            refined_delta <= 0x80,
+            "expected refined raw seek delta {refined_delta} to stay within one frame window"
         );
 
         fs::remove_file(path).expect("temp file must be removed");
