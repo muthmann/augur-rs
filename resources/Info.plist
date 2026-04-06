@@ -8,6 +8,8 @@
   <string>AugurRS</string>
   <key>CFBundleExecutable</key>
   <string>augur-gui</string>
+  <key>CFBundleIconFile</key>
+  <string>AugurGUI.icns</string>
   <key>CFBundleIdentifier</key>
   <string>rs.augur.gui</string>
   <key>CFBundleInfoDictionaryVersion</key>

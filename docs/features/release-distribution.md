@@ -13,7 +13,7 @@ This keeps tagged releases aligned with the repository's stated platform support
 
 ## macOS DMG Packaging
 
-The macOS release job assembles `AugurGUI.app`, stages it with an `Applications` symlink, and creates a distributable `.dmg`. The plan file for this task explicitly skips Apple signing and notarization because no Apple Developer account is available for the repository right now.
+The macOS release job assembles `AugurGUI.app`, stages it with an `Applications` symlink, and creates a distributable `.dmg`. The bundle script now derives `Contents/Resources/AugurGUI.icns` from `assets/logo.png` at packaging time and writes `CFBundleIconFile` into the generated `Info.plist`, so Finder and the running app use the same app-icon artwork. The plan file for this task explicitly skips Apple signing and notarization because no Apple Developer account is available for the repository right now.
 
 ## Cross-Platform Release Archives
 
