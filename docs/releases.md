@@ -7,8 +7,8 @@ AugurRS ships in five forms:
 | Channel | Audience | Contents |
 |---------|----------|----------|
 | **Source** | Developers | `cargo build --workspace` from the repository |
-| **macOS CLI archive** | Terminal users | `augur-macos.zip` — prebuilt `augur` / `augur-gui` binaries, docs, example config, changelog |
-| **macOS GUI installer** | Desktop users | `AugurGUI.dmg` — unsigned drag-to-Applications installer |
+| **macOS CLI archive** | Terminal users | `augur-macos.zip` — prebuilt `augur` / `AugurRS` binaries, docs, example config, changelog |
+| **macOS GUI installer** | Desktop users | `AugurRS.dmg` — unsigned drag-to-Applications installer |
 | **Linux archive** | Terminal and desktop users | `augur-linux.tar.gz` — prebuilt Linux binaries, docs, example config, changelog |
 | **Windows archive** | Terminal and desktop users | `augur-windows.zip` — prebuilt Windows binaries, docs, example config, changelog |
 
@@ -33,9 +33,9 @@ Releases are automated via [release-please](https://github.com/googleapis/releas
 
 On a pushed version tag, the pipeline:
 
-1. Builds `augur` and `augur-gui` on macOS, Linux, and Windows
+1. Builds `augur` and `AugurRS` on macOS, Linux, and Windows
 2. Packages the macOS CLI archive, Linux tarball, and Windows zip with binaries, docs, example config, and changelog
-3. Assembles `AugurGUI.app`, stages it alongside an `Applications` symlink, and wraps it in `AugurGUI.dmg`
+3. Assembles `AugurRS.app`, stages it alongside an `Applications` symlink, and wraps it in `AugurRS.dmg`
 4. Uploads all four release artifacts to the GitHub Release
 
 ### Manual release (fallback)

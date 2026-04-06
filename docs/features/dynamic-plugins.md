@@ -62,6 +62,10 @@ The GUI exposes a dedicated Plugin Manager window:
 
 Load failures are recorded per plugin instead of aborting the app.
 
+The loader validates both the exported `PluginVTable` size and the explicit ABI version before it
+calls any plugin function pointers. A stale plugin now shows up as a normal load error in the
+Plugin Manager instead of crashing AugurRS during startup.
+
 ## Runtime Plugin Sources
 
 Community runtime plugins are maintained in [augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin there, then copy its `plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
@@ -86,6 +90,12 @@ A source folder was copied instead of the built library. Build in `--release` mo
 ### "loading symbol augur_plugin_vtable failed"
 
 The library was built against a different version of the plugin API. Rebuild it against the current `augur-plugin-api` release before loading it into this host.
+
+### "plugin ABI mismatch"
+
+The plugin was compiled against an older `augur-plugin-api` layout whose vtable size may still look
+compatible by coincidence. Rebuild the plugin against the current host release, then replace the
+old library in `~/.augur/plugins/<plugin-name>/`.
 
 ## Why C FFI + `libloading`
 

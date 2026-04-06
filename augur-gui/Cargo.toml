@@ -10,7 +10,7 @@ default = []
 hdf5 = ["augur-core/hdf5"]
 
 [[bin]]
-name = "augur-gui"
+name = "AugurRS"
 path = "src/main.rs"
 
 [dependencies]

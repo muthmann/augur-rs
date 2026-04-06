@@ -123,7 +123,7 @@ cargo build --workspace
 export HDF5_DIR="$(brew --prefix hdf5)"   # macOS / Homebrew
 ./scripts/install-ecf-plugin.sh
 export HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin"
-cargo build -p augur-gui --features hdf5
+cargo build -p augur-gui --bin AugurRS --features hdf5
 
 # Check camera connection
 cargo run --bin augur -- status
@@ -132,10 +132,10 @@ cargo run --bin augur -- status
 cargo run --bin augur -- record captures/run.raw --duration-s 30
 
 # Launch the live GUI
-cargo run --bin augur-gui
+cargo run -p augur-gui --bin AugurRS
 
 # Launch the GUI with optional HDF5 replay support
-HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin" cargo run --bin augur-gui --features hdf5
+HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin" cargo run -p augur-gui --bin AugurRS --features hdf5
 ```
 
 For the full HDF5 / ECF setup, see [HDF5 File Support](./docs/features/hdf5-file-support.md).
@@ -180,7 +180,7 @@ This repository ships the runtime plugin host and API crates. Plugin implementat
 | Linux | CI-verified on every push |
 | Windows | CI-verified on every push |
 
-Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned macOS `AugurGUI.dmg`. Optional HDF5 replay remains source-build-only.
+Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned macOS `AugurRS.dmg`. Optional HDF5 replay remains source-build-only.
 
 ---
 

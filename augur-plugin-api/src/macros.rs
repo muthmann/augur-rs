@@ -386,6 +386,7 @@ macro_rules! export_plugin {
 
             static __AUGUR_PLUGIN_VTABLE: $crate::PluginVTable = $crate::PluginVTable {
                 vtable_size: ::std::mem::size_of::<$crate::PluginVTable>(),
+                abi_version: $crate::PLUGIN_ABI_VERSION,
                 create: __create,
                 destroy: __destroy,
                 name: __name,

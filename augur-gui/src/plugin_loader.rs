@@ -18,13 +18,14 @@ use augur_plugin_api::{
     AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
     FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
     FfiSubpixelMarker, HostViewRegistry, PluginCapabilities, PluginEntry, PluginInput,
-    PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ENTRY_SYMBOL,
+    PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
 use serde_json::Value;
 
 pub const PLUGIN_UI_CACHE_INTERVAL: Duration = Duration::from_millis(250);
+const MIN_PLAUSIBLE_FUNCTION_POINTER: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct CachedSettingValue {
@@ -85,28 +86,15 @@ impl DynPlugin {
             .map_err(|err| format!("loading {} failed: {err}", library_path.display()))?;
         let entry = unsafe { lib.get::<PluginEntry>(b"augur_plugin_vtable\0") }
             .map_err(|err| format!("loading symbol {PLUGIN_ENTRY_SYMBOL} failed: {err}"))?;
-        let vtable_ptr = unsafe { entry() };
-        if vtable_ptr.is_null() {
-            return Err("plugin entry returned a null vtable pointer".into());
-        }
-
-        let expected_size = std::mem::size_of::<PluginVTable>();
-        let reported_size = unsafe { (*vtable_ptr).vtable_size };
-        if reported_size != expected_size {
-            return Err(format!(
-                "plugin vtable size mismatch (plugin: {reported_size}, host: {expected_size}) — \
-                 rebuild the plugin against the current augur-plugin-api"
-            ));
-        }
-
-        let instance = unsafe { ((*vtable_ptr).create)() };
+        let vtable = validate_plugin_vtable(unsafe { entry() })?;
+        let instance = unsafe { (vtable.create)() };
         if instance.is_null() {
             return Err("plugin create() returned a null instance".into());
         }
 
         let mut plugin = Self {
             _lib: lib,
-            vtable: unsafe { *vtable_ptr },
+            vtable,
             instance,
             manifest: manifest.clone(),
             cached_name: String::new(),
@@ -396,6 +384,66 @@ impl DynPlugin {
             );
         }
     }
+}
+
+fn validate_plugin_vtable(vtable_ptr: *const PluginVTable) -> Result<PluginVTable, String> {
+    if vtable_ptr.is_null() {
+        return Err("plugin entry returned a null vtable pointer".into());
+    }
+
+    let expected_size = std::mem::size_of::<PluginVTable>();
+    let reported_size = unsafe { (*vtable_ptr).vtable_size };
+    if reported_size != expected_size {
+        return Err(format!(
+            "plugin vtable size mismatch (plugin: {reported_size}, host: {expected_size}) — \
+             rebuild the plugin against the current augur-plugin-api"
+        ));
+    }
+
+    let reported_abi = unsafe { (*vtable_ptr).abi_version };
+    if reported_abi != PLUGIN_ABI_VERSION {
+        return Err(format!(
+            "plugin ABI mismatch (plugin: {reported_abi}, host: {PLUGIN_ABI_VERSION}) — \
+             rebuild the plugin against the current augur-plugin-api"
+        ));
+    }
+
+    let vtable = unsafe { *vtable_ptr };
+    if !plugin_vtable_looks_plausible(&vtable) {
+        return Err(
+            "plugin vtable contains invalid function pointers — rebuild the plugin against the \
+             current augur-plugin-api"
+                .into(),
+        );
+    }
+
+    Ok(vtable)
+}
+
+fn plugin_vtable_looks_plausible(vtable: &PluginVTable) -> bool {
+    [
+        vtable.create as usize,
+        vtable.destroy as usize,
+        vtable.name as usize,
+        vtable.description as usize,
+        vtable.enabled as usize,
+        vtable.set_enabled as usize,
+        vtable.reset as usize,
+        vtable.input_kind as usize,
+        vtable.capabilities as usize,
+        vtable.num_dependencies as usize,
+        vtable.dependency as usize,
+        vtable.process_frame as usize,
+        vtable.settings_schema as usize,
+        vtable.get_setting as usize,
+        vtable.set_setting as usize,
+        vtable.status_entries as usize,
+        vtable.host_views as usize,
+        vtable.host_view_dataset as usize,
+        vtable.host_view_dataset_generation as usize,
+    ]
+    .into_iter()
+    .all(|address| address >= MIN_PLAUSIBLE_FUNCTION_POINTER)
 }
 
 impl Drop for DynPlugin {
@@ -973,6 +1021,7 @@ pub fn plugin_phase_label(input: PluginInput) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
 
     fn event(timestamp: u64, x: u16) -> FfiCdEvent {
         FfiCdEvent {
@@ -1045,5 +1094,127 @@ mod tests {
         assert_eq!(record.description(), "");
         assert_eq!(record.domain(), "-");
         assert_eq!(record.version(), "-");
+    }
+
+    unsafe extern "C" fn stub_create() -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn stub_destroy(_: *mut c_void) {}
+
+    unsafe extern "C" fn stub_string(_: *const c_void) -> FfiString {
+        FfiString::default()
+    }
+
+    unsafe extern "C" fn stub_enabled(_: *const c_void) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn stub_set_enabled(_: *mut c_void, _: bool) {}
+
+    unsafe extern "C" fn stub_reset(_: *mut c_void) {}
+
+    unsafe extern "C" fn stub_input_kind(_: *const c_void) -> PluginInput {
+        PluginInput::FrameOnly
+    }
+
+    unsafe extern "C" fn stub_capabilities(_: *const c_void) -> PluginCapabilities {
+        PluginCapabilities::default()
+    }
+
+    unsafe extern "C" fn stub_num_dependencies(_: *const c_void) -> usize {
+        0
+    }
+
+    unsafe extern "C" fn stub_dependency(_: *const c_void, _: usize) -> FfiString {
+        FfiString::default()
+    }
+
+    unsafe extern "C" fn stub_process_frame(
+        _: *mut c_void,
+        _: *const FfiPreviewFrame,
+        _: *mut FfiOutputCallbacks,
+        _: *mut FfiPluginContext,
+        _: *const FfiEventStoreHandle,
+    ) {
+    }
+
+    unsafe extern "C" fn stub_json(_: *const c_void, _: *mut *const u8, _: *mut usize) {}
+
+    unsafe extern "C" fn stub_get_setting(
+        _: *const c_void,
+        _: FfiString,
+        _: *mut *const u8,
+        _: *mut usize,
+    ) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn stub_set_setting(_: *mut c_void, _: FfiString, _: FfiSlice<u8>) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn stub_host_view_dataset(
+        _: *const c_void,
+        _: FfiString,
+        _: *mut *const u8,
+        _: *mut usize,
+    ) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn stub_host_view_dataset_generation(_: *const c_void, _: FfiString) -> u64 {
+        0
+    }
+
+    fn test_vtable() -> PluginVTable {
+        PluginVTable {
+            vtable_size: std::mem::size_of::<PluginVTable>(),
+            abi_version: PLUGIN_ABI_VERSION,
+            create: stub_create,
+            destroy: stub_destroy,
+            name: stub_string,
+            description: stub_string,
+            enabled: stub_enabled,
+            set_enabled: stub_set_enabled,
+            reset: stub_reset,
+            input_kind: stub_input_kind,
+            capabilities: stub_capabilities,
+            num_dependencies: stub_num_dependencies,
+            dependency: stub_dependency,
+            process_frame: stub_process_frame,
+            settings_schema: stub_json,
+            get_setting: stub_get_setting,
+            set_setting: stub_set_setting,
+            status_entries: stub_json,
+            host_views: stub_json,
+            host_view_dataset: stub_host_view_dataset,
+            host_view_dataset_generation: stub_host_view_dataset_generation,
+        }
+    }
+
+    #[test]
+    fn validate_plugin_vtable_rejects_abi_mismatches() {
+        let mut vtable = test_vtable();
+        vtable.abi_version = PLUGIN_ABI_VERSION - 1;
+
+        let err = match validate_plugin_vtable(&vtable) {
+            Ok(_) => panic!("abi mismatch should fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("plugin ABI mismatch"));
+    }
+
+    #[test]
+    fn validate_plugin_vtable_rejects_invalid_function_pointers() {
+        let mut vtable = test_vtable();
+        vtable.create =
+            unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> *mut c_void>(0xa0) };
+
+        let err = match validate_plugin_vtable(&vtable) {
+            Ok(_) => panic!("obviously invalid function pointer should fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("invalid function pointers"));
     }
 }

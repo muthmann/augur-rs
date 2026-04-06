@@ -7,11 +7,11 @@
   <key>CFBundleDisplayName</key>
   <string>AugurRS</string>
   <key>CFBundleExecutable</key>
-  <string>augur-gui</string>
+  <string>AugurRS</string>
   <key>CFBundleIconFile</key>
-  <string>AugurGUI.icns</string>
+  <string>AugurRS.icns</string>
   <key>CFBundleIdentifier</key>
-  <string>rs.augur.gui</string>
+  <string>rs.augur.augurrs</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

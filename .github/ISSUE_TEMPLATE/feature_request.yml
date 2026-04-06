@@ -30,7 +30,7 @@ body:
       description: Which part of AugurRS does this affect?
       options:
         - augur (CLI)
-        - augur-gui (GUI)
+        - AugurRS (GUI)
         - augur-core (library)
         - augur-prophesee (hardware layer)
         - Documentation
