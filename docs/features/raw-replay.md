@@ -2,13 +2,13 @@
 
 ## Summary
 
-AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, restores recorded raw-file metadata when present, resets its pacing baseline cleanly when speed changes, supports keyboard play/pause and frame stepping, and finalizes older `.raw` files without suppressing genuine preview errors.
+AugurRS can replay recorded EVT3 `.raw` files plus decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files through the same preview and plugin pipeline used for live camera sessions. Replay keeps the last frame visible at EOF, supports restart and seek operations without leaving replay mode, restores recorded raw-file metadata when present, accepts Prophesee-style RAW headers that omit `% end` or `% geometry` when the remaining metadata is still enough to infer the stream, resets its pacing baseline cleanly when speed changes, unwraps raw EVT3 timestamps across the 24-bit sensor rollover so replay time stays monotonic on long captures and later seeks, supports keyboard play/pause and frame stepping, keeps paused forward frame steps on the active replay controller instead of resetting byte progress through a reopen, reuses a small cache of already displayed replay frames for immediate backward and return-forward stepping, and finalizes older `.raw` files without suppressing genuine preview errors.
 
 ## Core Design
 
 Replay lives in `augur-core` as two file-backed camera adapters, so the rest of the stack can treat file playback like any other packet-stream camera:
 
-- `RawFileCamera` parses the EVT3 header (`% format`, `% geometry`, `% evt`, metadata lines, `% end`), tolerates older files that omit `% format` or contain non-UTF-8 header bytes, scans only the first and last replay windows to estimate duration/byte rate, and reopens at arbitrary EVT3-aligned offsets through `RawFileCamera::open_at`
+- `RawFileCamera` parses the EVT3 header (`% format`, `% geometry`, `% evt`, metadata lines, optional `% end`), tolerates older files that omit `% format` or contain non-UTF-8 header bytes, can end the header at the first non-`% ` payload line, falls back to Prophesee plugin metadata or a first-payload event scan when geometry is missing, scans only the first and last replay windows to estimate duration/byte rate, and reopens at arbitrary EVT3-aligned offsets through `RawFileCamera::open_at`
 - `DecodedEventFileCamera` parses decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` event files once, keeps the decoded `CdEvent` vector in shared memory for cheap seeks, and replays those events through an internal packed 14-byte transport consumed by `PackedEventPreviewDecoder`
 - `.raw` replay stores parsed header metadata in `ReplayFileInfo` and uses it to rebuild replay `DeviceInfo`
 - both cameras record geometry and replay timing in `ReplayFileInfo`
@@ -32,6 +32,7 @@ Replay lives in `augur-core` as two file-backed camera adapters, so the rest of 
 Replay pacing is now timestamp-driven instead of byte-rate-driven:
 
 - raw EVT3 replay updates `ReplayControls::current_timestamp_us` directly from the packet reader
+- raw EVT3 replay unwraps the packet-reader and preview-frame timestamps across the 24-bit EVT3 rollover instead of letting transport time jump back toward zero
 - decoded replay reads the current timestamp directly from its cached event vector
 - speed changes and seeks reset the local pacing baseline from the current timestamp rather than
   from bytes read or event count
@@ -91,9 +92,29 @@ Raw replay re-establishes its pacing baseline after a seek on the first decoded 
 Decoded replay can reset immediately from the reopened event index because the event vector is
 already in memory.
 
+For raw `.raw` seeks, both the packet-reader timing feedback and the preview decoder are seeded
+from the reopened byte position so the first replacement frame lands in the correct EVT3 rollover
+epoch instead of appearing near timestamp `0`.
+
 On the GUI side, the transport reflects the requested seek position immediately, then snaps to the
 actual decoded frame position once the replacement frame arrives. The previous rendered frame stays
 visible during that handoff instead of dropping to the empty replay placeholder.
+
+For paused raw replay seeks and `←` / `→` frame steps, Augur keeps decoding after the reopen until
+the requested target timestamp is actually reached; it does not stop on the first decoded frame if
+that frame still lands earlier than the requested acquisition window.
+
+Paused `→` frame steps reuse the current replay controller whenever it is still active. Instead of
+reopening the file from an approximate byte offset, Augur briefly resumes decoding from the current
+position until the requested next acquisition window is reached, so the MB progress keeps advancing
+from the current byte position instead of jumping back.
+
+Paused `←` frame steps first walk a small in-memory history of already displayed replay frames. As
+long as the requested previous frame is still inside that retained window, Augur restores it
+directly, including its displayed byte progress, without reopening the file. If the user resumes
+playback from one of those rewound snapshots, replay reopens from the displayed position so
+playback continues from what is on screen instead of jumping back to the newer paused controller
+state.
 
 ## Files
 
@@ -110,9 +131,11 @@ visible during that handoff instead of dropping to the empty replay placeholder.
 
 Some `.raw` files may differ from the standard header convention in three ways:
 
-1. **Non-UTF-8 header bytes** — the header parser uses `read_until` + `from_utf8_lossy` so stray binary bytes are tolerated.
-2. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
-3. **Single trailing padding byte** — the published `evt3-core` crate now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
+1. **Non-UTF-8 header bytes** — the header parser uses lossy text conversion for header lines so stray non-UTF-8 bytes do not immediately reject older files.
+2. **Missing `% end` terminator** — Augur follows Prophesee's RAW parsing rule that `% end` is optional and the payload begins as soon as the next line no longer starts with `% `.
+3. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
+4. **Missing geometry** — Augur first tries known Prophesee plugin-family fallbacks such as `hal_plugin_gen41_*`, `hal_plugin_imx636_*`, `hal_plugin_gen31_*`, and `hal_plugin_genx320_*`; if that still fails, it decodes an initial payload window and derives a best-effort geometry from the observed event bounds.
+5. **Single trailing padding byte** — the published `evt3-core` crate now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
 
 ## Verification
 

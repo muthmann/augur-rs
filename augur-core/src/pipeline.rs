@@ -19,6 +19,7 @@ use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3Trigger
 use crate::{
     camera::PacketStreamCamera,
     config::CameraConfig,
+    evt3_timestamps::Evt3TimestampUnwrapper,
     metadata::{RecordingMetadata, RecordingSidecar},
     CameraError, Result,
 };
@@ -63,6 +64,18 @@ pub struct Evt3CorePreviewDecoder {
     inner: Evt3Decoder,
     cd_scratch: Vec<Evt3CdEvent>,
     trigger_scratch: Vec<Evt3TriggerEvent>,
+    timestamp_unwrapper: Evt3TimestampUnwrapper,
+}
+
+impl Evt3CorePreviewDecoder {
+    pub fn with_expected_timestamp(expected_timestamp_us: u64) -> Self {
+        Self {
+            timestamp_unwrapper: Evt3TimestampUnwrapper::with_expected_timestamp(
+                expected_timestamp_us,
+            ),
+            ..Self::default()
+        }
+    }
 }
 
 impl PreviewDecoder for Evt3CorePreviewDecoder {
@@ -75,12 +88,15 @@ impl PreviewDecoder for Evt3CorePreviewDecoder {
             .decode_bytes(bytes, &mut self.cd_scratch, &mut self.trigger_scratch)
             .map_err(|e| CameraError::Other(format!("evt3 decode failed: {e}")))?;
 
-        out.extend(self.cd_scratch.iter().map(|event| CdEvent {
-            x: event.x,
-            y: event.y,
-            timestamp: event.timestamp,
-            polarity: event.polarity != 0,
-        }));
+        out.reserve(self.cd_scratch.len());
+        for event in &self.cd_scratch {
+            out.push(CdEvent {
+                x: event.x,
+                y: event.y,
+                timestamp: self.timestamp_unwrapper.map_timestamp(event.timestamp),
+                polarity: event.polarity != 0,
+            });
+        }
 
         Ok(())
     }
@@ -1259,6 +1275,54 @@ mod tests {
         assert_eq!(all_events[1].y, 11);
         assert!(!all_events[0].polarity);
         assert!(all_events[1].polarity);
+    }
+
+    #[test]
+    fn unwraps_evt3_timestamps_across_rollover() {
+        let first_chunk =
+            words_to_bytes(&[(0x8 << 12) | 0xFFF, (0x6 << 12) | 0xFF0, 8, (0x2 << 12) | 4]);
+        let second_chunk = words_to_bytes(&[(0x8 << 12), (0x6 << 12) | 0x010, 8, (0x2 << 12) | 5]);
+        let mut decoder = Evt3CorePreviewDecoder::default();
+        let mut events = Vec::new();
+        let mut all_events = Vec::new();
+
+        decoder
+            .decode_bytes(&first_chunk, &mut events)
+            .expect("first chunk must decode");
+        all_events.extend(events.iter().copied());
+        decoder
+            .decode_bytes(&second_chunk, &mut events)
+            .expect("second chunk must decode");
+        all_events.extend(events.iter().copied());
+
+        assert_eq!(all_events.len(), 2);
+        assert_eq!(
+            all_events[0].timestamp,
+            crate::evt3_timestamps::EVT3_TIMESTAMP_PERIOD_US - 16
+        );
+        assert_eq!(
+            all_events[1].timestamp,
+            crate::evt3_timestamps::EVT3_TIMESTAMP_PERIOD_US + 16
+        );
+    }
+
+    #[test]
+    fn seeds_evt3_timestamp_epoch_for_mid_file_decode() {
+        let bytes = words_to_bytes(&[(0x8 << 12), (0x6 << 12) | 0x010, 8, (0x2 << 12) | 5]);
+        let mut decoder = Evt3CorePreviewDecoder::with_expected_timestamp(
+            crate::evt3_timestamps::EVT3_TIMESTAMP_PERIOD_US,
+        );
+        let mut events = Vec::new();
+
+        decoder
+            .decode_bytes(&bytes, &mut events)
+            .expect("seeded chunk must decode");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].timestamp,
+            crate::evt3_timestamps::EVT3_TIMESTAMP_PERIOD_US + 16
+        );
     }
 
     #[test]

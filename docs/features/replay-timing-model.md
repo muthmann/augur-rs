@@ -14,8 +14,11 @@ Replay speed now maps directly onto event timestamps:
 
 `RawFileCamera` updates `ReplayControls::current_timestamp_us` directly from the
 raw EVT3 packets it reads, so pacing is no longer coupled to the lossy preview
-queue. `DecodedEventFileCamera` reads the current event timestamp directly from
-its cached event vector.
+queue. Raw EVT3 timestamps are unwrapped across the sensor's 24-bit rollover in
+both the packet-reader feedback path and the preview decoder, including mid-file
+seek reopens, so replay time and arrow-key frame stepping stay monotonic on
+long captures. `DecodedEventFileCamera` reads the current event timestamp
+directly from its cached event vector.
 
 Speed changes and seeks reset the replay pacing baseline from the current
 timestamp instead of the previous byte/event position.
