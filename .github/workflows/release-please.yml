@@ -14,6 +14,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Keep Cargo.lock in sync after release-please bumps Cargo.toml
+      - uses: actions/checkout@v4
+        if: steps.release.outputs.pr
+        with:
+          ref: release-please--branches--main
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.release.outputs.pr
+      - name: Update Cargo.lock
+        if: steps.release.outputs.pr
+        run: |
+          cargo update --workspace
+          if ! git diff --quiet Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: update Cargo.lock after version bump"
+            git push
+          fi
