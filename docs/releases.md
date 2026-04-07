@@ -14,6 +14,19 @@ AugurRS ships in five forms:
 
 All release artifacts are built by GitHub Actions and attached to every tagged release.
 
+## Current UX By Platform
+
+- macOS: GitHub releases provide an unsigned `AugurRS.dmg`. It is usable, but Gatekeeper may
+  prompt on first launch. Users who clone the repository can avoid the downloaded-app friction by
+  running `./scripts/build-macos-app.sh --install`, which builds and installs `AugurRS.app`
+  locally.
+- Linux: GitHub releases provide a runnable extracted archive, not a native installer. Users can
+  unpack the archive and run `AugurRS` directly, but no `.desktop` entry or distro package is
+  installed automatically.
+- Windows: GitHub releases provide a runnable zip archive, not an installer. Users can unpack the
+  archive and run `AugurRS.exe` directly, but no Start Menu shortcut or installer-managed uninstall
+  flow is created automatically.
+
 ## Release Workflow
 
 Releases are automated via [release-please](https://github.com/googleapis/release-please). No manual tagging is needed.
