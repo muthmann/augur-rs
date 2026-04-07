@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "augur-cli"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "augur-core",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "augur-core"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
  "evt3-core",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "augur-gui"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "augur-core",
  "augur-plugin-api",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "augur-plugin-api"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "augur-plugin-types"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "augur-prophesee"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "augur-core",
  "rusb",
