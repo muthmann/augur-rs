@@ -31,6 +31,31 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Install AugurRS.app On macOS
+
+For day-to-day use on macOS, prefer building the app bundle once and launching it from
+Applications instead of rerunning `cargo run` every time.
+
+```bash
+./scripts/build-macos-app.sh --install
+```
+
+This builds `target/release/AugurRS`, assembles `dist/local-macos/AugurRS.app`, and copies the app
+into `/Applications` by default.
+
+Useful variants:
+
+```bash
+# Install without admin rights
+./scripts/build-macos-app.sh --install --install-dir "$HOME/Applications"
+
+# Create a local DMG for installer testing
+./scripts/build-macos-app.sh --dmg
+```
+
+After that you can launch `AugurRS.app` from Finder, Spotlight, or the Dock like a normal desktop
+application.
+
 ## Confirm the Camera Is Reachable
 
 Run:
@@ -70,7 +95,8 @@ The `.toml` file stores the effective camera configuration used for the capture.
 
 ## First GUI Session
 
-Launch the desktop app:
+Launch the desktop app from Applications if you used the install flow above. For active development
+or quick testing, you can also run it directly from Cargo:
 
 ```bash
 cargo run -p augur-gui --bin AugurRS

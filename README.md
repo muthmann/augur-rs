@@ -138,6 +138,18 @@ cargo run -p augur-gui --bin AugurRS
 HDF5_PLUGIN_PATH="$HOME/.local/share/hdf5/plugin" cargo run -p augur-gui --bin AugurRS --features hdf5
 ```
 
+On macOS, the easiest way to turn a source checkout into a normal app is:
+
+```bash
+./scripts/build-macos-app.sh --install
+```
+
+That builds `AugurRS.app` and copies it into `/Applications` so you can launch it from Finder,
+Spotlight, or the Dock instead of rerunning `cargo run`. If `/Applications` needs admin
+permissions, rerun with `sudo` or choose another destination such as
+`--install-dir "$HOME/Applications"`. Add `--dmg` if you also want a local `AugurRS.dmg` for
+testing.
+
 For the full HDF5 / ECF setup, see [HDF5 File Support](./docs/features/hdf5-file-support.md).
 
 Copy the example config for a local profile:
@@ -181,6 +193,12 @@ This repository ships the runtime plugin host and API crates. Plugin implementat
 | Windows | CI-verified on every push |
 
 Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned macOS `AugurRS.dmg`. Optional HDF5 replay remains source-build-only.
+
+- macOS: the GitHub DMG works, but Gatekeeper can prompt because it is unsigned. A local source
+  build via `./scripts/build-macos-app.sh --install` is the smoothest path if you want a normal
+  app in Applications without repeating terminal launch commands.
+- Linux / Windows: the GitHub releases are runnable after extracting the archive, but they are
+  still archive-style distributions rather than native installers.
 
 ---
 
