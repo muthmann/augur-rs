@@ -12,9 +12,6 @@
 [![CI](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muthmann/augur-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/muthmann/augur-rs/actions/workflows/release.yml/badge.svg)](https://github.com/muthmann/augur-rs/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-![macOS](https://img.shields.io/github/actions/workflow/status/muthmann/augur-rs/ci.yml?label=macOS&logo=apple&branch=main)
-![Linux](https://img.shields.io/github/actions/workflow/status/muthmann/augur-rs/ci.yml?label=Linux&logo=linux&logoColor=white&branch=main)
-![Windows](https://img.shields.io/github/actions/workflow/status/muthmann/augur-rs/ci.yml?label=Windows&logo=windows&branch=main)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
 
 </div>
@@ -23,7 +20,7 @@
 
 AugurRS gives you direct, auditable control over an EVK4 event camera. Whether you are capturing raw event streams for computer vision research, running robotics experiments, doing high-speed measurements, or building a custom imaging workflow — the core tool does exactly what you need: reliable capture, live preview, recorded-file replay, and full sensor control. Nothing more, nothing less.
 
-If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything from signal processing to detection, tracking, metrics, and custom overlays. Community plugins ship separately in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
+If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything from signal processing to detection, tracking, metrics, and custom overlays. The plugin template, authoring docs, and community plugins live in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
 
 <!-- TODO: Add screenshot of augur-gui live preview here -->
 <!-- ![Screenshot](resources/screenshot-gui.png) -->
@@ -85,9 +82,10 @@ runtime plugins ───────┼──► augur-plugin-types
                         └──► host-owned analysis UI in augur-gui
 ```
 
-**`augur-core` is a pure camera SDK.** `augur-gui` owns the built-in hotpixel
-tool plus the runtime plugin host, while plugin implementations live outside
-this repository.
+**`augur-core` is a pure camera SDK.** `augur-gui` owns the built-in analysis
+tools (hotpixel detection, ROI-grid overlay) plus the runtime plugin host,
+while plugin implementations live in the companion
+[augur-plugins](https://github.com/muthmann/augur-plugins) repository.
 
 ### Streaming Pipeline
 
@@ -178,7 +176,7 @@ AugurRS ships a generic, FFI-based plugin system that turns the live preview int
 
 Drop a compiled plugin into `~/.augur/plugins/`, and the GUI's **Plugin Manager** picks it up. Enable, disable, reload — no recompilation of the host required.
 
-This repository ships the runtime plugin host and API crates. Plugin implementations are maintained in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository. `augur-gui` itself includes a built-in **Hotpixel Detection** tool as part of the core application rather than as a plugin.
+This repository ships the runtime plugin host and API crates. The plugin template, authoring docs, and plugin implementations are maintained in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository. `augur-gui` itself includes built-in tools such as **Hotpixel Detection** as part of the core application rather than as plugins.
 
 **Want to write a plugin?** See the [**Plugin Authoring Guide**](./docs/features/plugin-authoring-guide.md).
 
@@ -216,7 +214,7 @@ Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned mac
 | [Plugin Authoring Guide](./docs/features/plugin-authoring-guide.md) | Write your own plugin: FFI host, phases, context bus, host views |
 | [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
 | [GPU Preview Rendering](./docs/features/wgpu-preview-rendering.md) | Dual-backend wgpu/glow preview architecture and benchmark baseline |
-| [Technical Notes](./docs/features/README.md) | SDK internals, hotpixel detection, and feature details |
+| [Technical Notes](./docs/features/README.md) | SDK internals, built-in tools, and feature details |
 | [Architecture Decisions](./docs/adr/README.md) | ADRs |
 
 ---
@@ -225,7 +223,7 @@ Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned mac
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), and [SECURITY.md](./SECURITY.md).
 
-Plugin contributions go to the [augur-plugins](https://github.com/muthmann/augur-plugins) repository.
+Plugin contributions go to the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository, which also hosts the plugin template and authoring docs.
 
 ---
 

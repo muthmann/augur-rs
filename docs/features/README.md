@@ -4,9 +4,10 @@ These notes capture feature-level behavior and implementation constraints useful
 
 ## Plugin Ecosystem
 
-This repository defines the plugin API, runtime loader, host-side analysis UI, and the built-in
-hotpixel-detection tool. The broader runtime plugin registry lives in
-**[augur-plugins](https://github.com/muthmann/augur-plugins)**.
+This repository defines the plugin API, runtime loader, host-side analysis UI, and built-in
+tools (hotpixel detection, ROI-grid overlay). The plugin template, authoring docs, and
+community plugin implementations live in the companion
+**[augur-plugins](https://github.com/muthmann/augur-plugins)** repository.
 
 See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface spec and [Dynamic Plugin Loading](./dynamic-plugins.md) for the install/reload workflow.
 
@@ -37,4 +38,4 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [Output File Timestamps](./output-file-timestamps.md) — overwrite protection and automatic timestamp suffixes for recordings
 
-Community runtime plugins are documented in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.
+Community runtime plugins, the plugin template, and contributor docs are maintained in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.
