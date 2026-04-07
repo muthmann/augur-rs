@@ -153,6 +153,7 @@ pub(crate) struct ViewerOutput {
     pub(crate) replay_toggle_pause: bool,
     pub(crate) replay_restart: bool,
     pub(crate) replay_stop: bool,
+    pub(crate) replay_step_frames: Option<i64>,
     pub(crate) replay_seek_to: Option<f32>,
     pub(crate) replay_set_speed: Option<f32>,
 }
@@ -172,6 +173,7 @@ impl ViewerOutput {
             || self.replay_toggle_pause
             || self.replay_restart
             || self.replay_stop
+            || self.replay_step_frames.is_some()
             || self.replay_seek_to.is_some()
             || self.replay_set_speed.is_some()
             || self.new_roi.is_some()
@@ -193,6 +195,9 @@ impl ViewerOutput {
         self.replay_toggle_pause |= other.replay_toggle_pause;
         self.replay_restart |= other.replay_restart;
         self.replay_stop |= other.replay_stop;
+        if other.replay_step_frames.is_some() {
+            self.replay_step_frames = other.replay_step_frames;
+        }
         if other.replay_seek_to.is_some() {
             self.replay_seek_to = other.replay_seek_to;
         }
@@ -337,11 +342,11 @@ pub(crate) struct ViewerReplayState {
     pub(crate) active: bool,
     pub(crate) paused: bool,
     pub(crate) finished: bool,
+    pub(crate) stepping: bool,
     pub(crate) speed: f32,
     pub(crate) fraction: f32,
     pub(crate) duration_us: u64,
     pub(crate) time_us: u64,
-    pub(crate) frame_step_us: u64,
     pub(crate) bytes_read: u64,
     pub(crate) data_len: u64,
 }
@@ -2038,7 +2043,7 @@ fn handle_replay_shortcuts(
         if !replay.paused {
             output.replay_toggle_pause = true;
         }
-        output.replay_seek_to = Some(replay_step_target_fraction(replay, frame_steps));
+        output.replay_step_frames = Some(frame_steps);
         return;
     }
 
@@ -2046,18 +2051,6 @@ fn handle_replay_shortcuts(
         output.replay_toggle_pause = true;
     }
 }
-
-fn replay_step_target_fraction(replay: ViewerReplayState, frame_steps: i64) -> f32 {
-    if replay.duration_us == 0 {
-        return 0.0;
-    }
-
-    let step_us = replay.frame_step_us.max(1) as i128;
-    let target_time_us = (replay.time_us as i128 + frame_steps as i128 * step_us)
-        .clamp(0, replay.duration_us as i128) as u64;
-    (target_time_us as f64 / replay.duration_us as f64) as f32
-}
-
 fn replay_speed_label(speed: f32) -> &'static str {
     for &(s, label) in &REPLAY_SPEED_OPTIONS {
         if replay_speed_matches(speed, s) {
@@ -2086,8 +2079,8 @@ fn format_replay_time(duration_us: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_viewport, replay_step_target_fraction, sensor_rect_to_roi_config,
-        PreviewCropTarget, PreviewWorkspaceState, ViewerReplayState, PREVIEW_ZOOM_MAX,
+        build_preview_viewport, sensor_rect_to_roi_config, PreviewCropTarget,
+        PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
     };
     use crate::viewer_tools::{AnnotationManager, AnnotationShapeKind};
     use augur_core::{config::CameraConfig, pipeline::PreviewFrame};
@@ -2123,44 +2116,6 @@ mod tests {
         annotations.update_drawing((320, 270));
         annotations.finish_drawing();
         annotations
-    }
-
-    #[test]
-    fn replay_step_fraction_moves_by_one_frame_window() {
-        let replay = ViewerReplayState {
-            duration_us: 1_000_000,
-            time_us: 500_000,
-            frame_step_us: 50_000,
-            ..Default::default()
-        };
-
-        let next = replay_step_target_fraction(replay, 1);
-        let previous = replay_step_target_fraction(replay, -1);
-
-        assert!((next - 0.55).abs() < 1e-6);
-        assert!((previous - 0.45).abs() < 1e-6);
-    }
-
-    #[test]
-    fn replay_step_fraction_clamps_to_replay_bounds() {
-        let replay = ViewerReplayState {
-            duration_us: 1_000,
-            time_us: 980,
-            frame_step_us: 50,
-            ..Default::default()
-        };
-
-        assert!((replay_step_target_fraction(replay, 1) - 1.0).abs() < 1e-6);
-        assert_eq!(
-            replay_step_target_fraction(
-                ViewerReplayState {
-                    time_us: 20,
-                    ..replay
-                },
-                -1,
-            ),
-            0.0
-        );
     }
 
     #[test]

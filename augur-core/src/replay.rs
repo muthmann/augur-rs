@@ -15,6 +15,7 @@ use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3Trigger
 use crate::{
     camera::{DeviceInfo, EventCamera, PacketStreamCamera},
     config::CameraConfig,
+    evt3_timestamps::{Evt3TimestampUnwrapper, EVT3_TIMESTAMP_PERIOD_US},
     metadata::RecordingMetadata,
     CameraError, Result,
 };
@@ -23,9 +24,6 @@ const HEADER_END: &str = "% end";
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const THROTTLE_SLEEP_SLICE: Duration = Duration::from_millis(10);
 const FAST_SCAN_WINDOW_BYTES: u64 = 128 * 1024;
-/// EVT3 timestamps are 24 bits wide (TIME_HIGH:12 | TIME_LOW:12), so they
-/// wrap around every 2^24 µs ≈ 16.8 seconds.
-const EVT3_TIMESTAMP_PERIOD_US: u64 = 1 << 24;
 
 #[derive(Debug, Clone)]
 pub struct ReplayFileInfo {
@@ -42,6 +40,19 @@ pub struct ReplayFileInfo {
 impl ReplayFileInfo {
     pub fn data_len(&self) -> u64 {
         self.file_size.saturating_sub(self.data_offset)
+    }
+
+    pub fn estimated_timestamp_us_for_data_bytes(&self, data_bytes: u64) -> u64 {
+        let data_len = self.data_len();
+        if data_len == 0 || self.total_duration_us == 0 {
+            return self.first_timestamp_us;
+        }
+
+        let relative_time_us = ((self.total_duration_us as f64 * data_bytes.min(data_len) as f64
+            / data_len as f64)
+            .round() as u64)
+            .min(self.total_duration_us);
+        self.first_timestamp_us.saturating_add(relative_time_us)
     }
 }
 
@@ -88,10 +99,12 @@ pub struct RawFileCamera {
     timing_decoder: Evt3Decoder,
     timing_cd_scratch: Vec<Evt3CdEvent>,
     timing_trigger_scratch: Vec<Evt3TriggerEvent>,
+    timestamp_unwrapper: Evt3TimestampUnwrapper,
     last_speed_epoch: u32,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
     total_paused: Duration,
+    timestamp_hint_active: bool,
 }
 
 impl RawFileCamera {
@@ -141,6 +154,10 @@ impl RawFileCamera {
         file.seek(SeekFrom::Start(aligned_start))?;
 
         let controls = ReplayControls::new(info, start_data_bytes);
+        let initial_timestamp_us = info.estimated_timestamp_us_for_data_bytes(start_data_bytes);
+        controls
+            .current_timestamp_us
+            .store(initial_timestamp_us, Ordering::Relaxed);
         let device_info = build_device_info(path, &info.metadata);
 
         Ok((
@@ -153,10 +170,14 @@ impl RawFileCamera {
                 timing_decoder: Evt3Decoder::default(),
                 timing_cd_scratch: Vec::with_capacity(4_096),
                 timing_trigger_scratch: Vec::with_capacity(256),
+                timestamp_unwrapper: Evt3TimestampUnwrapper::with_expected_timestamp(
+                    initial_timestamp_us,
+                ),
                 last_speed_epoch: controls.speed_epoch.load(Ordering::Relaxed),
                 playback_started_at: None,
                 paused_at: None,
                 total_paused: Duration::ZERO,
+                timestamp_hint_active: true,
             },
             controls,
         ))
@@ -256,10 +277,22 @@ impl RawFileCamera {
             )
             .map_err(|e| CameraError::Other(format!("raw replay timing decode failed: {e}")))?;
 
-        if let Some(last) = self.timing_cd_scratch.last() {
+        let mut last_timestamp_us = None;
+        for event in &self.timing_cd_scratch {
+            last_timestamp_us = Some(self.timestamp_unwrapper.map_timestamp(event.timestamp));
+        }
+
+        if let Some(last_timestamp_us) = last_timestamp_us {
             self.controls
                 .current_timestamp_us
-                .fetch_max(last.timestamp, Ordering::Relaxed);
+                .store(last_timestamp_us, Ordering::Relaxed);
+            if self.timestamp_hint_active {
+                self.session_start_ts_us = 0;
+                self.playback_started_at = None;
+                self.total_paused = Duration::ZERO;
+                self.paused_at = None;
+                self.timestamp_hint_active = false;
+            }
         }
 
         Ok(())
@@ -320,8 +353,19 @@ fn build_device_info(path: &Path, metadata: &RecordingMetadata) -> DeviceInfo {
         vendor: metadata
             .system_id
             .clone()
+            .or_else(|| metadata_extra_value(metadata, &["camera_integrator_name"]))
+            .or_else(|| metadata_extra_value(metadata, &["plugin_integrator_name"]))
+            .or_else(|| metadata_extra_value(metadata, &["integrator_name"]))
             .unwrap_or_else(|| "AugurRS".into()),
-        model: metadata.system_id.clone().unwrap_or(fallback_model),
+        model: metadata
+            .system_id
+            .clone()
+            .or_else(|| metadata_extra_value(metadata, &["plugin_name"]))
+            .or_else(|| {
+                metadata_extra_value(metadata, &["system_ID", "system_id"])
+                    .map(|system_id| format!("System ID {system_id}"))
+            })
+            .unwrap_or(fallback_model),
         serial: metadata.serial_number.clone(),
         firmware: metadata.firmware_version.clone(),
         compatible: metadata.sensor_compatible.clone(),
@@ -336,16 +380,44 @@ fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16, RecordingMetadata)> 
     let mut metadata_pairs = Vec::new();
     // If a % format line is present it must declare EVT3; if absent we assume EVT3.
     let mut format_rejected = false;
+    let mut saw_header_line = false;
 
     loop {
-        buf.clear();
-        let bytes = reader.read_until(b'\n', &mut buf)?;
-        if bytes == 0 {
+        let peek = reader.fill_buf()?;
+        if peek.is_empty() {
+            if saw_header_line {
+                return finalize_evt3_header(
+                    file,
+                    &mut reader,
+                    geometry,
+                    format_geometry,
+                    metadata_pairs,
+                    format_rejected,
+                );
+            }
             return Err(CameraError::Config(
-                "raw file is missing the EVT3 header terminator".into(),
+                "raw file is missing EVT3 header lines".into(),
+            ));
+        }
+        if !peek.starts_with(b"% ") {
+            if saw_header_line {
+                return finalize_evt3_header(
+                    file,
+                    &mut reader,
+                    geometry,
+                    format_geometry,
+                    metadata_pairs,
+                    format_rejected,
+                );
+            }
+            return Err(CameraError::Config(
+                "raw file does not start with an EVT3 header".into(),
             ));
         }
 
+        buf.clear();
+        reader.read_until(b'\n', &mut buf)?;
+        saw_header_line = true;
         // Older files may have non-UTF-8 bytes in the header; use lossy conversion.
         let line = String::from_utf8_lossy(&buf);
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -358,22 +430,15 @@ fn parse_evt3_header(file: &File) -> Result<(u64, u16, u16, RecordingMetadata)> 
             geometry = Some(parse_geometry_line(rest)?);
         } else if trimmed.starts_with("% evt ") {
             continue;
-        } else if trimmed == HEADER_END {
-            let data_offset = reader.stream_position()?;
-            if format_rejected {
-                return Err(CameraError::Config(
-                    "raw file declares a non-EVT3 format".into(),
-                ));
-            }
-            let (width, height) = geometry
-                .or(format_geometry)
-                .ok_or_else(|| CameraError::Config("raw file header is missing geometry".into()))?;
-            return Ok((
-                data_offset,
-                width,
-                height,
-                RecordingMetadata::from_header_lines(metadata_pairs),
-            ));
+        } else if trimmed.eq_ignore_ascii_case(HEADER_END) {
+            return finalize_evt3_header(
+                file,
+                &mut reader,
+                geometry,
+                format_geometry,
+                metadata_pairs,
+                format_rejected,
+            );
         } else if let Some((key, value)) = parse_metadata_header_line(trimmed) {
             metadata_pairs.push((key, value));
         }
@@ -432,6 +497,109 @@ fn parse_u16(raw: &str, label: &str) -> Result<u16> {
             "failed to parse {label} value {:?}: {e}",
             raw.trim()
         ))
+    })
+}
+
+fn finalize_evt3_header(
+    file: &File,
+    reader: &mut BufReader<File>,
+    geometry: Option<(u16, u16)>,
+    format_geometry: Option<(u16, u16)>,
+    metadata_pairs: Vec<(String, String)>,
+    format_rejected: bool,
+) -> Result<(u64, u16, u16, RecordingMetadata)> {
+    let data_offset = reader.stream_position()?;
+    if format_rejected {
+        return Err(CameraError::Config(
+            "raw file declares a non-EVT3 format".into(),
+        ));
+    }
+    let metadata = RecordingMetadata::from_header_lines(metadata_pairs.iter().cloned());
+    let (width, height) = geometry
+        .or(format_geometry)
+        .or_else(|| infer_prophesee_geometry(&metadata_pairs))
+        .or(infer_evt3_geometry_from_payload(file, data_offset)?)
+        .ok_or_else(|| {
+            CameraError::Config(
+                "raw file header is missing geometry and Augur could not infer it".into(),
+            )
+        })?;
+    Ok((data_offset, width, height, metadata))
+}
+
+fn infer_prophesee_geometry(metadata_pairs: &[(String, String)]) -> Option<(u16, u16)> {
+    let plugin_name = header_value(metadata_pairs, &["plugin_name"])?;
+    let has_prophesee_integrator = header_value(
+        metadata_pairs,
+        &[
+            "camera_integrator_name",
+            "plugin_integrator_name",
+            "integrator_name",
+        ],
+    )
+    .is_some_and(|value| value.eq_ignore_ascii_case("prophesee"));
+    if !has_prophesee_integrator && !plugin_name.starts_with("hal_plugin_") {
+        return None;
+    }
+
+    let plugin_name = plugin_name.to_ascii_lowercase();
+    if plugin_name.contains("genx320") {
+        Some((320, 320))
+    } else if plugin_name.contains("gen31") || plugin_name.contains("vga") {
+        Some((640, 480))
+    } else if plugin_name.contains("gen41")
+        || plugin_name.contains("imx636")
+        || plugin_name.contains("hd")
+    {
+        Some((1280, 720))
+    } else {
+        None
+    }
+}
+
+fn infer_evt3_geometry_from_payload(file: &File, data_offset: u64) -> Result<Option<(u16, u16)>> {
+    let file_size = file.metadata()?.len();
+    let data_len = file_size.saturating_sub(data_offset);
+    let window_len = align_relative_evt3_word_offset(data_len.min(FAST_SCAN_WINDOW_BYTES));
+    if window_len < 2 {
+        return Ok(None);
+    }
+
+    let mut clone = file.try_clone()?;
+    clone.seek(SeekFrom::Start(data_offset))?;
+    let mut bytes = vec![0_u8; window_len as usize];
+    clone.read_exact(&mut bytes)?;
+
+    let mut decoder = Evt3Decoder::default();
+    let mut cd_events = Vec::<Evt3CdEvent>::with_capacity(4_096);
+    let mut trigger_events = Vec::<Evt3TriggerEvent>::with_capacity(256);
+    decoder
+        .decode_bytes(&bytes, &mut cd_events, &mut trigger_events)
+        .map_err(|e| CameraError::Other(format!("failed to infer replay geometry: {e}")))?;
+    decoder.finish_stream_lenient();
+
+    let max_x = cd_events.iter().map(|event| event.x).max();
+    let max_y = cd_events.iter().map(|event| event.y).max();
+    Ok(max_x
+        .zip(max_y)
+        .map(|(max_x, max_y)| (max_x.saturating_add(1), max_y.saturating_add(1))))
+}
+
+fn header_value(metadata_pairs: &[(String, String)], keys: &[&str]) -> Option<String> {
+    metadata_pairs.iter().find_map(|(key, value)| {
+        keys.iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+            .then_some(value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn metadata_extra_value(metadata: &RecordingMetadata, keys: &[&str]) -> Option<String> {
+    metadata.extra.iter().find_map(|(key, value)| {
+        keys.iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+            .then_some(value.trim().to_owned())
+            .filter(|value| !value.is_empty())
     })
 }
 
@@ -594,6 +762,14 @@ mod tests {
         env::temp_dir().join(format!("augur-replay-{name}-{nanos}.raw"))
     }
 
+    fn words_to_bytes(words: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(words.len() * 2);
+        for &word in words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
     fn sample_raw_bytes() -> Vec<u8> {
         let words: [u16; 8] = [
             (0x8 << 12) | 0x001,
@@ -612,8 +788,7 @@ mod tests {
         bytes
     }
 
-    fn write_sample_raw(path: &Path) -> (u64, Vec<u8>) {
-        let body = sample_raw_bytes();
+    fn write_raw_with_body(path: &Path, body: &[u8]) -> u64 {
         let header = concat!(
             "% format EVT3;width=1280;height=720\n",
             "% geometry 1280x720\n",
@@ -630,9 +805,22 @@ mod tests {
             "% end\n"
         );
         let mut bytes = header.as_bytes().to_vec();
-        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(body);
         fs::write(path, bytes).expect("sample raw file must be written");
-        (header.len() as u64, body)
+        header.len() as u64
+    }
+
+    fn write_sample_raw(path: &Path) -> (u64, Vec<u8>) {
+        let body = sample_raw_bytes();
+        let data_offset = write_raw_with_body(path, &body);
+        (data_offset, body)
+    }
+
+    fn write_raw_with_header(path: &Path, header: &str, body: &[u8]) -> u64 {
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        fs::write(path, bytes).expect("raw file must be written");
+        header.len() as u64
     }
 
     #[test]
@@ -708,6 +896,65 @@ mod tests {
     }
 
     #[test]
+    fn open_accepts_prophesee_header_without_end_or_geometry() {
+        let path = temp_path("prophesee-incomplete");
+        let body = sample_raw_bytes();
+        let header = concat!(
+            "% Date 2020-09-25 07:48:29\n",
+            "% evt 3.0\n",
+            "% firmware_version 3.2.3\n",
+            "% integrator_name Prophesee\n",
+            "% plugin_name hal_plugin_gen41_evk3\n",
+            "% serial_number 00000307a\n",
+            "% system_ID 48\n"
+        );
+        write_raw_with_header(&path, header, &body);
+
+        let (camera, controls, info) = RawFileCamera::open(&path).expect("raw file must open");
+        let device_info = camera.device_info();
+
+        assert_eq!(controls.width, 1280);
+        assert_eq!(controls.height, 720);
+        assert_eq!(
+            info.metadata.recording_date.as_deref(),
+            Some("2020-09-25 07:48:29")
+        );
+        assert_eq!(info.metadata.serial_number.as_deref(), Some("00000307a"));
+        assert_eq!(
+            info.metadata.extra.get("plugin_name").map(String::as_str),
+            Some("hal_plugin_gen41_evk3")
+        );
+        assert_eq!(
+            info.metadata.extra.get("system_ID").map(String::as_str),
+            Some("48")
+        );
+        assert_eq!(device_info.vendor, "Prophesee");
+        assert_eq!(device_info.model, "hal_plugin_gen41_evk3");
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn open_can_infer_geometry_from_payload_without_header_geometry() {
+        let path = temp_path("payload-geometry");
+        let body = words_to_bytes(&[
+            (0x8 << 12) | 0x001,
+            (0x6 << 12) | 0x010,
+            19,
+            (0x2 << 12) | 41,
+        ]);
+        let header = concat!("% evt 3.0\n", "% firmware_version 3.2.3\n");
+        write_raw_with_header(&path, header, &body);
+
+        let (_camera, controls, _info) = RawFileCamera::open(&path).expect("raw file must open");
+
+        assert_eq!(controls.width, 42);
+        assert_eq!(controls.height, 20);
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
     fn read_packet_updates_current_timestamp_feedback() {
         let path = temp_path("timestamp-feedback");
         write_sample_raw(&path);
@@ -730,6 +977,56 @@ mod tests {
         assert_eq!(
             controls.current_timestamp_us.load(Ordering::Relaxed),
             0x1020
+        );
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn open_at_preserves_wrapped_timestamp_epoch_for_mid_file_seek() {
+        let path = temp_path("wrapped-seek");
+        let wrapped_body = words_to_bytes(&[
+            (0x8 << 12) | 0xFFF,
+            (0x6 << 12) | 0xFF0,
+            7,
+            (0x2 << 12) | 100,
+            (0x8 << 12),
+            (0x6 << 12) | 0x010,
+            7,
+            (0x2 << 12) | 101,
+        ]);
+        let data_offset = write_raw_with_body(&path, &wrapped_body);
+        let info = ReplayFileInfo {
+            file_size: data_offset + wrapped_body.len() as u64,
+            data_offset,
+            width: 1280,
+            height: 720,
+            metadata: RecordingMetadata::default(),
+            total_duration_us: 32,
+            first_timestamp_us: EVT3_TIMESTAMP_PERIOD_US - 16,
+            nominal_bytes_per_sec: None,
+        };
+        let start_byte = data_offset + 8;
+
+        let (mut camera, controls) =
+            RawFileCamera::open_at(&path, &info, start_byte).expect("seeked open must work");
+        camera.start_streaming().expect("start must succeed");
+
+        assert_eq!(controls.bytes_read.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            controls.current_timestamp_us.load(Ordering::Relaxed),
+            EVT3_TIMESTAMP_PERIOD_US
+        );
+
+        let mut buf = [0_u8; 16];
+        let n = camera
+            .read_packet(&mut buf)
+            .expect("read after wrapped seek must succeed");
+
+        assert_eq!(n, 8);
+        assert_eq!(
+            controls.current_timestamp_us.load(Ordering::Relaxed),
+            EVT3_TIMESTAMP_PERIOD_US + 16
         );
 
         fs::remove_file(path).expect("temp file must be removed");

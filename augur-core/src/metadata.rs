@@ -141,29 +141,36 @@ impl RecordingMetadata {
         for (key, value) in pairs {
             let key = key.into();
             let value = value.into();
-            match key.as_str() {
-                "serial_number" => metadata.serial_number = normalize_optional(Some(value)),
-                "system_id" => metadata.system_id = normalize_optional(Some(value)),
-                "firmware_version" => metadata.firmware_version = normalize_optional(Some(value)),
-                "sensor_compatible" => {
-                    metadata.sensor_compatible = normalize_optional(Some(value));
+            if key.eq_ignore_ascii_case("serial_number") {
+                metadata.serial_number = normalize_optional(Some(value));
+            } else if key.eq_ignore_ascii_case("system_id") {
+                if value.trim().chars().all(|c| c.is_ascii_digit()) {
+                    metadata.extra.insert(key, value);
+                } else {
+                    metadata.system_id = normalize_optional(Some(value));
                 }
-                "augur_version" => metadata.augur_version = normalize_optional(Some(value)),
-                "recording_date" => metadata.recording_date = normalize_optional(Some(value)),
-                "recording_hostname" => {
-                    metadata.recording_hostname = normalize_optional(Some(value));
-                }
-                "pixel_pitch_nm" => match value.trim().parse::<f64>() {
+            } else if key.eq_ignore_ascii_case("firmware_version") {
+                metadata.firmware_version = normalize_optional(Some(value));
+            } else if key.eq_ignore_ascii_case("sensor_compatible") {
+                metadata.sensor_compatible = normalize_optional(Some(value));
+            } else if key.eq_ignore_ascii_case("augur_version") {
+                metadata.augur_version = normalize_optional(Some(value));
+            } else if key.eq_ignore_ascii_case("recording_date") || key.eq_ignore_ascii_case("date")
+            {
+                metadata.recording_date = normalize_optional(Some(value));
+            } else if key.eq_ignore_ascii_case("recording_hostname") {
+                metadata.recording_hostname = normalize_optional(Some(value));
+            } else if key.eq_ignore_ascii_case("pixel_pitch_nm") {
+                match value.trim().parse::<f64>() {
                     Ok(pixel_pitch_nm) if pixel_pitch_nm.is_finite() => {
                         metadata.pixel_pitch_nm = Some(pixel_pitch_nm);
                     }
                     _ => {
                         metadata.extra.insert(key, value);
                     }
-                },
-                _ => {
-                    metadata.extra.insert(key, value);
                 }
+            } else {
+                metadata.extra.insert(key, value);
             }
         }
         metadata
@@ -292,6 +299,31 @@ mod tests {
         assert_eq!(parsed.recording_duration_us, None);
         assert_eq!(parsed.total_events, None);
         assert_eq!(parsed.annotations, RecordingAnnotations::default());
+    }
+
+    #[test]
+    fn parses_case_insensitive_standard_keys_and_keeps_numeric_system_id_extra() {
+        let parsed = RecordingMetadata::from_header_lines([
+            ("Date", "2020-09-25 07:48:29"),
+            ("firmware_version", "3.2.3"),
+            ("system_ID", "48"),
+            ("integrator_name", "Prophesee"),
+        ]);
+
+        assert_eq!(
+            parsed.recording_date.as_deref(),
+            Some("2020-09-25 07:48:29")
+        );
+        assert_eq!(parsed.firmware_version.as_deref(), Some("3.2.3"));
+        assert_eq!(
+            parsed.extra.get("system_ID").map(String::as_str),
+            Some("48")
+        );
+        assert_eq!(
+            parsed.extra.get("integrator_name").map(String::as_str),
+            Some("Prophesee")
+        );
+        assert!(parsed.system_id.is_none());
     }
 
     #[test]

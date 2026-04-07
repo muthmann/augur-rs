@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, mpsc, Arc, Mutex},
@@ -68,6 +68,7 @@ const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
 const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const UI_THEME_STORAGE_KEY: &str = "augur_gui.theme_preference";
+const REPLAY_FRAME_HISTORY_CAPACITY: usize = 8;
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
@@ -112,7 +113,9 @@ fn process_interval_for_view_mode(
 
 fn viewport_stream_active(mode: AppMode, replay: ViewerReplayState) -> bool {
     matches!(mode, AppMode::Previewing | AppMode::Recording)
-        || (mode == AppMode::Replaying && replay.active && !replay.paused && !replay.finished)
+        || (mode == AppMode::Replaying
+            && replay.active
+            && ((!replay.paused && !replay.finished) || replay.stepping))
 }
 
 fn child_viewport_repaint_after(
@@ -221,10 +224,76 @@ fn replay_time_from_position_sources(
     replay_time_from_fraction(byte_fraction, total_duration_us)
 }
 
+fn replay_seek_target_reached(target_timestamp_us: Option<u64>, frame_window_end_us: u64) -> bool {
+    target_timestamp_us.is_none_or(|target_timestamp_us| frame_window_end_us >= target_timestamp_us)
+}
+
+fn replay_step_target_time_us(
+    current_time_us: u64,
+    frame_step_us: u64,
+    frame_steps: i64,
+    total_duration_us: u64,
+) -> u64 {
+    if total_duration_us == 0 {
+        return 0;
+    }
+
+    let step_us = frame_step_us.max(1) as i128;
+    (current_time_us as i128 + frame_steps as i128 * step_us).clamp(0, total_duration_us as i128)
+        as u64
+}
+
+fn replay_step_uses_current_controller(
+    frame_steps: i64,
+    replay_paused: bool,
+    replay_finished: bool,
+    controller_active: bool,
+) -> bool {
+    frame_steps > 0 && replay_paused && !replay_finished && controller_active
+}
+
+fn replay_history_has_display_override(history_len: usize, cursor: Option<usize>) -> bool {
+    matches!(cursor, Some(cursor) if history_len > 0 && cursor + 1 < history_len)
+}
+
+fn replay_history_step_target(
+    history_len: usize,
+    cursor: Option<usize>,
+    frame_steps: i64,
+) -> Option<usize> {
+    if frame_steps == 0 || history_len == 0 {
+        return None;
+    }
+
+    let cursor = cursor?;
+    let target = cursor as i64 + frame_steps;
+    (0..history_len as i64)
+        .contains(&target)
+        .then_some(target as usize)
+}
+
+fn pipeline_stream_active(
+    mode: AppMode,
+    replay_paused: bool,
+    replay_finished: bool,
+    replay_pause_after_seek_frame: bool,
+) -> bool {
+    matches!(mode, AppMode::Previewing | AppMode::Recording)
+        || (mode == AppMode::Replaying && !replay_paused && !replay_finished)
+        || (mode == AppMode::Replaying && replay_pause_after_seek_frame)
+}
+
 #[derive(Debug, Clone)]
 struct HostDatasetCacheEntry {
     generation: u64,
     snapshot: CachedHostDataset,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayFrameSnapshot {
+    frame: PreviewFrame,
+    analysis_output: AnalysisOutput,
+    bytes_read: u64,
 }
 
 /// Extract a table reference from a cached dataset entry.
@@ -460,7 +529,10 @@ pub struct CameraApp {
     replay_paused: bool,
     replay_finished: bool,
     replay_pause_after_seek_frame: bool,
+    replay_pause_after_seek_target_timestamp_us: Option<u64>,
     replay_pending_fraction: Option<f32>,
+    replay_frame_history: VecDeque<ReplayFrameSnapshot>,
+    replay_history_cursor: Option<usize>,
     replay_speed: f32,
     replay_notice: Option<String>,
     replay_open_task: Option<ReplayOpenTask>,
@@ -555,7 +627,10 @@ impl CameraApp {
             replay_paused: false,
             replay_finished: false,
             replay_pause_after_seek_frame: false,
+            replay_pause_after_seek_target_timestamp_us: None,
             replay_pending_fraction: None,
+            replay_frame_history: VecDeque::with_capacity(REPLAY_FRAME_HISTORY_CAPACITY),
+            replay_history_cursor: None,
             replay_speed: 1.0,
             replay_notice: None,
             replay_open_task: None,
@@ -713,6 +788,95 @@ impl CameraApp {
         self.popup_open = false;
     }
 
+    fn clear_replay_frame_history(&mut self) {
+        self.replay_frame_history.clear();
+        self.replay_history_cursor = None;
+    }
+
+    fn replay_history_cursor(&self) -> Option<usize> {
+        self.replay_history_cursor
+            .filter(|&cursor| cursor < self.replay_frame_history.len())
+    }
+
+    fn replay_has_display_override(&self) -> bool {
+        replay_history_has_display_override(
+            self.replay_frame_history.len(),
+            self.replay_history_cursor(),
+        )
+    }
+
+    fn replay_controller_bytes_read(&self) -> u64 {
+        self.replay_controls
+            .as_ref()
+            .map(|controls| controls.bytes_read.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn record_replay_frame_snapshot(&mut self, frame: &PreviewFrame) {
+        if self.mode != AppMode::Replaying {
+            return;
+        }
+
+        if self.replay_frame_history.len() == REPLAY_FRAME_HISTORY_CAPACITY {
+            self.replay_frame_history.pop_front();
+            if let Some(cursor) = self.replay_history_cursor {
+                self.replay_history_cursor = cursor.checked_sub(1);
+            }
+        }
+
+        self.replay_frame_history.push_back(ReplayFrameSnapshot {
+            frame: frame.clone(),
+            analysis_output: self.analysis_output.clone(),
+            bytes_read: self.replay_controller_bytes_read(),
+        });
+        self.replay_history_cursor = self.replay_frame_history.len().checked_sub(1);
+    }
+
+    fn apply_replay_frame_snapshot(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: ReplayFrameSnapshot,
+        history_cursor: usize,
+    ) {
+        self.replay_history_cursor = Some(history_cursor);
+        self.replay_pause_after_seek_frame = false;
+        self.replay_pause_after_seek_target_timestamp_us = None;
+        self.replay_pending_fraction = None;
+        self.replay_paused = true;
+        self.replay_finished = self.controller.is_none()
+            && !replay_history_has_display_override(
+                self.replay_frame_history.len(),
+                self.replay_history_cursor,
+            )
+            && self
+                .replay_file_info
+                .as_ref()
+                .is_some_and(|info| self.replay_controller_bytes_read() >= info.data_len());
+        self.analysis_output = snapshot.analysis_output;
+        self.update_preview_histogram_from_frame(&snapshot.frame);
+
+        self.with_active_viewer_mut(|viewer| {
+            if viewer.needs_line_profile_refresh() {
+                viewer.line_profile_tool.recompute(&snapshot.frame);
+            }
+            viewer.workspace.point_cloud.clear();
+            if let Some(events) = snapshot.frame.events.as_deref() {
+                viewer.workspace.point_cloud.push_events(events);
+            }
+        });
+
+        if !self.external_tool_status().is_streaming()
+            && self.active_view_mode() == ViewMode::Preview2d
+        {
+            if let Err(err) = self.render_preview_texture_from_frame(ctx, &snapshot.frame) {
+                self.last_error = Some(format!("preview render failed: {err}"));
+            }
+        }
+
+        self.latest_frame = Some(snapshot.frame);
+        self.last_preview_process_at = Some(Instant::now());
+    }
+
     fn viewer_replay_state(&self) -> ViewerReplayState {
         let (duration_us, data_len) = self
             .replay_file_info
@@ -723,11 +887,11 @@ impl CameraApp {
             active: self.mode == AppMode::Replaying && duration_us > 0,
             paused: self.replay_paused,
             finished: self.replay_finished,
+            stepping: self.replay_pause_after_seek_frame,
             speed: self.replay_speed,
             fraction: self.current_replay_fraction(),
             duration_us,
             time_us: self.current_replay_time_us(),
-            frame_step_us: self.published_acq_time_ms().saturating_mul(1_000),
             bytes_read: self.current_replay_bytes_read(),
             data_len,
         }
@@ -849,6 +1013,9 @@ impl CameraApp {
         }
         if output.replay_stop {
             self.stop_pipeline();
+        }
+        if let Some(frame_steps) = output.replay_step_frames {
+            self.step_replay(ctx, frame_steps);
         }
         if let Some(fraction) = output.replay_seek_to {
             self.seek_replay(fraction);
@@ -2380,7 +2547,9 @@ impl CameraApp {
         self.replay_paused = false;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
+        self.replay_pause_after_seek_target_timestamp_us = None;
         self.replay_pending_fraction = None;
+        self.clear_replay_frame_history();
         self.replay_speed = 1.0;
         self.saved_live_state = Some(saved_live_state);
         self.reset_analysis();
@@ -2618,6 +2787,11 @@ impl CameraApp {
     }
 
     fn set_replay_paused(&mut self, paused: bool) {
+        if !paused && self.replay_has_display_override() {
+            self.reopen_replay_at_fraction(self.current_replay_fraction(), false);
+            return;
+        }
+
         let Some(controls) = &self.replay_controls else {
             return;
         };
@@ -2791,11 +2965,84 @@ impl CameraApp {
         self.replay_speed = speed;
     }
 
+    fn step_replay(&mut self, ctx: &egui::Context, frame_steps: i64) {
+        if self.mode != AppMode::Replaying || frame_steps == 0 {
+            return;
+        }
+
+        if let Some(target_cursor) = replay_history_step_target(
+            self.replay_frame_history.len(),
+            self.replay_history_cursor(),
+            frame_steps,
+        ) {
+            if let Some(snapshot) = self.replay_frame_history.get(target_cursor).cloned() {
+                self.apply_replay_frame_snapshot(ctx, snapshot, target_cursor);
+                return;
+            }
+        }
+
+        let Some((first_timestamp_us, total_duration_us)) = self
+            .replay_file_info
+            .as_ref()
+            .map(|info| (info.first_timestamp_us, info.total_duration_us))
+        else {
+            self.last_error = Some("replay file metadata is missing".into());
+            return;
+        };
+
+        let target_time_us = replay_step_target_time_us(
+            self.current_replay_time_us(),
+            self.published_acq_time_ms().saturating_mul(1_000),
+            frame_steps,
+            total_duration_us,
+        );
+        let target_fraction = replay_fraction_from_time(target_time_us, total_duration_us);
+        let controller_active = self.replay_controls.is_some()
+            && self
+                .controller
+                .as_ref()
+                .is_some_and(|ctrl| !ctrl.is_stopped());
+
+        if replay_step_uses_current_controller(
+            frame_steps,
+            self.replay_paused,
+            self.replay_finished,
+            controller_active,
+        ) {
+            self.step_replay_forward_from_current(
+                first_timestamp_us.saturating_add(target_time_us),
+                target_fraction,
+            );
+            return;
+        }
+
+        self.seek_replay(target_fraction);
+    }
+
+    fn step_replay_forward_from_current(&mut self, target_timestamp_us: u64, target_fraction: f32) {
+        let Some(controls) = self.replay_controls.clone() else {
+            return;
+        };
+
+        self.set_replay_paused_internal(&controls, false);
+        self.replay_paused = true;
+        self.replay_finished = false;
+        self.replay_pause_after_seek_frame = true;
+        self.replay_pause_after_seek_target_timestamp_us = Some(target_timestamp_us);
+        self.replay_pending_fraction = Some(target_fraction);
+        self.last_error = None;
+    }
+
     fn seek_replay(&mut self, fraction: f32) {
         if self.mode != AppMode::Replaying {
             return;
         }
 
+        let desired_paused = self.replay_paused || self.replay_finished;
+        self.reopen_replay_at_fraction(fraction, desired_paused);
+    }
+
+    fn reopen_replay_at_fraction(&mut self, fraction: f32, desired_paused: bool) {
         let Some(path) = self.replay_path.as_ref().map(PathBuf::from) else {
             self.last_error = Some("replay path is missing".into());
             return;
@@ -2805,7 +3052,7 @@ impl CameraApp {
             return;
         };
         let decoded_events = self.replay_decoded_events.clone();
-        let desired_paused = self.replay_paused || self.replay_finished;
+        self.clear_replay_frame_history();
 
         if let Some(controller) = self.controller.take() {
             if let Err(err) = controller.shutdown() {
@@ -2816,6 +3063,8 @@ impl CameraApp {
         let data_len = info.data_len();
         let fraction = fraction.clamp(0.0, 1.0);
         let target_rel = ((data_len as f64 * fraction as f64) as u64).min(data_len);
+        let target_time_us = replay_time_from_fraction(fraction, info.total_duration_us);
+        let target_timestamp_us = info.first_timestamp_us.saturating_add(target_time_us);
         let reopen_result = if let Some(decoded_events) = decoded_events {
             let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
             match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
@@ -2830,11 +3079,13 @@ impl CameraApp {
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         } else {
-            let target_byte = info.data_offset + align_relative_evt3_word_offset(target_rel);
+            let target_data_bytes = align_relative_evt3_word_offset(target_rel);
+            let target_byte = info.data_offset + target_data_bytes;
+            let timestamp_hint_us = info.estimated_timestamp_us_for_data_bytes(target_data_bytes);
             match RawFileCamera::open_at(&path, &info, target_byte) {
                 Ok((camera, controls)) => spawn_pipeline(
                     camera,
-                    Evt3CorePreviewDecoder::default(),
+                    Evt3CorePreviewDecoder::with_expected_timestamp(timestamp_hint_us),
                     replay_pipeline_config(&info),
                     PipelineOptions::preview_only(info.width, info.height),
                 )
@@ -2868,6 +3119,8 @@ impl CameraApp {
         self.replay_paused = desired_paused;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = pause_after_first_frame;
+        self.replay_pause_after_seek_target_timestamp_us =
+            pause_after_first_frame.then_some(target_timestamp_us);
         self.replay_pending_fraction = Some(fraction);
         self.last_error = None;
         self.with_active_viewer_mut(ViewerState::clear_session_state);
@@ -2901,7 +3154,9 @@ impl CameraApp {
         self.replay_paused = false;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = false;
+        self.replay_pause_after_seek_target_timestamp_us = None;
         self.replay_pending_fraction = None;
+        self.clear_replay_frame_history();
         self.replay_speed = 1.0;
         self.replay_notice = None;
         self.replay_path = None;
@@ -2926,6 +3181,7 @@ impl CameraApp {
         self.preview_renderer.reset();
         self.preview_perf.reset();
         self.latest_frame = None;
+        self.clear_replay_frame_history();
         reset_preview_render_cache();
         self.last_preview_process_at = None;
         self.with_active_viewer_mut(|viewer| {
@@ -2957,6 +3213,7 @@ impl CameraApp {
         self.replay_finished = true;
         self.replay_paused = true;
         self.replay_pause_after_seek_frame = false;
+        self.replay_pause_after_seek_target_timestamp_us = None;
         self.replay_pending_fraction = None;
         if self.last_error.is_none() {
             self.camera_status = "Replay finished.".into();
@@ -3117,11 +3374,24 @@ impl CameraApp {
             return;
         }
 
+        let waiting_for_seek_target = !replay_seek_target_reached(
+            self.replay_pause_after_seek_target_timestamp_us,
+            frame.window_end_us,
+        );
+        if self.mode == AppMode::Replaying
+            && self.replay_pause_after_seek_frame
+            && waiting_for_seek_target
+        {
+            ctx.request_repaint_after(process_interval);
+            return;
+        }
+
         if self.mode == AppMode::Replaying && self.replay_pause_after_seek_frame {
             if let Some(controls) = &self.replay_controls {
                 self.set_replay_paused_internal(controls, true);
             }
             self.replay_pause_after_seek_frame = false;
+            self.replay_pause_after_seek_target_timestamp_us = None;
             self.replay_paused = true;
         }
         if self.mode == AppMode::Replaying && self.replay_pending_fraction.is_some() {
@@ -3171,6 +3441,9 @@ impl CameraApp {
         }
         if let Some(events) = frame.events.as_deref() {
             self.with_active_viewer_mut(|viewer| viewer.workspace.point_cloud.push_events(events));
+        }
+        if self.mode == AppMode::Replaying {
+            self.record_replay_frame_snapshot(&frame);
         }
         self.latest_frame = Some(frame);
         self.last_preview_process_at = Some(Instant::now());
@@ -3235,10 +3508,15 @@ impl CameraApp {
     }
 
     fn current_replay_bytes_read(&self) -> u64 {
-        self.replay_controls
-            .as_ref()
-            .map(|controls| controls.bytes_read.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        if self.replay_has_display_override() {
+            return self
+                .replay_history_cursor()
+                .and_then(|cursor| self.replay_frame_history.get(cursor))
+                .map(|snapshot| snapshot.bytes_read)
+                .unwrap_or_else(|| self.replay_controller_bytes_read());
+        }
+
+        self.replay_controller_bytes_read()
     }
 
     fn current_replay_time_us(&self) -> u64 {
@@ -4623,8 +4901,12 @@ impl eframe::App for CameraApp {
 
         self.sync_active_pipeline_requirements();
 
-        let stream_active = matches!(self.mode, AppMode::Previewing | AppMode::Recording)
-            || (self.mode == AppMode::Replaying && !self.replay_paused && !self.replay_finished);
+        let stream_active = pipeline_stream_active(
+            self.mode,
+            self.replay_paused,
+            self.replay_finished,
+            self.replay_pause_after_seek_frame,
+        );
         let process_interval = self.active_preview_process_interval();
         if self.replay_open_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
@@ -4710,9 +4992,13 @@ impl Drop for CameraApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        derived_replay_preview_interval_ms, replay_fraction_from_time,
-        replay_time_from_position_sources,
+        derived_replay_preview_interval_ms, pipeline_stream_active, replay_fraction_from_time,
+        replay_history_has_display_override, replay_history_step_target,
+        replay_seek_target_reached, replay_step_target_time_us,
+        replay_step_uses_current_controller, replay_time_from_position_sources,
+        viewport_stream_active,
     };
+    use crate::viewer_widget::{AppMode, ViewerReplayState};
 
     #[test]
     fn replay_preview_interval_scales_with_speed() {
@@ -4743,5 +5029,76 @@ mod tests {
 
         assert_eq!(time_us, 750);
         assert!((replay_fraction_from_time(time_us, 1_000) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn paused_seek_keeps_decoding_until_target_frame_is_reached() {
+        assert!(!replay_seek_target_reached(Some(1_000), 950));
+        assert!(replay_seek_target_reached(Some(1_000), 1_000));
+        assert!(replay_seek_target_reached(Some(1_000), 1_050));
+    }
+
+    #[test]
+    fn paused_seek_without_target_accepts_first_frame() {
+        assert!(replay_seek_target_reached(None, 50));
+    }
+
+    #[test]
+    fn replay_step_target_time_clamps_backward_and_forward() {
+        assert_eq!(replay_step_target_time_us(500, 100, 1, 1_000), 600);
+        assert_eq!(replay_step_target_time_us(500, 100, -6, 1_000), 0);
+        assert_eq!(replay_step_target_time_us(950, 100, 2, 1_000), 1_000);
+    }
+
+    #[test]
+    fn only_paused_forward_steps_keep_the_current_controller() {
+        assert!(replay_step_uses_current_controller(1, true, false, true));
+        assert!(!replay_step_uses_current_controller(-1, true, false, true));
+        assert!(!replay_step_uses_current_controller(1, false, false, true));
+        assert!(!replay_step_uses_current_controller(1, true, true, true));
+        assert!(!replay_step_uses_current_controller(1, true, false, false));
+    }
+
+    #[test]
+    fn replay_history_detects_when_display_is_behind_latest() {
+        assert!(replay_history_has_display_override(3, Some(1)));
+        assert!(!replay_history_has_display_override(3, Some(2)));
+        assert!(!replay_history_has_display_override(0, None));
+    }
+
+    #[test]
+    fn replay_history_step_target_stays_within_cached_frames() {
+        assert_eq!(replay_history_step_target(4, Some(2), -1), Some(1));
+        assert_eq!(replay_history_step_target(4, Some(1), 2), Some(3));
+        assert_eq!(replay_history_step_target(4, Some(0), -1), None);
+        assert_eq!(replay_history_step_target(4, Some(3), 1), None);
+    }
+
+    #[test]
+    fn paused_seek_keeps_stream_updates_alive() {
+        assert!(pipeline_stream_active(
+            AppMode::Replaying,
+            true,
+            false,
+            true,
+        ));
+        assert!(!pipeline_stream_active(
+            AppMode::Replaying,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn paused_seek_keeps_child_viewports_alive() {
+        let replay = ViewerReplayState {
+            active: true,
+            paused: true,
+            finished: false,
+            stepping: true,
+            ..ViewerReplayState::default()
+        };
+        assert!(viewport_stream_active(AppMode::Replaying, replay));
     }
 }
