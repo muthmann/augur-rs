@@ -1,7 +1,6 @@
 <div align="center">
 
-<!-- TODO: Add project logo / banner here -->
-<!-- ![AugurRS](resources/augur-banner.png) -->
+<img src="assets/logo.png" alt="AugurRS" width="120" />
 
 # AugurRS
 
@@ -22,8 +21,7 @@ AugurRS gives you direct, auditable control over an EVK4 event camera. Whether y
 
 If you want to go further, the **plugin system** turns AugurRS into a live analysis surface. Plugins run alongside the preview stream and can do anything from signal processing to detection, tracking, metrics, and custom overlays. The plugin template, authoring docs, and community plugins live in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
 
-<!-- TODO: Add screenshot of augur-gui live preview here -->
-<!-- ![Screenshot](resources/screenshot-gui.png) -->
+![Screenshot](assets/example_screenshot_driving_example.png)
 
 ---
 
