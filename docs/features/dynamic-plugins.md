@@ -68,7 +68,7 @@ Plugin Manager instead of crashing AugurRS during startup.
 
 ## Runtime Plugin Sources
 
-Community runtime plugins are maintained in [augur-plugins](https://github.com/muthmann/augur-plugins). Build a plugin there, then copy its `plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
+The companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository hosts the plugin template, authoring docs, and community plugin implementations. Build a plugin there (or start from the template), then copy its `plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
 
 ## Troubleshooting
 
