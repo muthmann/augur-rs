@@ -477,6 +477,7 @@ fn reset_preview_frame_accumulators(
     *frame_start_ts = None;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_preview_frame(
     frame_tx: &Sender<PreviewFrame>,
     stats_preview: &Arc<Mutex<PipelineStatsInner>>,
