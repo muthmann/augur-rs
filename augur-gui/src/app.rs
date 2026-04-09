@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -180,6 +183,14 @@ fn derived_replay_preview_interval_ms(acq_time_ms: u64, speed: f32) -> u64 {
         10
     }
     .clamp(10, 200)
+}
+
+fn acq_time_us_from_ms(acq_time_ms: u64) -> u64 {
+    acq_time_ms.max(1).saturating_mul(1_000)
+}
+
+fn sync_acq_time_atomic(acq_time_us: &Arc<AtomicU64>, acq_time_ms: u64) {
+    acq_time_us.store(acq_time_us_from_ms(acq_time_ms), Ordering::Relaxed);
 }
 
 fn replay_time_from_fraction(fraction: f32, total_duration_us: u64) -> u64 {
@@ -2436,6 +2447,7 @@ impl CameraApp {
         };
 
         let extension = replay_file_extension(&path);
+        let replay_acq_time_ms = self.acq_time_ms;
         let open_result = match extension.as_deref() {
             Some("raw") => match RawFileCamera::open(&path) {
                 Ok((camera, controls, info)) => {
@@ -2443,7 +2455,7 @@ impl CameraApp {
                     spawn_pipeline(
                         camera,
                         Evt3CorePreviewDecoder::default(),
-                        replay_pipeline_config(&info),
+                        replay_pipeline_config(&info, replay_acq_time_ms),
                         PipelineOptions::preview_only(info.width, info.height),
                     )
                     .map(|controller| OpenedReplay {
@@ -2467,7 +2479,7 @@ impl CameraApp {
                             spawn_pipeline(
                                 camera,
                                 PackedEventPreviewDecoder::default(),
-                                replay_pipeline_config(&info),
+                                replay_pipeline_config(&info, replay_acq_time_ms),
                                 PipelineOptions::preview_only(info.width, info.height),
                             )
                             .map(|controller| OpenedReplay {
@@ -2538,6 +2550,9 @@ impl CameraApp {
         self.config = display_config;
         let global = self.config.global.clone();
         self.apply_global_config(&global);
+        if let Some(controller) = &self.controller {
+            sync_acq_time_atomic(&controller.acq_time_us, self.acq_time_ms);
+        }
         self.mask_file = display_mask_file;
         self.replay_notice = replay_notice;
         self.replay_path = Some(path.display().to_string());
@@ -2685,7 +2700,7 @@ impl CameraApp {
         raw_path: &Path,
         info: &ReplayFileInfo,
     ) -> (CameraConfig, String, Option<String>) {
-        let default_config = replay_pipeline_config(info);
+        let default_config = replay_pipeline_config(info, self.acq_time_ms);
 
         let Some(config_path) = replay_config_path(raw_path) else {
             return (
@@ -2768,9 +2783,7 @@ impl CameraApp {
             options,
         )
         .map_err(|e| format!("pipeline start failed: {e}"))?;
-        controller
-            .acq_time_us
-            .store(self.acq_time_ms * 1_000, Ordering::Relaxed);
+        sync_acq_time_atomic(&controller.acq_time_us, self.acq_time_ms);
         Ok(controller)
     }
 
@@ -3071,7 +3084,7 @@ impl CameraApp {
                 Ok((camera, controls)) => spawn_pipeline(
                     camera,
                     PackedEventPreviewDecoder::default(),
-                    replay_pipeline_config(&info),
+                    replay_pipeline_config(&info, self.acq_time_ms),
                     PipelineOptions::preview_only(info.width, info.height),
                 )
                 .map(|controller| (controller, controls))
@@ -3086,7 +3099,7 @@ impl CameraApp {
                 Ok((camera, controls)) => spawn_pipeline(
                     camera,
                     Evt3CorePreviewDecoder::with_expected_timestamp(timestamp_hint_us),
-                    replay_pipeline_config(&info),
+                    replay_pipeline_config(&info, self.acq_time_ms),
                     PipelineOptions::preview_only(info.width, info.height),
                 )
                 .map(|controller| (controller, controls))
@@ -3113,6 +3126,9 @@ impl CameraApp {
         self.set_replay_speed_internal(&controls, self.replay_speed);
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
+        if let Some(controller) = &self.controller {
+            sync_acq_time_atomic(&controller.acq_time_us, self.acq_time_ms);
+        }
         self.last_preview_process_at = None;
         self.replay_controls = Some(controls);
         self.replay_file_info = Some(info);
@@ -3262,8 +3278,7 @@ impl CameraApp {
         }
 
         if self.acq_dirty {
-            ctrl.acq_time_us
-                .store(self.acq_time_ms.saturating_mul(1_000), Ordering::Relaxed);
+            sync_acq_time_atomic(&ctrl.acq_time_us, self.acq_time_ms);
             self.acq_dirty = false;
         }
 
@@ -4934,12 +4949,13 @@ fn analysis_info_color() -> egui::Color32 {
     egui::Color32::from_rgb(30, 100, 220)
 }
 
-fn replay_pipeline_config(info: &ReplayFileInfo) -> CameraConfig {
+fn replay_pipeline_config(info: &ReplayFileInfo, acq_time_ms: u64) -> CameraConfig {
     let mut config = CameraConfig::default();
     config.roi.width = info.width;
     config.roi.height = info.height;
     config.global.sensor_width = info.width;
     config.global.sensor_height = info.height;
+    config.global.acq_time_ms = acq_time_ms.max(1);
     if let Some(pixel_pitch_nm) = info.metadata.pixel_pitch_nm {
         config.global.nm_per_pixel = pixel_pitch_nm;
     }
@@ -4992,13 +5008,19 @@ impl Drop for CameraApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        derived_replay_preview_interval_ms, pipeline_stream_active, replay_fraction_from_time,
-        replay_history_has_display_override, replay_history_step_target,
-        replay_seek_target_reached, replay_step_target_time_us,
+        acq_time_us_from_ms, derived_replay_preview_interval_ms, pipeline_stream_active,
+        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
+        replay_pipeline_config, replay_seek_target_reached, replay_step_target_time_us,
         replay_step_uses_current_controller, replay_time_from_position_sources,
-        viewport_stream_active,
+        sync_acq_time_atomic, viewport_stream_active,
     };
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+
     use crate::viewer_widget::{AppMode, ViewerReplayState};
+    use augur_core::{metadata::RecordingMetadata, replay::ReplayFileInfo};
 
     #[test]
     fn replay_preview_interval_scales_with_speed() {
@@ -5100,5 +5122,37 @@ mod tests {
             ..ViewerReplayState::default()
         };
         assert!(viewport_stream_active(AppMode::Replaying, replay));
+    }
+
+    #[test]
+    fn replay_pipeline_config_preserves_requested_acquisition_time() {
+        let info = ReplayFileInfo {
+            file_size: 0,
+            data_offset: 0,
+            width: 640,
+            height: 480,
+            metadata: RecordingMetadata::default(),
+            total_duration_us: 0,
+            first_timestamp_us: 0,
+            nominal_bytes_per_sec: None,
+        };
+
+        let config = replay_pipeline_config(&info, 125);
+
+        assert_eq!(config.global.acq_time_ms, 125);
+        assert_eq!(config.global.sensor_width, 640);
+        assert_eq!(config.global.sensor_height, 480);
+    }
+
+    #[test]
+    fn replay_acquisition_time_sync_writes_microseconds() {
+        let acq_time_us = Arc::new(AtomicU64::new(50_000));
+
+        sync_acq_time_atomic(&acq_time_us, 125);
+
+        assert_eq!(
+            acq_time_us.load(Ordering::Relaxed),
+            acq_time_us_from_ms(125)
+        );
     }
 }

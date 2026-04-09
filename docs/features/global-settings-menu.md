@@ -95,7 +95,11 @@ informational text. The `Preview update [Hz]` control still applies to live prev
 Replay also now keeps `Acq time [ms]` enabled in the top-bar `Settings` menu. The GUI already
 stores the value through `PipelineController::acq_time_us`, and the preview pipeline samples that
 atomic on each frame boundary, so replay-time edits take effect on the next decoded frame window
-without rebuilding the replay session.
+without rebuilding the replay session. Replay controller rebuilds such as open, seek, restart, and
+reopen-based stepping now also resync that atomic immediately so replay does not silently fall back
+to the pipeline default acquisition window. The preview accumulator also splits large decoded replay
+chunks across multiple acquisition windows, so changing replay `Acq time [ms]` actually changes the
+next frame's event count instead of staying pinned to file-read packet boundaries.
 
 ## Files
 

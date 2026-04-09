@@ -104,6 +104,15 @@ For paused raw replay seeks and `←` / `→` frame steps, Augur keeps decoding 
 the requested target timestamp is actually reached; it does not stop on the first decoded frame if
 that frame still lands earlier than the requested acquisition window.
 
+Whenever replay opens or reopens the preview pipeline, it also reapplies the current replay
+acquisition-time setting to the new controller, so seek/restart/step paths keep using the same
+frame-window length instead of drifting back to the default `50 ms` preview window.
+
+Replay preview accumulation also now closes frames at the first decoded event that reaches the
+requested acquisition window, even when one file-read / decode packet spans multiple frame windows.
+That keeps replay event counts and visible frame content responsive to acquisition-time changes
+instead of letting large packet boundaries dominate the frame size.
+
 Paused `→` frame steps reuse the current replay controller whenever it is still active. Instead of
 reopening the file from an approximate byte offset, Augur briefly resumes decoding from the current
 position until the requested next acquisition window is reached, so the MB progress keeps advancing

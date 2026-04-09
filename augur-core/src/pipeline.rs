@@ -477,6 +477,83 @@ fn reset_preview_frame_accumulators(
     *frame_start_ts = None;
 }
 
+fn emit_preview_frame(
+    frame_tx: &Sender<PreviewFrame>,
+    stats_preview: &Arc<Mutex<PipelineStatsInner>>,
+    frame_buffers: &mut PreviewFrameBuffers,
+    frame_events: &mut Vec<CdEvent>,
+    capture_raw_events: bool,
+    on_count: &mut u64,
+    off_count: &mut u64,
+    frame_start_ts: &mut Option<u64>,
+    width: u16,
+    height: u16,
+    pixel_count: usize,
+    window_end_us: u64,
+) {
+    let Some(window_start_us) = *frame_start_ts else {
+        return;
+    };
+
+    if frame_tx.is_full() {
+        reset_preview_frame_accumulators(
+            frame_buffers,
+            frame_events,
+            on_count,
+            off_count,
+            frame_start_ts,
+        );
+        if let Ok(mut s) = stats_preview.lock() {
+            s.record_preview_frame_drop();
+        }
+        return;
+    }
+
+    let frame_send_started = Instant::now();
+    let raw_events = if capture_raw_events {
+        let next_capacity = frame_events.capacity().max(8_192);
+        Some(std::mem::replace(
+            frame_events,
+            Vec::with_capacity(next_capacity),
+        ))
+    } else {
+        frame_events.clear();
+        None
+    };
+    let frame_buffers = std::mem::replace(frame_buffers, take_preview_frame_buffers(pixel_count));
+    let frame = PreviewFrame {
+        width,
+        height,
+        pixels: frame_buffers.pixels,
+        pixels_on: frame_buffers.pixels_on,
+        pixels_off: frame_buffers.pixels_off,
+        cached_total_histogram: frame_buffers.total_histogram,
+        cached_signed_histogram: frame_buffers.signed_histogram,
+        on_count: *on_count,
+        off_count: *off_count,
+        events: raw_events,
+        window_start_us,
+        window_end_us,
+    };
+    match frame_tx.try_send(frame) {
+        Ok(()) => {
+            if let Ok(mut s) = stats_preview.lock() {
+                s.record_preview_frame_queue_depth(frame_tx.len());
+                s.record_preview_frame_send_time(frame_send_started.elapsed());
+            }
+        }
+        Err(err) => {
+            if let Ok(mut s) = stats_preview.lock() {
+                s.record_preview_frame_drop();
+            }
+            drop(err);
+        }
+    }
+    *on_count = 0;
+    *off_count = 0;
+    *frame_start_ts = None;
+}
+
 fn histogram_index(value: u16) -> usize {
     usize::from(value).min(PREVIEW_HISTOGRAM_BINS - 1)
 }
@@ -666,7 +743,13 @@ where
     let (settings_tx, settings_rx) = bounded::<CameraConfig>(8);
     let (error_tx, error_rx) = bounded::<String>(32);
 
-    let acq_time_us = Arc::new(AtomicU64::new(50_000));
+    let acq_time_us = Arc::new(AtomicU64::new(
+        initial_config
+            .global
+            .acq_time_ms
+            .max(1)
+            .saturating_mul(1_000),
+    ));
     let raw_events_needed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(PipelineStatsInner::new()));
@@ -948,6 +1031,8 @@ where
                         }
                     }
                     let accumulate_started = Instant::now();
+                    let capture_raw_events = raw_events_preview.load(Ordering::Relaxed);
+                    let mut raw_event_copy_elapsed = Duration::ZERO;
                     for ev in &events {
                         if ev.x >= width || ev.y >= height {
                             continue;
@@ -978,88 +1063,39 @@ where
                             new_on.abs_diff(new_off),
                         );
                         frame_start_ts.get_or_insert(ev.timestamp);
+                        if capture_raw_events {
+                            let raw_event_copy_started = Instant::now();
+                            frame_events.push(*ev);
+                            raw_event_copy_elapsed += raw_event_copy_started.elapsed();
+                        }
+
+                        if frame_start_ts.is_some_and(|t0| {
+                            ev.timestamp.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed)
+                        }) {
+                            emit_preview_frame(
+                                &frame_tx,
+                                &stats_preview,
+                                &mut frame_buffers,
+                                &mut frame_events,
+                                capture_raw_events,
+                                &mut on_count,
+                                &mut off_count,
+                                &mut frame_start_ts,
+                                width,
+                                height,
+                                pixel_count,
+                                ev.timestamp,
+                            );
+                        }
                     }
                     let accumulate_elapsed = accumulate_started.elapsed();
-                    let mut raw_event_copy_elapsed = Duration::ZERO;
-                    if raw_events_preview.load(Ordering::Relaxed) {
-                        let raw_event_copy_started = Instant::now();
-                        frame_events.extend_from_slice(&events);
-                        raw_event_copy_elapsed = raw_event_copy_started.elapsed();
-                    } else if !frame_events.is_empty() {
+                    if !capture_raw_events && !frame_events.is_empty() {
                         frame_events.clear();
                     }
                     if let Ok(mut s) = stats_preview.lock() {
                         s.record_preview_accumulate_time(accumulate_elapsed);
                         if raw_event_copy_elapsed > Duration::ZERO {
                             s.record_preview_raw_event_copy_time(raw_event_copy_elapsed);
-                        }
-                    }
-
-                    if let (Some(t0), Some(last_ts)) =
-                        (frame_start_ts, events.last().map(|e| e.timestamp))
-                    {
-                        if last_ts.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed) {
-                            if frame_tx.is_full() {
-                                reset_preview_frame_accumulators(
-                                    &mut frame_buffers,
-                                    &mut frame_events,
-                                    &mut on_count,
-                                    &mut off_count,
-                                    &mut frame_start_ts,
-                                );
-                                if let Ok(mut s) = stats_preview.lock() {
-                                    s.record_preview_frame_drop();
-                                }
-                                continue;
-                            }
-                            let frame_send_started = Instant::now();
-                            let raw_events = if raw_events_preview.load(Ordering::Relaxed) {
-                                let next_capacity = frame_events.capacity().max(8_192);
-                                Some(std::mem::replace(
-                                    &mut frame_events,
-                                    Vec::with_capacity(next_capacity),
-                                ))
-                            } else {
-                                frame_events.clear();
-                                None
-                            };
-                            let frame_buffers = std::mem::replace(
-                                &mut frame_buffers,
-                                take_preview_frame_buffers(pixel_count),
-                            );
-                            let frame = PreviewFrame {
-                                width,
-                                height,
-                                pixels: frame_buffers.pixels,
-                                pixels_on: frame_buffers.pixels_on,
-                                pixels_off: frame_buffers.pixels_off,
-                                cached_total_histogram: frame_buffers.total_histogram,
-                                cached_signed_histogram: frame_buffers.signed_histogram,
-                                on_count,
-                                off_count,
-                                events: raw_events,
-                                window_start_us: t0,
-                                window_end_us: last_ts,
-                            };
-                            match frame_tx.try_send(frame) {
-                                Ok(()) => {
-                                    if let Ok(mut s) = stats_preview.lock() {
-                                        s.record_preview_frame_queue_depth(frame_tx.len());
-                                        s.record_preview_frame_send_time(
-                                            frame_send_started.elapsed(),
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    if let Ok(mut s) = stats_preview.lock() {
-                                        s.record_preview_frame_drop();
-                                    }
-                                    drop(err);
-                                }
-                            }
-                            on_count = 0;
-                            off_count = 0;
-                            frame_start_ts = None;
                         }
                     }
                 }
@@ -1164,7 +1200,114 @@ fn estimate_evt3_cd_events(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::{DeviceInfo, EventCamera};
     use crate::metadata::RecordingMetadata;
+
+    #[derive(Default)]
+    struct TimeoutCamera;
+
+    impl EventCamera for TimeoutCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+    }
+
+    impl PacketStreamCamera for TimeoutCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("idle test camera".into()))
+        }
+    }
+
+    struct ScriptedPacketCamera {
+        packets: Vec<Vec<u8>>,
+        next_packet: usize,
+        release_after_first: Option<Arc<AtomicBool>>,
+    }
+
+    impl EventCamera for ScriptedPacketCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+    }
+
+    impl PacketStreamCamera for ScriptedPacketCamera {
+        fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if self.next_packet >= self.packets.len() {
+                return Err(CameraError::Eof);
+            }
+            if self.next_packet > 0
+                && self
+                    .release_after_first
+                    .as_ref()
+                    .is_some_and(|gate| !gate.load(Ordering::Relaxed))
+            {
+                return Err(CameraError::Timeout("waiting for test gate".into()));
+            }
+
+            let packet = &self.packets[self.next_packet];
+            buf[..packet.len()].copy_from_slice(packet);
+            self.next_packet += 1;
+            Ok(packet.len())
+        }
+    }
+
+    struct TaggedEventDecoder {
+        tagged_events: Vec<(u8, Vec<CdEvent>)>,
+    }
+
+    impl TaggedEventDecoder {
+        fn new(tagged_events: Vec<(u8, Vec<CdEvent>)>) -> Self {
+            Self { tagged_events }
+        }
+    }
+
+    impl PreviewDecoder for TaggedEventDecoder {
+        fn decode_bytes(&mut self, bytes: &[u8], out: &mut Vec<CdEvent>) -> Result<()> {
+            out.clear();
+            let Some(tag) = bytes.first().copied() else {
+                return Ok(());
+            };
+            if let Some((_, events)) = self
+                .tagged_events
+                .iter()
+                .find(|(candidate, _)| *candidate == tag)
+            {
+                out.extend_from_slice(events);
+            }
+            Ok(())
+        }
+    }
+
+    fn recv_preview_frame(controller: &PipelineController) -> PreviewFrame {
+        controller
+            .frame_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("preview frame must arrive")
+    }
 
     fn words_to_bytes(words: &[u16]) -> Vec<u8> {
         let mut out = Vec::with_capacity(words.len() * 2);
@@ -1511,5 +1654,209 @@ mod tests {
         assert_eq!(buffers.total_histogram.len(), PREVIEW_HISTOGRAM_BINS);
         assert_eq!(buffers.signed_histogram.len(), PREVIEW_HISTOGRAM_BINS);
         assert_eq!(preview_frame_pool_len(), 0);
+    }
+
+    #[test]
+    fn pipeline_controller_uses_initial_config_acquisition_time() {
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 123;
+
+        let controller = spawn_pipeline(
+            TimeoutCamera,
+            Evt3CorePreviewDecoder::default(),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        assert_eq!(controller.acq_time_us.load(Ordering::Relaxed), 123_000);
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    #[test]
+    fn preview_pipeline_splits_multiple_frames_within_one_packet() {
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 1;
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![vec![1]],
+                next_packet: 0,
+                release_after_first: None,
+            },
+            TaggedEventDecoder::new(vec![(
+                1,
+                vec![
+                    CdEvent {
+                        x: 0,
+                        y: 0,
+                        timestamp: 0,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        x: 1,
+                        y: 0,
+                        timestamp: 600,
+                        polarity: false,
+                    },
+                    CdEvent {
+                        x: 2,
+                        y: 0,
+                        timestamp: 1_200,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        x: 3,
+                        y: 0,
+                        timestamp: 1_800,
+                        polarity: false,
+                    },
+                    CdEvent {
+                        x: 4,
+                        y: 0,
+                        timestamp: 2_400,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        x: 5,
+                        y: 0,
+                        timestamp: 3_000,
+                        polarity: false,
+                    },
+                ],
+            )]),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        let first = recv_preview_frame(&controller);
+        let second = recv_preview_frame(&controller);
+
+        assert_eq!(first.window_start_us, 0);
+        assert_eq!(first.window_end_us, 1_200);
+        assert_eq!(first.on_count + first.off_count, 3);
+        assert_eq!(second.window_start_us, 1_800);
+        assert_eq!(second.window_end_us, 3_000);
+        assert_eq!(second.on_count + second.off_count, 3);
+        assert!(
+            controller
+                .frame_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "partial trailing windows should not emit a frame"
+        );
+
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    #[test]
+    fn preview_pipeline_applies_runtime_acquisition_time_to_later_packets() {
+        let release_after_first = Arc::new(AtomicBool::new(false));
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 1;
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![vec![1], vec![2]],
+                next_packet: 0,
+                release_after_first: Some(Arc::clone(&release_after_first)),
+            },
+            TaggedEventDecoder::new(vec![
+                (
+                    1,
+                    vec![
+                        CdEvent {
+                            x: 0,
+                            y: 0,
+                            timestamp: 0,
+                            polarity: true,
+                        },
+                        CdEvent {
+                            x: 1,
+                            y: 0,
+                            timestamp: 600,
+                            polarity: false,
+                        },
+                        CdEvent {
+                            x: 2,
+                            y: 0,
+                            timestamp: 1_200,
+                            polarity: true,
+                        },
+                    ],
+                ),
+                (
+                    2,
+                    vec![
+                        CdEvent {
+                            x: 3,
+                            y: 0,
+                            timestamp: 2_000,
+                            polarity: false,
+                        },
+                        CdEvent {
+                            x: 4,
+                            y: 0,
+                            timestamp: 2_600,
+                            polarity: true,
+                        },
+                        CdEvent {
+                            x: 5,
+                            y: 0,
+                            timestamp: 3_200,
+                            polarity: false,
+                        },
+                        CdEvent {
+                            x: 6,
+                            y: 0,
+                            timestamp: 3_800,
+                            polarity: true,
+                        },
+                        CdEvent {
+                            x: 7,
+                            y: 0,
+                            timestamp: 4_400,
+                            polarity: false,
+                        },
+                        CdEvent {
+                            x: 8,
+                            y: 0,
+                            timestamp: 5_000,
+                            polarity: true,
+                        },
+                        CdEvent {
+                            x: 9,
+                            y: 0,
+                            timestamp: 5_600,
+                            polarity: false,
+                        },
+                    ],
+                ),
+            ]),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        let first = recv_preview_frame(&controller);
+        assert_eq!(first.on_count + first.off_count, 3);
+
+        controller.acq_time_us.store(2_000, Ordering::Relaxed);
+        release_after_first.store(true, Ordering::Relaxed);
+
+        let second = recv_preview_frame(&controller);
+        assert_eq!(second.window_start_us, 2_000);
+        assert_eq!(second.window_end_us, 4_400);
+        assert_eq!(second.on_count + second.off_count, 5);
+        assert!(
+            controller
+                .frame_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the remaining events stay below the larger acquisition window"
+        );
+
+        controller.shutdown().expect("pipeline must shut down");
     }
 }
