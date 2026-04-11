@@ -16,6 +16,27 @@ pub struct SubpixelMarker {
     pub y: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkerShape {
+    Point,
+    Cross,
+    Box,
+    Ellipse,
+    Diamond,
+    FilledCircle,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerOverlayItem {
+    pub x: f32,
+    pub y: f32,
+    pub shape: MarkerShape,
+    pub size: f32,
+    pub color: [u8; 4],
+    pub timestamp_us: Option<u64>,
+    pub stable_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisSeverity {
     Info,
@@ -40,6 +61,12 @@ pub enum Overlay {
         markers: Vec<SubpixelMarker>,
         color: [u8; 4],
         arm_len: u16,
+    },
+    MarkerOverlay {
+        markers: Vec<MarkerOverlayItem>,
+        dataset_id: Option<String>,
+        layer_id: Option<String>,
+        source_label: Option<String>,
     },
 }
 

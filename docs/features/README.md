@@ -30,6 +30,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Theme-Aware GUI Status Colors](./theme-aware-gui-status-colors.md) — theme-adaptive warning/error labels plus contrast-safe success/info colors
 - [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, idle launch shortcuts, ROI drag tool, zoom/crop, popup enlarge, point cloud
+- [Investigation Workspace](./investigation-workspace.md) — host-owned 2D/3D layouts, linked selection, stable row identities, generic layer styling, and popup/shared inspection state
 - [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the bundled Augur Bridge handoff path for ImageJ/Fiji
 - [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window and popup host
 - [Built-In Hotpixel Detection](./built-in-hotpixel-detection.md) — host-owned hotpixel detection, overlays, and DEM-mask copy flow

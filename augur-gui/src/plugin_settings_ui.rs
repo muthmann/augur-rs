@@ -3,13 +3,19 @@ use serde_json::json;
 
 use crate::plugin_loader::DynPlugin;
 
-pub fn render_plugin_settings(ui: &mut egui::Ui, plugin: &mut DynPlugin) -> Result<bool, String> {
+pub fn render_plugin_settings(
+    ui: &mut egui::Ui,
+    plugin: &mut DynPlugin,
+    show_header: bool,
+) -> Result<bool, String> {
     let mut changed = false;
     let mut setting_error = None;
 
-    ui.heading(plugin.name());
-    if !plugin.description().is_empty() {
-        ui.weak(plugin.description());
+    if show_header {
+        ui.heading(plugin.name());
+        if !plugin.description().is_empty() {
+            ui.weak(plugin.description());
+        }
     }
 
     for section in plugin.settings_schema().sections.clone() {

@@ -29,3 +29,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 013: Self-Describing Recording Metadata](./013-self-describing-recording-metadata.md)
 - [ADR 014: Timestamp-Driven Replay Pacing](./014-timestamp-driven-replay-pacing.md)
 - [ADR 015: Dual-Backend Preview Rendering With WGPU Presentation](./015-dual-backend-preview-rendering.md)
+- [ADR 016: Host-Owned Generic Investigation Workspace](./016-generic-investigation-workspace.md)

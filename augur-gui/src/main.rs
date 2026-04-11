@@ -5,6 +5,8 @@ mod export_dialog;
 mod external_tools;
 mod host_views;
 mod hotpixel;
+mod inspection_3d;
+mod investigation;
 mod plugin_loader;
 mod plugin_settings_ui;
 mod point_cloud;

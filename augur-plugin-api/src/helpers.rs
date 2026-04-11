@@ -3,8 +3,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     ffi::{
         AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
-        FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-        FfiSubpixelMarker, PluginCapabilities, PluginInput,
+        FfiMarkerOverlayItem, FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame,
+        FfiSlice, FfiString, FfiSubpixelMarker, PluginCapabilities, PluginInput,
     },
     settings::{SettingsSchema, StatusEntry},
     HostViewRegistry,
@@ -75,6 +75,24 @@ impl<'a> HostOutput<'a> {
                 FfiSlice::from_slice(markers),
                 FfiColorRgba::from_rgba(color),
                 arm_len,
+            );
+        }
+    }
+
+    pub fn add_marker_overlay(
+        &mut self,
+        markers: &[FfiMarkerOverlayItem],
+        dataset_id: Option<&str>,
+        layer_id: Option<&str>,
+        source_label: Option<&str>,
+    ) {
+        unsafe {
+            (self.raw.add_marker_overlay)(
+                self.raw.ctx,
+                FfiSlice::from_slice(markers),
+                dataset_id.map_or_else(FfiString::empty, FfiString::from),
+                layer_id.map_or_else(FfiString::empty, FfiString::from),
+                source_label.map_or_else(FfiString::empty, FfiString::from),
             );
         }
     }

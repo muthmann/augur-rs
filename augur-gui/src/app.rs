@@ -41,15 +41,23 @@ use crate::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
         render_compact_table, render_density2d_view, render_density_window_viewport,
         render_image2d_view, render_image_window_viewport, render_line_series_view,
-        render_scatter2d_view, render_scatter_window_viewport, render_series_window_viewport,
-        render_table_window, render_table_window_viewport, reset_provider_for_dataset,
+        render_linked_table_view, render_scatter2d_view, render_scatter_window_viewport,
+        render_series_window_viewport, render_table_window_viewport, reset_provider_for_dataset,
         resolve_host_view_registry, DensityWindowViewportData, HostDatasetSnapshot,
         HostRegistryContribution, HostViewImageFormat, HostViewProviderKey, HostViewRenderState,
-        HostViewUiActions, ImageWindowViewportData, ResolvedHostView, ResolvedHostViewRegistry,
-        Scatter2dViewOptions, ScatterWindowViewportData, SeriesWindowViewportData,
-        TableWindowViewportData,
+        HostViewUiActions, ImageWindowViewportData, LinkedTableViewOptions, ResolvedHostView,
+        ResolvedHostViewRegistry, Scatter2dViewOptions, ScatterWindowViewportData,
+        SeriesWindowViewportData, TableWindowViewportData,
     },
     hotpixel::BuiltInHotpixelDetection,
+    inspection_3d::{
+        draw_investigation_3d, Investigation3dFocusVolume, Investigation3dLayer,
+        Investigation3dPoint, Investigation3dRenderer, Investigation3dScene,
+    },
+    investigation::{
+        coordinate_2d_for_row, coordinate_3d_for_row, dataset_layer_id, filtered_row_indices,
+        row_key_for_row, AnalysisRoi, Investigation2dPoint, InvestigationLayout,
+    },
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
     preview::{
@@ -61,9 +69,9 @@ use crate::{
     render_backend::ActiveRendererInfo,
     settings::draw_settings,
     viewer_widget::{
-        draw_text_placeholder, draw_viewer, replay_speed_matches, AppMode, PreviewHistogramRequest,
-        PreviewTool, ViewMode, ViewerAuxChanges, ViewerInput, ViewerOutput, ViewerReplayState,
-        ViewerState, REPLAY_SPEED_OPTIONS,
+        draw_replay_transport, draw_text_placeholder, draw_viewer, replay_speed_matches, AppMode,
+        PreviewHistogramRequest, PreviewTool, ViewerAuxChanges, ViewerInput, ViewerOutput,
+        ViewerReplayState, ViewerState, REPLAY_SPEED_OPTIONS,
     },
 };
 
@@ -72,6 +80,10 @@ const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const UI_THEME_STORAGE_KEY: &str = "augur_gui.theme_preference";
 const REPLAY_FRAME_HISTORY_CAPACITY: usize = 8;
+const RAW_EVENTS_ON_LAYER_ID: &str = "host.raw_events.on";
+const RAW_EVENTS_OFF_LAYER_ID: &str = "host.raw_events.off";
+const RAW_EVENTS_ON_COLOR: [u8; 4] = [255, 186, 92, 240];
+const RAW_EVENTS_OFF_COLOR: [u8; 4] = [92, 214, 201, 220];
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
@@ -102,15 +114,17 @@ impl UiThemePreference {
     }
 }
 
-fn process_interval_for_view_mode(
-    view_mode: ViewMode,
+fn process_interval_for_layout(
+    layout: InvestigationLayout,
     preview_interval_ms: u64,
     point_cloud_interval_ms: u64,
 ) -> Duration {
-    if view_mode == ViewMode::PointCloud3d {
-        Duration::from_millis(point_cloud_interval_ms)
-    } else {
-        Duration::from_millis(preview_interval_ms)
+    match layout {
+        InvestigationLayout::Preview2dOnly => Duration::from_millis(preview_interval_ms),
+        InvestigationLayout::Split2d3d => {
+            Duration::from_millis(preview_interval_ms.min(point_cloud_interval_ms))
+        }
+        InvestigationLayout::Inspection3dOnly => Duration::from_millis(point_cloud_interval_ms),
     }
 }
 
@@ -174,6 +188,63 @@ fn interval_ms_to_hz(interval_ms: u64) -> f64 {
 fn hz_to_interval_ms(hz: f64, hz_range: std::ops::RangeInclusive<f64>) -> u64 {
     let hz = hz.clamp(*hz_range.start(), *hz_range.end());
     (1000.0 / hz).round().max(1.0) as u64
+}
+
+fn raw_event_depth_scale(sensor_height: u16, time_window_ms: f32) -> f32 {
+    f32::from(sensor_height.max(1)) / time_window_ms.max(1.0)
+}
+
+fn sensor_y_to_world(sensor_height: u16, sensor_y: f64) -> f32 {
+    (f64::from(sensor_height.saturating_sub(1)) - sensor_y).max(0.0) as f32
+}
+
+fn raw_event_point_position(
+    event: CdEvent,
+    latest_timestamp: u64,
+    sensor_height: u16,
+    effective_time_window_ms: f32,
+) -> [f32; 3] {
+    let age_ms = latest_timestamp.saturating_sub(event.timestamp) as f32 / 1_000.0;
+    [
+        f32::from(event.x),
+        sensor_y_to_world(sensor_height, f64::from(event.y)),
+        -age_ms * raw_event_depth_scale(sensor_height, effective_time_window_ms),
+    ]
+}
+
+fn roi_is_effectively_full_frame(roi: &AnalysisRoi, sensor_width: u16, sensor_height: u16) -> bool {
+    roi.x_min <= 0.0
+        && roi.y_min <= 0.0
+        && roi.x_max >= f64::from(sensor_width.saturating_sub(1))
+        && roi.y_max >= f64::from(sensor_height.saturating_sub(1))
+}
+
+fn raw_event_focus_volume(
+    roi: &AnalysisRoi,
+    earliest_timestamp: u64,
+    latest_timestamp: u64,
+    sensor_height: u16,
+    effective_time_window_ms: f32,
+) -> Investigation3dFocusVolume {
+    let z_min = -(latest_timestamp.saturating_sub(earliest_timestamp) as f32) / 1_000.0
+        * raw_event_depth_scale(sensor_height, effective_time_window_ms);
+    Investigation3dFocusVolume {
+        min: [
+            roi.x_min as f32,
+            sensor_y_to_world(sensor_height, roi.y_max),
+            z_min,
+        ],
+        max: [
+            roi.x_max as f32,
+            sensor_y_to_world(sensor_height, roi.y_min),
+            0.0,
+        ],
+        label: format!(
+            "x {:.0}..{:.0}, y {:.0}..{:.0}",
+            roi.x_min, roi.x_max, roi.y_min, roi.y_max
+        ),
+        color: [255, 221, 116, 220],
+    }
 }
 
 fn derived_replay_preview_interval_ms(acq_time_ms: u64, speed: f32) -> u64 {
@@ -398,6 +469,9 @@ struct TiffStackExportTask {
 
 struct PopupSharedData {
     viewer: ViewerState,
+    investigation_renderer: Investigation3dRenderer,
+    investigation_points_2d: Vec<Investigation2dPoint>,
+    investigation_scene_3d: Investigation3dScene,
     texture: Option<PreviewDisplayTexture>,
     frame: Option<PreviewFrame>,
     time_surface_hover_value: Option<u8>,
@@ -430,6 +504,9 @@ impl Default for PopupSharedData {
         let global_defaults = GlobalSettingsConfig::default();
         Self {
             viewer: ViewerState::default(),
+            investigation_renderer: Investigation3dRenderer::Disabled,
+            investigation_points_2d: Vec::new(),
+            investigation_scene_3d: Investigation3dScene::default(),
             texture: None,
             frame: None,
             time_surface_hover_value: None,
@@ -529,6 +606,7 @@ pub struct CameraApp {
     controller: Option<PipelineController>,
     texture: Option<PreviewDisplayTexture>,
     preview_renderer: PreviewRenderer,
+    investigation_renderer: Investigation3dRenderer,
     preview_perf: PreviewPerfStats,
     renderer_info: ActiveRendererInfo,
     preview_renderer_notice: Option<String>,
@@ -609,6 +687,7 @@ impl CameraApp {
         let global_defaults = GlobalSettingsConfig::default();
         let renderer_info = ActiveRendererInfo::from_creation_context(cc);
         let (preview_renderer, preview_renderer_notice) = PreviewRenderer::new(cc);
+        let investigation_renderer = Investigation3dRenderer::new(cc);
         eprintln!(
             "Augur renderer requested={} active={} backend={} adapter={} preview={}",
             renderer_info.requested.label(),
@@ -627,6 +706,7 @@ impl CameraApp {
             controller: None,
             texture: None,
             preview_renderer,
+            investigation_renderer,
             preview_perf: PreviewPerfStats::default(),
             renderer_info,
             preview_renderer_notice,
@@ -689,6 +769,9 @@ impl CameraApp {
         };
         app.event_store
             .set_memory_budget(mib_to_bytes(global_defaults.event_store_budget_mib));
+        if !app.investigation_renderer.is_wgpu() {
+            app.viewer.investigation.layout = InvestigationLayout::Preview2dOnly;
+        }
         app.sync_config_global_from_runtime();
         app.refresh_host_view_registry();
         app
@@ -773,8 +856,354 @@ impl CameraApp {
         }
     }
 
-    fn active_view_mode(&self) -> ViewMode {
-        self.with_active_viewer(|viewer| viewer.view_mode)
+    fn active_investigation_layout(&self) -> InvestigationLayout {
+        self.with_active_viewer(|viewer| viewer.investigation.layout)
+    }
+
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            AppMode::Idle => "Idle",
+            AppMode::Previewing => "Previewing",
+            AppMode::Recording => "Recording",
+            AppMode::Replaying => "Replaying",
+        }
+    }
+
+    fn set_active_investigation_layout(&mut self, layout: InvestigationLayout) {
+        let layout = if self.investigation_renderer.is_wgpu() {
+            layout
+        } else {
+            InvestigationLayout::Preview2dOnly
+        };
+        self.with_active_viewer_mut(|viewer| {
+            viewer.investigation.layout = layout;
+            viewer.workspace.clear_selection();
+        });
+    }
+
+    fn sync_active_analysis_roi(&mut self) {
+        let fallback_roi = AnalysisRoi::from_sensor_roi(self.config.roi);
+        self.with_active_viewer_mut(|viewer| {
+            if !viewer.investigation.link_roi_between_2d_and_3d {
+                viewer.investigation.active_analysis_roi = None;
+                return;
+            }
+
+            viewer.investigation.active_analysis_roi =
+                viewer.annotation_manager.selected_annotation().map_or_else(
+                    || Some(fallback_roi.clone()),
+                    |annotation| {
+                        let bounds = annotation.shape.bounds_rect();
+                        Some(AnalysisRoi {
+                            x_min: f64::from(bounds.min.0),
+                            x_max: f64::from(bounds.max.0),
+                            y_min: f64::from(bounds.min.1),
+                            y_max: f64::from(bounds.max.1),
+                        })
+                    },
+                );
+        });
+    }
+
+    fn render_investigation_inspector(&mut self, ui: &mut egui::Ui) {
+        let current_layout = self.active_investigation_layout();
+        let (
+            mut link_roi_between_2d_and_3d,
+            active_roi,
+            selected_row,
+            hovered_row,
+            focused_layers,
+            mut layer_ids,
+        ) = self.with_active_viewer(|viewer| {
+            (
+                viewer.investigation.link_roi_between_2d_and_3d,
+                viewer.investigation.active_analysis_roi.clone(),
+                viewer.investigation.primary_selection().cloned(),
+                viewer.investigation.hovered_row.clone(),
+                viewer.investigation.focused_layers.clone(),
+                viewer
+                    .investigation
+                    .layer_styles
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        });
+        layer_ids.sort();
+        let (raw_layer_ids, analysis_layer_ids): (Vec<_>, Vec<_>) =
+            layer_ids.into_iter().partition(|layer_id| {
+                matches!(
+                    layer_id.as_str(),
+                    RAW_EVENTS_ON_LAYER_ID | RAW_EVENTS_OFF_LAYER_ID
+                )
+            });
+
+        ui.collapsing("Workspace", |ui| {
+            ui.small(
+                "Use the top bar to switch between 2D, split, and 3D. This panel keeps the linked ROI, selection, and layer styling together.",
+            );
+            ui.small(format!("Current layout: {}", current_layout.label()));
+            if ui
+                .checkbox(
+                    &mut link_roi_between_2d_and_3d,
+                    "Link 2D ROI into the 3D focus volume",
+                )
+                .on_hover_text(
+                    "Use the selected 2D ROI to drive linked table filtering and the highlighted 3D focus box.",
+                )
+                .changed()
+            {
+                self.with_active_viewer_mut(|viewer| {
+                    viewer.investigation.link_roi_between_2d_and_3d = link_roi_between_2d_and_3d;
+                });
+                self.sync_active_analysis_roi();
+            }
+
+            match active_roi {
+                Some(roi) => {
+                    ui.small(format!(
+                        "Linked ROI: x {:.1}..{:.1}, y {:.1}..{:.1}",
+                        roi.x_min, roi.x_max, roi.y_min, roi.y_max
+                    ));
+                }
+                None => {
+                    ui.small("Linked ROI: off");
+                }
+            }
+
+            if let Some(selected) = &selected_row {
+                let layer_title = self.with_active_viewer(|viewer| {
+                    viewer
+                        .investigation
+                        .layer_styles
+                        .iter()
+                        .find(|(id, _)| selected.dataset_id.contains(id.as_str()))
+                        .map(|(_, s)| s.title.clone())
+                });
+                let label = layer_title.unwrap_or_else(|| selected.dataset_id.clone());
+                ui.label(format!("Selected item: {label} row {}", selected.row_id));
+            } else {
+                ui.small("Selected item: none");
+            }
+
+            if let Some(hovered) = &hovered_row {
+                ui.small(format!("Hovered row: {}", hovered.row_id));
+            }
+
+            if (selected_row.is_some() || hovered_row.is_some())
+                && ui
+                    .small_button("Clear selection")
+                    .on_hover_text("Clear the current linked 2D/3D/table selection.")
+                    .clicked()
+            {
+                self.with_active_viewer_mut(|viewer| {
+                    viewer.investigation.clear_selection();
+                    viewer.investigation.hovered_row = None;
+                });
+            }
+            ui.small("Shortcuts: 1/2/3 layout, L link ROI, Esc clear selection, F focus 3D");
+        });
+
+        ui.separator();
+        ui.collapsing("Layers", |ui| {
+            ui.small(
+                "Raw event ON/OFF layers style the current point cloud. Extra analysis layers only affect the 3D scene when a plugin publishes a 3D scatter view.",
+            );
+            if !focused_layers.is_empty() {
+                ui.small(format!(
+                    "Isolated: {}",
+                    focused_layers
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if ui.button("Show all layers").clicked() {
+                self.with_active_viewer_mut(|viewer| {
+                    viewer.investigation.focused_layers.clear();
+                    let layer_ids: Vec<String> =
+                        viewer.investigation.layer_styles.keys().cloned().collect();
+                    for layer_id in layer_ids {
+                        viewer.investigation.set_layer_visible(layer_id, true);
+                    }
+                });
+            }
+            ui.separator();
+            if !raw_layer_ids.is_empty() {
+                ui.strong("Point Cloud");
+                self.render_investigation_layer_cards(ui, raw_layer_ids.as_slice());
+            }
+            if !analysis_layer_ids.is_empty() {
+                if !raw_layer_ids.is_empty() {
+                    ui.separator();
+                }
+                ui.strong("Analysis Layers");
+                self.render_investigation_layer_cards(ui, analysis_layer_ids.as_slice());
+            } else {
+                ui.small("No additional analysis layers are active.");
+            }
+
+            ui.separator();
+            ui.small(
+                "Raw-event history controls now live in the 3D toolbar so the time span can be widened while you inspect the cloud.",
+            );
+        });
+
+        ui.separator();
+        ui.collapsing("Status & warnings", |ui| {
+            ui.small(format!("Mode: {}", self.mode_label()));
+            if self.config_dirty || self.acq_dirty {
+                let mut dirty = Vec::new();
+                if self.config_dirty {
+                    dirty.push("settings");
+                }
+                if self.acq_dirty {
+                    dirty.push("acquisition timing");
+                }
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("Apply pending changes: {}", dirty.join(", ")),
+                );
+            } else {
+                ui.small("Host settings and current outputs are in sync.");
+            }
+
+            if self.analysis_output.warnings.is_empty() {
+                ui.small("No analysis warnings.");
+            } else {
+                for warning in self.analysis_output.warnings.iter().take(6) {
+                    let color = match warning.severity {
+                        augur_core::analysis::AnalysisSeverity::Info => {
+                            ui.visuals().weak_text_color()
+                        }
+                        augur_core::analysis::AnalysisSeverity::Warning => {
+                            ui.visuals().warn_fg_color
+                        }
+                        augur_core::analysis::AnalysisSeverity::Error => {
+                            ui.visuals().error_fg_color
+                        }
+                    };
+                    ui.colored_label(color, format!("{}: {}", warning.source, warning.message));
+                }
+                let remaining = self.analysis_output.warnings.len().saturating_sub(6);
+                if remaining > 0 {
+                    ui.small(format!("{remaining} more warning(s) remain."));
+                }
+            }
+
+            if let Some(notice) = &self.analysis_notice {
+                ui.label(format!("Notice: {notice}"));
+            }
+            if let Some(error) = &self.last_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+        });
+    }
+
+    fn render_investigation_layer_cards(&mut self, ui: &mut egui::Ui, layer_ids: &[String]) {
+        for layer_id in layer_ids {
+            let (mut style, mut visible) = self.with_active_viewer(|viewer| {
+                let style = viewer
+                    .investigation
+                    .layer_styles
+                    .get(layer_id)
+                    .cloned()
+                    .expect("layer id came from layer_styles");
+                let visible = viewer.investigation.layer_visible(layer_id, style.visible);
+                (style, visible)
+            });
+            let mut changed = false;
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let swatch = egui::Color32::from_rgba_unmultiplied(
+                        style.color[0],
+                        style.color[1],
+                        style.color[2],
+                        style.color[3],
+                    );
+                    ui.colored_label(swatch, "■");
+                    changed |= ui
+                        .checkbox(&mut visible, &style.title)
+                        .on_hover_text("Show or hide this layer in linked investigation views.")
+                        .changed();
+                    if ui
+                        .small_button("Only")
+                        .on_hover_text("Hide all other layers so this one is easier to inspect.")
+                        .clicked()
+                    {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer.investigation.isolate_layer(layer_id);
+                        });
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Color")
+                        .on_hover_text("Tint used for this layer in 2D and 3D.");
+                    changed |= ui
+                        .color_edit_button_srgba_unmultiplied(&mut style.color)
+                        .on_hover_text("Tint used for this layer in 2D and 3D.")
+                        .changed();
+
+                    let is_raw_event_layer = matches!(
+                        layer_id.as_str(),
+                        RAW_EVENTS_ON_LAYER_ID | RAW_EVENTS_OFF_LAYER_ID
+                    );
+                    ui.label("Shape").on_hover_text(
+                        "Marker shape affects linked 2D markers. The current 3D point cloud uses round billboards.",
+                    );
+                    if is_raw_event_layer {
+                        ui.small("3D round sprites only").on_hover_text(
+                            "Raw-event point clouds currently support color and size, but not alternate 3D marker shapes.",
+                        );
+                    } else {
+                        egui::ComboBox::from_id_source(("investigation_layer_shape", layer_id))
+                            .selected_text(host_marker_shape_label(style.marker_shape))
+                            .show_ui(ui, |ui| {
+                                for shape in [
+                                    augur_plugin_api::HostMarkerShape::Point,
+                                    augur_plugin_api::HostMarkerShape::Cross,
+                                    augur_plugin_api::HostMarkerShape::Box,
+                                    augur_plugin_api::HostMarkerShape::Ellipse,
+                                    augur_plugin_api::HostMarkerShape::Diamond,
+                                    augur_plugin_api::HostMarkerShape::FilledCircle,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut style.marker_shape,
+                                        shape,
+                                        host_marker_shape_label(shape),
+                                    );
+                                }
+                            });
+                    }
+
+                    ui.label("Size").on_hover_text(
+                        "Base marker size. The 3D view also uses this for the point-cloud sprite radius.",
+                    );
+                    changed |= ui
+                        .add(egui::Slider::new(&mut style.size, 1.0..=12.0))
+                        .on_hover_text(
+                            "Base marker size. The 3D view also uses this for the point-cloud sprite radius.",
+                        )
+                        .changed();
+                });
+            });
+
+            if changed {
+                self.with_active_viewer_mut(|viewer| {
+                    if let Some(entry) = viewer.investigation.layer_styles.get_mut(layer_id) {
+                        *entry = style.clone();
+                    }
+                    viewer
+                        .investigation
+                        .set_layer_visible(layer_id.clone(), visible);
+                    if visible {
+                        viewer.investigation.focused_layers.remove(layer_id);
+                    }
+                });
+            }
+        }
     }
 
     fn open_popup_viewer(&mut self) {
@@ -783,6 +1212,7 @@ impl CameraApp {
         }
         let mut data = self.popup_shared.lock().unwrap();
         data.viewer = std::mem::take(&mut self.viewer);
+        data.investigation_renderer = std::mem::take(&mut self.investigation_renderer);
         data.close_requested = false;
         data.output = None;
         self.popup_open = true;
@@ -794,6 +1224,7 @@ impl CameraApp {
         }
         let mut data = self.popup_shared.lock().unwrap();
         self.viewer = std::mem::take(&mut data.viewer);
+        self.investigation_renderer = std::mem::take(&mut data.investigation_renderer);
         data.close_requested = false;
         data.output = None;
         self.popup_open = false;
@@ -877,7 +1308,7 @@ impl CameraApp {
         });
 
         if !self.external_tool_status().is_streaming()
-            && self.active_view_mode() == ViewMode::Preview2d
+            && self.active_investigation_layout().shows_2d()
         {
             if let Err(err) = self.render_preview_texture_from_frame(ctx, &snapshot.frame) {
                 self.last_error = Some(format!("preview render failed: {err}"));
@@ -938,6 +1369,8 @@ impl CameraApp {
         settings_locked: bool,
         external_streaming: bool,
         external_streaming_label: &str,
+        investigation_points_2d: &[Investigation2dPoint],
+        investigation_scene_3d: &Investigation3dScene,
     ) {
         if !self.popup_open {
             return;
@@ -964,6 +1397,8 @@ impl CameraApp {
             latest_frame_for_hover.as_ref(),
         );
         let mut data = self.popup_shared.lock().unwrap();
+        data.investigation_points_2d = investigation_points_2d.to_vec();
+        data.investigation_scene_3d = investigation_scene_3d.clone();
         data.texture = self.texture.clone();
         data.frame = self.latest_frame.clone();
         data.time_surface_hover_value = popup_time_surface_hover_value;
@@ -995,6 +1430,10 @@ impl CameraApp {
         output: ViewerOutput,
         from_popup: bool,
     ) {
+        let needs_preview_refresh = output.needs_preview_refresh();
+        let investigation_select_row = output.investigation_select_row.clone();
+        let investigation_hover_row = output.investigation_hover_row.clone();
+
         if output.popup_toggled {
             if from_popup || self.popup_open {
                 self.close_popup_viewer();
@@ -1034,8 +1473,22 @@ impl CameraApp {
         if let Some(speed) = output.replay_set_speed {
             self.set_replay_speed(speed);
         }
+        if let Some(selected) = investigation_select_row {
+            self.with_active_viewer_mut(|viewer| {
+                viewer.investigation.set_single_selection(selected);
+            });
+        }
+        if let Some(hovered) = investigation_hover_row {
+            self.with_active_viewer_mut(|viewer| {
+                viewer.investigation.hovered_row = Some(hovered);
+            });
+        } else {
+            self.with_active_viewer_mut(|viewer| {
+                viewer.investigation.hovered_row = None;
+            });
+        }
 
-        if output.needs_preview_refresh() {
+        if needs_preview_refresh {
             self.refresh_preview_if_needed(ctx, true);
         }
     }
@@ -1414,6 +1867,287 @@ impl CameraApp {
         );
     }
 
+    fn sync_investigation_layers(&mut self) {
+        let datasets: Vec<_> = self.host_view_registry.datasets().cloned().collect();
+        self.with_active_viewer_mut(|viewer| {
+            for dataset in &datasets {
+                let schema = match &dataset.descriptor.kind {
+                    HostDatasetKind::TableV1(schema) => Some(schema),
+                    HostDatasetKind::Image2dV1 | HostDatasetKind::Series1dV1 => None,
+                };
+                viewer
+                    .investigation
+                    .sync_dataset_layer(&dataset.descriptor, schema);
+            }
+            viewer
+                .investigation
+                .layer_styles
+                .entry(RAW_EVENTS_ON_LAYER_ID.into())
+                .or_insert_with(|| crate::investigation::InvestigationLayerStyle {
+                    title: "Raw Events ON".into(),
+                    visible: true,
+                    color: RAW_EVENTS_ON_COLOR,
+                    marker_shape: augur_plugin_api::HostMarkerShape::Point,
+                    size: 2.0,
+                });
+            viewer
+                .investigation
+                .layer_styles
+                .entry(RAW_EVENTS_OFF_LAYER_ID.into())
+                .or_insert_with(|| crate::investigation::InvestigationLayerStyle {
+                    title: "Raw Events OFF".into(),
+                    visible: true,
+                    color: RAW_EVENTS_OFF_COLOR,
+                    marker_shape: augur_plugin_api::HostMarkerShape::Point,
+                    size: 2.0,
+                });
+        });
+    }
+
+    fn build_investigation_points_2d(&mut self) -> Vec<Investigation2dPoint> {
+        self.sync_active_analysis_roi();
+        self.sync_investigation_layers();
+
+        let investigation = self.with_active_viewer(|viewer| viewer.investigation.clone());
+        let datasets: Vec<_> = self.host_view_registry.datasets().cloned().collect();
+        let mut points = Vec::new();
+
+        for dataset in datasets {
+            let HostDatasetKind::TableV1(schema) = &dataset.descriptor.kind else {
+                continue;
+            };
+            if schema.coordinate_space_2d.is_none() {
+                continue;
+            }
+
+            let layer_id = dataset_layer_id(&dataset.descriptor, Some(schema));
+            let Some(style) = investigation.layer_styles.get(&layer_id) else {
+                continue;
+            };
+            if !investigation.layer_visible(&layer_id, style.visible) {
+                continue;
+            }
+
+            self.ensure_host_view_dataset_cached(&dataset.descriptor.id);
+            let cache_entry = self.host_view_dataset_cache.get(&dataset.descriptor.id);
+            let generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+            let Ok(Some(table)) = cached_table(cache_entry) else {
+                continue;
+            };
+
+            for row in filtered_row_indices(&investigation, &dataset.descriptor.id, schema, table) {
+                let Some([x, y]) = coordinate_2d_for_row(schema, table, row) else {
+                    continue;
+                };
+                points.push(Investigation2dPoint {
+                    position: [x, y],
+                    color: style.color,
+                    marker_shape: style.marker_shape,
+                    size: style.size,
+                    item_key: row_key_for_row(
+                        &dataset.descriptor.id,
+                        generation,
+                        schema,
+                        table,
+                        row,
+                    ),
+                    label: style.title.clone(),
+                    layer_id: layer_id.clone(),
+                });
+            }
+        }
+
+        points
+    }
+
+    fn build_investigation_scene_3d(&mut self) -> Investigation3dScene {
+        self.sync_active_analysis_roi();
+        self.sync_investigation_layers();
+
+        let investigation = self.with_active_viewer(|viewer| viewer.investigation.clone());
+        let views: Vec<_> = self.host_view_registry.views().cloned().collect();
+        let mut layers = Vec::new();
+        let mut focus_volume = None;
+
+        for view in views {
+            let HostViewKind::Scatter3dFromTable {
+                x_column,
+                y_column,
+                z_column,
+            } = &view.descriptor.kind
+            else {
+                continue;
+            };
+
+            let Some(dataset) = self
+                .host_view_registry
+                .dataset(&view.descriptor.dataset_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let HostDatasetKind::TableV1(schema) = &dataset.descriptor.kind else {
+                continue;
+            };
+
+            self.ensure_host_view_dataset_cached(&view.descriptor.dataset_id);
+            let cache_entry = self
+                .host_view_dataset_cache
+                .get(&view.descriptor.dataset_id);
+            let generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+            let Ok(Some(table)) = cached_table(cache_entry) else {
+                continue;
+            };
+
+            let layer_id = dataset_layer_id(&dataset.descriptor, Some(schema));
+            let Some(style) = investigation.layer_styles.get(&layer_id) else {
+                continue;
+            };
+            if !investigation.layer_visible(&layer_id, style.visible) {
+                continue;
+            }
+
+            let mut points = Vec::new();
+            for row in
+                filtered_row_indices(&investigation, &view.descriptor.dataset_id, schema, table)
+            {
+                let Some([x, y, z]) = coordinate_3d_for_row(
+                    schema,
+                    table,
+                    row,
+                    Some((x_column.as_str(), y_column.as_str(), z_column.as_str())),
+                ) else {
+                    continue;
+                };
+                points.push(Investigation3dPoint {
+                    position: [x as f32, y as f32, z as f32],
+                    color: style.color,
+                    size: style.size,
+                    item_key: Some(row_key_for_row(
+                        &view.descriptor.dataset_id,
+                        generation,
+                        schema,
+                        table,
+                        row,
+                    )),
+                    label: view.descriptor.title.clone(),
+                });
+            }
+
+            layers.push(Investigation3dLayer {
+                id: layer_id,
+                title: view.descriptor.title,
+                visible: true,
+                points,
+            });
+        }
+
+        let raw_layer_ids = [RAW_EVENTS_ON_LAYER_ID, RAW_EVENTS_OFF_LAYER_ID];
+        let raw_layers_visible = raw_layer_ids
+            .iter()
+            .any(|layer_id| investigation.layer_visible(layer_id, true));
+        if raw_layers_visible {
+            let (raw_events, effective_time_window_ms, active_roi, on_style, off_style) = self
+                .with_active_viewer(|viewer| {
+                    (
+                        viewer.workspace.point_cloud.visible_events(),
+                        viewer.workspace.point_cloud.effective_time_window_ms(),
+                        viewer.investigation.active_analysis_roi.clone(),
+                        viewer
+                            .investigation
+                            .layer_styles
+                            .get(RAW_EVENTS_ON_LAYER_ID)
+                            .cloned(),
+                        viewer
+                            .investigation
+                            .layer_styles
+                            .get(RAW_EVENTS_OFF_LAYER_ID)
+                            .cloned(),
+                    )
+                });
+            let sensor_height = self
+                .latest_frame
+                .as_ref()
+                .map(|frame| frame.height)
+                .unwrap_or(self.sensor_height);
+            let sensor_width = self
+                .latest_frame
+                .as_ref()
+                .map(|frame| frame.width)
+                .unwrap_or(self.sensor_width);
+            let focus_roi = active_roi
+                .filter(|roi| !roi_is_effectively_full_frame(roi, sensor_width, sensor_height));
+            let earliest_timestamp = raw_events.first().map(|event| event.timestamp).unwrap_or(0);
+
+            let latest_timestamp = raw_events.last().map(|event| event.timestamp).unwrap_or(0);
+            if let Some(roi) = focus_roi.as_ref() {
+                focus_volume = Some(raw_event_focus_volume(
+                    roi,
+                    earliest_timestamp,
+                    latest_timestamp,
+                    sensor_height,
+                    effective_time_window_ms,
+                ));
+            }
+            for (layer_id, polarity, style) in [
+                (RAW_EVENTS_ON_LAYER_ID, true, on_style),
+                (RAW_EVENTS_OFF_LAYER_ID, false, off_style),
+            ] {
+                let Some(style) = style else {
+                    continue;
+                };
+                if !investigation.layer_visible(layer_id, style.visible) {
+                    continue;
+                }
+
+                let points: Vec<_> = raw_events
+                    .iter()
+                    .copied()
+                    .filter(|event| event.polarity == polarity)
+                    .map(|event| {
+                        let inside_focus = focus_roi
+                            .as_ref()
+                            .is_none_or(|roi| roi.contains(f64::from(event.x), f64::from(event.y)));
+                        let mut color = style.color;
+                        color[3] = if inside_focus {
+                            style.color[3]
+                        } else {
+                            style.color[3].min(36)
+                        };
+                        Investigation3dPoint {
+                            position: raw_event_point_position(
+                                event,
+                                latest_timestamp,
+                                sensor_height,
+                                effective_time_window_ms,
+                            ),
+                            color,
+                            size: if inside_focus {
+                                style.size.max(1.5) * 1.05
+                            } else {
+                                style.size.max(1.0) * 0.85
+                            },
+                            item_key: None,
+                            label: style.title.clone(),
+                        }
+                    })
+                    .collect();
+
+                layers.push(Investigation3dLayer {
+                    id: layer_id.into(),
+                    title: style.title,
+                    visible: true,
+                    points,
+                });
+            }
+        }
+
+        Investigation3dScene {
+            layers,
+            focus_volume,
+        }
+    }
+
     fn export_host_view_csv(&mut self, view: &ResolvedHostView) {
         let Some(dataset) = self
             .host_view_registry
@@ -1564,16 +2298,68 @@ impl CameraApp {
                 }
             }
             (HostViewKind::TableWindow, HostDatasetKind::TableV1(schema)) => {
-                let actions = match cached_table(cache_entry) {
+                let table_state = self.with_active_viewer(|viewer| {
+                    viewer
+                        .investigation
+                        .table_views
+                        .get(&view.descriptor.dataset_id)
+                        .cloned()
+                        .unwrap_or_default()
+                });
+                let selected_row = self
+                    .with_active_viewer(|viewer| viewer.investigation.primary_selection().cloned());
+                let hovered_row =
+                    self.with_active_viewer(|viewer| viewer.investigation.hovered_row.clone());
+                let output = match cached_table(cache_entry) {
                     Ok(table) => {
-                        render_table_window(ui, schema, table, &dataset.descriptor.empty_message)
+                        let filtered_rows = table
+                            .map(|table| {
+                                self.with_active_viewer(|viewer| {
+                                    filtered_row_indices(
+                                        &viewer.investigation,
+                                        &view.descriptor.dataset_id,
+                                        schema,
+                                        table,
+                                    )
+                                })
+                            })
+                            .unwrap_or_default();
+                        render_linked_table_view(
+                            ui,
+                            schema,
+                            table,
+                            &table_state,
+                            &dataset.descriptor.empty_message,
+                            LinkedTableViewOptions {
+                                dataset_id: &view.descriptor.dataset_id,
+                                generation: dataset_generation,
+                                rows: &filtered_rows,
+                                selected_row: selected_row.as_ref(),
+                                hovered_row: hovered_row.as_ref(),
+                                allow_export: true,
+                                allow_clear: false,
+                            },
+                        )
                     }
                     Err(err) => {
                         ui.colored_label(ui.visuals().error_fg_color, err);
-                        HostViewUiActions::default()
+                        Default::default()
                     }
                 };
-                self.handle_host_view_actions(view, actions);
+                if let Some(selected_row) = output.selected_row {
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer.investigation.set_single_selection(selected_row);
+                    });
+                }
+                if let Some(sort_column) = output.sort_column {
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer
+                            .investigation
+                            .table_view_state_mut(&view.descriptor.dataset_id)
+                            .toggle_sort(&sort_column);
+                    });
+                }
+                self.handle_host_view_actions(view, output.actions);
             }
             (
                 HostViewKind::Density2dFromTable { x_column, y_column },
@@ -1758,23 +2544,57 @@ impl CameraApp {
 
             match (&view.descriptor.kind, &dataset.descriptor.kind) {
                 (HostViewKind::TableWindow, HostDatasetKind::TableV1(schema)) => {
-                    let (table_arc, error_message) = match &cache_entry {
+                    let (table_arc, error_message, generation) = match &cache_entry {
                         Some(HostDatasetCacheEntry {
                             snapshot: Ok(Some(HostDatasetSnapshot::Table(table))),
-                            ..
-                        }) => (Some(Arc::clone(table)), None),
+                            generation,
+                        }) => (Some(Arc::clone(table)), None, *generation),
                         Some(HostDatasetCacheEntry {
-                            snapshot: Err(err), ..
-                        }) => (None, Some(err.clone())),
-                        _ => (None, None),
+                            snapshot: Err(err),
+                            generation,
+                        }) => (None, Some(err.clone()), *generation),
+                        _ => (None, None, 0),
                     };
+                    let (filtered_rows, table_state, selected_row, hovered_row) = self
+                        .with_active_viewer(|viewer| {
+                            let filtered_rows = table_arc
+                                .as_deref()
+                                .map(|table| {
+                                    filtered_row_indices(
+                                        &viewer.investigation,
+                                        &view.descriptor.dataset_id,
+                                        schema,
+                                        table,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            (
+                                filtered_rows,
+                                viewer
+                                    .investigation
+                                    .table_views
+                                    .get(&view.descriptor.dataset_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                viewer.investigation.primary_selection().cloned(),
+                                viewer.investigation.hovered_row.clone(),
+                            )
+                        });
                     let shared = Arc::new(Mutex::new(TableWindowViewportData {
+                        dataset_id: view.descriptor.dataset_id.clone(),
+                        generation,
                         schema: schema.clone(),
                         dataset: table_arc,
+                        filtered_rows,
+                        table_state,
+                        selected_row,
+                        hovered_row,
                         empty_message: dataset.descriptor.empty_message.clone(),
                         error_message,
                         close_requested: false,
                         export_csv_requested: false,
+                        selected_row_requested: None,
+                        sort_column_requested: None,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let window_title = title.clone();
@@ -1816,11 +2636,16 @@ impl CameraApp {
                         },
                     );
 
-                    let (close, export_csv) = {
+                    let (close, export_csv, selected_row, sort_column) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
-                        let result = (data.close_requested, data.export_csv_requested);
+                        let result = (
+                            data.close_requested,
+                            data.export_csv_requested,
+                            data.selected_row_requested.take(),
+                            data.sort_column_requested.take(),
+                        );
                         data.close_requested = false;
                         data.export_csv_requested = false;
                         result
@@ -1831,6 +2656,19 @@ impl CameraApp {
                     }
                     if export_csv {
                         self.export_host_view_csv(&view);
+                    }
+                    if let Some(selected_row) = selected_row {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer.investigation.set_single_selection(selected_row);
+                        });
+                    }
+                    if let Some(sort_column) = sort_column {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer
+                                .investigation
+                                .table_view_state_mut(&view.descriptor.dataset_id)
+                                .toggle_sort(&sort_column);
+                        });
                     }
                 }
                 (
@@ -2308,10 +3146,10 @@ impl CameraApp {
 
     fn raw_events_required(&self) -> bool {
         let preview_mode = self.with_active_viewer(|viewer| viewer.preview_mode);
-        self.active_view_mode() == ViewMode::PointCloud3d
+        let layout = self.active_investigation_layout();
+        layout.shows_3d()
             || preview_mode.requires_raw_events()
-            || (self.active_view_mode() == ViewMode::Preview2d
-                && self.preview_renderer.prefers_raw_events(preview_mode))
+            || (layout.shows_2d() && self.preview_renderer.prefers_raw_events(preview_mode))
             || self.plugins_need_raw_events()
             || self.plugins_need_retained_event_history()
     }
@@ -2958,7 +3796,7 @@ impl CameraApp {
     }
 
     fn refresh_preview_if_needed(&mut self, ctx: &egui::Context, settings_changed: bool) {
-        if !settings_changed || self.active_view_mode() != ViewMode::Preview2d {
+        if !settings_changed || !self.active_investigation_layout().shows_2d() {
             return;
         }
         let Some(frame) = self.latest_frame.clone() else {
@@ -3285,7 +4123,7 @@ impl CameraApp {
         self.last_error = None;
     }
 
-    fn run_analysis(&mut self, frame: &PreviewFrame) {
+    fn run_analysis(&mut self, frame: &PreviewFrame, append_current_frame_to_event_store: bool) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
         if self.hotpixel_detection.enabled() {
@@ -3323,11 +4161,13 @@ impl CameraApp {
                 })
                 .collect();
             if retained_history_needed {
-                self.event_store.push_frame(
-                    &ffi_events,
-                    frame.window_start_us,
-                    frame.window_end_us,
-                );
+                if append_current_frame_to_event_store {
+                    self.event_store.push_frame(
+                        &ffi_events,
+                        frame.window_start_us,
+                        frame.window_end_us,
+                    );
+                }
             } else {
                 self.event_store.clear();
             }
@@ -3360,6 +4200,101 @@ impl CameraApp {
         }
     }
 
+    fn rerun_current_analysis_frame(&mut self, ctx: &egui::Context, reason: &str) -> bool {
+        let Some(frame) = self.latest_frame.clone() else {
+            self.analysis_notice = Some(format!(
+                "{reason} changed, but there is no decoded frame to recompute yet."
+            ));
+            return false;
+        };
+
+        self.host_view_registry_dirty = true;
+        self.refresh_host_view_registry_if_dirty();
+        self.run_analysis(&frame, false);
+        self.mark_host_view_datasets_stale();
+        self.analysis_notice = Some(format!(
+            "Recomputed the current replay frame after {reason}."
+        ));
+        ctx.request_repaint();
+        true
+    }
+
+    fn note_analysis_change(&mut self, ctx: &egui::Context, reason: &str) {
+        if self.mode == AppMode::Replaying && self.replay_paused {
+            self.rerun_current_analysis_frame(ctx, reason);
+        } else {
+            self.analysis_notice = Some(format!(
+                "{reason} changed. Investigation outputs will refresh on the next processed frame."
+            ));
+            self.host_view_registry_dirty = true;
+            self.mark_host_view_datasets_stale();
+            ctx.request_repaint();
+        }
+    }
+
+    fn handle_investigation_shortcuts(
+        &mut self,
+        ctx: &egui::Context,
+        scene: &Investigation3dScene,
+    ) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        let (layout_1, layout_2, layout_3, toggle_link, clear_selection, focus_selection) = ctx
+            .input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Num1),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Num2),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Num3),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::L),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::F),
+                )
+            });
+
+        if layout_1 {
+            self.set_active_investigation_layout(InvestigationLayout::Preview2dOnly);
+            ctx.request_repaint();
+        }
+        if layout_2 {
+            self.set_active_investigation_layout(InvestigationLayout::Split2d3d);
+            ctx.request_repaint();
+        }
+        if layout_3 {
+            self.set_active_investigation_layout(InvestigationLayout::Inspection3dOnly);
+            ctx.request_repaint();
+        }
+        if toggle_link {
+            self.with_active_viewer_mut(|viewer| {
+                viewer.investigation.link_roi_between_2d_and_3d =
+                    !viewer.investigation.link_roi_between_2d_and_3d;
+            });
+            self.sync_active_analysis_roi();
+            ctx.request_repaint();
+        }
+        if clear_selection {
+            self.with_active_viewer_mut(|viewer| {
+                viewer.investigation.clear_selection();
+                viewer.investigation.hovered_row = None;
+            });
+            ctx.request_repaint();
+        }
+        if focus_selection {
+            let selected =
+                self.with_active_viewer(|viewer| viewer.investigation.primary_selection().cloned());
+            if let Some(selected) = selected {
+                if let Some(target) = scene_point_for_selection(scene, &selected) {
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer.investigation.camera_focus_target = Some(target);
+                        viewer.investigation_3d.focus_on(target);
+                    });
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
         let Some(ctrl) = &self.controller else {
             return;
@@ -3367,7 +4302,11 @@ impl CameraApp {
 
         let dequeue_started = Instant::now();
         let mut newest_frame = None;
+        let mut drained_point_cloud_events = Vec::new();
         while let Ok(frame) = ctrl.frame_rx.try_recv() {
+            if let Some(events) = frame.events.as_deref() {
+                drained_point_cloud_events.extend_from_slice(events);
+            }
             newest_frame = Some(frame);
         }
 
@@ -3375,9 +4314,17 @@ impl CameraApp {
             return;
         };
         self.preview_perf.record_dequeue(dequeue_started.elapsed());
+        if !drained_point_cloud_events.is_empty() {
+            self.with_active_viewer_mut(|viewer| {
+                viewer
+                    .workspace
+                    .point_cloud
+                    .push_events(drained_point_cloud_events.as_slice());
+            });
+        }
 
         let external_streaming = self.external_tool_status().is_streaming();
-        let needs_texture = !external_streaming && self.active_view_mode() == ViewMode::Preview2d;
+        let needs_texture = !external_streaming && self.active_investigation_layout().shows_2d();
         let force_process =
             (needs_texture && self.texture.is_none()) || self.replay_pause_after_seek_frame;
         let process_interval = self.active_preview_process_interval();
@@ -3415,7 +4362,7 @@ impl CameraApp {
 
         let frame_total_started = Instant::now();
         let analysis_started = Instant::now();
-        self.run_analysis(&frame);
+        self.run_analysis(&frame, true);
         self.preview_perf
             .record_analysis(analysis_started.elapsed());
 
@@ -3453,9 +4400,6 @@ impl CameraApp {
             if let Err(err) = self.render_preview_texture_from_frame(ctx, &frame) {
                 self.last_error = Some(format!("preview render failed: {err}"));
             }
-        }
-        if let Some(events) = frame.events.as_deref() {
-            self.with_active_viewer_mut(|viewer| viewer.workspace.point_cloud.push_events(events));
         }
         if self.mode == AppMode::Replaying {
             self.record_replay_frame_snapshot(&frame);
@@ -3553,8 +4497,8 @@ impl CameraApp {
     }
 
     fn active_preview_process_interval(&self) -> Duration {
-        process_interval_for_view_mode(
-            self.active_view_mode(),
+        process_interval_for_layout(
+            self.active_investigation_layout(),
             self.effective_preview_interval_ms(),
             self.point_cloud_interval_ms,
         )
@@ -3612,7 +4556,7 @@ impl eframe::App for CameraApp {
         let mode = self.mode;
         let settings_locked = self.settings_are_locked();
         let mut analysis_toggle_changed = false;
-        let mut view_mode_changed = false;
+        let mut analysis_parameter_changed = false;
         let mut plugin_scan_requested = false;
         let mut open_plugins_dir_requested = false;
         let mut disconnect_external_tool_requested = false;
@@ -4101,7 +5045,7 @@ impl eframe::App for CameraApp {
                 // ── View ──────────────────────────────────────────────────────
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.settings_panel_open, "Settings Panel");
-                    ui.checkbox(&mut self.analysis_panel_open, "Analysis Panel");
+                    ui.checkbox(&mut self.analysis_panel_open, "Inspector Panel");
                     let mut scale_bar_show =
                         self.with_active_viewer(|viewer| viewer.scale_bar_settings.show);
                     if ui.checkbox(&mut scale_bar_show, "Show Scale Bar").changed() {
@@ -4131,13 +5075,24 @@ impl eframe::App for CameraApp {
                         ui.checkbox(open, &view.descriptor.title);
                     }
                     ui.separator();
-                    let mut view_mode = self.active_view_mode();
-                    let r2d = ui.radio_value(&mut view_mode, ViewMode::Preview2d, "2D Preview");
-                    let r3d =
-                        ui.radio_value(&mut view_mode, ViewMode::PointCloud3d, "3D Point Cloud");
-                    if r2d.changed() || r3d.changed() {
-                        view_mode_changed = true;
-                        self.with_active_viewer_mut(|viewer| viewer.set_view_mode(view_mode));
+                    let mut layout = self.active_investigation_layout();
+                    for candidate in [
+                        InvestigationLayout::Preview2dOnly,
+                        InvestigationLayout::Split2d3d,
+                        InvestigationLayout::Inspection3dOnly,
+                    ] {
+                        let enabled = self.investigation_renderer.is_wgpu()
+                            || candidate == InvestigationLayout::Preview2dOnly;
+                        let response = ui.add_enabled(
+                            enabled,
+                            egui::RadioButton::new(layout == candidate, candidate.label()),
+                        );
+                        if response.clicked() {
+                            layout = candidate;
+                        }
+                    }
+                    if layout != self.active_investigation_layout() {
+                        self.set_active_investigation_layout(layout);
                     }
                 });
 
@@ -4221,12 +5176,29 @@ impl eframe::App for CameraApp {
                         ui.label(format!("ImageJ: {}", external_status.label()));
                         ui.separator();
                     }
-                    let mut view_mode = self.active_view_mode();
-                    let r3d = ui.selectable_value(&mut view_mode, ViewMode::PointCloud3d, "3D");
-                    let r2d = ui.selectable_value(&mut view_mode, ViewMode::Preview2d, "2D");
-                    if r2d.changed() || r3d.changed() {
-                        view_mode_changed = true;
-                        self.with_active_viewer_mut(|viewer| viewer.set_view_mode(view_mode));
+                    let mut layout = self.active_investigation_layout();
+                    let split = ui.selectable_value(
+                        &mut layout,
+                        InvestigationLayout::Split2d3d,
+                        "2D+3D",
+                    );
+                    let only_3d = ui.add_enabled(
+                        self.investigation_renderer.is_wgpu(),
+                        egui::SelectableLabel::new(
+                            layout == InvestigationLayout::Inspection3dOnly,
+                            "3D",
+                        ),
+                    );
+                    if only_3d.clicked() {
+                        layout = InvestigationLayout::Inspection3dOnly;
+                    }
+                    let only_2d = ui.selectable_value(
+                        &mut layout,
+                        InvestigationLayout::Preview2dOnly,
+                        "2D",
+                    );
+                    if only_2d.changed() || only_3d.clicked() || split.changed() {
+                        self.set_active_investigation_layout(layout);
                     }
                     if mode == AppMode::Recording {
                         ui.separator();
@@ -4389,94 +5361,193 @@ impl eframe::App for CameraApp {
 
         let enabled_plugin_names = self.enabled_plugin_names();
         let hotpixel_enabled = self.hotpixel_detection.enabled();
-        let has_analysis_tools = hotpixel_enabled || !enabled_plugin_names.is_empty();
-        if self.analysis_panel_open && has_analysis_tools {
+        let has_analysis_extensions = hotpixel_enabled || !enabled_plugin_names.is_empty();
+        if self.analysis_panel_open {
             egui::SidePanel::right("analysis")
-                .min_width(360.0)
+                .min_width(320.0)
+                .default_width(380.0)
+                .max_width(500.0)
                 .show_separator_line(true)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("▶")
-                                            .size(14.0)
-                                            .color(ui.visuals().weak_text_color()),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                self.analysis_panel_open = false;
-                            }
+                    let panel_rect = ui.max_rect();
+                    let panel_width = panel_rect.width();
+                    ui.set_min_size(panel_rect.size());
+                    ui.set_width(panel_width);
+                    ui.style_mut().wrap = Some(true);
+                    ui.expand_to_include_rect(panel_rect);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_min_size(panel_rect.size());
+                        ui.set_width(panel_width);
+                        ui.expand_to_include_rect(panel_rect);
+                        ui.horizontal(|ui| {
+                            ui.heading("Investigation Inspector");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("▶")
+                                                    .size(14.0)
+                                                    .color(ui.visuals().weak_text_color()),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.analysis_panel_open = false;
+                                    }
+                                },
+                            );
                         });
-                        ui.heading("Analysis Tools");
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if hotpixel_enabled {
-                                self.hotpixel_detection.render_ui(ui);
-                                if !enabled_plugin_names.is_empty() {
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_source("analysis_panel_scroll")
+                            .hscroll(false)
+                            .horizontal_scroll_offset(0.0)
+                            .auto_shrink([true, false])
+                            .show(ui, |ui| {
+                                let scroll_rect = ui.max_rect();
+                                ui.set_min_size(scroll_rect.size());
+                                ui.set_width(panel_width);
+                                ui.style_mut().wrap = Some(true);
+                                ui.expand_to_include_rect(scroll_rect);
+                                self.render_investigation_inspector(ui);
+
+                                if has_analysis_extensions {
                                     ui.separator();
-                                }
-                            }
-
-                            let runtime_count = self.plugin_manager.records().len();
-                            for index in 0..runtime_count {
-                                let rendered = {
-                                    let record = &mut self.plugin_manager.records_mut()[index];
-                                    let Some(plugin) = record.plugin_mut() else {
-                                        continue;
-                                    };
-                                    if !plugin.enabled() {
-                                        continue;
-                                    }
-
-                                    let missing_dependencies: Vec<String> = plugin
-                                        .dependencies()
-                                        .iter()
-                                        .filter(|dependency| {
-                                            !enabled_plugin_names
-                                                .iter()
-                                                .any(|name| name == *dependency)
-                                        })
-                                        .cloned()
-                                        .collect();
-                                    if !missing_dependencies.is_empty() {
-                                        ui.colored_label(
-                                            ui.visuals().warn_fg_color,
-                                            format!(
-                                                "Missing dependency: {}",
-                                                missing_dependencies.join(", ")
-                                            ),
-                                        );
-                                    }
-
-                                    if let Err(err) = render_plugin_settings(ui, plugin) {
-                                        ui.colored_label(
-                                            ui.visuals().error_fg_color,
-                                            format!("Dynamic plugin UI failed: {err}"),
-                                        );
-                                    }
-                                    true
-                                };
-
-                                if rendered {
-                                    self.render_provider_host_views(
-                                        ctx,
-                                        ui,
-                                        HostViewProviderKey::Runtime(index),
+                                    ui.heading("Analysis Extensions");
+                                    ui.small(
+                                        "Only enabled analysis modules appear here. Hidden modules stay out of the way.",
                                     );
                                     ui.separator();
+
+                                    if hotpixel_enabled {
+                                        let mut stage_changed = false;
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.heading("Hotpixel Detection");
+                                                stage_dirty_badge(
+                                                    ui,
+                                                    self.hotpixel_detection.is_dirty(),
+                                                );
+                                            });
+                                            ui.small("Phase: host frame analysis");
+                                            ui.small(format!(
+                                                "Metrics: {} hot pixels detected in the last frame",
+                                                self.hotpixel_detection.detected_pixels().len()
+                                            ));
+                                            ui.separator();
+                                            stage_changed =
+                                                self.hotpixel_detection.render_ui(ui, false);
+                                        });
+                                        analysis_parameter_changed |= stage_changed;
+                                        if !enabled_plugin_names.is_empty() {
+                                            ui.separator();
+                                        }
+                                    }
+
+                                    let runtime_count = self.plugin_manager.records().len();
+                                    for index in 0..runtime_count {
+                                        let provider = HostViewProviderKey::Runtime(index);
+                                        let dataset_count = self
+                                            .host_view_registry
+                                            .datasets()
+                                            .filter(|dataset| dataset.provider == provider)
+                                            .count();
+                                        let panel_view_count = self
+                                            .host_view_registry
+                                            .panel_views_for_provider(provider)
+                                            .count();
+                                        let rendered = {
+                                            let phase_label =
+                                                self.plugin_manager.records()[index].phase_label();
+                                            let record =
+                                                &mut self.plugin_manager.records_mut()[index];
+                                            let Some(plugin) = record.plugin_mut() else {
+                                                continue;
+                                            };
+                                            if !plugin.enabled() {
+                                                continue;
+                                            }
+
+                                            let missing_dependencies: Vec<String> = plugin
+                                                .dependencies()
+                                                .iter()
+                                                .filter(|dependency| {
+                                                    !enabled_plugin_names
+                                                        .iter()
+                                                        .any(|name| name == *dependency)
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            let mut stage_changed = false;
+                                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.heading(plugin.name());
+                                                    stage_dirty_badge(ui, plugin.is_dirty());
+                                                });
+                                                if !plugin.description().is_empty() {
+                                                    ui.weak(plugin.description());
+                                                }
+                                                ui.small(format!("Phase: {phase_label}"));
+                                                ui.small(format!(
+                                                    "Metrics: {dataset_count} datasets, {panel_view_count} panel views"
+                                                ));
+                                                ui.small(format!(
+                                                    "Dependencies: {}",
+                                                    if plugin.dependencies().is_empty() {
+                                                        "none".to_owned()
+                                                    } else {
+                                                        plugin.dependencies().join(", ")
+                                                    }
+                                                ));
+                                                if !missing_dependencies.is_empty() {
+                                                    ui.colored_label(
+                                                        ui.visuals().warn_fg_color,
+                                                        format!(
+                                                            "Missing dependency: {}",
+                                                            missing_dependencies.join(", ")
+                                                        ),
+                                                    );
+                                                }
+                                                ui.separator();
+                                                match render_plugin_settings(ui, plugin, false) {
+                                                    Ok(changed) => {
+                                                        stage_changed = changed;
+                                                    }
+                                                    Err(err) => {
+                                                        ui.colored_label(
+                                                            ui.visuals().error_fg_color,
+                                                            format!(
+                                                                "Dynamic plugin UI failed: {err}"
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                            analysis_parameter_changed |= stage_changed;
+                                            true
+                                        };
+
+                                        if rendered {
+                                            self.render_provider_host_views(
+                                                ctx,
+                                                ui,
+                                                HostViewProviderKey::Runtime(index),
+                                            );
+                                            ui.separator();
+                                        }
+                                    }
                                 }
-                            }
-                        });
+                                ui.expand_to_include_rect(scroll_rect);
+                            });
+                        ui.expand_to_include_rect(panel_rect);
+                    });
+                    ui.expand_to_include_rect(panel_rect);
                 });
-        } else if has_analysis_tools {
-            egui::SidePanel::right("analysis-collapsed")
+        } else {
+            egui::SidePanel::right("analysis_collapsed")
                 .exact_width(COLLAPSED_PANEL_WIDTH)
                 .resizable(false)
                 .show_separator_line(true)
@@ -4614,8 +5685,10 @@ impl eframe::App for CameraApp {
 
         if analysis_toggle_changed {
             self.analysis_output = AnalysisOutput::default();
-            self.analysis_notice = None;
-            self.host_view_registry_dirty = true;
+            self.note_analysis_change(ctx, "analysis stage enablement");
+        }
+        if analysis_parameter_changed {
+            self.note_analysis_change(ctx, "analysis parameters");
         }
 
         let external_status = self.external_tool_status();
@@ -4626,14 +5699,28 @@ impl eframe::App for CameraApp {
             .as_ref()
             .map(PipelineController::stats_snapshot);
         let detected_hotpixels = self.latest_detected_hotpixels();
-        let mut main_viewer_output = None;
+        let mut main_viewer_output: Option<ViewerOutput> = None;
+        let mut main_3d_output = None;
         let mut return_preview_to_main = false;
+        let mut transport_output = ViewerOutput::default();
+        let investigation_points_2d = self.build_investigation_points_2d();
+        let investigation_scene_3d = self.build_investigation_scene_3d();
+        // Auto-fit camera to scene bounds when data first appears
+        if !self.viewer.investigation_3d.auto_fitted && !investigation_scene_3d.is_empty() {
+            self.viewer
+                .investigation_3d
+                .fit_to_scene(&investigation_scene_3d);
+            self.viewer.investigation_3d.auto_fitted = true;
+        }
+        self.handle_investigation_shortcuts(ctx, &investigation_scene_3d);
 
         if self.popup_open {
             self.sync_popup_shared(
                 settings_locked,
                 external_streaming,
                 &external_streaming_label,
+                &investigation_points_2d,
+                &investigation_scene_3d,
             );
         }
 
@@ -4655,7 +5742,9 @@ impl eframe::App for CameraApp {
                     self.viewer.time_surface_tau_us,
                     latest_frame_for_hover.as_ref(),
                 );
-                let input = ViewerInput {
+                let selected_row = self.viewer.investigation.primary_selection().cloned();
+                let replay_state = self.viewer_replay_state();
+                let make_input = |viewer_id: &'static str| ViewerInput {
                     texture: self.texture.as_ref(),
                     frame: self.latest_frame.as_ref(),
                     time_surface_hover_value: main_time_surface_hover_value,
@@ -4663,10 +5752,12 @@ impl eframe::App for CameraApp {
                     camera_info: self.camera_info.as_ref(),
                     nm_per_pixel: self.nm_per_pixel,
                     config: &self.config,
+                    investigation_points_2d: &investigation_points_2d,
+                    selected_row: selected_row.as_ref(),
                     mode: self.mode,
                     settings_locked,
                     pipeline_stats: pipeline_stats.as_ref(),
-                    replay: self.viewer_replay_state(),
+                    replay: replay_state,
                     analysis_warnings: &self.analysis_output.warnings,
                     analysis_notice: self.analysis_notice.as_deref(),
                     detected_hotpixels: &detected_hotpixels,
@@ -4678,11 +5769,63 @@ impl eframe::App for CameraApp {
                     external_streaming,
                     external_streaming_label: &external_streaming_label,
                     popup_active: false,
-                    popup_button_label: "Enlarge",
                     popup_button_tooltip: "Open in separate window",
-                    viewer_id: "main",
+                    viewer_id,
                 };
-                main_viewer_output = Some(draw_viewer(ctx, ui, &mut self.viewer, input));
+
+                if self.mode == AppMode::Replaying {
+                    draw_replay_transport(
+                        ui,
+                        &mut self.viewer,
+                        replay_state,
+                        "central_transport",
+                        &mut transport_output,
+                    );
+                    ui.separator();
+                }
+
+                match self.viewer.investigation.layout {
+                    InvestigationLayout::Preview2dOnly => {
+                        main_viewer_output =
+                            Some(draw_viewer(ctx, ui, &mut self.viewer, make_input("main")));
+                    }
+                    InvestigationLayout::Inspection3dOnly => {
+                        let max_3d_height = ui.available_size().y.min(800.0);
+                        main_3d_output = Some(draw_investigation_3d(
+                            ui,
+                            &mut self.investigation_renderer,
+                            &mut self.viewer.investigation_3d,
+                            &investigation_scene_3d,
+                            selected_row.as_ref(),
+                            Some(&mut self.viewer.workspace.point_cloud),
+                            max_3d_height,
+                        ));
+                    }
+                    InvestigationLayout::Split2d3d => {
+                        let parent_clip = ui.clip_rect();
+                        let (left_rect, right_rect) = show_investigation_split(
+                            ui,
+                            "investigation_split",
+                            &mut self.viewer.investigation.split_ratio,
+                        );
+                        main_viewer_output =
+                            Some(show_investigation_pane(ui, left_rect, parent_clip, |ui| {
+                                draw_viewer(ctx, ui, &mut self.viewer, make_input("main_split"))
+                            }));
+                        main_3d_output =
+                            Some(show_investigation_pane(ui, right_rect, parent_clip, |ui| {
+                                draw_investigation_3d(
+                                    ui,
+                                    &mut self.investigation_renderer,
+                                    &mut self.viewer.investigation_3d,
+                                    &investigation_scene_3d,
+                                    selected_row.as_ref(),
+                                    Some(&mut self.viewer.workspace.point_cloud),
+                                    right_rect.height(),
+                                )
+                            }));
+                    }
+                }
             }
         });
 
@@ -4690,8 +5833,22 @@ impl eframe::App for CameraApp {
             self.close_popup_viewer();
         }
 
+        if let Some(ref mut output) = main_viewer_output {
+            output.merge(transport_output);
+        } else if transport_output.has_replay_actions() {
+            main_viewer_output = Some(transport_output);
+        }
         if let Some(output) = main_viewer_output {
             self.handle_viewer_output(ctx, output, false);
+        }
+        if let Some(output) = main_3d_output {
+            if let Some(target) = output.focus_target {
+                self.viewer.investigation_3d.focus_on(target);
+            }
+            if let Some(selected) = output.selected {
+                self.viewer.investigation.set_single_selection(selected);
+            }
+            self.viewer.investigation.hovered_row = output.hovered;
         }
         if !self.popup_open {
             let aux = self.viewer.show_aux_windows(ctx);
@@ -4723,6 +5880,9 @@ impl eframe::App for CameraApp {
                                 egui::CentralPanel::default().show(ctx, |ui| {
                                     let PopupSharedData {
                                         viewer,
+                                        investigation_renderer,
+                                        investigation_points_2d,
+                                        investigation_scene_3d,
                                         texture,
                                         frame,
                                         time_surface_hover_value,
@@ -4749,7 +5909,9 @@ impl eframe::App for CameraApp {
                                         close_requested: _,
                                         output,
                                     } = &mut *data;
-                                    let input = ViewerInput {
+                                    let selected_row =
+                                        viewer.investigation.primary_selection().cloned();
+                                    let make_input = |viewer_id: &'static str| ViewerInput {
                                         texture: texture.as_ref(),
                                         frame: frame.as_ref(),
                                         time_surface_hover_value: *time_surface_hover_value,
@@ -4757,6 +5919,8 @@ impl eframe::App for CameraApp {
                                         camera_info: camera_info.as_ref(),
                                         nm_per_pixel: *nm_per_pixel,
                                         config,
+                                        investigation_points_2d: investigation_points_2d.as_slice(),
+                                        selected_row: selected_row.as_ref(),
                                         mode: *mode,
                                         settings_locked: *settings_locked,
                                         pipeline_stats: pipeline_stats.as_ref(),
@@ -4772,11 +5936,93 @@ impl eframe::App for CameraApp {
                                         external_streaming: *external_streaming,
                                         external_streaming_label: external_streaming_label.as_str(),
                                         popup_active: true,
-                                        popup_button_label: "Return to augur",
                                         popup_button_tooltip: "Return viewer to main window",
-                                        viewer_id: "popup",
+                                        viewer_id,
                                     };
-                                    let mut popup_output = draw_viewer(ctx, ui, viewer, input);
+                                    let mut popup_transport_output = ViewerOutput::default();
+                                    if *mode == AppMode::Replaying {
+                                        draw_replay_transport(
+                                            ui,
+                                            viewer,
+                                            *replay,
+                                            "popup_transport",
+                                            &mut popup_transport_output,
+                                        );
+                                        ui.separator();
+                                    }
+                                    let mut popup_output = match viewer.investigation.layout {
+                                        InvestigationLayout::Preview2dOnly => {
+                                            draw_viewer(ctx, ui, viewer, make_input("popup"))
+                                        }
+                                        InvestigationLayout::Inspection3dOnly => {
+                                            let output = draw_investigation_3d(
+                                                ui,
+                                                investigation_renderer,
+                                                &mut viewer.investigation_3d,
+                                                investigation_scene_3d,
+                                                selected_row.as_ref(),
+                                                Some(&mut viewer.workspace.point_cloud),
+                                                ui.available_size().y,
+                                            );
+                                            if let Some(target) = output.focus_target {
+                                                viewer.investigation_3d.focus_on(target);
+                                            }
+                                            if let Some(selected) = output.selected {
+                                                viewer.investigation.set_single_selection(selected);
+                                            }
+                                            viewer.investigation.hovered_row = output.hovered;
+                                            ViewerOutput::default()
+                                        }
+                                        InvestigationLayout::Split2d3d => {
+                                            let parent_clip = ui.clip_rect();
+                                            let (left_rect, right_rect) = show_investigation_split(
+                                                ui,
+                                                "popup_investigation_split",
+                                                &mut viewer.investigation.split_ratio,
+                                            );
+                                            let viewer_output = show_investigation_pane(
+                                                ui,
+                                                left_rect,
+                                                parent_clip,
+                                                |ui| {
+                                                    draw_viewer(
+                                                        ctx,
+                                                        ui,
+                                                        viewer,
+                                                        make_input("popup_split"),
+                                                    )
+                                                },
+                                            );
+                                            show_investigation_pane(
+                                                ui,
+                                                right_rect,
+                                                parent_clip,
+                                                |ui| {
+                                                    let output = draw_investigation_3d(
+                                                        ui,
+                                                        investigation_renderer,
+                                                        &mut viewer.investigation_3d,
+                                                        investigation_scene_3d,
+                                                        selected_row.as_ref(),
+                                                        Some(&mut viewer.workspace.point_cloud),
+                                                        right_rect.height(),
+                                                    );
+                                                    if let Some(target) = output.focus_target {
+                                                        viewer.investigation_3d.focus_on(target);
+                                                    }
+                                                    if let Some(selected) = output.selected {
+                                                        viewer
+                                                            .investigation
+                                                            .set_single_selection(selected);
+                                                    }
+                                                    viewer.investigation.hovered_row =
+                                                        output.hovered;
+                                                },
+                                            );
+                                            viewer_output
+                                        }
+                                    };
+                                    popup_output.merge(popup_transport_output);
                                     let aux = viewer.show_aux_windows(ctx);
                                     popup_output.contrast_changed |= aux.contrast_changed;
                                     popup_output.histogram_visibility_changed |=
@@ -4788,8 +6034,8 @@ impl eframe::App for CameraApp {
                                     repaint_after = child_viewport_repaint_after(
                                         viewport_stream_active(*mode, *replay),
                                         *replay_open_task_active,
-                                        process_interval_for_view_mode(
-                                            viewer.view_mode,
+                                        process_interval_for_layout(
+                                            viewer.investigation.layout,
                                             *preview_interval_ms,
                                             *point_cloud_interval_ms,
                                         ),
@@ -4819,6 +6065,9 @@ impl eframe::App for CameraApp {
                                     if let Ok(mut data) = shared.lock() {
                                         let PopupSharedData {
                                             viewer,
+                                            investigation_renderer,
+                                            investigation_points_2d,
+                                            investigation_scene_3d,
                                             texture,
                                             frame,
                                             time_surface_hover_value,
@@ -4845,7 +6094,9 @@ impl eframe::App for CameraApp {
                                             close_requested: _,
                                             output,
                                         } = &mut *data;
-                                        let input = ViewerInput {
+                                        let selected_row =
+                                            viewer.investigation.primary_selection().cloned();
+                                        let make_input = |viewer_id: &'static str| ViewerInput {
                                             texture: texture.as_ref(),
                                             frame: frame.as_ref(),
                                             time_surface_hover_value: *time_surface_hover_value,
@@ -4853,6 +6104,9 @@ impl eframe::App for CameraApp {
                                             camera_info: camera_info.as_ref(),
                                             nm_per_pixel: *nm_per_pixel,
                                             config,
+                                            investigation_points_2d: investigation_points_2d
+                                                .as_slice(),
+                                            selected_row: selected_row.as_ref(),
                                             mode: *mode,
                                             settings_locked: *settings_locked,
                                             pipeline_stats: pipeline_stats.as_ref(),
@@ -4869,11 +6123,98 @@ impl eframe::App for CameraApp {
                                             external_streaming_label: external_streaming_label
                                                 .as_str(),
                                             popup_active: true,
-                                            popup_button_label: "Return to augur",
                                             popup_button_tooltip: "Return viewer to main window",
-                                            viewer_id: "popup",
+                                            viewer_id,
                                         };
-                                        let mut popup_output = draw_viewer(ctx, ui, viewer, input);
+                                        let mut popup_transport_output = ViewerOutput::default();
+                                        if *mode == AppMode::Replaying {
+                                            draw_replay_transport(
+                                                ui,
+                                                viewer,
+                                                *replay,
+                                                "popup_embedded_transport",
+                                                &mut popup_transport_output,
+                                            );
+                                            ui.separator();
+                                        }
+                                        let mut popup_output = match viewer.investigation.layout {
+                                            InvestigationLayout::Preview2dOnly => {
+                                                draw_viewer(ctx, ui, viewer, make_input("popup"))
+                                            }
+                                            InvestigationLayout::Inspection3dOnly => {
+                                                let output = draw_investigation_3d(
+                                                    ui,
+                                                    investigation_renderer,
+                                                    &mut viewer.investigation_3d,
+                                                    investigation_scene_3d,
+                                                    selected_row.as_ref(),
+                                                    Some(&mut viewer.workspace.point_cloud),
+                                                    ui.available_size().y,
+                                                );
+                                                if let Some(target) = output.focus_target {
+                                                    viewer.investigation_3d.focus_on(target);
+                                                }
+                                                if let Some(selected) = output.selected {
+                                                    viewer
+                                                        .investigation
+                                                        .set_single_selection(selected);
+                                                }
+                                                viewer.investigation.hovered_row = output.hovered;
+                                                ViewerOutput::default()
+                                            }
+                                            InvestigationLayout::Split2d3d => {
+                                                let parent_clip = ui.clip_rect();
+                                                let (left_rect, right_rect) =
+                                                    show_investigation_split(
+                                                        ui,
+                                                        "popup_embedded_investigation_split",
+                                                        &mut viewer.investigation.split_ratio,
+                                                    );
+                                                let viewer_output = show_investigation_pane(
+                                                    ui,
+                                                    left_rect,
+                                                    parent_clip,
+                                                    |ui| {
+                                                        draw_viewer(
+                                                            ctx,
+                                                            ui,
+                                                            viewer,
+                                                            make_input("popup_split"),
+                                                        )
+                                                    },
+                                                );
+                                                show_investigation_pane(
+                                                    ui,
+                                                    right_rect,
+                                                    parent_clip,
+                                                    |ui| {
+                                                        let output = draw_investigation_3d(
+                                                            ui,
+                                                            investigation_renderer,
+                                                            &mut viewer.investigation_3d,
+                                                            investigation_scene_3d,
+                                                            selected_row.as_ref(),
+                                                            Some(&mut viewer.workspace.point_cloud),
+                                                            right_rect.height(),
+                                                        );
+                                                        if let Some(target) = output.focus_target {
+                                                            viewer
+                                                                .investigation_3d
+                                                                .focus_on(target);
+                                                        }
+                                                        if let Some(selected) = output.selected {
+                                                            viewer
+                                                                .investigation
+                                                                .set_single_selection(selected);
+                                                        }
+                                                        viewer.investigation.hovered_row =
+                                                            output.hovered;
+                                                    },
+                                                );
+                                                viewer_output
+                                            }
+                                        };
+                                        popup_output.merge(popup_transport_output);
                                         let aux = viewer.show_aux_windows(ctx);
                                         popup_output.contrast_changed |= aux.contrast_changed;
                                         popup_output.histogram_visibility_changed |=
@@ -4939,6 +6280,128 @@ impl eframe::App for CameraApp {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
+}
+
+fn host_marker_shape_label(shape: augur_plugin_api::HostMarkerShape) -> &'static str {
+    match shape {
+        augur_plugin_api::HostMarkerShape::Circle
+        | augur_plugin_api::HostMarkerShape::FilledCircle => "Filled circle",
+        augur_plugin_api::HostMarkerShape::Square | augur_plugin_api::HostMarkerShape::Box => "Box",
+        augur_plugin_api::HostMarkerShape::Diamond => "Diamond",
+        augur_plugin_api::HostMarkerShape::Cross => "Cross",
+        augur_plugin_api::HostMarkerShape::Point => "Point",
+        augur_plugin_api::HostMarkerShape::Ellipse => "Ellipse",
+    }
+}
+
+fn stage_dirty_badge(ui: &mut egui::Ui, dirty: bool) {
+    let (text, color) = if dirty {
+        ("dirty", ui.visuals().warn_fg_color)
+    } else {
+        ("ready", status_success_color())
+    };
+    ui.label(egui::RichText::new(text).small().color(color).monospace());
+}
+
+fn show_investigation_split(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    split_ratio: &mut f32,
+) -> (egui::Rect, egui::Rect) {
+    // `available_rect_before_wrap` can extend beyond the current clip rect in panel-heavy
+    // layouts, which made the split panes reserve/paint space underneath the right inspector.
+    // Clamp the split geometry to the visible clip region so the central workspace cannot
+    // overlap side panels.
+    let full_rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    if full_rect.width() <= 0.0 || full_rect.height() <= 0.0 {
+        return (egui::Rect::NOTHING, egui::Rect::NOTHING);
+    }
+
+    let handle_width = 12.0;
+    let usable_width = (full_rect.width() - handle_width).max(1.0);
+    let min_pane_width = 280.0f32.min(((usable_width - 40.0).max(40.0)) * 0.5);
+    let (min_ratio, max_ratio) = investigation_split_ratio_bounds(usable_width, min_pane_width);
+    let mut left_width = (usable_width * (*split_ratio).clamp(min_ratio, max_ratio))
+        .clamp(min_pane_width, usable_width - min_pane_width);
+    let handle_rect = egui::Rect::from_min_size(
+        egui::pos2(full_rect.left() + left_width, full_rect.top()),
+        egui::vec2(handle_width, full_rect.height()),
+    );
+    let response = ui.interact(
+        handle_rect,
+        ui.id().with(id_source),
+        egui::Sense::click_and_drag(),
+    );
+    if response.dragged() {
+        left_width = (left_width + ui.ctx().input(|input| input.pointer.delta().x))
+            .clamp(min_pane_width, usable_width - min_pane_width);
+        *split_ratio = (left_width / usable_width).clamp(min_ratio, max_ratio);
+        ui.ctx().request_repaint();
+    }
+
+    let left_rect = egui::Rect::from_min_max(
+        full_rect.min,
+        egui::pos2(handle_rect.left(), full_rect.bottom()),
+    );
+    let right_rect = egui::Rect::from_min_max(
+        egui::pos2(handle_rect.right(), full_rect.top()),
+        full_rect.max,
+    );
+    ui.allocate_rect(full_rect, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(handle_rect, 4.0, ui.visuals().faint_bg_color);
+    painter.line_segment(
+        [
+            egui::pos2(handle_rect.center().x, handle_rect.top() + 12.0),
+            egui::pos2(handle_rect.center().x, handle_rect.bottom() - 12.0),
+        ],
+        egui::Stroke::new(
+            if response.hovered() || response.dragged() {
+                2.0
+            } else {
+                1.0
+            },
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        ),
+    );
+    (left_rect, right_rect)
+}
+
+fn show_investigation_pane<R>(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    parent_clip: egui::Rect,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let pane_clip = rect.intersect(parent_clip);
+    ui.allocate_ui_at_rect(rect, |ui| {
+        ui.set_clip_rect(pane_clip);
+        ui.set_width(pane_clip.width().max(0.0));
+        ui.set_height(pane_clip.height().max(0.0));
+        add_contents(ui)
+    })
+    .inner
+}
+
+fn investigation_split_ratio_bounds(usable_width: f32, min_pane_width: f32) -> (f32, f32) {
+    if usable_width <= 0.0 {
+        return (0.5, 0.5);
+    }
+
+    let min_ratio = (min_pane_width / usable_width).clamp(0.0, 0.5);
+    (min_ratio, 1.0 - min_ratio)
+}
+
+fn scene_point_for_selection(
+    scene: &Investigation3dScene,
+    selected: &crate::investigation::StableRowKey,
+) -> Option<[f32; 3]> {
+    scene
+        .layers
+        .iter()
+        .flat_map(|layer| layer.points.iter())
+        .find(|point| point.item_key.as_ref() == Some(selected))
+        .map(|point| point.position)
 }
 
 fn status_success_color() -> egui::Color32 {
@@ -5008,19 +6471,23 @@ impl Drop for CameraApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        acq_time_us_from_ms, derived_replay_preview_interval_ms, pipeline_stream_active,
+        acq_time_us_from_ms, derived_replay_preview_interval_ms, investigation_split_ratio_bounds,
+        pipeline_stream_active, raw_event_focus_volume, raw_event_point_position,
         replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
         replay_pipeline_config, replay_seek_target_reached, replay_step_target_time_us,
         replay_step_uses_current_controller, replay_time_from_position_sources,
-        sync_acq_time_atomic, viewport_stream_active,
+        roi_is_effectively_full_frame, sync_acq_time_atomic, viewport_stream_active,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     };
 
-    use crate::viewer_widget::{AppMode, ViewerReplayState};
-    use augur_core::{metadata::RecordingMetadata, replay::ReplayFileInfo};
+    use crate::{
+        investigation::AnalysisRoi,
+        viewer_widget::{AppMode, ViewerReplayState},
+    };
+    use augur_core::{metadata::RecordingMetadata, pipeline::CdEvent, replay::ReplayFileInfo};
 
     #[test]
     fn replay_preview_interval_scales_with_speed() {
@@ -5097,6 +6564,67 @@ mod tests {
     }
 
     #[test]
+    fn raw_event_point_position_flips_sensor_y_and_scales_depth_to_history_window() {
+        let point = raw_event_point_position(
+            CdEvent {
+                x: 12,
+                y: 10,
+                timestamp: 8_000,
+                polarity: true,
+            },
+            10_000,
+            720,
+            100.0,
+        );
+
+        assert_eq!(point[0], 12.0);
+        assert_eq!(point[1], 709.0);
+        assert!((point[2] + 14.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn raw_event_focus_volume_uses_current_time_span() {
+        let focus = raw_event_focus_volume(
+            &AnalysisRoi {
+                x_min: 10.0,
+                x_max: 20.0,
+                y_min: 30.0,
+                y_max: 50.0,
+            },
+            8_000,
+            10_000,
+            720,
+            100.0,
+        );
+
+        assert_eq!(focus.min[0], 10.0);
+        assert_eq!(focus.max[0], 20.0);
+        assert_eq!(focus.min[1], 669.0);
+        assert_eq!(focus.max[1], 689.0);
+        assert!((focus.min[2] + 14.4).abs() < 1e-4);
+        assert_eq!(focus.max[2], 0.0);
+    }
+
+    #[test]
+    fn full_frame_roi_detection_ignores_linked_full_sensor_bounds() {
+        let full = AnalysisRoi {
+            x_min: 0.0,
+            x_max: 1279.0,
+            y_min: 0.0,
+            y_max: 719.0,
+        };
+        let partial = AnalysisRoi {
+            x_min: 10.0,
+            x_max: 100.0,
+            y_min: 20.0,
+            y_max: 120.0,
+        };
+
+        assert!(roi_is_effectively_full_frame(&full, 1280, 720));
+        assert!(!roi_is_effectively_full_frame(&partial, 1280, 720));
+    }
+
+    #[test]
     fn paused_seek_keeps_stream_updates_alive() {
         assert!(pipeline_stream_active(
             AppMode::Replaying,
@@ -5154,5 +6682,18 @@ mod tests {
             acq_time_us.load(Ordering::Relaxed),
             acq_time_us_from_ms(125)
         );
+    }
+
+    #[test]
+    fn split_ratio_bounds_follow_the_actual_min_pane_width() {
+        let (min_ratio, max_ratio) = investigation_split_ratio_bounds(1_188.0, 280.0);
+
+        assert!((min_ratio - (280.0 / 1_188.0)).abs() < 1e-6);
+        assert!((max_ratio - (1.0 - (280.0 / 1_188.0))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_ratio_bounds_collapse_to_center_when_min_panes_fill_the_width() {
+        assert_eq!(investigation_split_ratio_bounds(200.0, 120.0), (0.5, 0.5));
     }
 }

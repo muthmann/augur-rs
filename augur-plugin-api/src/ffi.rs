@@ -141,6 +141,18 @@ pub struct FfiSubpixelMarker {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FfiMarkerShape {
+    Point = 0,
+    Cross = 1,
+    Box = 2,
+    Ellipse = 3,
+    Diamond = 4,
+    FilledCircle = 5,
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FfiColorRgba {
     pub r: u8,
@@ -162,6 +174,19 @@ impl FfiColorRgba {
     pub const fn to_rgba(self) -> [u8; 4] {
         [self.r, self.g, self.b, self.a]
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FfiMarkerOverlayItem {
+    pub x: f32,
+    pub y: f32,
+    pub shape: FfiMarkerShape,
+    pub size: f32,
+    pub color: FfiColorRgba,
+    pub timestamp_us: u64,
+    pub has_timestamp: bool,
+    pub stable_id: FfiString,
 }
 
 #[repr(C)]
@@ -212,6 +237,13 @@ pub struct FfiPreviewFrame {
 pub type AddHighlightPixelsFn = unsafe extern "C" fn(*mut c_void, FfiSlice<FfiPixel>, FfiColorRgba);
 pub type AddCrosshairMarkersFn =
     unsafe extern "C" fn(*mut c_void, FfiSlice<FfiSubpixelMarker>, FfiColorRgba, u16);
+pub type AddMarkerOverlayFn = unsafe extern "C" fn(
+    *mut c_void,
+    FfiSlice<FfiMarkerOverlayItem>,
+    FfiString,
+    FfiString,
+    FfiString,
+);
 pub type AddWarningFn = unsafe extern "C" fn(*mut c_void, FfiString, AnalysisSeverity, FfiString);
 
 #[repr(C)]
@@ -220,6 +252,7 @@ pub struct FfiOutputCallbacks {
     pub ctx: *mut c_void,
     pub add_highlight_pixels: AddHighlightPixelsFn,
     pub add_crosshair_markers: AddCrosshairMarkersFn,
+    pub add_marker_overlay: AddMarkerOverlayFn,
     pub add_warning: AddWarningFn,
 }
 
@@ -235,7 +268,7 @@ pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 
-pub const PLUGIN_ABI_VERSION: u64 = 2;
+pub const PLUGIN_ABI_VERSION: u64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

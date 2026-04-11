@@ -9,16 +9,17 @@ use std::{
 
 use augur_core::{
     analysis::{
-        AnalysisOutput, AnalysisSeverity as CoreSeverity, AnalysisWarning, Overlay, Pixel,
-        SubpixelMarker,
+        AnalysisOutput, AnalysisSeverity as CoreSeverity, AnalysisWarning, MarkerOverlayItem,
+        MarkerShape, Overlay, Pixel, SubpixelMarker,
     },
     pipeline::PreviewFrame,
 };
 use augur_plugin_api::{
     AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
-    FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-    FfiSubpixelMarker, HostViewRegistry, PluginCapabilities, PluginEntry, PluginInput,
-    PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
+    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostViewRegistry, PluginCapabilities,
+    PluginEntry, PluginInput, PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ABI_VERSION,
+    PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -76,6 +77,7 @@ pub struct DynPlugin {
     capabilities: PluginCapabilities,
     cached_setting_values: HashMap<String, CachedSettingValue>,
     cached_status_entries: Option<CachedStatusEntries>,
+    ui_dirty: bool,
 }
 
 impl DynPlugin {
@@ -105,6 +107,7 @@ impl DynPlugin {
             capabilities: PluginCapabilities::default(),
             cached_setting_values: HashMap::new(),
             cached_status_entries: None,
+            ui_dirty: false,
         };
         if let Err(err) = plugin.refresh_cached_metadata() {
             unsafe {
@@ -204,10 +207,12 @@ impl DynPlugin {
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
+        let changed = self.enabled() != enabled;
         unsafe {
             (self.vtable.set_enabled)(self.instance, enabled);
         }
         self.invalidate_ui_cache();
+        self.ui_dirty |= changed;
     }
 
     pub fn reset(&mut self) {
@@ -215,6 +220,7 @@ impl DynPlugin {
             (self.vtable.reset)(self.instance);
         }
         self.invalidate_ui_cache();
+        self.ui_dirty = false;
     }
 
     pub fn get_setting_value(&self, key: &str) -> Result<Option<Value>, String> {
@@ -268,8 +274,13 @@ impl DynPlugin {
         };
         if updated {
             self.invalidate_ui_cache();
+            self.ui_dirty = true;
         }
         Ok(updated)
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.ui_dirty
     }
 
     pub fn status_entries(&self) -> Result<Vec<StatusEntry>, String> {
@@ -356,6 +367,7 @@ impl DynPlugin {
             ctx: (&mut output_bridge as *mut OutputBridge).cast(),
             add_highlight_pixels,
             add_crosshair_markers,
+            add_marker_overlay,
             add_warning,
         };
         let mut plugin_context = FfiPluginContext {
@@ -383,6 +395,7 @@ impl DynPlugin {
                 &ffi_event_store,
             );
         }
+        self.ui_dirty = false;
     }
 }
 
@@ -655,6 +668,56 @@ unsafe extern "C" fn add_crosshair_markers(
         markers,
         color: color.to_rgba(),
         arm_len,
+    });
+}
+
+unsafe extern "C" fn add_marker_overlay(
+    ctx: *mut c_void,
+    markers: FfiSlice<FfiMarkerOverlayItem>,
+    dataset_id: FfiString,
+    layer_id: FfiString,
+    source_label: FfiString,
+) {
+    let Some(bridge) = ctx.cast::<OutputBridge>().as_mut() else {
+        return;
+    };
+    let Ok(dataset_id) = ffi_string_to_option(dataset_id, "marker overlay dataset_id") else {
+        return;
+    };
+    let Ok(layer_id) = ffi_string_to_option(layer_id, "marker overlay layer_id") else {
+        return;
+    };
+    let Ok(source_label) = ffi_string_to_option(source_label, "marker overlay source_label") else {
+        return;
+    };
+
+    let markers = markers
+        .as_slice()
+        .iter()
+        .map(|marker| MarkerOverlayItem {
+            x: marker.x,
+            y: marker.y,
+            shape: match marker.shape {
+                FfiMarkerShape::Point => MarkerShape::Point,
+                FfiMarkerShape::Cross => MarkerShape::Cross,
+                FfiMarkerShape::Box => MarkerShape::Box,
+                FfiMarkerShape::Ellipse => MarkerShape::Ellipse,
+                FfiMarkerShape::Diamond => MarkerShape::Diamond,
+                FfiMarkerShape::FilledCircle => MarkerShape::FilledCircle,
+            },
+            size: marker.size,
+            color: marker.color.to_rgba(),
+            timestamp_us: marker.has_timestamp.then_some(marker.timestamp_us),
+            stable_id: ffi_string_to_option(marker.stable_id, "marker overlay stable_id")
+                .ok()
+                .flatten(),
+        })
+        .collect();
+    bridge.output.overlays.push(Overlay::MarkerOverlay {
+        markers,
+        dataset_id,
+        layer_id,
+        source_label,
     });
 }
 

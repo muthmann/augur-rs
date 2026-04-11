@@ -80,11 +80,33 @@ Current host-rendered view kinds:
 - `HostViewKind::TableWindow`
 - `HostViewKind::Density2dFromTable`
 - `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::Scatter3dFromTable`
 - `HostViewKind::ImageWindow`
 - `HostViewKind::LineSeriesWindow`
 
 The host owns rendering, exports, caching, and window state. Plugins do not render `egui`
 directly.
+
+## Overlay Outputs
+
+Plugins can still emit lightweight overlay data through `HostOutput`:
+
+- `add_highlight_pixels(...)`
+- `add_crosshair_markers(...)`
+- `add_marker_overlay(...)`
+- `add_warning(...)`
+
+`add_marker_overlay(...)` is the generic path for richer 2D markers. It supports:
+
+- per-item shape: point, cross, box, ellipse, diamond, filled circle
+- per-item color and size
+- optional timestamp
+- optional stable id
+- optional overlay-level dataset id, layer id, and source label
+
+Use host-view datasets plus metadata for the primary linked-workspace model. Use marker overlays
+when the plugin needs an additional 2D annotation layer or wants 2D hit-testing on marks that do
+not map cleanly to existing `HighlightPixels` / `CrosshairMarkers`.
 
 ## Event Inputs And Retained History
 

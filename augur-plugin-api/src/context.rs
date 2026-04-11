@@ -17,15 +17,16 @@ pub struct HostViewRegistry {
     pub views: Vec<HostViewDescriptor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct HostDatasetDescriptor {
     pub id: String,
     pub title: String,
     pub kind: HostDatasetKind,
     pub empty_message: String,
+    pub display: Option<HostDatasetDisplayMetadata>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct HostViewDescriptor {
     pub id: String,
     pub title: String,
@@ -34,12 +35,19 @@ pub struct HostViewDescriptor {
     pub kind: HostViewKind,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "schema", rename_all = "snake_case")]
 pub enum HostDatasetKind {
     TableV1(TableSchema),
     Image2dV1,
     Series1dV1,
+}
+
+impl Default for HostDatasetKind {
+    fn default() -> Self {
+        Self::TableV1(TableSchema::default())
+    }
 }
 
 impl HostDatasetKind {
@@ -58,21 +66,49 @@ pub enum HostViewPlacement {
     Window,
 }
 
+impl Default for HostViewPlacement {
+    fn default() -> Self {
+        Self::AnalysisPanel
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostViewKind {
     CompactTable,
     TableWindow,
-    Density2dFromTable { x_column: String, y_column: String },
-    Scatter2dFromTable { x_column: String, y_column: String },
+    Density2dFromTable {
+        x_column: String,
+        y_column: String,
+    },
+    Scatter2dFromTable {
+        x_column: String,
+        y_column: String,
+    },
+    Scatter3dFromTable {
+        x_column: String,
+        y_column: String,
+        z_column: String,
+    },
     ImageWindow,
     LineSeriesWindow,
+}
+
+impl Default for HostViewKind {
+    fn default() -> Self {
+        Self::CompactTable
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TableSchema {
     pub columns: Vec<TableColumn>,
     pub coordinate_space_2d: Option<TableCoordinateSpace2d>,
+    pub coordinate_space_3d: Option<TableCoordinateSpace3d>,
+    pub row_id_column: Option<String>,
+    pub time_column: Option<String>,
+    pub layer_id: Option<String>,
+    pub semantic_label: Option<String>,
 }
 
 impl TableSchema {
@@ -81,7 +117,7 @@ impl TableSchema {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TableColumn {
     pub id: String,
     pub title: String,
@@ -96,6 +132,12 @@ pub enum TableValueType {
     F64,
     String,
     Bool,
+}
+
+impl Default for TableValueType {
+    fn default() -> Self {
+        Self::F64
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -144,6 +186,96 @@ impl<'de> Deserialize<'de> for TableCoordinateSpace2d {
             y_max: raw.y_max,
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TableCoordinateSpace3d {
+    pub x_column: String,
+    pub y_column: String,
+    pub z_column: String,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
+    pub z_min: f64,
+    pub z_max: f64,
+}
+
+impl<'de> Deserialize<'de> for TableCoordinateSpace3d {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawCoordinateSpace3d {
+            x_column: String,
+            y_column: String,
+            z_column: String,
+            x_min: f64,
+            x_max: f64,
+            y_min: f64,
+            y_max: f64,
+            z_min: f64,
+            z_max: f64,
+        }
+
+        let raw = RawCoordinateSpace3d::deserialize(deserializer)?;
+        if raw.x_min > raw.x_max {
+            return Err(D::Error::custom(
+                "x_min must be less than or equal to x_max",
+            ));
+        }
+        if raw.y_min > raw.y_max {
+            return Err(D::Error::custom(
+                "y_min must be less than or equal to y_max",
+            ));
+        }
+        if raw.z_min > raw.z_max {
+            return Err(D::Error::custom(
+                "z_min must be less than or equal to z_max",
+            ));
+        }
+
+        Ok(Self {
+            x_column: raw.x_column,
+            y_column: raw.y_column,
+            z_column: raw.z_column,
+            x_min: raw.x_min,
+            x_max: raw.x_max,
+            y_min: raw.y_min,
+            y_max: raw.y_max,
+            z_min: raw.z_min,
+            z_max: raw.z_max,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostMarkerShape {
+    Circle,
+    Square,
+    Diamond,
+    Cross,
+    Point,
+    Box,
+    Ellipse,
+    FilledCircle,
+}
+
+impl Default for HostMarkerShape {
+    fn default() -> Self {
+        Self::Circle
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HostDatasetDisplayMetadata {
+    pub layer_title: Option<String>,
+    pub default_visibility: Option<bool>,
+    pub default_color: Option<[u8; 4]>,
+    pub default_marker_shape: Option<HostMarkerShape>,
+    pub default_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]

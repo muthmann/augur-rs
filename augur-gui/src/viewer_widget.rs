@@ -1,5 +1,5 @@
 use augur_core::{
-    analysis::{AnalysisSeverity, AnalysisWarning, Overlay},
+    analysis::{AnalysisSeverity, AnalysisWarning, MarkerShape, Overlay},
     camera::DeviceInfo,
     config::{CameraConfig, RoiConfig},
     pipeline::{PipelineStatsSnapshot, PreviewFrame},
@@ -9,7 +9,9 @@ use egui_phosphor::regular as phosphor;
 use crate::{
     app::PANEL_ROUNDING,
     colormap::Colormap,
-    point_cloud::{PointCloudMetrics, PointCloudState},
+    inspection_3d::Investigation3dState,
+    investigation::{Investigation2dPoint, InvestigationState, StableRowKey},
+    point_cloud::PointCloudState,
     preview::{reset_preview_render_cache, PreviewDisplaySettings, PreviewMode},
     preview_renderer::PreviewDisplayTexture,
     viewer_tools::{
@@ -30,12 +32,6 @@ pub(crate) const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 pub(crate) const PREVIEW_ZOOM_MAX: f32 = 16.0;
 pub(crate) const DEFAULT_TIME_SURFACE_TAU_US: u64 = 30_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ViewMode {
-    Preview2d,
-    PointCloud3d,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreviewTool {
@@ -156,6 +152,8 @@ pub(crate) struct ViewerOutput {
     pub(crate) replay_step_frames: Option<i64>,
     pub(crate) replay_seek_to: Option<f32>,
     pub(crate) replay_set_speed: Option<f32>,
+    pub(crate) investigation_select_row: Option<StableRowKey>,
+    pub(crate) investigation_hover_row: Option<StableRowKey>,
 }
 
 impl ViewerOutput {
@@ -176,8 +174,19 @@ impl ViewerOutput {
             || self.replay_step_frames.is_some()
             || self.replay_seek_to.is_some()
             || self.replay_set_speed.is_some()
+            || self.investigation_select_row.is_some()
+            || self.investigation_hover_row.is_some()
             || self.new_roi.is_some()
             || self.needs_preview_refresh()
+    }
+
+    pub(crate) fn has_replay_actions(&self) -> bool {
+        self.replay_toggle_pause
+            || self.replay_restart
+            || self.replay_stop
+            || self.replay_step_frames.is_some()
+            || self.replay_seek_to.is_some()
+            || self.replay_set_speed.is_some()
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
@@ -204,12 +213,19 @@ impl ViewerOutput {
         if other.replay_set_speed.is_some() {
             self.replay_set_speed = other.replay_set_speed;
         }
+        if other.investigation_select_row.is_some() {
+            self.investigation_select_row = other.investigation_select_row;
+        }
+        if other.investigation_hover_row.is_some() {
+            self.investigation_hover_row = other.investigation_hover_row;
+        }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct ViewerState {
-    pub(crate) view_mode: ViewMode,
+    pub(crate) investigation: InvestigationState,
+    pub(crate) investigation_3d: Investigation3dState,
     pub(crate) workspace: PreviewWorkspaceState,
     pub(crate) preview_mode: PreviewMode,
     pub(crate) time_surface_tau_us: u64,
@@ -225,7 +241,8 @@ pub(crate) struct ViewerState {
 impl Default for ViewerState {
     fn default() -> Self {
         Self {
-            view_mode: ViewMode::Preview2d,
+            investigation: InvestigationState::default(),
+            investigation_3d: Investigation3dState::default(),
             workspace: PreviewWorkspaceState::default(),
             preview_mode: PreviewMode::default(),
             time_surface_tau_us: DEFAULT_TIME_SURFACE_TAU_US,
@@ -251,13 +268,6 @@ impl ViewerState {
     pub(crate) fn clear_session_state(&mut self) {
         self.workspace.clear_session_state();
         self.replay_seek_drag = None;
-    }
-
-    pub(crate) fn set_view_mode(&mut self, view_mode: ViewMode) {
-        self.view_mode = view_mode;
-        if view_mode != ViewMode::Preview2d {
-            self.workspace.clear_selection();
-        }
     }
 
     pub(crate) fn preview_display_settings(&self) -> PreviewDisplaySettings {
@@ -359,6 +369,8 @@ pub(crate) struct ViewerInput<'a> {
     pub(crate) camera_info: Option<&'a DeviceInfo>,
     pub(crate) nm_per_pixel: f64,
     pub(crate) config: &'a CameraConfig,
+    pub(crate) investigation_points_2d: &'a [Investigation2dPoint],
+    pub(crate) selected_row: Option<&'a StableRowKey>,
     pub(crate) mode: AppMode,
     pub(crate) settings_locked: bool,
     pub(crate) pipeline_stats: Option<&'a PipelineStatsSnapshot>,
@@ -374,7 +386,6 @@ pub(crate) struct ViewerInput<'a> {
     pub(crate) external_streaming: bool,
     pub(crate) external_streaming_label: &'a str,
     pub(crate) popup_active: bool,
-    pub(crate) popup_button_label: &'a str,
     pub(crate) popup_button_tooltip: &'a str,
     pub(crate) viewer_id: &'a str,
 }
@@ -386,13 +397,16 @@ pub(crate) fn draw_viewer(
     input: ViewerInput<'_>,
 ) -> ViewerOutput {
     let mut output = ViewerOutput::default();
-    let mut pc_metrics: Option<PointCloudMetrics> = None;
 
     if input.mode == AppMode::Replaying {
         handle_replay_shortcuts(ctx, input.replay, &mut output);
     }
 
-    ui.heading(preview_heading(input.mode, state.view_mode));
+    // Capture total available height before any dynamic content is laid out.
+    // This prevents the canvas from resizing when hover info or toolbar state changes.
+    let total_available_height = ui.available_size().y.min(ui.clip_rect().height());
+
+    ui.heading(preview_heading(input.mode));
     ui.separator();
 
     if let Some(info) = input.camera_info {
@@ -404,62 +418,42 @@ pub(crate) fn draw_viewer(
         ));
     }
 
-    let controls_reserve = 190.0;
+    let controls_reserve = 140.0;
+    // Fixed overhead: heading (~24px) + separator (~8px) + camera info (~20px) + toolbar (~28px)
+    let header_overhead = 80.0;
+    let max_image_height = (total_available_height - controls_reserve - header_overhead).max(180.0);
 
     if input.external_streaming {
         output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
-        let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
         draw_text_placeholder(ui, max_image_height, input.external_streaming_label);
         ui.add_space(8.0);
         if ui.button("Return to augur").clicked() {
             output.return_from_external = true;
         }
     } else {
-        match state.view_mode {
-            ViewMode::Preview2d => {
-                output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
-                let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
-                if let (Some(texture), Some(frame)) = (input.texture, input.frame) {
-                    let scale_bar_settings = state.scale_bar_settings.clone();
-                    output.merge(draw_preview_canvas(
-                        ui,
-                        texture,
-                        frame,
-                        input.overlays,
-                        input.config,
-                        state,
-                        PreviewCanvasOptions {
-                            scale_bar_settings,
-                            nm_per_pixel: input.nm_per_pixel,
-                            settings_locked: input.settings_locked,
-                            max_height: max_image_height,
-                        },
-                    ));
-                } else {
-                    state.workspace.hover_sensor = None;
-                    draw_empty_preview_placeholder(
-                        ui,
-                        max_image_height,
-                        input.mode,
-                        state.view_mode,
-                    );
-                }
-            }
-            ViewMode::PointCloud3d => {
-                output.popup_toggled |= draw_point_cloud_toolbar(ui, state, &input);
-                let max_image_height = (ui.available_size().y - controls_reserve).max(180.0);
-                pc_metrics = Some(state.workspace.point_cloud.draw(
-                    ui,
-                    input.config.roi,
-                    max_image_height,
-                ));
-            }
+        output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
+        if let (Some(texture), Some(frame)) = (input.texture, input.frame) {
+            let scale_bar_settings = state.scale_bar_settings.clone();
+            output.merge(draw_preview_canvas(
+                ui,
+                texture,
+                frame,
+                input.overlays,
+                input.config,
+                state,
+                PreviewCanvasOptions {
+                    scale_bar_settings,
+                    nm_per_pixel: input.nm_per_pixel,
+                    settings_locked: input.settings_locked,
+                    investigation_points: input.investigation_points_2d,
+                    selected_row: input.selected_row,
+                    max_height: max_image_height,
+                },
+            ));
+        } else {
+            state.workspace.hover_sensor = None;
+            draw_empty_preview_placeholder(ui, max_image_height, input.mode);
         }
-    }
-
-    if input.mode == AppMode::Replaying {
-        ui.add_space(4.0);
-        draw_replay_transport(ui, state, input.replay, input.viewer_id, &mut output);
     }
 
     egui::ScrollArea::vertical()
@@ -467,7 +461,7 @@ pub(crate) fn draw_viewer(
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.separator();
-            draw_viewer_controls(ctx, ui, state, &input, pc_metrics, &mut output);
+            draw_viewer_controls(ctx, ui, state, &input, &mut output);
         });
 
     output
@@ -476,7 +470,10 @@ pub(crate) fn draw_viewer(
 pub(crate) fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, message: &str) {
     let placeholder_height = max_image_height;
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), placeholder_height),
+        egui::vec2(
+            ui.available_width().min(ui.clip_rect().width()).max(1.0),
+            placeholder_height,
+        ),
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
@@ -500,163 +497,148 @@ fn draw_viewer_controls(
     ui: &mut egui::Ui,
     state: &mut ViewerState,
     input: &ViewerInput<'_>,
-    pc_metrics: Option<PointCloudMetrics>,
     output: &mut ViewerOutput,
 ) {
-    match state.view_mode {
-        ViewMode::Preview2d => {
-            ui.horizontal(|ui| {
-                let previous_preview_mode = state.preview_mode;
-                ui.label("Mode");
-                egui::ComboBox::from_id_source((input.viewer_id, "preview_mode"))
-                    .selected_text(match state.preview_mode {
-                        PreviewMode::Intensity(colormap) => {
-                            format!("Intensity / {}", colormap.label())
-                        }
-                        mode => mode.label().to_owned(),
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut state.preview_mode,
-                            PreviewMode::RedBlue,
-                            PreviewMode::RedBlue.label(),
-                        );
-                        ui.selectable_value(
-                            &mut state.preview_mode,
-                            PreviewMode::SignedCount,
-                            PreviewMode::SignedCount.label(),
-                        );
-                        ui.selectable_value(
-                            &mut state.preview_mode,
-                            PreviewMode::TimeSurface,
-                            PreviewMode::TimeSurface.label(),
-                        );
-                        ui.separator();
-                        for colormap in Colormap::ALL {
-                            ui.selectable_value(
-                                &mut state.preview_mode,
-                                PreviewMode::Intensity(colormap),
-                                format!("Intensity / {}", colormap.label()),
-                            );
-                        }
-                    });
-                output.preview_mode_changed |= state.preview_mode != previous_preview_mode;
-                if output.preview_mode_changed {
-                    reset_preview_render_cache();
-                }
-
-                ui.checkbox(&mut state.scale_bar_settings.show, "Scale bar");
-                if state.scale_bar_settings.show {
-                    egui::ComboBox::from_id_source((input.viewer_id, "scale_bar_position"))
-                        .selected_text(match state.scale_bar_settings.position {
-                            ScaleBarPosition::TopLeft => "Top left",
-                            ScaleBarPosition::TopRight => "Top right",
-                            ScaleBarPosition::BottomLeft => "Bottom left",
-                            ScaleBarPosition::BottomRight => "Bottom right",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut state.scale_bar_settings.position,
-                                ScaleBarPosition::TopLeft,
-                                "Top left",
-                            );
-                            ui.selectable_value(
-                                &mut state.scale_bar_settings.position,
-                                ScaleBarPosition::TopRight,
-                                "Top right",
-                            );
-                            ui.selectable_value(
-                                &mut state.scale_bar_settings.position,
-                                ScaleBarPosition::BottomLeft,
-                                "Bottom left",
-                            );
-                            ui.selectable_value(
-                                &mut state.scale_bar_settings.position,
-                                ScaleBarPosition::BottomRight,
-                                "Bottom right",
-                            );
-                        });
+    ui.horizontal(|ui| {
+        let previous_preview_mode = state.preview_mode;
+        ui.label("Mode");
+        egui::ComboBox::from_id_source((input.viewer_id, "preview_mode"))
+            .selected_text(match state.preview_mode {
+                PreviewMode::Intensity(colormap) => format!("Intensity / {}", colormap.label()),
+                mode => mode.label().to_owned(),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.preview_mode,
+                    PreviewMode::RedBlue,
+                    PreviewMode::RedBlue.label(),
+                );
+                ui.selectable_value(
+                    &mut state.preview_mode,
+                    PreviewMode::SignedCount,
+                    PreviewMode::SignedCount.label(),
+                );
+                ui.selectable_value(
+                    &mut state.preview_mode,
+                    PreviewMode::TimeSurface,
+                    PreviewMode::TimeSurface.label(),
+                );
+                ui.separator();
+                for colormap in Colormap::ALL {
+                    ui.selectable_value(
+                        &mut state.preview_mode,
+                        PreviewMode::Intensity(colormap),
+                        format!("Intensity / {}", colormap.label()),
+                    );
                 }
             });
+        output.preview_mode_changed |= state.preview_mode != previous_preview_mode;
+        if output.preview_mode_changed {
+            reset_preview_render_cache();
+        }
 
-            if matches!(state.preview_mode, PreviewMode::TimeSurface) {
-                ui.horizontal(|ui| {
-                    let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
-                    let response = ui.add(
-                        egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
-                            .text("Decay τ [ms]")
-                            .logarithmic(true),
+        ui.checkbox(&mut state.scale_bar_settings.show, "Scale bar");
+        if state.scale_bar_settings.show {
+            egui::ComboBox::from_id_source((input.viewer_id, "scale_bar_position"))
+                .selected_text(match state.scale_bar_settings.position {
+                    ScaleBarPosition::TopLeft => "Top left",
+                    ScaleBarPosition::TopRight => "Top right",
+                    ScaleBarPosition::BottomLeft => "Bottom left",
+                    ScaleBarPosition::BottomRight => "Bottom right",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.scale_bar_settings.position,
+                        ScaleBarPosition::TopLeft,
+                        "Top left",
                     );
-                    if response.changed() {
-                        state.time_surface_tau_us = (tau_ms * 1_000.0).round().max(1.0) as u64;
-                        output.time_surface_tau_changed = true;
-                    }
+                    ui.selectable_value(
+                        &mut state.scale_bar_settings.position,
+                        ScaleBarPosition::TopRight,
+                        "Top right",
+                    );
+                    ui.selectable_value(
+                        &mut state.scale_bar_settings.position,
+                        ScaleBarPosition::BottomLeft,
+                        "Bottom left",
+                    );
+                    ui.selectable_value(
+                        &mut state.scale_bar_settings.position,
+                        ScaleBarPosition::BottomRight,
+                        "Bottom right",
+                    );
                 });
-                if input.frame.is_some_and(|frame| frame.events.is_none()) {
-                    ui.small(
-                        "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
-                    );
-                }
-            }
+        }
+    });
 
-            if !state.annotation_manager.annotations().is_empty() {
-                egui::CollapsingHeader::new("Annotations")
-                    .id_source((input.viewer_id, "annotations"))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        let mut clicked_annotation = None;
-                        for (index, annotation) in
-                            state.annotation_manager.annotations().iter().enumerate()
-                        {
-                            let selected =
-                                state.annotation_manager.selected_id() == Some(annotation.id);
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("\u{25A0}").color(annotation.color));
-                                let response =
-                                    ui.selectable_label(selected, format!("ROI {}", index + 1));
-                                if response.clicked() {
-                                    clicked_annotation = Some(annotation.id);
-                                }
-                            });
-                        }
-                        if let Some(annotation_id) = clicked_annotation {
-                            state.annotation_manager.select(annotation_id);
-                            activate_pointer_tool(state);
-                        }
-                        if ui
-                            .add_enabled(
-                                state.annotation_manager.selected_id().is_some(),
-                                egui::Button::new("Delete selected"),
-                            )
-                            .clicked()
-                        {
-                            delete_selected_annotation(state);
+    if matches!(state.preview_mode, PreviewMode::TimeSurface) {
+        ui.horizontal(|ui| {
+            let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
+            let response = ui.add(
+                egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
+                    .text("Decay τ [ms]")
+                    .logarithmic(true),
+            );
+            if response.changed() {
+                state.time_surface_tau_us = (tau_ms * 1_000.0).round().max(1.0) as u64;
+                output.time_surface_tau_changed = true;
+            }
+        });
+        if input.frame.is_some_and(|frame| frame.events.is_none()) {
+            ui.small(
+                "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
+            );
+        }
+    }
+
+    if !state.annotation_manager.annotations().is_empty() {
+        egui::CollapsingHeader::new("Annotations")
+            .id_source((input.viewer_id, "annotations"))
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut clicked_annotation = None;
+                for (index, annotation) in state.annotation_manager.annotations().iter().enumerate()
+                {
+                    let selected = state.annotation_manager.selected_id() == Some(annotation.id);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("\u{25A0}").color(annotation.color));
+                        let response = ui.selectable_label(selected, format!("ROI {}", index + 1));
+                        if response.clicked() {
+                            clicked_annotation = Some(annotation.id);
                         }
                     });
-            }
+                }
+                if let Some(annotation_id) = clicked_annotation {
+                    state.annotation_manager.select(annotation_id);
+                    activate_pointer_tool(state);
+                }
+                if ui
+                    .add_enabled(
+                        state.annotation_manager.selected_id().is_some(),
+                        egui::Button::new("Delete selected"),
+                    )
+                    .clicked()
+                {
+                    delete_selected_annotation(state);
+                }
+            });
+    }
 
-            if let Some(stats) = input
-                .frame
-                .and_then(|frame| state.annotation_manager.statistics_for_selected(frame))
-            {
-                ui.small(format!(
-                    "{} | {} px | ON {:.2}±{:.2} | OFF {:.2}±{:.2} | Total {:.2}±{:.2}",
-                    stats.label,
-                    stats.pixel_count,
-                    stats.on.mean,
-                    stats.on.stddev,
-                    stats.off.mean,
-                    stats.off.stddev,
-                    stats.combined.mean,
-                    stats.combined.stddev,
-                ));
-            }
-        }
-        ViewMode::PointCloud3d => {
-            if let Some(metrics) = pc_metrics {
-                draw_point_cloud_metrics(ui, metrics);
-            }
-        }
+    if let Some(stats) = input
+        .frame
+        .and_then(|frame| state.annotation_manager.statistics_for_selected(frame))
+    {
+        ui.small(format!(
+            "{} | {} px | ON {:.2}±{:.2} | OFF {:.2}±{:.2} | Total {:.2}±{:.2}",
+            stats.label,
+            stats.pixel_count,
+            stats.on.mean,
+            stats.on.stddev,
+            stats.off.mean,
+            stats.off.stddev,
+            stats.combined.mean,
+            stats.combined.stddev,
+        ));
     }
 
     if let Some(stats) = input.pipeline_stats {
@@ -763,193 +745,200 @@ fn draw_preview_toolbar(
     let histogram_open = &mut state.histogram_window.open;
 
     let mut output = ViewerOutput::default();
-    ui.horizontal(|ui| {
-        if ui
-            .add(egui::SelectableLabel::new(
-                workspace.tool == PreviewTool::None,
-                toolbar_icon(phosphor::CURSOR),
-            ))
-            .on_hover_text("Pointer")
-            .clicked()
-        {
-            workspace.clear_selection();
-            line_profile_tool.clear();
-            ruler_tool.clear();
-            state.annotation_manager.cancel_drawing();
-        }
-
-        let mut select_roi_button = ui.add_enabled(
-            !input.settings_locked,
-            egui::SelectableLabel::new(
-                workspace.tool == PreviewTool::SelectRoi,
-                toolbar_icon(phosphor::SELECTION),
-            ),
-        );
-        if input.settings_locked {
-            select_roi_button = select_roi_button.on_hover_text(
-                "Hardware ROI editing is disabled during replay. Use the rectangle annotation tool instead.",
-            );
-        } else {
-            select_roi_button = select_roi_button.on_hover_text("Select hardware ROI");
-        }
-        if select_roi_button.clicked() {
-            if workspace.tool == PreviewTool::SelectRoi {
-                workspace.clear_selection();
-            } else {
-                workspace.tool = PreviewTool::SelectRoi;
-                workspace.selection_anchor = None;
-                workspace.pending_roi = None;
-                workspace.annotation_drag = None;
-            }
-        }
-
-        if preview_tool_button(
-            ui,
-            workspace,
-            PreviewTool::LineProfile,
-            phosphor::LINE_SEGMENT,
-            "Line profile",
-        ) {
-            line_profile_tool.clear();
-        }
-        if preview_tool_button(
-            ui,
-            workspace,
-            PreviewTool::Ruler,
-            phosphor::RULER,
-            "Measure distance",
-        ) {
-            ruler_tool.clear();
-        }
-        preview_tool_button(
-            ui,
-            workspace,
-            PreviewTool::AnnotateRect,
-            phosphor::RECTANGLE,
-            "Rectangle annotation",
-        );
-        preview_tool_button(
-            ui,
-            workspace,
-            PreviewTool::AnnotateEllipse,
-            phosphor::CIRCLE,
-            "Ellipse annotation",
-        );
-
-        ui.separator();
-        if ui
-            .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_MINUS))
-            .on_hover_text("Zoom out")
-            .clicked()
-        {
-            workspace.zoom = (workspace.zoom / 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
-            if (workspace.zoom - PREVIEW_ZOOM_MIN).abs() < f32::EPSILON {
-                workspace.pan = egui::Vec2::ZERO;
-            }
-        }
-        if ui
-            .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_PLUS))
-            .on_hover_text("Zoom in")
-            .clicked()
-        {
-            workspace.zoom = (workspace.zoom * 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
-        }
-        if ui
-            .small_button(toolbar_icon(phosphor::FRAME_CORNERS))
-            .on_hover_text("Fit to window")
-            .clicked()
-        {
-            workspace.reset_zoom();
-        }
-
-        if ui
-            .add(egui::SelectableLabel::new(
-                workspace.crop_active(),
-                toolbar_icon(phosphor::CROP),
-            ))
-            .on_hover_text("Crop to ROI")
-            .clicked()
-        {
-            workspace.toggle_crop_target(selected_annotation);
-        }
-
-        ui.separator();
-        if ui
-            .add(egui::SelectableLabel::new(
-                *histogram_open,
-                toolbar_icon(phosphor::CHART_BAR),
-            ))
-            .on_hover_text("Histogram & Brightness/Contrast")
-            .clicked()
-        {
-            *histogram_open = !*histogram_open;
-            output.histogram_visibility_changed = true;
-        }
-
-        if ui
-            .add(egui::SelectableLabel::new(
-                popup_active,
-                toolbar_icon(phosphor::ARROW_SQUARE_OUT),
-            ))
-            .on_hover_text(input.popup_button_tooltip)
-            .clicked()
-        {
-            output.popup_toggled = true;
-        }
-
-        ui.separator();
-        if let (Some((x, y)), Some(frame)) = (workspace.hover_sensor, input.frame) {
-            let width = usize::from(frame.width.max(1));
-            let idx = usize::from(y) * width + usize::from(x);
-            if idx < frame.pixels.len() {
-                let full = match state.preview_mode {
-                    PreviewMode::TimeSurface => {
-                        let value = input
-                            .time_surface_hover_value
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "n/a".to_owned());
-                        format!("x {x}, y {y} | Value: {value} Total: {}", frame.pixels[idx])
-                    }
-                    _ => format!(
-                        "x {x}, y {y} | ON: {} OFF: {} Total: {}",
-                        frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
-                    ),
-                };
-                let short = format!("x {x}, y {y}");
-                let avail = ui.available_width();
-                let full_w = ui.fonts(|f| {
-                    f.layout_no_wrap(
-                        full.clone(),
-                        egui::FontId::monospace(
-                            ui.style().text_styles[&egui::TextStyle::Monospace].size,
-                        ),
-                        egui::Color32::WHITE,
-                    )
-                    .size()
-                    .x
-                });
-                if full_w <= avail {
-                    ui.monospace(&full);
-                } else {
-                    ui.monospace(format!("{short}\u{2026}"))
-                        .on_hover_text(full);
+    let toolbar_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 8.0;
+    egui::ScrollArea::horizontal()
+        .id_source((input.viewer_id, "preview_toolbar_scroll"))
+        .auto_shrink([false, false])
+        .max_height(toolbar_height)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        workspace.tool == PreviewTool::None,
+                        toolbar_icon(phosphor::CURSOR),
+                    ))
+                    .on_hover_text("Pointer")
+                    .clicked()
+                {
+                    workspace.clear_selection();
+                    line_profile_tool.clear();
+                    ruler_tool.clear();
+                    state.annotation_manager.cancel_drawing();
                 }
-            } else {
-                ui.weak("Hover preview for pixel values");
-            }
-        } else {
-            ui.weak("Hover preview for pixel values");
-        }
-        if workspace.tool == PreviewTool::Ruler {
-            if let Some(measurement) = ruler_tool.measurement(input.nm_per_pixel) {
+
+                let mut select_roi_button = ui.add_enabled(
+                    !input.settings_locked,
+                    egui::SelectableLabel::new(
+                        workspace.tool == PreviewTool::SelectRoi,
+                        toolbar_icon(phosphor::SELECTION),
+                    ),
+                );
+                if input.settings_locked {
+                    select_roi_button = select_roi_button.on_hover_text(
+                        "Hardware ROI editing is disabled during replay. Use the rectangle annotation tool instead.",
+                    );
+                } else {
+                    select_roi_button = select_roi_button.on_hover_text("Select hardware ROI");
+                }
+                if select_roi_button.clicked() {
+                    if workspace.tool == PreviewTool::SelectRoi {
+                        workspace.clear_selection();
+                    } else {
+                        workspace.tool = PreviewTool::SelectRoi;
+                        workspace.selection_anchor = None;
+                        workspace.pending_roi = None;
+                        workspace.annotation_drag = None;
+                    }
+                }
+
+                if preview_tool_button(
+                    ui,
+                    workspace,
+                    PreviewTool::LineProfile,
+                    phosphor::LINE_SEGMENT,
+                    "Line profile",
+                ) {
+                    line_profile_tool.clear();
+                }
+                if preview_tool_button(
+                    ui,
+                    workspace,
+                    PreviewTool::Ruler,
+                    phosphor::RULER,
+                    "Measure distance",
+                ) {
+                    ruler_tool.clear();
+                }
+                preview_tool_button(
+                    ui,
+                    workspace,
+                    PreviewTool::AnnotateRect,
+                    phosphor::RECTANGLE,
+                    "Rectangle annotation",
+                );
+                preview_tool_button(
+                    ui,
+                    workspace,
+                    PreviewTool::AnnotateEllipse,
+                    phosphor::CIRCLE,
+                    "Ellipse annotation",
+                );
+
                 ui.separator();
-                ui.small(format!(
-                    "{:.1} px | {:.2} µm",
-                    measurement.pixel_distance, measurement.micrometers
-                ));
-            }
-        }
-    });
+                if ui
+                    .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_MINUS))
+                    .on_hover_text("Zoom out")
+                    .clicked()
+                {
+                    workspace.zoom = (workspace.zoom / 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+                    if (workspace.zoom - PREVIEW_ZOOM_MIN).abs() < f32::EPSILON {
+                        workspace.pan = egui::Vec2::ZERO;
+                    }
+                }
+                if ui
+                    .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_PLUS))
+                    .on_hover_text("Zoom in")
+                    .clicked()
+                {
+                    workspace.zoom = (workspace.zoom * 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
+                }
+                if ui
+                    .small_button(toolbar_icon(phosphor::FRAME_CORNERS))
+                    .on_hover_text("Fit to window")
+                    .clicked()
+                {
+                    workspace.reset_zoom();
+                }
+
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        workspace.crop_active(),
+                        toolbar_icon(phosphor::CROP),
+                    ))
+                    .on_hover_text("Crop to ROI")
+                    .clicked()
+                {
+                    workspace.toggle_crop_target(selected_annotation);
+                }
+
+                ui.separator();
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        *histogram_open,
+                        toolbar_icon(phosphor::CHART_BAR),
+                    ))
+                    .on_hover_text("Histogram & Brightness/Contrast")
+                    .clicked()
+                {
+                    *histogram_open = !*histogram_open;
+                    output.histogram_visibility_changed = true;
+                }
+
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        popup_active,
+                        toolbar_icon(phosphor::ARROW_SQUARE_OUT),
+                    ))
+                    .on_hover_text(input.popup_button_tooltip)
+                    .clicked()
+                {
+                    output.popup_toggled = true;
+                }
+
+                ui.separator();
+                if let (Some((x, y)), Some(frame)) = (workspace.hover_sensor, input.frame) {
+                    let width = usize::from(frame.width.max(1));
+                    let idx = usize::from(y) * width + usize::from(x);
+                    if idx < frame.pixels.len() {
+                        let full = match state.preview_mode {
+                            PreviewMode::TimeSurface => {
+                                let value = input
+                                    .time_surface_hover_value
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "n/a".to_owned());
+                                format!("x {x}, y {y} | Value: {value} Total: {}", frame.pixels[idx])
+                            }
+                            _ => format!(
+                                "x {x}, y {y} | ON: {} OFF: {} Total: {}",
+                                frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
+                            ),
+                        };
+                        let short = format!("x {x}, y {y}");
+                        let avail = ui.available_width();
+                        let full_w = ui.fonts(|f| {
+                            f.layout_no_wrap(
+                                full.clone(),
+                                egui::FontId::monospace(
+                                    ui.style().text_styles[&egui::TextStyle::Monospace].size,
+                                ),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x
+                        });
+                        if full_w <= avail {
+                            ui.monospace(&full);
+                        } else {
+                            ui.monospace(format!("{short}\u{2026}"))
+                                .on_hover_text(full);
+                        }
+                    } else {
+                        ui.weak("Hover preview for pixel values");
+                    }
+                } else {
+                    ui.weak("Hover preview for pixel values");
+                }
+                if workspace.tool == PreviewTool::Ruler {
+                    if let Some(measurement) = ruler_tool.measurement(input.nm_per_pixel) {
+                        ui.separator();
+                        ui.small(format!(
+                            "{:.1} px | {:.2} µm",
+                            measurement.pixel_distance, measurement.micrometers
+                        ));
+                    }
+                }
+            });
+        });
 
     output
 }
@@ -1004,70 +993,8 @@ fn toolbar_icon(symbol: &str) -> egui::RichText {
     egui::RichText::new(symbol).size(18.0)
 }
 
-fn draw_point_cloud_toolbar(
-    ui: &mut egui::Ui,
-    state: &mut ViewerState,
-    input: &ViewerInput<'_>,
-) -> bool {
-    state.workspace.point_cloud.sanitize_controls();
-
-    egui::Grid::new(egui::Id::new(input.viewer_id).with("pc_controls_grid"))
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            ui.label("Time range [ms]")
-                .on_hover_text("How far back in time to show events");
-            ui.add(
-                egui::DragValue::new(&mut state.workspace.point_cloud.time_window_ms)
-                    .speed(5.0)
-                    .clamp_range(5.0..=2_000.0),
-            );
-            ui.end_row();
-
-            ui.label("Max render")
-                .on_hover_text("Limits rendered points for smoother interaction");
-            ui.add(
-                egui::DragValue::new(&mut state.workspace.point_cloud.point_limit)
-                    .speed(250.0)
-                    .clamp_range(1_000..=100_000),
-            );
-            ui.end_row();
-        });
-
-    let mut popup_toggled = false;
-    ui.horizontal(|ui| {
-        if ui.button("Reset Camera").clicked() {
-            state.workspace.point_cloud.reset_camera();
-        }
-        if ui.button(input.popup_button_label).clicked() {
-            popup_toggled = true;
-        }
-        ui.small("Drag to orbit. Scroll to zoom.");
-    });
-
-    popup_toggled
-}
-
-fn draw_point_cloud_metrics(ui: &mut egui::Ui, metrics: PointCloudMetrics) {
-    if metrics.visible_points == 0 {
-        ui.label("No events in view");
-    } else if metrics.rendered_points < metrics.visible_points {
-        ui.label(format!(
-            "Showing {} of {} events (downsampled)",
-            metrics.rendered_points, metrics.visible_points
-        ));
-    } else {
-        ui.label(format!("Showing {} events", metrics.rendered_points));
-    }
-}
-
-fn draw_empty_preview_placeholder(
-    ui: &mut egui::Ui,
-    max_image_height: f32,
-    mode: AppMode,
-    view_mode: ViewMode,
-) {
-    draw_text_placeholder(ui, max_image_height, empty_preview_message(mode, view_mode));
+fn draw_empty_preview_placeholder(ui: &mut egui::Ui, max_image_height: f32, mode: AppMode) {
+    draw_text_placeholder(ui, max_image_height, empty_preview_message(mode));
 }
 
 #[derive(Default)]
@@ -1076,10 +1003,18 @@ struct PreviewCanvasResult {
     new_roi: Option<RoiConfig>,
 }
 
-struct PreviewCanvasOptions {
+#[derive(Debug, Clone)]
+struct OverlayPickCandidate {
+    sensor_position: egui::Pos2,
+    item_key: Option<StableRowKey>,
+}
+
+struct PreviewCanvasOptions<'a> {
     scale_bar_settings: ScaleBarSettings,
     nm_per_pixel: f64,
     settings_locked: bool,
+    investigation_points: &'a [Investigation2dPoint],
+    selected_row: Option<&'a StableRowKey>,
     max_height: f32,
 }
 
@@ -1090,7 +1025,7 @@ fn draw_preview_canvas(
     overlays: &[Overlay],
     config: &CameraConfig,
     state: &mut ViewerState,
-    options: PreviewCanvasOptions,
+    options: PreviewCanvasOptions<'_>,
 ) -> ViewerOutput {
     let workspace = &mut state.workspace;
     let line_profile_tool = &mut state.line_profile_tool;
@@ -1100,11 +1035,18 @@ fn draw_preview_canvas(
         scale_bar_settings,
         nm_per_pixel,
         settings_locked,
+        investigation_points,
+        selected_row,
         max_height,
     } = options;
 
     let viewport = build_preview_viewport(frame, config, annotation_manager, workspace);
-    let canvas_size = egui::vec2(ui.available_width().max(1.0), max_height.max(1.0));
+    let canvas_size = egui::vec2(
+        ui.available_width().min(ui.clip_rect().width()).max(1.0),
+        max_height
+            .min(ui.available_height().min(ui.clip_rect().height()).max(1.0))
+            .max(1.0),
+    );
     let (canvas_rect, response) =
         ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
     let display_size = viewport.display_size(canvas_rect.size());
@@ -1119,6 +1061,18 @@ fn draw_preview_canvas(
     let pointer_sensor = response
         .interact_pointer_pos()
         .and_then(|pos| viewport.screen_to_sensor(image_rect, pos));
+    let hovered_overlay = workspace
+        .hover_sensor
+        .and_then(|sensor| pick_overlay_candidate(overlays, sensor));
+    let hovered_overlay_row = hovered_overlay
+        .as_ref()
+        .and_then(|candidate| overlay_candidate_row(candidate, investigation_points));
+    let hovered_investigation = workspace
+        .hover_sensor
+        .and_then(|sensor| pick_investigation_point(investigation_points, sensor));
+    let hovered_row = hovered_overlay_row
+        .clone()
+        .or_else(|| hovered_investigation.map(|point| point.item_key.clone()));
 
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         match workspace.tool {
@@ -1287,6 +1241,32 @@ fn draw_preview_canvas(
             if let Some(pointer_pos) = pointer_sensor {
                 if !annotation_manager.select_at(pointer_pos) {
                     annotation_manager.clear_selection();
+                    if let Some(point) = pick_investigation_point(investigation_points, pointer_pos)
+                    {
+                        let output = ViewerOutput {
+                            roi_committed: result.roi_committed,
+                            new_roi: result.new_roi,
+                            investigation_select_row: Some(point.item_key.clone()),
+                            investigation_hover_row: hovered_investigation
+                                .map(|point| point.item_key.clone()),
+                            ..Default::default()
+                        };
+                        return output;
+                    }
+                    if let Some(candidate) = pick_overlay_candidate(overlays, pointer_pos) {
+                        if let Some(item_key) =
+                            overlay_candidate_row(&candidate, investigation_points)
+                        {
+                            let output = ViewerOutput {
+                                roi_committed: result.roi_committed,
+                                new_roi: result.new_roi,
+                                investigation_select_row: Some(item_key),
+                                investigation_hover_row: hovered_row,
+                                ..Default::default()
+                            };
+                            return output;
+                        }
+                    }
                 }
             } else {
                 annotation_manager.clear_selection();
@@ -1298,6 +1278,14 @@ fn draw_preview_canvas(
         .painter()
         .with_clip_rect(image_rect.intersect(ui.clip_rect()));
     paint_analysis_overlays(&painter, image_rect, viewport, overlays);
+    paint_investigation_points(
+        &painter,
+        image_rect,
+        viewport,
+        investigation_points,
+        selected_row,
+        hovered_row.as_ref(),
+    );
     if let Some(current_roi) = viewport.roi_rect {
         if !workspace.crop_active() {
             paint_sensor_rect(
@@ -1383,7 +1371,254 @@ fn draw_preview_canvas(
     ViewerOutput {
         roi_committed: result.roi_committed,
         new_roi: result.new_roi,
+        investigation_hover_row: hovered_row,
         ..Default::default()
+    }
+}
+
+fn pick_overlay_candidate(
+    overlays: &[Overlay],
+    sensor: (u16, u16),
+) -> Option<OverlayPickCandidate> {
+    let sensor = egui::pos2(f32::from(sensor.0), f32::from(sensor.1));
+    let mut best: Option<(OverlayPickCandidate, f32)> = None;
+
+    let mut consider = |sensor_position: egui::Pos2, max_distance: f32, item_key| {
+        let distance = sensor_position.distance(sensor);
+        if distance > max_distance {
+            return;
+        }
+        match best {
+            Some((_, best_distance)) if distance >= best_distance => {}
+            _ => {
+                best = Some((
+                    OverlayPickCandidate {
+                        sensor_position,
+                        item_key,
+                    },
+                    distance,
+                ));
+            }
+        }
+    };
+
+    for overlay in overlays {
+        match overlay {
+            Overlay::HighlightPixels { pixels, .. } => {
+                for pixel in pixels {
+                    consider(
+                        egui::pos2(f32::from(pixel.x) + 0.5, f32::from(pixel.y) + 0.5),
+                        1.1,
+                        None,
+                    );
+                }
+            }
+            Overlay::CrosshairMarkers {
+                markers, arm_len, ..
+            } => {
+                let max_distance = f32::from((*arm_len).max(6)) + 2.0;
+                for marker in markers {
+                    consider(egui::pos2(marker.x, marker.y), max_distance, None);
+                }
+            }
+            Overlay::MarkerOverlay {
+                markers,
+                dataset_id,
+                ..
+            } => {
+                for marker in markers {
+                    let item_key = marker.stable_id.as_ref().and_then(|stable_id| {
+                        dataset_id.as_ref().map(|dataset_id| {
+                            StableRowKey::new(dataset_id.clone(), stable_id.clone())
+                        })
+                    });
+                    consider(
+                        egui::pos2(marker.x, marker.y),
+                        marker.size.max(5.0),
+                        item_key,
+                    );
+                }
+            }
+        }
+    }
+
+    best.map(|(candidate, _)| candidate)
+}
+
+fn overlay_candidate_row(
+    candidate: &OverlayPickCandidate,
+    investigation_points: &[Investigation2dPoint],
+) -> Option<StableRowKey> {
+    candidate.item_key.clone().or_else(|| {
+        pick_investigation_point(
+            investigation_points,
+            (
+                candidate.sensor_position.x.round() as u16,
+                candidate.sensor_position.y.round() as u16,
+            ),
+        )
+        .map(|point| point.item_key.clone())
+    })
+}
+
+fn pick_investigation_point(
+    points: &[Investigation2dPoint],
+    sensor: (u16, u16),
+) -> Option<&Investigation2dPoint> {
+    let sensor = egui::pos2(f32::from(sensor.0), f32::from(sensor.1));
+    let mut best: Option<(&Investigation2dPoint, f32)> = None;
+    for point in points {
+        let point_pos = egui::pos2(point.position[0] as f32, point.position[1] as f32);
+        let distance = point_pos.distance(sensor);
+        if distance > 8.0 {
+            continue;
+        }
+        match best {
+            Some((_, best_distance)) if distance >= best_distance => {}
+            _ => best = Some((point, distance)),
+        }
+    }
+    best.map(|(point, _)| point)
+}
+
+fn paint_investigation_points(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    viewport: PreviewViewport,
+    points: &[Investigation2dPoint],
+    selected_row: Option<&StableRowKey>,
+    hovered_row: Option<&StableRowKey>,
+) {
+    for point in points {
+        let screen = viewport.sensor_to_screen(
+            image_rect,
+            egui::pos2(point.position[0] as f32, point.position[1] as f32),
+        );
+        let is_selected = selected_row == Some(&point.item_key);
+        let is_hovered = hovered_row == Some(&point.item_key);
+        let radius = (point.size.max(2.0)
+            + if is_selected {
+                2.0
+            } else if is_hovered {
+                1.2
+            } else {
+                0.0
+            })
+        .max(2.0);
+        let color = egui::Color32::from_rgba_unmultiplied(
+            point.color[0],
+            point.color[1],
+            point.color[2],
+            point.color[3],
+        );
+        paint_marker_shape(
+            painter,
+            screen,
+            marker_shape_from_host(point.marker_shape),
+            radius,
+            color,
+            Some(egui::Stroke::new(
+                if is_selected { 2.0 } else { 1.0 },
+                if is_selected {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_black_alpha(160)
+                },
+            )),
+        );
+    }
+}
+
+fn marker_shape_from_host(shape: augur_plugin_api::HostMarkerShape) -> MarkerShape {
+    match shape {
+        augur_plugin_api::HostMarkerShape::Circle
+        | augur_plugin_api::HostMarkerShape::FilledCircle => MarkerShape::FilledCircle,
+        augur_plugin_api::HostMarkerShape::Square | augur_plugin_api::HostMarkerShape::Box => {
+            MarkerShape::Box
+        }
+        augur_plugin_api::HostMarkerShape::Diamond => MarkerShape::Diamond,
+        augur_plugin_api::HostMarkerShape::Cross => MarkerShape::Cross,
+        augur_plugin_api::HostMarkerShape::Point => MarkerShape::Point,
+        augur_plugin_api::HostMarkerShape::Ellipse => MarkerShape::Ellipse,
+    }
+}
+
+fn paint_marker_shape(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    shape: MarkerShape,
+    size: f32,
+    fill: egui::Color32,
+    stroke: Option<egui::Stroke>,
+) {
+    let stroke =
+        stroke.unwrap_or_else(|| egui::Stroke::new(1.0, egui::Color32::from_black_alpha(160)));
+    match shape {
+        MarkerShape::Point => {
+            painter.circle_filled(center, size.max(1.5), fill);
+        }
+        MarkerShape::Cross => {
+            let arm = size.max(3.0);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - arm, center.y),
+                    egui::pos2(center.x + arm, center.y),
+                ],
+                egui::Stroke::new(stroke.width + 1.0, egui::Color32::from_black_alpha(120)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - arm),
+                    egui::pos2(center.x, center.y + arm),
+                ],
+                egui::Stroke::new(stroke.width + 1.0, egui::Color32::from_black_alpha(120)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - arm, center.y),
+                    egui::pos2(center.x + arm, center.y),
+                ],
+                egui::Stroke::new(stroke.width.max(1.5), fill),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - arm),
+                    egui::pos2(center.x, center.y + arm),
+                ],
+                egui::Stroke::new(stroke.width.max(1.5), fill),
+            );
+        }
+        MarkerShape::Box => {
+            let rect = egui::Rect::from_center_size(center, egui::vec2(size * 2.0, size * 2.0));
+            painter.rect_filled(rect, 1.0, fill);
+            painter.rect_stroke(rect, 1.0, stroke);
+        }
+        MarkerShape::Ellipse => {
+            let radii = egui::vec2(size * 1.2, size);
+            let points: Vec<egui::Pos2> = (0..=24)
+                .map(|step| {
+                    let angle = std::f32::consts::TAU * step as f32 / 24.0;
+                    egui::pos2(
+                        center.x + radii.x * angle.cos(),
+                        center.y + radii.y * angle.sin(),
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::convex_polygon(points.clone(), fill, stroke));
+        }
+        MarkerShape::Diamond => {
+            let points = vec![
+                egui::pos2(center.x, center.y - size),
+                egui::pos2(center.x + size, center.y),
+                egui::pos2(center.x, center.y + size),
+                egui::pos2(center.x - size, center.y),
+            ];
+            painter.add(egui::Shape::convex_polygon(points, fill, stroke));
+        }
+        MarkerShape::FilledCircle => {
+            painter.circle_filled(center, size.max(2.0), fill);
+            painter.circle_stroke(center, size.max(2.0), stroke);
+        }
     }
 }
 
@@ -1687,6 +1922,26 @@ fn paint_analysis_overlays(
                     painter.line_segment(vertical, egui::Stroke::new(1.5, overlay_color));
                 }
             }
+            Overlay::MarkerOverlay { markers, .. } => {
+                for marker in markers {
+                    let overlay_color = egui::Color32::from_rgba_unmultiplied(
+                        marker.color[0],
+                        marker.color[1],
+                        marker.color[2],
+                        marker.color[3],
+                    );
+                    let screen =
+                        viewport.sensor_to_screen(image_rect, egui::pos2(marker.x, marker.y));
+                    paint_marker_shape(
+                        painter,
+                        screen,
+                        marker.shape,
+                        marker.size.max(2.0),
+                        overlay_color,
+                        Some(egui::Stroke::new(1.0, egui::Color32::from_black_alpha(140))),
+                    );
+                }
+            }
         }
     }
 }
@@ -1873,27 +2128,20 @@ fn paint_scale_bar(
     );
 }
 
-fn preview_heading(mode: AppMode, view_mode: ViewMode) -> &'static str {
-    match (mode, view_mode) {
-        (AppMode::Replaying, ViewMode::Preview2d) => "Replay",
-        (AppMode::Replaying, ViewMode::PointCloud3d) => "Replay 3D View",
-        (_, ViewMode::Preview2d) => "Live Preview",
-        (_, ViewMode::PointCloud3d) => "3D Point Cloud",
+fn preview_heading(mode: AppMode) -> &'static str {
+    match mode {
+        AppMode::Replaying => "Replay",
+        _ => "Live Preview",
     }
 }
 
-fn empty_preview_message(mode: AppMode, view_mode: ViewMode) -> &'static str {
-    match (mode, view_mode) {
-        (AppMode::Idle, ViewMode::Preview2d) => {
-            "No camera probed. Click Probe Camera to connect, or open a replay file."
-        }
-        (AppMode::Replaying, ViewMode::Preview2d) => {
+fn empty_preview_message(mode: AppMode) -> &'static str {
+    match mode {
+        AppMode::Idle => "No camera probed. Click Probe Camera to connect, or open a replay file.",
+        AppMode::Replaying => {
             "No replay frame yet. Use the timeline or wait for playback to decode the next frame."
         }
-        (_, ViewMode::Preview2d) => {
-            "No preview yet. Probe the camera, then click Preview or Record."
-        }
-        (_, ViewMode::PointCloud3d) => "No recent raw events available for the 3D view yet.",
+        _ => "No preview yet. Probe the camera, then click Preview or Record.",
     }
 }
 
@@ -1905,7 +2153,7 @@ fn analysis_warning_color(severity: AnalysisSeverity, visuals: &egui::Visuals) -
     }
 }
 
-fn draw_replay_transport(
+pub(crate) fn draw_replay_transport(
     ui: &mut egui::Ui,
     state: &mut ViewerState,
     replay: ViewerReplayState,

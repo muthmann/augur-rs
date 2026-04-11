@@ -6,18 +6,19 @@ mod macros;
 mod settings;
 
 pub use context::{
-    GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
-    HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine, Series1dPoint, Series1dV1,
-    TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
-    TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    GlobalSettings, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
+    HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
+    Image2dV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
+    TableColumnValues, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
+    TableValueType, CTX_GLOBAL_SETTINGS,
 };
 pub use event_store::EventStore;
 pub use ffi::{
     AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
-    FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
-    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
-    HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn, PluginEntry,
-    PluginInput, PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape,
+    FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
+    FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
+    PluginEntry, PluginInput, PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
 pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
@@ -67,17 +68,17 @@ pub mod __private {
 mod tests {
     use super::{
         context::{
-            GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor,
-            HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine,
-            Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
-            TableCoordinateSpace2d, TableDatasetV1, TableSchema, TableValueType,
-            CTX_GLOBAL_SETTINGS,
+            GlobalSettings, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
+            HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
+            Image2dV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
+            TableColumnValues, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1,
+            TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
-        FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiPixel, FfiSlice, FfiString,
-        FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
-        PluginInput, PluginVTable, PLUGIN_ABI_VERSION,
+        FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape,
+        FfiPixel, FfiSlice, FfiString, FfiSubpixelMarker, HostViewDatasetGenerationFn,
+        PluginCapabilities, PluginCapabilitiesFn, PluginInput, PluginVTable, PLUGIN_ABI_VERSION,
     };
 
     #[test]
@@ -89,6 +90,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiColorRgba>(), 4);
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
+        assert_eq!(std::mem::size_of::<FfiMarkerShape>(), 4);
+        assert_eq!(std::mem::size_of::<FfiMarkerOverlayItem>(), 56);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
         assert_eq!(std::mem::size_of::<PluginVTable>(), 168);
         assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
@@ -98,7 +101,7 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
-        assert_eq!(PLUGIN_ABI_VERSION, 2);
+        assert_eq!(PLUGIN_ABI_VERSION, 3);
     }
 
     #[test]
@@ -215,20 +218,44 @@ mod tests {
                             y_min: 0.0,
                             y_max: 100.0,
                         }),
+                        coordinate_space_3d: Some(TableCoordinateSpace3d {
+                            x_column: "x_nm".into(),
+                            y_column: "y_nm".into(),
+                            z_column: "frame".into(),
+                            x_min: 0.0,
+                            x_max: 100.0,
+                            y_min: 0.0,
+                            y_max: 100.0,
+                            z_min: 0.0,
+                            z_max: 20.0,
+                        }),
+                        row_id_column: Some("frame".into()),
+                        time_column: Some("frame".into()),
+                        layer_id: Some("reconstruction".into()),
+                        semantic_label: Some("localization".into()),
                     }),
                     empty_message: "No rows yet".into(),
+                    display: Some(HostDatasetDisplayMetadata {
+                        layer_title: Some("Reconstruction".into()),
+                        default_visibility: Some(true),
+                        default_color: Some([255, 180, 80, 255]),
+                        default_marker_shape: Some(HostMarkerShape::Circle),
+                        default_size: Some(3.5),
+                    }),
                 },
                 HostDatasetDescriptor {
                     id: "image.preview".into(),
                     title: "Rendered Image".into(),
                     kind: HostDatasetKind::Image2dV1,
                     empty_message: "No image yet".into(),
+                    display: None,
                 },
                 HostDatasetDescriptor {
                     id: "series.focus".into(),
                     title: "Focus Series".into(),
                     kind: HostDatasetKind::Series1dV1,
                     empty_message: "No samples yet".into(),
+                    display: None,
                 },
             ],
             views: vec![
@@ -247,6 +274,17 @@ mod tests {
                     kind: HostViewKind::Density2dFromTable {
                         x_column: "x_nm".into(),
                         y_column: "y_nm".into(),
+                    },
+                },
+                HostViewDescriptor {
+                    id: "window.scatter3d".into(),
+                    title: "Localization 3D".into(),
+                    dataset_id: "table.localization".into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::Scatter3dFromTable {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                        z_column: "frame".into(),
                     },
                 },
                 HostViewDescriptor {

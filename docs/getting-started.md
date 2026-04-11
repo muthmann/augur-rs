@@ -2,8 +2,10 @@
 
 ## Requirements
 
-- macOS
 - Rust toolchain with Cargo installed
+- macOS, Linux, or Windows
+
+**For live camera capture only** (not needed for replay and analysis):
 - Prophesee EVK4 with IMX636 sensor
 - Direct USB 3.0 connection to the host machine
 
@@ -56,6 +58,27 @@ Useful variants:
 After that you can launch `AugurRS.app` from Finder, Spotlight, or the Dock like a normal desktop
 application.
 
+## Replay-Only Quick Start (No Camera Required)
+
+You do not need a camera to use AugurRS. Open any supported event file and get the full
+investigation workspace with 2D preview, GPU-accelerated 3D inspection, cross-view linked
+selection, and plugin analysis.
+
+```bash
+cargo run -p augur-gui --bin AugurRS
+```
+
+1. Use `File -> Open Replay` to load a `.raw`, `.csv`, `.bin`, `.npy`, or `.h5` / `.hdf5` file.
+2. Press `2` or use the toolbar to switch to split 2D+3D view.
+3. Use the timeline to scrub through the recording.
+4. Enable plugins from `Analysis` to run live analysis on the replayed data.
+5. Click markers in 2D, rows in tables, or points in 3D — selections are linked across all views.
+6. Press `L` to link the 2D ROI to the 3D view for spatial filtering.
+
+If you have a camera and want to do live capture, continue below.
+
+---
+
 ## Confirm the Camera Is Reachable
 
 Run:
@@ -106,15 +129,17 @@ Suggested first run:
 
 1. Click `Probe` to detect the EVK4 and populate device information.
 2. Click `Preview` to start live display.
-3. Adjust pixel scale, acquisition time, or retained history budget from the top-bar `Settings` menu.
-4. Adjust ROI, pixel mask, or digital filters in the left settings panel.
-5. Click `Apply Settings` to push live camera changes while previewing.
-6. Click `Record` when you are ready to capture to disk.
+3. Press `2` to switch to split 2D+3D view and see live events in both preview and 3D point cloud.
+4. Adjust pixel scale, acquisition time, or retained history budget from the top-bar `Settings` menu.
+5. Adjust ROI, pixel mask, or digital filters in the left settings panel.
+6. Click `Apply Settings` to push live camera changes while previewing.
+7. Click `Record` when you are ready to capture to disk.
 
 ## Next Steps
 
+- Use [GUI usage](./gui.md) for the investigation workspace, cross-view analysis, and plugin workflows
+- Use [Investigation Workspace](./features/investigation-workspace.md) for details on linked 2D/3D views, selection, and layer styling
 - Use [Configuration reference](./configuration.md) to create a reusable TOML file
 - Use [CLI usage](./cli.md) for headless operation and scripting
-- Use [GUI usage](./gui.md) for hotpixel workflows and runtime plugin usage
 - Use [HDF5 file support](./features/hdf5-file-support.md) when replaying `.h5` / `.hdf5` files
 - Read [Performance](./performance.md) for architecture and design rationale

@@ -14,7 +14,12 @@ use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 use image::{ImageFormat, RgbaImage};
 
-use crate::colormap::Colormap;
+use crate::{
+    colormap::Colormap,
+    investigation::{
+        row_key_for_row, InvestigationSortDirection, InvestigationTableViewState, StableRowKey,
+    },
+};
 
 pub const COMPACT_TABLE_PREVIEW_ROWS: usize = 10;
 
@@ -54,6 +59,14 @@ pub struct ResolvedHostViewRegistry {
 }
 
 impl ResolvedHostViewRegistry {
+    pub fn datasets(&self) -> impl Iterator<Item = &ResolvedHostDataset> {
+        self.datasets.iter()
+    }
+
+    pub fn views(&self) -> impl Iterator<Item = &ResolvedHostView> {
+        self.views.iter()
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -97,7 +110,8 @@ fn host_view_kind_matches_dataset(
             HostViewKind::CompactTable
                 | HostViewKind::TableWindow
                 | HostViewKind::Density2dFromTable { .. }
-                | HostViewKind::Scatter2dFromTable { .. },
+                | HostViewKind::Scatter2dFromTable { .. }
+                | HostViewKind::Scatter3dFromTable { .. },
             HostDatasetKind::TableV1(_)
         ) | (HostViewKind::ImageWindow, HostDatasetKind::Image2dV1)
             | (HostViewKind::LineSeriesWindow, HostDatasetKind::Series1dV1)
@@ -110,6 +124,7 @@ fn host_view_kind_label(kind: &HostViewKind) -> &'static str {
         HostViewKind::TableWindow => "table",
         HostViewKind::Density2dFromTable { .. } => "density",
         HostViewKind::Scatter2dFromTable { .. } => "scatter",
+        HostViewKind::Scatter3dFromTable { .. } => "scatter-3d",
         HostViewKind::ImageWindow => "image",
         HostViewKind::LineSeriesWindow => "line-series",
     }
@@ -592,43 +607,123 @@ pub fn render_compact_table(
     ));
 }
 
-pub fn render_table_window(
+#[derive(Debug, Clone, Copy)]
+pub struct LinkedTableViewOptions<'a> {
+    pub dataset_id: &'a str,
+    pub generation: u64,
+    pub rows: &'a [usize],
+    pub selected_row: Option<&'a StableRowKey>,
+    pub hovered_row: Option<&'a StableRowKey>,
+    pub allow_export: bool,
+    pub allow_clear: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinkedTableViewOutput {
+    pub actions: HostViewUiActions,
+    pub selected_row: Option<StableRowKey>,
+    pub sort_column: Option<String>,
+}
+
+pub fn render_linked_table_view(
     ui: &mut egui::Ui,
     schema: &TableSchema,
     dataset: Option<&TableDatasetV1>,
+    table_state: &InvestigationTableViewState,
     empty_message: &str,
-) -> HostViewUiActions {
-    let mut actions = HostViewUiActions::default();
-    ui.horizontal(|ui| {
-        if ui.button("Export CSV").clicked() {
-            actions.export_csv = true;
+    options: LinkedTableViewOptions<'_>,
+) -> LinkedTableViewOutput {
+    let mut output = LinkedTableViewOutput::default();
+
+    ui.horizontal_wrapped(|ui| {
+        if options.allow_export && ui.button("Export CSV").clicked() {
+            output.actions.export_csv = true;
+        }
+        if options.allow_clear && ui.button("Clear").clicked() {
+            output.actions.clear_requested = true;
         }
         ui.separator();
-        ui.label(format!(
-            "Rows: {}",
-            dataset.map(TableDatasetV1::row_count).unwrap_or(0)
-        ));
+        let total_rows = dataset.map(TableDatasetV1::row_count).unwrap_or(0);
+        ui.label(format!("Rows: {} / {}", options.rows.len(), total_rows));
     });
     ui.separator();
 
     let Some(dataset) = dataset else {
         ui.label(empty_message);
-        return actions;
+        return output;
     };
 
-    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-    render_table_header(ui, schema);
+    render_sortable_table_header(ui, schema, table_state, &mut output);
     ui.separator();
+
+    if options.rows.is_empty() {
+        ui.small("No rows match the current linked ROI/filter state.");
+        return output;
+    }
+
+    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
+    let selected_filtered_index = options.selected_row.and_then(|selected| {
+        options.rows.iter().position(|row| {
+            row_key_for_row(
+                options.dataset_id,
+                options.generation,
+                schema,
+                dataset,
+                *row,
+            ) == *selected
+        })
+    });
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show_rows(ui, row_height, dataset.row_count(), |ui, range| {
-            for row in range {
-                render_table_row(ui, schema, dataset, row);
+        .show_viewport(ui, |ui, viewport| {
+            if let Some(index) = selected_filtered_index {
+                let target_rect = egui::Rect::from_min_size(
+                    egui::pos2(0.0, index as f32 * row_height),
+                    egui::vec2(ui.available_width().max(1.0), row_height),
+                );
+                ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+            }
+
+            ui.set_min_height(options.rows.len() as f32 * row_height);
+            let start = (viewport.min.y / row_height).floor().max(0.0) as usize;
+            let end = ((viewport.max.y / row_height).ceil() as usize + 1).min(options.rows.len());
+
+            for (visible_index, row) in options.rows[start..end].iter().enumerate() {
+                let filtered_index = start + visible_index;
+                let key = row_key_for_row(
+                    options.dataset_id,
+                    options.generation,
+                    schema,
+                    dataset,
+                    *row,
+                );
+                let is_selected = options.selected_row == Some(&key);
+                let is_hovered = options.hovered_row == Some(&key);
+                let fill = if is_selected {
+                    ui.visuals().selection.bg_fill
+                } else if is_hovered {
+                    ui.visuals().widgets.hovered.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(0.0, filtered_index as f32 * row_height),
+                    egui::vec2(ui.available_width().max(1.0), row_height),
+                );
+                let inner = ui.allocate_ui_at_rect(rect, |ui| {
+                    egui::Frame::none().fill(fill).show(ui, |ui| {
+                        render_table_row(ui, schema, dataset, *row);
+                    });
+                });
+                if inner.response.clicked() {
+                    output.selected_row = Some(key);
+                }
             }
         });
-    ui.separator();
-    ui.label(format!("{} rows", dataset.row_count()));
-    actions
+
+    output
 }
 
 pub fn render_density2d_view(
@@ -910,12 +1005,20 @@ pub fn render_line_series_view(
 
 #[derive(Clone, Default)]
 pub struct TableWindowViewportData {
+    pub dataset_id: String,
+    pub generation: u64,
     pub schema: TableSchema,
     pub dataset: Option<Arc<TableDatasetV1>>,
+    pub filtered_rows: Vec<usize>,
+    pub table_state: InvestigationTableViewState,
+    pub selected_row: Option<StableRowKey>,
+    pub hovered_row: Option<StableRowKey>,
     pub empty_message: String,
     pub error_message: Option<String>,
     pub close_requested: bool,
     pub export_csv_requested: bool,
+    pub selected_row_requested: Option<StableRowKey>,
+    pub sort_column_requested: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -971,11 +1074,28 @@ pub fn render_table_window_viewport(
     ui: &mut egui::Ui,
     shared: &Arc<Mutex<TableWindowViewportData>>,
 ) {
-    let (schema, dataset, empty_message, error_message) = {
+    let (
+        dataset_id,
+        generation,
+        schema,
+        dataset,
+        filtered_rows,
+        table_state,
+        selected_row,
+        hovered_row,
+        empty_message,
+        error_message,
+    ) = {
         let data = shared.lock().expect("table viewport mutex poisoned");
         (
+            data.dataset_id.clone(),
+            data.generation,
             data.schema.clone(),
             data.dataset.clone(),
+            data.filtered_rows.clone(),
+            data.table_state.clone(),
+            data.selected_row.clone(),
+            data.hovered_row.clone(),
             data.empty_message.clone(),
             data.error_message.clone(),
         )
@@ -986,10 +1106,34 @@ pub fn render_table_window_viewport(
         return;
     }
 
-    let actions = render_table_window(ui, &schema, dataset.as_deref(), &empty_message);
-    if actions.export_csv {
+    let output = render_linked_table_view(
+        ui,
+        &schema,
+        dataset.as_deref(),
+        &table_state,
+        &empty_message,
+        LinkedTableViewOptions {
+            dataset_id: &dataset_id,
+            generation,
+            rows: &filtered_rows,
+            selected_row: selected_row.as_ref(),
+            hovered_row: hovered_row.as_ref(),
+            allow_export: true,
+            allow_clear: false,
+        },
+    );
+    if output.actions.export_csv {
         let mut data = shared.lock().expect("table viewport mutex poisoned");
         data.export_csv_requested = true;
+    }
+    if output.selected_row.is_some() || output.sort_column.is_some() {
+        let mut data = shared.lock().expect("table viewport mutex poisoned");
+        if let Some(selected_row) = output.selected_row {
+            data.selected_row_requested = Some(selected_row);
+        }
+        if let Some(sort_column) = output.sort_column {
+            data.sort_column_requested = Some(sort_column);
+        }
     }
 }
 
@@ -1284,6 +1428,33 @@ pub fn export_image_to_path(path: &Path, image: &ColorImage) -> Result<(), Strin
         .map_err(|err| format!("saving {} failed: {err}", path.display()))
 }
 
+fn render_sortable_table_header(
+    ui: &mut egui::Ui,
+    schema: &TableSchema,
+    table_state: &InvestigationTableViewState,
+    output: &mut LinkedTableViewOutput,
+) {
+    ui.horizontal_wrapped(|ui| {
+        for column in &schema.columns {
+            let sort_indicator = if table_state.sort_column.as_deref() == Some(&column.id) {
+                match table_state.sort_direction {
+                    InvestigationSortDirection::Ascending => " ↑",
+                    InvestigationSortDirection::Descending => " ↓",
+                }
+            } else {
+                ""
+            };
+            if ui
+                .small_button(format!("{}{}", column.title, sort_indicator))
+                .clicked()
+            {
+                output.sort_column = Some(column.id.clone());
+            }
+            ui.add_space(8.0);
+        }
+    });
+}
+
 fn render_table_header(ui: &mut egui::Ui, schema: &TableSchema) {
     ui.horizontal_wrapped(|ui| {
         for column in &schema.columns {
@@ -1572,6 +1743,11 @@ mod tests {
                 },
             ],
             coordinate_space_2d: None,
+            coordinate_space_3d: None,
+            row_id_column: None,
+            time_column: None,
+            layer_id: None,
+            semantic_label: None,
         }
     }
 
@@ -1633,6 +1809,7 @@ mod tests {
                 title: "Localizations".into(),
                 kind: HostDatasetKind::TableV1(table_schema()),
                 empty_message: "No rows".into(),
+                display: None,
             },
             HostViewDescriptor {
                 id: "view.localization".into(),
@@ -1650,6 +1827,7 @@ mod tests {
                 title: "Different".into(),
                 kind: HostDatasetKind::TableV1(table_schema()),
                 empty_message: "No rows".into(),
+                display: None,
             },
             HostViewDescriptor {
                 id: "view.localization".into(),
@@ -1684,6 +1862,7 @@ mod tests {
             title: "Localizations".into(),
             kind: HostDatasetKind::TableV1(table_schema()),
             empty_message: "No rows".into(),
+            display: None,
         };
         let view = HostViewDescriptor {
             id: "view.localization".into(),
@@ -1736,6 +1915,7 @@ mod tests {
             title: "Localizations".into(),
             kind: HostDatasetKind::TableV1(table_schema()),
             empty_message: "No rows".into(),
+            display: None,
         };
         let bytes = serde_json::to_vec(&table_dataset()).expect("dataset json");
 
@@ -1753,6 +1933,7 @@ mod tests {
             title: "Image".into(),
             kind: HostDatasetKind::Image2dV1,
             empty_message: "No image".into(),
+            display: None,
         };
         let image_bytes = serde_json::to_vec(&image_dataset()).expect("image json");
         let image_snapshot =
@@ -1767,6 +1948,7 @@ mod tests {
             title: "Series".into(),
             kind: HostDatasetKind::Series1dV1,
             empty_message: "No series".into(),
+            display: None,
         };
         let series_bytes = serde_json::to_vec(&series_dataset()).expect("series json");
         let series_snapshot =
@@ -1784,6 +1966,7 @@ mod tests {
             title: "Localizations".into(),
             kind: HostDatasetKind::TableV1(table_schema()),
             empty_message: "No rows".into(),
+            display: None,
         };
         let resolved = resolve_host_view_registry([
             contribution(
@@ -1832,6 +2015,7 @@ mod tests {
                 title: "Image".into(),
                 kind: HostDatasetKind::Image2dV1,
                 empty_message: "No image".into(),
+                display: None,
             },
             HostViewDescriptor {
                 id: "view.table".into(),
@@ -1855,6 +2039,7 @@ mod tests {
                 title: "Localizations".into(),
                 kind: HostDatasetKind::TableV1(table_schema()),
                 empty_message: "No rows".into(),
+                display: None,
             },
             provider: HostViewProviderKey::Runtime(2),
             provider_name: "Runtime".into(),
