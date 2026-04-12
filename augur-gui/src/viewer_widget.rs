@@ -1381,26 +1381,33 @@ fn pick_overlay_candidate(
     sensor: (u16, u16),
 ) -> Option<OverlayPickCandidate> {
     let sensor = egui::pos2(f32::from(sensor.0), f32::from(sensor.1));
-    let mut best: Option<(OverlayPickCandidate, f32)> = None;
+    let mut best_keyed: Option<(OverlayPickCandidate, f32)> = None;
+    let mut best_unkeyed: Option<(OverlayPickCandidate, f32)> = None;
 
-    let mut consider = |sensor_position: egui::Pos2, max_distance: f32, item_key| {
-        let distance = sensor_position.distance(sensor);
-        if distance > max_distance {
-            return;
-        }
-        match best {
-            Some((_, best_distance)) if distance >= best_distance => {}
-            _ => {
-                best = Some((
-                    OverlayPickCandidate {
-                        sensor_position,
-                        item_key,
-                    },
-                    distance,
-                ));
+    let mut consider =
+        |sensor_position: egui::Pos2, max_distance: f32, item_key: Option<StableRowKey>| {
+            let distance = sensor_position.distance(sensor);
+            if distance > max_distance {
+                return;
             }
-        }
-    };
+            let best = if item_key.is_some() {
+                &mut best_keyed
+            } else {
+                &mut best_unkeyed
+            };
+            match best {
+                Some((_, best_distance)) if distance >= *best_distance => {}
+                _ => {
+                    *best = Some((
+                        OverlayPickCandidate {
+                            sensor_position,
+                            item_key,
+                        },
+                        distance,
+                    ));
+                }
+            }
+        };
 
     for overlay in overlays {
         match overlay {
@@ -1442,7 +1449,7 @@ fn pick_overlay_candidate(
         }
     }
 
-    best.map(|(candidate, _)| candidate)
+    best_keyed.or(best_unkeyed).map(|(candidate, _)| candidate)
 }
 
 fn overlay_candidate_row(
@@ -2327,11 +2334,16 @@ fn format_replay_time(duration_us: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_viewport, sensor_rect_to_roi_config, PreviewCropTarget,
-        PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
+        build_preview_viewport, pick_overlay_candidate, sensor_rect_to_roi_config,
+        PreviewCropTarget, PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
     };
+    use crate::investigation::StableRowKey;
     use crate::viewer_tools::{AnnotationManager, AnnotationShapeKind};
-    use augur_core::{config::CameraConfig, pipeline::PreviewFrame};
+    use augur_core::{
+        analysis::{MarkerOverlayItem, MarkerShape, Overlay, Pixel},
+        config::CameraConfig,
+        pipeline::PreviewFrame,
+    };
 
     fn test_frame() -> PreviewFrame {
         PreviewFrame {
@@ -2467,5 +2479,38 @@ mod tests {
         assert_eq!(roi.y, 20);
         assert_eq!(roi.width, 16);
         assert_eq!(roi.height, 10);
+    }
+
+    #[test]
+    fn overlay_picker_prefers_keyed_marker_over_closer_unkeyed_highlight() {
+        let overlays = vec![
+            Overlay::HighlightPixels {
+                pixels: vec![Pixel::new(100, 100)],
+                color: [255, 0, 0, 255],
+            },
+            Overlay::MarkerOverlay {
+                markers: vec![MarkerOverlayItem {
+                    x: 102.0,
+                    y: 100.0,
+                    shape: MarkerShape::FilledCircle,
+                    size: 5.0,
+                    color: [0, 255, 0, 255],
+                    timestamp_us: None,
+                    stable_id: Some("row-7".into()),
+                }],
+                dataset_id: Some("dataset-a".into()),
+                layer_id: None,
+                source_label: None,
+            },
+        ];
+
+        let candidate =
+            pick_overlay_candidate(&overlays, (100, 100)).expect("candidate should exist");
+
+        assert_eq!(
+            candidate.item_key,
+            Some(StableRowKey::new("dataset-a", "row-7"))
+        );
+        assert_eq!(candidate.sensor_position, egui::pos2(102.0, 100.0));
     }
 }

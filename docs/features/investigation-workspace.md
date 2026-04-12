@@ -56,6 +56,12 @@ metadata. Plugin-specific research semantics are still outside this repository.
 - Selecting a point in 3D updates the same host selection state and focuses the camera target.
 - Clicking a rich overlay marker in 2D now resolves into the same host selection model when the
   plugin provides stable ids, and falls back to the nearest linked dataset point otherwise.
+- After plugin reset or replay re-analysis, the host now invalidates and rebuilds the host-view
+  registry before the next investigation render, so 2D inspectable points keep their coordinate
+  metadata instead of disappearing until a later refresh.
+- When a boundary/highlight pixel overlaps a keyed marker overlay, the keyed marker now wins the
+  2D hit-test so candidate clicks resolve into the linked table/3D selection flow instead of
+  silently landing on an unkeyed outline pixel.
 - Table windows filter against the active linked ROI, sort through the shared investigation table
   state, and auto-scroll toward externally selected rows.
 - The investigation inspector shows:

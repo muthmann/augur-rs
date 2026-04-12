@@ -4363,6 +4363,8 @@ impl CameraApp {
         let frame_total_started = Instant::now();
         let analysis_started = Instant::now();
         self.run_analysis(&frame, true);
+        self.host_view_registry_dirty = true;
+        self.mark_host_view_datasets_stale();
         self.preview_perf
             .record_analysis(analysis_started.elapsed());
 
