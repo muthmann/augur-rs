@@ -33,6 +33,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Investigation Workspace](./investigation-workspace.md) — host-owned 2D/3D layouts, linked selection, stable row identities, generic layer styling, and popup/shared inspection state
 - [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the bundled Augur Bridge handoff path for ImageJ/Fiji
 - [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window and popup host
+- [Viewer Toolbar And Status Layout](./viewer-toolbar-and-status-layout.md) — consistent toolbar/display-strip/footer structure across the 2D and 3D viewers
 - [Built-In Hotpixel Detection](./built-in-hotpixel-detection.md) — host-owned hotpixel detection, overlays, and DEM-mask copy flow
 - [Plugin Authoring Guide](./plugin-authoring-guide.md) — runtime-only plugin host, FFI API, phased execution, and shared context types
 - [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables, plots, and images

@@ -227,6 +227,7 @@ pub(crate) struct ViewerState {
     pub(crate) investigation: InvestigationState,
     pub(crate) investigation_3d: Investigation3dState,
     pub(crate) workspace: PreviewWorkspaceState,
+    pub(crate) display_strip_open: bool,
     pub(crate) preview_mode: PreviewMode,
     pub(crate) time_surface_tau_us: u64,
     pub(crate) contrast_settings: ContrastSettings,
@@ -244,6 +245,7 @@ impl Default for ViewerState {
             investigation: InvestigationState::default(),
             investigation_3d: Investigation3dState::default(),
             workspace: PreviewWorkspaceState::default(),
+            display_strip_open: true,
             preview_mode: PreviewMode::default(),
             time_surface_tau_us: DEFAULT_TIME_SURFACE_TAU_US,
             contrast_settings: ContrastSettings::default(),
@@ -418,13 +420,18 @@ pub(crate) fn draw_viewer(
         ));
     }
 
-    let controls_reserve = 140.0;
+    let display_strip_reserve = 88.0;
+    let status_footer_reserve = 96.0;
     // Fixed overhead: heading (~24px) + separator (~8px) + camera info (~20px) + toolbar (~28px)
     let header_overhead = 80.0;
-    let max_image_height = (total_available_height - controls_reserve - header_overhead).max(180.0);
+    let max_image_height =
+        (total_available_height - display_strip_reserve - status_footer_reserve - header_overhead)
+            .max(180.0);
 
     if input.external_streaming {
         output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
+        draw_display_strip(ui, state, &input, &mut output, display_strip_reserve);
+        ui.separator();
         draw_text_placeholder(ui, max_image_height, input.external_streaming_label);
         ui.add_space(8.0);
         if ui.button("Return to augur").clicked() {
@@ -432,6 +439,8 @@ pub(crate) fn draw_viewer(
         }
     } else {
         output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
+        draw_display_strip(ui, state, &input, &mut output, display_strip_reserve);
+        ui.separator();
         if let (Some(texture), Some(frame)) = (input.texture, input.frame) {
             let scale_bar_settings = state.scale_bar_settings.clone();
             output.merge(draw_preview_canvas(
@@ -456,13 +465,8 @@ pub(crate) fn draw_viewer(
         }
     }
 
-    egui::ScrollArea::vertical()
-        .max_height(controls_reserve)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.separator();
-            draw_viewer_controls(ctx, ui, state, &input, &mut output);
-        });
+    ui.add_space(2.0);
+    draw_status_footer(ui, state, &input, &mut output, status_footer_reserve);
 
     output
 }
@@ -492,244 +496,433 @@ pub(crate) fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, me
     );
 }
 
-fn draw_viewer_controls(
-    _ctx: &egui::Context,
+fn draw_display_strip(
     ui: &mut egui::Ui,
     state: &mut ViewerState,
     input: &ViewerInput<'_>,
     output: &mut ViewerOutput,
+    max_height: f32,
 ) {
-    ui.horizontal(|ui| {
-        let previous_preview_mode = state.preview_mode;
-        ui.label("Mode");
-        egui::ComboBox::from_id_source((input.viewer_id, "preview_mode"))
-            .selected_text(match state.preview_mode {
-                PreviewMode::Intensity(colormap) => format!("Intensity / {}", colormap.label()),
-                mode => mode.label().to_owned(),
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut state.preview_mode,
-                    PreviewMode::RedBlue,
-                    PreviewMode::RedBlue.label(),
-                );
-                ui.selectable_value(
-                    &mut state.preview_mode,
-                    PreviewMode::SignedCount,
-                    PreviewMode::SignedCount.label(),
-                );
-                ui.selectable_value(
-                    &mut state.preview_mode,
-                    PreviewMode::TimeSurface,
-                    PreviewMode::TimeSurface.label(),
-                );
-                ui.separator();
-                for colormap in Colormap::ALL {
-                    ui.selectable_value(
-                        &mut state.preview_mode,
-                        PreviewMode::Intensity(colormap),
-                        format!("Intensity / {}", colormap.label()),
-                    );
-                }
-            });
-        output.preview_mode_changed |= state.preview_mode != previous_preview_mode;
-        if output.preview_mode_changed {
-            reset_preview_render_cache();
+    ui.push_id((input.viewer_id, "display_strip"), |ui| {
+        draw_section_toggle(ui, &mut state.display_strip_open, "Display");
+        if !state.display_strip_open {
+            return;
         }
 
-        ui.checkbox(&mut state.scale_bar_settings.show, "Scale bar");
-        if state.scale_bar_settings.show {
-            egui::ComboBox::from_id_source((input.viewer_id, "scale_bar_position"))
-                .selected_text(match state.scale_bar_settings.position {
-                    ScaleBarPosition::TopLeft => "Top left",
-                    ScaleBarPosition::TopRight => "Top right",
-                    ScaleBarPosition::BottomLeft => "Bottom left",
-                    ScaleBarPosition::BottomRight => "Bottom right",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut state.scale_bar_settings.position,
-                        ScaleBarPosition::TopLeft,
-                        "Top left",
-                    );
-                    ui.selectable_value(
-                        &mut state.scale_bar_settings.position,
-                        ScaleBarPosition::TopRight,
-                        "Top right",
-                    );
-                    ui.selectable_value(
-                        &mut state.scale_bar_settings.position,
-                        ScaleBarPosition::BottomLeft,
-                        "Bottom left",
-                    );
-                    ui.selectable_value(
-                        &mut state.scale_bar_settings.position,
-                        ScaleBarPosition::BottomRight,
-                        "Bottom right",
-                    );
-                });
-        }
-    });
-
-    if matches!(state.preview_mode, PreviewMode::TimeSurface) {
-        ui.horizontal(|ui| {
-            let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
-            let response = ui.add(
-                egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
-                    .text("Decay τ [ms]")
-                    .logarithmic(true),
-            );
-            if response.changed() {
-                state.time_surface_tau_us = (tau_ms * 1_000.0).round().max(1.0) as u64;
-                output.time_surface_tau_changed = true;
-            }
-        });
-        if input.frame.is_some_and(|frame| frame.events.is_none()) {
-            ui.small(
-                "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
-            );
-        }
-    }
-
-    if !state.annotation_manager.annotations().is_empty() {
-        egui::CollapsingHeader::new("Annotations")
-            .id_source((input.viewer_id, "annotations"))
-            .default_open(true)
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .auto_shrink([true, true])
             .show(ui, |ui| {
-                let mut clicked_annotation = None;
-                for (index, annotation) in state.annotation_manager.annotations().iter().enumerate()
-                {
-                    let selected = state.annotation_manager.selected_id() == Some(annotation.id);
+                constrain_section_width(ui);
+                ui.horizontal_wrapped(|ui| {
+                    let previous_preview_mode = state.preview_mode;
+                    ui.label("Mode");
+                    egui::ComboBox::from_id_source((input.viewer_id, "preview_mode"))
+                        .selected_text(match state.preview_mode {
+                            PreviewMode::Intensity(colormap) => {
+                                format!("Intensity / {}", colormap.label())
+                            }
+                            mode => mode.label().to_owned(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.preview_mode,
+                                PreviewMode::RedBlue,
+                                PreviewMode::RedBlue.label(),
+                            );
+                            ui.selectable_value(
+                                &mut state.preview_mode,
+                                PreviewMode::SignedCount,
+                                PreviewMode::SignedCount.label(),
+                            );
+                            ui.selectable_value(
+                                &mut state.preview_mode,
+                                PreviewMode::TimeSurface,
+                                PreviewMode::TimeSurface.label(),
+                            );
+                            ui.separator();
+                            for colormap in Colormap::ALL {
+                                ui.selectable_value(
+                                    &mut state.preview_mode,
+                                    PreviewMode::Intensity(colormap),
+                                    format!("Intensity / {}", colormap.label()),
+                                );
+                            }
+                        });
+                    output.preview_mode_changed |=
+                        state.preview_mode != previous_preview_mode;
+                    if output.preview_mode_changed {
+                        reset_preview_render_cache();
+                    }
+
+                    ui.checkbox(&mut state.scale_bar_settings.show, "Scale bar");
+                    if state.scale_bar_settings.show {
+                        egui::ComboBox::from_id_source((
+                            input.viewer_id,
+                            "scale_bar_position",
+                        ))
+                        .selected_text(match state.scale_bar_settings.position {
+                            ScaleBarPosition::TopLeft => "Top left",
+                            ScaleBarPosition::TopRight => "Top right",
+                            ScaleBarPosition::BottomLeft => "Bottom left",
+                            ScaleBarPosition::BottomRight => "Bottom right",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.scale_bar_settings.position,
+                                ScaleBarPosition::TopLeft,
+                                "Top left",
+                            );
+                            ui.selectable_value(
+                                &mut state.scale_bar_settings.position,
+                                ScaleBarPosition::TopRight,
+                                "Top right",
+                            );
+                            ui.selectable_value(
+                                &mut state.scale_bar_settings.position,
+                                ScaleBarPosition::BottomLeft,
+                                "Bottom left",
+                            );
+                            ui.selectable_value(
+                                &mut state.scale_bar_settings.position,
+                                ScaleBarPosition::BottomRight,
+                                "Bottom right",
+                            );
+                        });
+                    }
+                });
+
+                if matches!(state.preview_mode, PreviewMode::TimeSurface) {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("\u{25A0}").color(annotation.color));
-                        let response = ui.selectable_label(selected, format!("ROI {}", index + 1));
-                        if response.clicked() {
-                            clicked_annotation = Some(annotation.id);
+                        let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
+                        let response = ui.add(
+                            egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
+                                .text("Decay \u{03C4} [ms]")
+                                .logarithmic(true),
+                        );
+                        if response.changed() {
+                            state.time_surface_tau_us =
+                                (tau_ms * 1_000.0).round().max(1.0) as u64;
+                            output.time_surface_tau_changed = true;
                         }
                     });
+                    if input.frame.is_some_and(|frame| frame.events.is_none()) {
+                        ui.small(
+                            "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
+                        );
+                    }
                 }
-                if let Some(annotation_id) = clicked_annotation {
-                    state.annotation_manager.select(annotation_id);
-                    activate_pointer_tool(state);
+
+                if !state.annotation_manager.annotations().is_empty() {
+                    egui::CollapsingHeader::new("Annotations")
+                        .id_source((input.viewer_id, "annotations"))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            constrain_section_width(ui);
+                            let mut clicked_annotation = None;
+                            for (index, annotation) in
+                                state.annotation_manager.annotations().iter().enumerate()
+                            {
+                                let selected =
+                                    state.annotation_manager.selected_id() == Some(annotation.id);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("\u{25A0}").color(annotation.color),
+                                    );
+                                    let response = ui.selectable_label(
+                                        selected,
+                                        format!("ROI {}", index + 1),
+                                    );
+                                    if response.clicked() {
+                                        clicked_annotation = Some(annotation.id);
+                                    }
+                                });
+                            }
+                            if let Some(annotation_id) = clicked_annotation {
+                                state.annotation_manager.select(annotation_id);
+                                activate_pointer_tool(state);
+                            }
+                            if ui
+                                .add_enabled(
+                                    state.annotation_manager.selected_id().is_some(),
+                                    egui::Button::new("Delete selected"),
+                                )
+                                .clicked()
+                            {
+                                delete_selected_annotation(state);
+                            }
+                        });
                 }
-                if ui
-                    .add_enabled(
-                        state.annotation_manager.selected_id().is_some(),
-                        egui::Button::new("Delete selected"),
-                    )
-                    .clicked()
+
+                if let Some(stats) = input
+                    .frame
+                    .and_then(|frame| state.annotation_manager.statistics_for_selected(frame))
                 {
-                    delete_selected_annotation(state);
+                    ui.small(format!(
+                        "{} | {} px | ON {:.2}\u{00B1}{:.2} | OFF {:.2}\u{00B1}{:.2} | Total {:.2}\u{00B1}{:.2}",
+                        stats.label,
+                        stats.pixel_count,
+                        stats.on.mean,
+                        stats.on.stddev,
+                        stats.off.mean,
+                        stats.off.stddev,
+                        stats.combined.mean,
+                        stats.combined.stddev,
+                    ));
                 }
             });
+    });
+}
+
+fn draw_status_footer(
+    ui: &mut egui::Ui,
+    state: &mut ViewerState,
+    input: &ViewerInput<'_>,
+    output: &mut ViewerOutput,
+    max_height: f32,
+) {
+    let emphasize_details = input.config_dirty
+        || input.acq_dirty
+        || !input.analysis_warnings.is_empty()
+        || input.replay_open_task_active
+        || input.last_error.is_some();
+
+    ui.push_id((input.viewer_id, "status_footer"), |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .auto_shrink([true, true])
+            .show(ui, |ui| {
+                constrain_section_width(ui);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let mut first = true;
+                    if let Some(stats) = input.pipeline_stats {
+                        draw_inline_separator(ui, &mut first);
+                        ui.small(format!("{:.2} Mev/s", stats.mev_per_s));
+                    }
+                    if let Some(frame_summary) = preview_frame_status_summary(input.frame) {
+                        draw_inline_separator(ui, &mut first);
+                        ui.small(frame_summary);
+                    }
+
+                    draw_inline_separator(ui, &mut first);
+                    if let Some(hover_summary) = preview_hover_status_text(state, input) {
+                        ui.monospace(hover_summary);
+                    } else {
+                        ui.weak("Hover preview for pixel values");
+                    }
+
+                    if state.workspace.tool == PreviewTool::Ruler {
+                        if let Some(measurement) =
+                            state.ruler_tool.measurement(input.nm_per_pixel)
+                        {
+                            draw_inline_separator(ui, &mut first);
+                            ui.small(format!(
+                                "{:.1} px | {:.2} \u{00B5}m",
+                                measurement.pixel_distance, measurement.micrometers
+                            ));
+                        }
+                    }
+                });
+
+                egui::CollapsingHeader::new("Pipeline details")
+                    .id_source((input.viewer_id, "pipeline_details"))
+                    .default_open(emphasize_details)
+                    .show(ui, |ui| {
+                        constrain_section_width(ui);
+                        let mut rendered_anything = false;
+
+                        if let Some(stats) = input.pipeline_stats {
+                            rendered_anything = true;
+                            ui.label(format!(
+                                "{:.2} Mev/s  |  {:.2} MB/s  |  {:02}:{:02}:{:02} elapsed",
+                                stats.mev_per_s,
+                                stats.mb_per_s,
+                                (stats.elapsed_s as u64) / 3600,
+                                (stats.elapsed_s as u64 % 3600) / 60,
+                                stats.elapsed_s as u64 % 60
+                            ));
+                            ui.small(format!(
+                                "Preview drops: {} packets / {} frames  |  Preview queues HW: {} / {}  |  Disk queue HW: {}  |  Disk wait/write: {:.1} / {:.1} ms",
+                                stats.preview_packet_drops,
+                                stats.preview_frame_drops,
+                                stats.preview_packet_queue_high_water,
+                                stats.preview_frame_queue_high_water,
+                                stats.disk_queue_high_water,
+                                stats.disk_send_wait_us as f64 / 1_000.0,
+                                stats.disk_write_us as f64 / 1_000.0,
+                            ));
+                            ui.small(format!(
+                                "Preview thread avg [ms]: decode {:.3}  |  accumulate {:.3}  |  raw-copy {:.3}  |  frame send {:.3}",
+                                stats.preview_decode_avg_ms(),
+                                stats.preview_accumulate_avg_ms(),
+                                stats.preview_raw_event_copy_avg_ms(),
+                                stats.preview_frame_send_avg_ms(),
+                            ));
+                        }
+
+                        if let Some(frame_summary) = preview_frame_status_summary(input.frame) {
+                            rendered_anything = true;
+                            ui.small(frame_summary);
+                        }
+
+                        if input.mode != AppMode::Idle && input.mode != AppMode::Replaying {
+                            rendered_anything = true;
+                            if input.config_dirty || input.acq_dirty {
+                                ui.colored_label(
+                                    ui.visuals().warn_fg_color,
+                                    "There are unapplied runtime changes.",
+                                );
+                            } else {
+                                ui.label("Runtime settings on the camera are up to date.");
+                            }
+                        }
+
+                        if !input.analysis_warnings.is_empty() {
+                            rendered_anything = true;
+                            ui.separator();
+                            for warning in input.analysis_warnings {
+                                ui.colored_label(
+                                    analysis_warning_color(warning.severity, ui.visuals()),
+                                    format!("{}: {}", warning.source, warning.message),
+                                );
+                            }
+
+                            if !input.detected_hotpixels.is_empty() {
+                                let can_copy = !input.settings_locked;
+                                if ui
+                                    .add_enabled(
+                                        can_copy,
+                                        egui::Button::new("Mask detected hotpixels"),
+                                    )
+                                    .clicked()
+                                {
+                                    output.mask_hotpixels_clicked = true;
+                                }
+                                if !can_copy {
+                                    ui.label(
+                                        "Unlock runtime settings to copy detections into the DEM mask.",
+                                    );
+                                }
+                            }
+                        }
+
+                        if let Some(notice) = input.analysis_notice {
+                            rendered_anything = true;
+                            ui.label(notice);
+                        }
+
+                        if input.replay_open_task_active {
+                            rendered_anything = true;
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(input.replay_notice.unwrap_or("Opening replay..."));
+                            });
+                        }
+
+                        if let Some(err) = input.last_error {
+                            rendered_anything = true;
+                            ui.separator();
+                            ui.colored_label(ui.visuals().error_fg_color, err);
+                        }
+
+                        if !rendered_anything {
+                            ui.small("No additional diagnostics.");
+                        }
+                    });
+            });
+    });
+}
+
+fn draw_section_toggle(ui: &mut egui::Ui, open: &mut bool, label: &str) {
+    let chevron = if *open {
+        phosphor::CARET_DOWN
+    } else {
+        phosphor::CARET_RIGHT
+    };
+    let response = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let chevron_response = ui
+            .add(
+                egui::Label::new(egui::RichText::new(chevron).size(10.0))
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let icon_response = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(phosphor::SLIDERS_HORIZONTAL)
+                        .size(14.0)
+                        .weak(),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let label_response = ui
+            .add(
+                egui::Label::new(egui::RichText::new(label).size(12.0).strong())
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        chevron_response.union(icon_response).union(label_response)
+    });
+    if response.inner.clicked() {
+        *open = !*open;
+    }
+}
+
+fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
+    let width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
+    ui.set_min_width(width);
+    ui.set_max_width(width);
+    ui.set_width(width);
+    ui.style_mut().wrap = Some(true);
+    width
+}
+
+fn draw_inline_separator(ui: &mut egui::Ui, first: &mut bool) {
+    if !*first {
+        ui.label(egui::RichText::new("\u{2022}").weak().size(10.0));
+    }
+    *first = false;
+}
+
+fn preview_frame_status_summary(frame: Option<&PreviewFrame>) -> Option<String> {
+    let frame = frame?;
+    let total = frame.on_count + frame.off_count;
+    if total == 0 {
+        return None;
+    }
+    let on_pct = frame.on_count as f64 * 100.0 / total as f64;
+    let off_pct = frame.off_count as f64 * 100.0 / total as f64;
+    Some(format!(
+        "ON {:.1}% / OFF {:.1}% ({} ev this frame)",
+        on_pct, off_pct, total
+    ))
+}
+
+fn preview_hover_status_text(state: &ViewerState, input: &ViewerInput<'_>) -> Option<String> {
+    let (x, y) = state.workspace.hover_sensor?;
+    let frame = input.frame?;
+    let width = usize::from(frame.width.max(1));
+    let idx = usize::from(y) * width + usize::from(x);
+    if idx >= frame.pixels.len() {
+        return None;
     }
 
-    if let Some(stats) = input
-        .frame
-        .and_then(|frame| state.annotation_manager.statistics_for_selected(frame))
-    {
-        ui.small(format!(
-            "{} | {} px | ON {:.2}±{:.2} | OFF {:.2}±{:.2} | Total {:.2}±{:.2}",
-            stats.label,
-            stats.pixel_count,
-            stats.on.mean,
-            stats.on.stddev,
-            stats.off.mean,
-            stats.off.stddev,
-            stats.combined.mean,
-            stats.combined.stddev,
-        ));
-    }
-
-    if let Some(stats) = input.pipeline_stats {
-        ui.label(format!(
-            "{:.2} Mev/s  |  {:.2} MB/s  |  {:02}:{:02}:{:02} elapsed",
-            stats.mev_per_s,
-            stats.mb_per_s,
-            (stats.elapsed_s as u64) / 3600,
-            (stats.elapsed_s as u64 % 3600) / 60,
-            stats.elapsed_s as u64 % 60
-        ));
-        ui.small(format!(
-            "Preview drops: {} packets / {} frames  |  Preview queues HW: {} / {}  |  Disk queue HW: {}  |  Disk wait/write: {:.1} / {:.1} ms",
-            stats.preview_packet_drops,
-            stats.preview_frame_drops,
-            stats.preview_packet_queue_high_water,
-            stats.preview_frame_queue_high_water,
-            stats.disk_queue_high_water,
-            stats.disk_send_wait_us as f64 / 1_000.0,
-            stats.disk_write_us as f64 / 1_000.0,
-        ));
-        ui.small(format!(
-            "Preview thread avg [ms]: decode {:.3}  |  accumulate {:.3}  |  raw-copy {:.3}  |  frame send {:.3}",
-            stats.preview_decode_avg_ms(),
-            stats.preview_accumulate_avg_ms(),
-            stats.preview_raw_event_copy_avg_ms(),
-            stats.preview_frame_send_avg_ms(),
-        ));
-    }
-
-    if let Some(frame) = input.frame {
-        let total = frame.on_count + frame.off_count;
-        if total > 0 {
-            let on_pct = frame.on_count as f64 * 100.0 / total as f64;
-            let off_pct = frame.off_count as f64 * 100.0 / total as f64;
-            ui.label(format!(
-                "ON {:.1}%  |  OFF {:.1}%  ({} ev this frame)",
-                on_pct, off_pct, total
-            ));
+    Some(match state.preview_mode {
+        PreviewMode::TimeSurface => {
+            let value = input
+                .time_surface_hover_value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_owned());
+            format!("x {x}, y {y} | Value: {value} Total: {}", frame.pixels[idx])
         }
-    }
-
-    if input.mode != AppMode::Idle && input.mode != AppMode::Replaying {
-        if input.config_dirty || input.acq_dirty {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "There are unapplied runtime changes.",
-            );
-        } else {
-            ui.label("Runtime settings on the camera are up to date.");
-        }
-    }
-
-    if !input.analysis_warnings.is_empty() {
-        ui.separator();
-        for warning in input.analysis_warnings {
-            ui.colored_label(
-                analysis_warning_color(warning.severity, ui.visuals()),
-                format!("{}: {}", warning.source, warning.message),
-            );
-        }
-
-        if !input.detected_hotpixels.is_empty() {
-            let can_copy = !input.settings_locked;
-            if ui
-                .add_enabled(can_copy, egui::Button::new("Mask detected hotpixels"))
-                .clicked()
-            {
-                output.mask_hotpixels_clicked = true;
-            }
-            if !can_copy {
-                ui.label("Unlock runtime settings to copy detections into the DEM mask.");
-            }
-        }
-    }
-
-    if let Some(notice) = input.analysis_notice {
-        ui.label(notice);
-    }
-
-    if input.replay_open_task_active {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(input.replay_notice.unwrap_or("Opening replay..."));
-        });
-    }
-
-    if let Some(err) = input.last_error {
-        ui.separator();
-        ui.colored_label(ui.visuals().error_fg_color, err);
-    }
+        _ => format!(
+            "x {x}, y {y} | ON: {} OFF: {} Total: {}",
+            frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
+        ),
+    })
 }
 
 fn draw_preview_toolbar(
@@ -885,58 +1078,6 @@ fn draw_preview_toolbar(
                     output.popup_toggled = true;
                 }
 
-                ui.separator();
-                if let (Some((x, y)), Some(frame)) = (workspace.hover_sensor, input.frame) {
-                    let width = usize::from(frame.width.max(1));
-                    let idx = usize::from(y) * width + usize::from(x);
-                    if idx < frame.pixels.len() {
-                        let full = match state.preview_mode {
-                            PreviewMode::TimeSurface => {
-                                let value = input
-                                    .time_surface_hover_value
-                                    .map(|value| value.to_string())
-                                    .unwrap_or_else(|| "n/a".to_owned());
-                                format!("x {x}, y {y} | Value: {value} Total: {}", frame.pixels[idx])
-                            }
-                            _ => format!(
-                                "x {x}, y {y} | ON: {} OFF: {} Total: {}",
-                                frame.pixels_on[idx], frame.pixels_off[idx], frame.pixels[idx]
-                            ),
-                        };
-                        let short = format!("x {x}, y {y}");
-                        let avail = ui.available_width();
-                        let full_w = ui.fonts(|f| {
-                            f.layout_no_wrap(
-                                full.clone(),
-                                egui::FontId::monospace(
-                                    ui.style().text_styles[&egui::TextStyle::Monospace].size,
-                                ),
-                                egui::Color32::WHITE,
-                            )
-                            .size()
-                            .x
-                        });
-                        if full_w <= avail {
-                            ui.monospace(&full);
-                        } else {
-                            ui.monospace(format!("{short}\u{2026}"))
-                                .on_hover_text(full);
-                        }
-                    } else {
-                        ui.weak("Hover preview for pixel values");
-                    }
-                } else {
-                    ui.weak("Hover preview for pixel values");
-                }
-                if workspace.tool == PreviewTool::Ruler {
-                    if let Some(measurement) = ruler_tool.measurement(input.nm_per_pixel) {
-                        ui.separator();
-                        ui.small(format!(
-                            "{:.1} px | {:.2} µm",
-                            measurement.pixel_distance, measurement.micrometers
-                        ));
-                    }
-                }
             });
         });
 

@@ -175,6 +175,7 @@ pub struct Investigation3dState {
     pub pitch: f32,
     pub distance: f32,
     pub target: [f32; 3],
+    pub display_strip_open: bool,
     pub clip_enabled: bool,
     pub clip_half_extent: f32,
     pub point_scale: f32,
@@ -190,6 +191,7 @@ impl Default for Investigation3dState {
             pitch: 0.52,
             distance: 12.0,
             target: [0.0, 0.0, 0.0],
+            display_strip_open: true,
             clip_enabled: false,
             clip_half_extent: 240.0,
             point_scale: DEFAULT_POINT_SCALE,
@@ -347,6 +349,25 @@ struct PreparedPoint {
 
 type RenderTextureOutput = (PreviewDisplayTexture, Arc<Vec<PreparedPoint>>);
 type RenderTextureResult = Result<Option<RenderTextureOutput>, String>;
+
+#[derive(Debug, Clone, Copy)]
+struct RawHistoryFooterStatus {
+    requested_ms: f32,
+    retained_ms: Option<f32>,
+    sample_count: usize,
+    point_limit: usize,
+}
+
+impl RawHistoryFooterStatus {
+    fn from_state(raw_history: &PointCloudState) -> Self {
+        Self {
+            requested_ms: raw_history.time_window_ms,
+            retained_ms: raw_history.visible_time_span_ms(),
+            sample_count: raw_history.visible_event_count(),
+            point_limit: raw_history.point_limit,
+        }
+    }
+}
 
 pub(crate) enum Investigation3dRenderer {
     Disabled,
@@ -773,9 +794,11 @@ pub fn draw_investigation_3d(
     let mut output = Investigation3dOutput::default();
     let scene_empty = scene.is_empty();
     let selected_focus_target = selected.and_then(|key| scene_focus_target(scene, key));
-    let mut raw_history_status = None;
+    let total_available_height = ui.available_height().min(ui.clip_rect().height());
 
     let toolbar_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 8.0;
+    let display_strip_reserve = 88.0;
+    let footer_height = 96.0;
     egui::ScrollArea::horizontal()
         .id_source("investigation_3d_toolbar_scroll")
         .auto_shrink([false, false])
@@ -810,64 +833,6 @@ pub fn draw_investigation_3d(
                 {
                     output.focus_target = selected_focus_target;
                 }
-                ui.checkbox(&mut state.clip_enabled, "Depth slice")
-                    .on_hover_text(
-                        "Hide points outside a camera-aligned slab so dense clouds are easier to inspect.",
-                    );
-                ui.add_enabled(
-                    state.clip_enabled,
-                    egui::Slider::new(&mut state.clip_half_extent, 10.0..=4_000.0)
-                        .text("Slice depth")
-                        .logarithmic(true),
-                )
-                .on_hover_text(
-                    "Thickness of the depth slice. Larger values reveal more of the cloud.",
-                );
-                ui.add(
-                    egui::Slider::new(&mut state.point_scale, 2.0..=24.0)
-                        .text("Point scale")
-                        .logarithmic(true),
-                )
-                .on_hover_text(
-                    "Change the rendered point size without changing the underlying data.",
-                );
-                if let Some(raw_history) = raw_history {
-                    raw_history.sanitize_controls();
-                    ui.separator();
-                    ui.add(
-                        egui::Slider::new(&mut raw_history.time_window_ms, 5.0..=5_000.0)
-                            .text("History [ms]")
-                            .logarithmic(true),
-                    )
-                    .on_hover_text(
-                        "Extend or shrink the raw-event time span shown in 3D. The 2D preview window stays unchanged.",
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut raw_history.point_limit, 1_000..=100_000)
-                            .text("Max points")
-                            .logarithmic(true),
-                    )
-                    .on_hover_text(
-                        "Cap the retained raw-event sample for the 3D view so dense windows stay responsive.",
-                    );
-                    let sample_note = match raw_history.visible_time_span_ms() {
-                        Some(span_ms) => format!(
-                            "Sample {} | Retained {:.1} ms",
-                            raw_history.visible_event_count(),
-                            span_ms
-                        ),
-                        None => format!("Sample {}", raw_history.visible_event_count()),
-                    };
-                    ui.small(sample_note).on_hover_text(
-                        "Current raw-event sample count and retained time span after the time-range and point-budget limits are applied.",
-                    );
-                    raw_history_status = Some((
-                        raw_history.time_window_ms,
-                        raw_history.visible_time_span_ms(),
-                        raw_history.visible_event_count(),
-                        raw_history.point_limit,
-                    ));
-                }
                 ui.separator();
                 for (preset, label) in [
                     (AxisPreset::Xy, "XY"),
@@ -895,12 +860,16 @@ pub fn draw_investigation_3d(
                 }
             });
         });
+
+    let raw_history_status = draw_3d_display_strip(ui, state, raw_history, display_strip_reserve);
     ui.separator();
 
     let available_w = ui.available_width().min(ui.clip_rect().width()).max(1.0);
-    let available_h = ui.available_height().min(ui.clip_rect().height()).max(1.0);
-    let footer_height = 72.0;
-    let viewport_h = (available_h - footer_height).max(100.0).min(max_height);
+    let layout_overhead = toolbar_height + 20.0;
+    let viewport_h =
+        (total_available_height - display_strip_reserve - footer_height - layout_overhead)
+            .max(100.0)
+            .min(max_height);
     let desired = egui::vec2(available_w, viewport_h);
     let (rect, response) = ui.allocate_exact_size(
         desired,
@@ -981,8 +950,8 @@ pub fn draw_investigation_3d(
             }
         }
         None => {
-            let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
-            painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
+            let painter = ui.painter_at(paint_rect);
+            painter.rect_filled(paint_rect, 6.0, ui.visuals().extreme_bg_color);
             let message = if renderer.is_wgpu() {
                 if scene_empty {
                     "No 3D data yet.\nLoad a replay or start streaming to see raw events.\nPlugins with 3D scatter views will also appear here."
@@ -993,7 +962,7 @@ pub fn draw_investigation_3d(
                 "3D inspection requires the WGPU renderer.\nRestart with AUGUR_RENDERER=wgpu or AUGUR_RENDERER=auto."
             };
             painter.text(
-                rect.center(),
+                paint_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 message,
                 egui::FontId::proportional(14.0),
@@ -1002,64 +971,253 @@ pub fn draw_investigation_3d(
         }
     }
 
-    ui.add_space(6.0);
-    ui.push_id(response.id.with("footer"), |ui| {
-        egui::ScrollArea::vertical()
-            .max_height(footer_height)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let visible_layers: Vec<_> = scene
-                    .layers
-                    .iter()
-                    .filter(|layer| layer.visible)
-                    .map(|layer| layer.title.as_str())
-                    .collect();
-                let focus_note = scene
-                    .focus_volume
-                    .as_ref()
-                    .map(|focus| format!(" | Focus volume: {}", focus.label))
-                    .unwrap_or_default();
-                ui.add(egui::Label::new(format!(
-                    "Layers: {}{} | Points: {}{}",
-                    visible_layers.len(),
-                    if visible_layers.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", visible_layers.join(", "))
-                    },
-                    scene.visible_point_count(),
-                    focus_note,
-                )));
-                if let Some((requested_ms, retained_ms, sample_count, point_limit)) =
-                    raw_history_status
-                {
-                    let retained_label = retained_ms.unwrap_or(0.0);
-                    let suffix = if sample_count > 0
-                        && retained_label + f32::EPSILON < requested_ms
-                    {
-                        " from the current buffer"
-                    } else {
-                        ""
-                    };
-                    ui.small(format!(
-                        "History: requested {:.0} ms, retained {:.1} ms{}, sample {} / {} points.",
-                        requested_ms,
-                        retained_label,
-                        suffix,
-                        sample_count,
-                        point_limit
-                    ));
-                }
-                ui.small(
-                    "Orientation: sensor X points right, sensor Y points up to match the 2D preview, and older events extend deeper into the cloud.",
-                );
-                ui.small(
-                    "Controls: drag to orbit, Shift/right-drag to pan, scroll to zoom, double-click to fit.",
-                );
-            });
-    });
+    ui.add_space(2.0);
+    draw_3d_status_footer(ui, response.id, scene, raw_history_status, footer_height);
 
     output
+}
+
+fn draw_3d_display_strip(
+    ui: &mut egui::Ui,
+    state: &mut Investigation3dState,
+    raw_history: Option<&mut PointCloudState>,
+    _max_height: f32,
+) -> Option<RawHistoryFooterStatus> {
+    let mut raw_history = raw_history;
+    if let Some(history) = raw_history.as_deref_mut() {
+        history.sanitize_controls();
+    }
+    let mut raw_history_status = raw_history
+        .as_deref()
+        .map(RawHistoryFooterStatus::from_state);
+
+    ui.push_id(ui.id().with("display_strip"), |ui| {
+        draw_section_toggle(ui, &mut state.display_strip_open, "Display");
+        if !state.display_strip_open {
+            return;
+        }
+
+        let strip_row_height =
+            ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 4.0;
+        egui::ScrollArea::horizontal()
+            .id_source("3d_display_strip_scroll_a")
+            .auto_shrink([false, false])
+            .max_height(strip_row_height)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut state.clip_enabled, "Depth slice")
+                        .on_hover_text(
+                            "Hide points outside a camera-aligned slab so dense clouds are easier to inspect.",
+                        );
+                    ui.add_enabled(
+                        state.clip_enabled,
+                        egui::Slider::new(&mut state.clip_half_extent, 10.0..=4_000.0)
+                            .text("Slice depth")
+                            .logarithmic(true),
+                    )
+                    .on_hover_text(
+                        "Thickness of the depth slice. Larger values reveal more of the cloud.",
+                    );
+                    ui.separator();
+                    ui.add(
+                        egui::Slider::new(&mut state.point_scale, 2.0..=24.0)
+                            .text("Point scale")
+                            .logarithmic(true),
+                    )
+                    .on_hover_text(
+                        "Change the rendered point size without changing the underlying data.",
+                    );
+                });
+            });
+
+        if let Some(history) = raw_history {
+            egui::ScrollArea::horizontal()
+                .id_source("3d_display_strip_scroll_b")
+                .auto_shrink([false, false])
+                .max_height(strip_row_height)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Slider::new(&mut history.time_window_ms, 5.0..=5_000.0)
+                                .text("History [ms]")
+                                .logarithmic(true),
+                        )
+                        .on_hover_text(
+                            "Extend or shrink the raw-event time span shown in 3D. The 2D preview window stays unchanged.",
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut history.point_limit, 1_000..=100_000)
+                                .text("Max points")
+                                .logarithmic(true),
+                        )
+                        .on_hover_text(
+                            "Cap the retained raw-event sample for the 3D view so dense windows stay responsive.",
+                        );
+                    });
+                });
+            raw_history_status = Some(RawHistoryFooterStatus::from_state(history));
+        }
+    });
+
+    raw_history_status
+}
+
+fn draw_3d_status_footer(
+    ui: &mut egui::Ui,
+    response_id: egui::Id,
+    scene: &Investigation3dScene,
+    raw_history_status: Option<RawHistoryFooterStatus>,
+    max_height: f32,
+) {
+    let visible_layers: Vec<_> = scene
+        .layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .map(|layer| layer.title.as_str())
+        .collect();
+    let focus_label = scene
+        .focus_volume
+        .as_ref()
+        .map(|focus| focus.label.as_str());
+
+    ui.push_id(response_id.with("footer"), |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .auto_shrink([true, true])
+            .show(ui, |ui| {
+                constrain_section_width(ui);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let mut first = true;
+                    draw_inline_separator(ui, &mut first);
+                    ui.small(format!("Layers: {}", visible_layers.len()));
+                    draw_inline_separator(ui, &mut first);
+                    ui.small(format!("Points: {}", scene.visible_point_count()));
+
+                    if let Some(status) = raw_history_status {
+                        draw_inline_separator(ui, &mut first);
+                        ui.small(format!(
+                            "History: {:.1}/{:.0} ms",
+                            status.retained_ms.unwrap_or(0.0),
+                            status.requested_ms
+                        ));
+                    }
+
+                    if let Some(label) = focus_label {
+                        draw_inline_separator(ui, &mut first);
+                        ui.small(format!("Focus: {label}"));
+                    }
+                });
+
+                egui::CollapsingHeader::new("View details")
+                    .id_source("investigation_3d_view_details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        constrain_section_width(ui);
+                        ui.small(format!(
+                            "Layers: {}{}",
+                            visible_layers.len(),
+                            if visible_layers.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", visible_layers.join(", "))
+                            }
+                        ));
+                        if let Some(status) = raw_history_status {
+                            let retained_label = status.retained_ms.unwrap_or(0.0);
+                            let suffix = if status.sample_count > 0
+                                && retained_label + f32::EPSILON < status.requested_ms
+                            {
+                                " from the current buffer"
+                            } else {
+                                ""
+                            };
+                            ui.small(format!(
+                                "History: requested {:.0} ms, retained {:.1} ms{}, sample {} / {} points.",
+                                status.requested_ms,
+                                retained_label,
+                                suffix,
+                                status.sample_count,
+                                status.point_limit
+                            ));
+                        }
+                        if let Some(label) = focus_label {
+                            ui.small(format!("Focus volume: {label}"));
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Orientation: sensor X points right, sensor Y points up to match the 2D preview, and older events extend deeper into the cloud.",
+                                )
+                                .small(),
+                            )
+                            .wrap(true),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Controls: drag to orbit, Shift/right-drag to pan, scroll to zoom, double-click to fit.",
+                                )
+                                .small(),
+                            )
+                            .wrap(true),
+                        );
+                    });
+            });
+    });
+}
+
+fn draw_section_toggle(ui: &mut egui::Ui, open: &mut bool, label: &str) {
+    let chevron = if *open {
+        egui_phosphor::regular::CARET_DOWN
+    } else {
+        egui_phosphor::regular::CARET_RIGHT
+    };
+    let response = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let chevron_response = ui
+            .add(
+                egui::Label::new(egui::RichText::new(chevron).size(10.0))
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let icon_response = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(egui_phosphor::regular::SLIDERS_HORIZONTAL)
+                        .size(14.0)
+                        .weak(),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let label_response = ui
+            .add(
+                egui::Label::new(egui::RichText::new(label).size(12.0).strong())
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        chevron_response.union(icon_response).union(label_response)
+    });
+    if response.inner.clicked() {
+        *open = !*open;
+    }
+}
+
+fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
+    let width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
+    ui.set_min_width(width);
+    ui.set_max_width(width);
+    ui.set_width(width);
+    ui.style_mut().wrap = Some(true);
+    width
+}
+
+fn draw_inline_separator(ui: &mut egui::Ui, first: &mut bool) {
+    if !*first {
+        ui.label(egui::RichText::new("\u{2022}").weak().size(10.0));
+    }
+    *first = false;
 }
 
 fn scene_focus_target(scene: &Investigation3dScene, key: &StableRowKey) -> Option<[f32; 3]> {

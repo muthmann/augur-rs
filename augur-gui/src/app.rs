@@ -5369,16 +5369,10 @@ impl eframe::App for CameraApp {
                 .max_width(500.0)
                 .show_separator_line(true)
                 .show(ctx, |ui| {
-                    let panel_rect = ui.max_rect();
-                    let panel_width = panel_rect.width();
-                    ui.set_min_size(panel_rect.size());
-                    ui.set_width(panel_width);
+                    let _panel_width = constrain_ui_to_clip_width(ui);
                     ui.style_mut().wrap = Some(true);
-                    ui.expand_to_include_rect(panel_rect);
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.set_min_size(panel_rect.size());
-                        ui.set_width(panel_width);
-                        ui.expand_to_include_rect(panel_rect);
+                    ui.vertical(|ui| {
+                        constrain_ui_to_clip_width(ui);
                         ui.horizontal(|ui| {
                             ui.heading("Investigation Inspector");
                             ui.with_layout(
@@ -5391,7 +5385,8 @@ impl eframe::App for CameraApp {
                                                     .size(14.0)
                                                     .color(ui.visuals().weak_text_color()),
                                             )
-                                            .frame(false),
+                                            .frame(false)
+                                            .min_size(egui::vec2(20.0, 20.0)),
                                         )
                                         .clicked()
                                     {
@@ -5407,11 +5402,8 @@ impl eframe::App for CameraApp {
                             .horizontal_scroll_offset(0.0)
                             .auto_shrink([true, false])
                             .show(ui, |ui| {
-                                let scroll_rect = ui.max_rect();
-                                ui.set_min_size(scroll_rect.size());
-                                ui.set_width(panel_width);
+                                constrain_ui_to_clip_width(ui);
                                 ui.style_mut().wrap = Some(true);
-                                ui.expand_to_include_rect(scroll_rect);
                                 self.render_investigation_inspector(ui);
 
                                 if has_analysis_extensions {
@@ -5540,11 +5532,8 @@ impl eframe::App for CameraApp {
                                         }
                                     }
                                 }
-                                ui.expand_to_include_rect(scroll_rect);
                             });
-                        ui.expand_to_include_rect(panel_rect);
                     });
-                    ui.expand_to_include_rect(panel_rect);
                 });
         } else {
             egui::SidePanel::right("analysis_collapsed")
@@ -6332,6 +6321,9 @@ fn show_investigation_split(
         ui.id().with(id_source),
         egui::Sense::click_and_drag(),
     );
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
     if response.dragged() {
         left_width = (left_width + ui.ctx().input(|input| input.pointer.delta().x))
             .clamp(min_pane_width, usable_width - min_pane_width);
@@ -6339,12 +6331,13 @@ fn show_investigation_split(
         ui.ctx().request_repaint();
     }
 
+    let pane_inset = 4.0;
     let left_rect = egui::Rect::from_min_max(
         full_rect.min,
-        egui::pos2(handle_rect.left(), full_rect.bottom()),
+        egui::pos2(handle_rect.left() - pane_inset, full_rect.bottom()),
     );
     let right_rect = egui::Rect::from_min_max(
-        egui::pos2(handle_rect.right(), full_rect.top()),
+        egui::pos2(handle_rect.right() + pane_inset, full_rect.top()),
         full_rect.max,
     );
     ui.allocate_rect(full_rect, egui::Sense::hover());
@@ -6376,6 +6369,10 @@ fn show_investigation_pane<R>(
     let pane_clip = rect.intersect(parent_clip);
     ui.allocate_ui_at_rect(rect, |ui| {
         ui.set_clip_rect(pane_clip);
+        ui.set_min_width(pane_clip.width().max(0.0));
+        ui.set_min_height(pane_clip.height().max(0.0));
+        ui.set_max_width(pane_clip.width().max(0.0));
+        ui.set_max_height(pane_clip.height().max(0.0));
         ui.set_width(pane_clip.width().max(0.0));
         ui.set_height(pane_clip.height().max(0.0));
         add_contents(ui)
@@ -6390,6 +6387,18 @@ fn investigation_split_ratio_bounds(usable_width: f32, min_pane_width: f32) -> (
 
     let min_ratio = (min_pane_width / usable_width).clamp(0.0, 0.5);
     (min_ratio, 1.0 - min_ratio)
+}
+
+fn clipped_ui_width(available_width: f32, clip_width: f32) -> f32 {
+    available_width.min(clip_width).max(0.0)
+}
+
+fn constrain_ui_to_clip_width(ui: &mut egui::Ui) -> f32 {
+    let width = clipped_ui_width(ui.available_width(), ui.clip_rect().width());
+    ui.set_min_width(width);
+    ui.set_max_width(width);
+    ui.set_width(width);
+    width
 }
 
 fn scene_point_for_selection(
@@ -6471,12 +6480,13 @@ impl Drop for CameraApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        acq_time_us_from_ms, derived_replay_preview_interval_ms, investigation_split_ratio_bounds,
-        pipeline_stream_active, raw_event_focus_volume, raw_event_point_position,
-        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
-        replay_pipeline_config, replay_seek_target_reached, replay_step_target_time_us,
-        replay_step_uses_current_controller, replay_time_from_position_sources,
-        roi_is_effectively_full_frame, sync_acq_time_atomic, viewport_stream_active,
+        acq_time_us_from_ms, clipped_ui_width, derived_replay_preview_interval_ms,
+        investigation_split_ratio_bounds, pipeline_stream_active, raw_event_focus_volume,
+        raw_event_point_position, replay_fraction_from_time, replay_history_has_display_override,
+        replay_history_step_target, replay_pipeline_config, replay_seek_target_reached,
+        replay_step_target_time_us, replay_step_uses_current_controller,
+        replay_time_from_position_sources, roi_is_effectively_full_frame, sync_acq_time_atomic,
+        viewport_stream_active,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -6695,5 +6705,12 @@ mod tests {
     #[test]
     fn split_ratio_bounds_collapse_to_center_when_min_panes_fill_the_width() {
         assert_eq!(investigation_split_ratio_bounds(200.0, 120.0), (0.5, 0.5));
+    }
+
+    #[test]
+    fn clipped_ui_width_prefers_the_visible_inner_width() {
+        assert_eq!(clipped_ui_width(380.0, 362.0), 362.0);
+        assert_eq!(clipped_ui_width(280.0, 320.0), 280.0);
+        assert_eq!(clipped_ui_width(-5.0, 320.0), 0.0);
     }
 }

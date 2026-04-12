@@ -22,8 +22,8 @@ This pass adds:
 - the same layout model for the embedded viewer and the popup viewer
 - a right-side investigation inspector for layout, ROI linking, selection state, layer visibility,
   style controls, stage cards, and stale/provenance signals
-- raw-event 3D history controls directly in the 3D toolbar, plus tooltip coverage for the exposed
-  3D controls and layer actions
+- a consistent viewer structure across 2D and 3D: toolbar for navigation, a collapsible display
+  strip for render settings, and a footer for live status plus expandable guidance
 - raw-event continuity across drained preview frames so the 3D history no longer shows avoidable
   temporal holes when the 2D preview coalesces intermediate frames
 - raw-event depth scaling against the history that is actually retained, so requesting more history
@@ -51,6 +51,10 @@ metadata. Plugin-specific research semantics are still outside this repository.
 - The 2D preview toolbar and 3D controls now scroll horizontally at narrow widths, so hover text,
   layer/status labels, and tool buttons no longer force the split panes wider than the divider
   allocation.
+- After the later toolbar/footer reorganization, the viewer display strips, status footers, and
+  the open investigation inspector were tightened again to the visible inner content width so the
+  right inspector header stays left-anchored and its collapse button remains fully visible during
+  aggressive split/window resizing.
 - Selecting a host-owned inspectable point in 2D highlights the same item in 3D and in linked
   tables.
 - Selecting a point in 3D updates the same host selection state and focuses the camera target.
@@ -73,10 +77,13 @@ metadata. Plugin-specific research semantics are still outside this repository.
   - `Esc` clears the linked selection
   - `F` focuses the 3D camera on the current selection
 - The 3D toolbar now exposes hover explanations for reset/fit/focus, depth slicing, point scale,
-  history range, point budget, and axis presets.
-- The raw-event history and point-budget controls now live in the 3D toolbar so the temporal
-  context can be widened while inspecting the cloud, instead of forcing a trip through the right
-  inspector.
+  and axis presets.
+- The 3D display strip now carries depth slicing, point scale, raw-event history range, and point
+  budget controls so the temporal context can be widened while inspecting the cloud without
+  crowding the navigation toolbar or forcing a trip through the right inspector.
+- The 2D preview now mirrors that structure with its preview-mode, scale-bar, time-surface, and
+  annotation controls in a matching `Display` strip above the viewport, while hover/pipeline
+  status moved into the footer below the canvas.
 - Raw-event point clouds now keep the events from every drained preview frame, not only the newest
   frame chosen for 2D rendering. This removes the avoidable time-axis packet gaps caused by the
   lossy preview queue.
