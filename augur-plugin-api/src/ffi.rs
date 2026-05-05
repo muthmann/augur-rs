@@ -267,7 +267,7 @@ pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 
-pub const PLUGIN_ABI_VERSION: u64 = 5;
+pub const PLUGIN_ABI_VERSION: u64 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

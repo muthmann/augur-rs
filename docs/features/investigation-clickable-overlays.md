@@ -16,7 +16,7 @@ whenever a `rejected_fits` row is selected.
 
 ## Plugin Contract
 
-Additive fields on `FfiMarkerOverlayItem` (plugin-api ABI bumped from 3 → 4):
+Additive fields on `FfiMarkerOverlayItem`:
 
 - `source_dataset_id: FfiString` — optional (`FfiString::empty()` means "fall
   back"). The dataset whose row backs this marker.
@@ -46,7 +46,7 @@ plugins that have not opted in keep working.
 
 | Path | Role |
 | --- | --- |
-| `augur-plugin-api/src/ffi.rs` | `FfiMarkerOverlayItem::{source_dataset_id, source_row_id}`, `PLUGIN_ABI_VERSION = 4` |
+| `augur-plugin-api/src/ffi.rs` | `FfiMarkerOverlayItem::{source_dataset_id, source_row_id}` |
 | `augur-core/src/analysis/mod.rs` | `MarkerOverlayItem::source_row` |
 | `augur-gui/src/plugin_loader.rs` | FFI → `MarkerOverlayItem::source_row` bridge in `add_marker_overlay` |
 | `augur-gui/src/viewer_widget.rs` | `pick_overlay_candidate` precedence, regression test `overlay_picker_prefers_explicit_source_row_over_layer_dataset_id` |
