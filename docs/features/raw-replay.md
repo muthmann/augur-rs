@@ -92,6 +92,15 @@ Raw replay re-establishes its pacing baseline after a seek on the first decoded 
 Decoded replay can reset immediately from the reopened event index because the event vector is
 already in memory.
 
+Decoded replay files also expose that shared event vector through
+`DecodedReplayEventSource`, a timestamp-range `EventSource` used by the
+upstream raw-event migration. Raw `.raw` replay exposes `RawReplayEventSource`
+with correct cold-scan range reads. The remaining ADR 020 performance work is a
+sparse `.idx` sidecar keyed by file size, mtime, and header bytes, with
+timestamp / byte-offset checkpoints that let the host seek before a requested
+timestamp, decode forward, and repaginate events without scanning from the data
+start each time.
+
 For raw `.raw` seeks, both the packet-reader timing feedback and the preview decoder are seeded
 from the reopened byte position so the first replacement frame lands in the correct EVT3 rollover
 epoch instead of appearing near timestamp `0`.

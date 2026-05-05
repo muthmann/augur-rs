@@ -79,7 +79,6 @@ mod tests {
             Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
             TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
             TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
-            HOST_ACTION_CLUSTER_ROWS_PARAM,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
@@ -108,7 +107,7 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
-        assert_eq!(PLUGIN_ABI_VERSION, 4);
+        assert_eq!(PLUGIN_ABI_VERSION, 5);
     }
 
     #[test]

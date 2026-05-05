@@ -360,10 +360,11 @@ struct RawHistoryFooterStatus {
 
 impl RawHistoryFooterStatus {
     fn from_state(raw_history: &PointCloudState) -> Self {
+        let summary = raw_history.visible_summary();
         Self {
             requested_ms: raw_history.time_window_ms,
-            retained_ms: raw_history.visible_time_span_ms(),
-            sample_count: raw_history.visible_event_count(),
+            retained_ms: summary.retained_time_span_ms,
+            sample_count: summary.sampled_count,
             point_limit: raw_history.point_limit,
         }
     }

@@ -1379,12 +1379,12 @@ impl WgpuPreviewRenderer {
             time_surface_tau_us,
             ..
         } = request;
-        if uses_gpu_count_accumulation(mode) && frame.events.is_some() {
+        if uses_gpu_count_accumulation(mode) && frame.raw_events_available() {
             return self.render_count_accumulated(frame, settings, mode, perf);
         }
 
         if matches!(mode, PreviewMode::TimeSurface) {
-            if frame.events.is_some() {
+            if frame.raw_events_available() {
                 return self.render_time_surface_accumulated(
                     frame,
                     settings,
@@ -1415,12 +1415,12 @@ impl WgpuPreviewRenderer {
         if histogram_request == PreviewHistogramRequest::None {
             return Ok(None);
         }
-        if matches!(mode, PreviewMode::TimeSurface) && frame.events.is_some() {
+        if matches!(mode, PreviewMode::TimeSurface) && frame.raw_events_available() {
             return self
                 .compute_time_surface_histogram(frame, time_surface_tau_us, histogram_request)
                 .map(Some);
         }
-        if !uses_gpu_count_accumulation(mode) || frame.events.is_none() {
+        if !uses_gpu_count_accumulation(mode) || !frame.raw_events_available() {
             return Ok(None);
         }
 
@@ -1433,7 +1433,7 @@ impl WgpuPreviewRenderer {
         time_surface_tau_us: u64,
         index: usize,
     ) -> Option<u8> {
-        if frame.events.is_none() {
+        if !frame.raw_events_available() {
             return query_time_surface_value(frame, time_surface_tau_us, index);
         }
         self.query_time_surface_value_gpu(frame, time_surface_tau_us, index)
@@ -1565,7 +1565,7 @@ impl WgpuPreviewRenderer {
                 mode,
                 size,
                 settings,
-                frame.events.as_deref().map_or(0, |events| events.len()),
+                frame.event_count().unwrap_or(0),
             )),
         );
         self.ensure_count_render_bind_group()?;
@@ -1599,7 +1599,7 @@ impl WgpuPreviewRenderer {
                 mode,
                 size,
                 PreviewDisplaySettings::default(),
-                frame.events.as_deref().map_or(0, |events| events.len()),
+                frame.event_count().unwrap_or(0),
             )),
         );
 
@@ -1684,8 +1684,7 @@ impl WgpuPreviewRenderer {
         mode: PreviewMode,
     ) -> Result<(), String> {
         let events = frame
-            .events
-            .as_deref()
+            .events_snapshot()
             .ok_or_else(|| "count accumulation requires raw preview events".to_owned())?;
         let key = CountAccumulationKey {
             width: frame.width,
@@ -1934,8 +1933,7 @@ impl WgpuPreviewRenderer {
         frame: &augur_core::pipeline::PreviewFrame,
     ) -> Result<(), String> {
         let events = frame
-            .events
-            .as_deref()
+            .events_snapshot()
             .ok_or_else(|| "time-surface accumulation requires raw preview events".to_owned())?;
         let size = [frame.width as usize, frame.height as usize];
         self.ensure_time_surface_buffers(size, events.len())?;
@@ -2792,6 +2790,8 @@ mod tests {
             on_count: 5,
             off_count: 5,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         }

@@ -187,8 +187,8 @@ impl<'a> EventStoreHandle<'a> {
                 continue;
             };
             let events = unsafe { frame.as_slice() };
-            let start_index = events.partition_point(|event| event.timestamp < start_us);
-            let end_index = events.partition_point(|event| event.timestamp <= end_us);
+            let start_index = events.partition_point(|event| event.timestamp_us() < start_us);
+            let end_index = events.partition_point(|event| event.timestamp_us() <= end_us);
             out.extend_from_slice(&events[start_index..end_index]);
         }
     }
@@ -399,12 +399,7 @@ mod tests {
     }
 
     fn event(timestamp: u64, x: u16) -> FfiCdEvent {
-        FfiCdEvent {
-            timestamp,
-            x,
-            y: 0,
-            polarity: 1,
-        }
+        FfiCdEvent::new(x, 0, timestamp, 1)
     }
 
     unsafe extern "C" fn frame_count(ctx: *const c_void) -> usize {

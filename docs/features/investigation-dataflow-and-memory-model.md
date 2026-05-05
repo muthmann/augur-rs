@@ -8,24 +8,43 @@ data from capture or replay into:
 - the 2D preview image
 - the host-owned 2D investigation markers
 - the 3D raw-event cloud
-- the plugin-facing retained `EventStore`
+- the plugin-facing retained event history exposed as `EventStoreHandle`
 - plugin-provided table/image/series datasets and host views
 
 The short version is:
 
 - the **2D preview image** is rendered from the latest `PreviewFrame`'s
   accumulated pixel planes
-- the **3D raw-event cloud** is rendered from a separate GUI-owned
-  `PointCloudState` history built from drained `PreviewFrame.events`
-- the **plugin retained history** is a third structure: a host-owned
-  `EventStore` that stores copied `FfiCdEvent` frame segments under a memory
-  budget
+- the **3D raw-event cloud** is rendered from GUI-owned projection metadata in
+  `PointCloudState`; it stores upstream source handles and frame ranges, then
+  materializes sampled events only for the renderer
+- the **plugin retained history** is another projection: `PluginEventHistory`
+  registers a dedicated lossless upstream cursor, copies complete frame windows
+  from that cursor under the existing memory budget, and materializes
+  `FfiCdEvent` slices when an `EventStoreHandle` callback is invoked
 - the **host-view datasets** are a fourth path: plugins serialize datasets to
   bytes, the host copies those bytes, decodes them into cached snapshots, and
   then builds 2D/3D investigation layers from those snapshots
 
-So yes: the current implementation has multiple data copies and multiple
-histories. Some are deliberate, but they are not the same source of truth.
+So yes: the current implementation still has multiple histories, but the raw
+3D cloud and GUI-hosted plugin history are now projections over the upstream
+event source instead of independent raw-event owners.
+
+The migration target is now documented in ADR 020:
+
+- one upstream raw-event `EventSource` receives decoded `CompactEvent`s before
+  the bounded preview-frame channel
+- recording and runtime plugins read from that upstream source through
+  lossless cursors
+- the 2D preview, 3D raw-event cloud, and replay UI become lossy projections
+  that keep only derived caches such as count planes or GPU sample buffers
+- host-view datasets stay in `host_views.rs`; the raw-event ring unifies raw
+  events only, not plugin-provided tables/images/series
+
+The upstream ring, GUI projection, dedicated plugin-history cursor, decoded
+replay `EventSource`, and cold-scan raw replay `EventSource` are in place. The
+remaining target gap is indexed raw replay / recording-file repagination as
+described in ADR 020.
 
 ## Existing Documentation Audit
 
@@ -71,26 +90,31 @@ For each decoded batch of `CdEvent`s, the preview thread:
    - `pixels_on`
    - `pixels_off`
    - cached histograms
-2. optionally copies raw events into `frame_events` when
+2. appends the closed frame's raw events into the upstream `LiveEventSource`
+   / `EventRing`
+3. optionally keeps an inline `PreviewFrame.events` copy when
    `raw_events_needed == true`
-3. emits a `PreviewFrame` once the acquisition window closes
+4. emits a `PreviewFrame` once the acquisition window closes
 
 `PreviewFrame` contains:
 
 - image-sized count planes
 - cached histograms
-- optional `events: Option<Vec<CdEvent>>`
+- optional `events: Option<Vec<CdEvent>>` compatibility cache
+- optional `event_range: Option<Range<u64>>` plus `event_source` handle for
+  resolving raw events from the upstream ring
 - `window_start_us` / `window_end_us`
 
 The image/count buffers are pooled and recycled on `Drop`. The raw-event
-`Vec<CdEvent>` is not pooled the same way; it is moved into the frame when raw
-events were requested.
+`Vec<CdEvent>` is not pooled the same way; it is moved into the frame only when
+raw events were requested. The upstream ring receives the frame before the
+bounded preview-frame queue can drop the UI projection.
 
 ### 2. Drain preview frames in `augur-gui`
 
 `CameraApp::update_preview_texture()` drains the preview-frame queue and keeps:
 
-- **all drained raw events** for the GUI raw-history path
+- **all drained frame ranges** for the GUI raw-history projection
 - **only the newest drained `PreviewFrame`** for 2D rendering, plugin
   execution, histograms, line profile, and replay snapshots
 
@@ -119,9 +143,30 @@ Owner: `augur-core`, then `augur-gui`
 
 - allocated only when `raw_events_needed` is true
 - moved into the emitted `PreviewFrame`
-- later cloned or copied again by the GUI
+- later materialized through `PreviewFrame::events_snapshot()` only for
+  compatibility consumers that still need a vector
+- kept temporarily for compatibility while GUI consumers migrate to
+  `PreviewFrame::events_snapshot()`
 
-This raw-event vector is the branching point for most later duplication.
+This raw-event vector used to be the branching point for most later
+duplication. During the upstream-source migration, `PreviewFrame.event_range`
+is the preferred identity for the raw events represented by a frame.
+
+### `LiveEventSource`
+
+Owner: `augur-core`, shared with `augur-gui` through cloned handles
+
+- wraps the upstream `augur_event_types::EventRing`
+- stores decoded frame events before the bounded preview channel can drop a
+  `PreviewFrame`
+- exposes logical event ranges to `PreviewFrame::events_snapshot()`
+- registers a recording cursor in recording sessions; this cursor is advanced
+  after each append because the raw-byte disk writer has already received the
+  packet stream independently
+
+This is the first landed piece of ADR 020. Runtime plugins still receive the
+current compatibility snapshots in this phase, but the source of those
+snapshots can now be upstream of preview-frame drops.
 
 ### `latest_frame`
 
@@ -135,25 +180,38 @@ Owner: `augur-gui::CameraApp`
 
 Owner: `augur-gui`
 
-- type: `VecDeque<CdEvent>`
-- filled from **all drained `PreviewFrame.events`**, not just the newest frame
+- type: `VecDeque<RetainedEventFrame>` projection metadata
+- filled from **all drained `PreviewFrame` event ranges**, not just the newest
+  frame
 - trimmed by time and point-count limits, not by the plugin memory budget
 
-This is the raw-event source for the 3D cloud. It is independent from the
-plugin `EventStore`.
+This is no longer a raw-event owner. It stores upstream source handles and
+logical frame ranges, then materializes a sampled `Vec<CdEvent>` only when the
+3D scene asks for visible events. It remains independent from the plugin
+retained-history projection.
 
-### `EventStore`
+### Plugin retained history / `EventStoreHandle`
 
-Owner: `augur-gui`, implementation in `augur-plugin-api`
+Owner: `augur-gui`, implementation in `augur-gui/src/plugin_loader.rs`
 
-- type: `VecDeque<StoredFrame>`
-- each stored frame owns `Box<[FfiCdEvent]>`
+- type: `VecDeque<PluginEventFrame>`
+- each stored frame normally keeps a `LiveEventSource` handle plus a logical
+  event range
+- fallback inline storage exists only for compatibility frames that do not
+  carry an upstream source/range
 - limited by `event_store_budget_bytes`
 - only appended from the newest processed frame when
   `append_current_frame_to_event_store == true`
 
-This is the retained-history source for plugins. It is independent from the
-GUI 3D raw-event history.
+This is the retained-history source for plugins. The ABI-facing
+`EventStoreHandle` remains unchanged: plugins still request frame counts,
+specific frames, timestamp ranges, and the oldest timestamp. The host resolves
+those requests by materializing `FfiCdEvent` frame slices on demand from the
+upstream source.
+
+`augur-plugin-api/src/event_store.rs` remains as the public helper and
+compatibility implementation for plugin-side tests, but it is no longer the
+GUI host's runtime retained-history owner.
 
 ### Host-view dataset cache
 
@@ -207,8 +265,8 @@ Important detail:
 
 - normal 2D preview is count-plane based
 - it is not rendered from the 3D raw-history buffer
-- time-surface is reconstructed from `frame.events` when raw events were
-  requested; otherwise it falls back
+- time-surface is reconstructed through `PreviewFrame::events_snapshot()` when
+  upstream raw events are available; otherwise it falls back
 
 ### 2. Overlay layers
 
@@ -251,15 +309,15 @@ Source:
 
 Those events came from:
 
-- drained `PreviewFrame.events`
-- copied into `PointCloudState`
-- then copied again into a temporary `Vec<CdEvent>` when `visible_events()`
+- drained `PreviewFrame.event_range` values
+- retained in `PointCloudState` as source/range projection metadata
+- materialized into a sampled temporary `Vec<CdEvent>` when `visible_events()`
   is called
 
 Path:
 
 1. `update_preview_texture()` drains all queued frames
-2. all drained `frame.events` are appended into `PointCloudState`
+2. all drained frame projections are appended into `PointCloudState`
 3. `build_investigation_scene_3d()` pulls `visible_events()`
 4. each event becomes an `Investigation3dPoint`
 5. `inspection_3d.rs` prepares GPU instance data and uploads it
@@ -316,8 +374,10 @@ No, not in the strict sense.
 ### What is not shared physically
 
 - the 2D preview image uses accumulated count planes
-- the raw 3D cloud uses copied raw events in `PointCloudState`
-- plugins use copied `FfiCdEvent`s in `EventStore`
+- the raw 3D cloud uses upstream frame ranges and samples materialized events
+  for rendering
+- plugins use upstream frame ranges through `PluginEventHistory`, with
+  `FfiCdEvent` slices materialized only during `EventStoreHandle` callbacks
 - host views use decoded dataset snapshots built from serialized plugin bytes
 
 ### What is not even the same temporal slice
@@ -349,7 +409,8 @@ Decoded replay:
 - decodes the entire file once into `Arc<Vec<CdEvent>>`
 - seek/reopen reuses that shared event vector
 - each emitted replay frame can still create a new per-frame raw-event vector,
-  plus copies into `PointCloudState` and `EventStore`
+  but the GUI point cloud and plugin retained history keep upstream ranges
+  rather than owning additional raw-event copies
 
 So decoded replay is seek-friendly, but it has the highest number of live
 representations of the same event data.
@@ -358,9 +419,10 @@ representations of the same event data.
 
 - paused seek/forward-step can keep decoding until the requested target frame
   is actually reached
-- while waiting, drained raw events are already appended into `PointCloudState`
-- plugin analysis and `EventStore` are only updated when the chosen display
-  frame is finally processed
+- while waiting, drained raw events are already appended into the upstream event
+  source and can feed point-cloud projections
+- plugin analysis and plugin retained history are only updated when the chosen
+  display frame is finally processed
 
 This again means raw 3D history and plugin history can diverge during seeking.
 
@@ -374,14 +436,18 @@ That snapshot restores:
 - the displayed `PreviewFrame`
 - the cached `analysis_output`
 - the preview histogram
-- a point-cloud history rebuilt from `snapshot.frame.events` only
+- a point-cloud history rebuilt from `snapshot.frame`'s upstream source/range
 
-It does **not** rebuild the plugin `EventStore`.
+When a snapshot carries an upstream source/range, it intentionally drops the
+temporary inline `PreviewFrame.events` cache. Restoring the snapshot can still
+resolve raw events through `PreviewFrame::events_snapshot()`.
 
-That is an important current asymmetry: when the user is looking at an older
-snapshot, the visible 2D frame, visible 3D cloud, and saved plugin outputs can
-all reflect the snapshot, while the retained plugin history may still reflect
-the later controller state.
+It does **not** rewind plugin retained history.
+
+That remains an important state-coherence caveat: when the user is looking at
+an older snapshot, the visible 2D frame, visible 3D cloud, and saved plugin
+outputs can all reflect the snapshot, while plugin retained history may still
+reflect the later controller state.
 
 ## Plugin Interface Boundary
 
@@ -421,21 +487,27 @@ This means the plugin boundary itself already has three distinct data paths:
 
 These are observations about the current implementation, not decisions.
 
-### 1. Raw 3D history and plugin history are separate systems
+### 1. Raw 3D history and plugin history are separate projections
 
-They retain different data, under different policies, with different temporal
-coverage:
+They retain different metadata, under different policies, with different
+temporal coverage:
 
 - `PointCloudState`: time-window + point-limit
-- `EventStore`: memory-budgeted frame segments
+- `PluginEventHistory`: memory-budgeted frame windows exposed through
+  `EventStoreHandle`
 
-Any future indexing, seek-acceleration, or trustworthiness work likely has to
-decide whether those should stay separate.
+ADR 020 resolves this directionally: raw-event indexing moves to the upstream
+`EventSource`; GUI 3D state is now a lossy projection, and plugin retained
+history is copied from a dedicated lossless cursor upstream of UI frame drops.
+The remaining gap is indexed raw replay / recording-file repagination.
 
 ### 2. Queue draining favors 3D continuity over single-source consistency
 
-Drained intermediate frames feed the raw 3D history, but not the plugin
-history or visible 2D/plugin analysis frame.
+Drained intermediate frames feed the upstream source and can feed the raw 3D
+projection. Runtime plugin retained history now catches those frames by draining
+its own upstream cursor even when the bounded preview-frame queue drops a GUI
+projection. Visible 2D rendering and current-frame plugin execution still use
+the newest processed preview frame.
 
 This improves 3D continuity but creates multiple truths.
 
@@ -447,36 +519,39 @@ plugins are all `FrameOnly`.
 
 So the raw-event FFI copy boundary is wider than the logical plugin demand.
 
-### 4. Decoded replay is efficient for seeks, but copy-heavy afterward
+### 4. Decoded replay is efficient for seeks, but still has a compatibility cache
 
 Decoded replay keeps one shared `Arc<Vec<CdEvent>>`, but later stages still
-materialize:
+can still materialize:
 
 - per-frame `PreviewFrame.events`
-- `PointCloudState` history
-- `EventStore` frame copies
+- renderer/plugin callback staging vectors
 - optional plugin-owned datasets
 
-### 5. Replay snapshot stepping does not rewind `EventStore`
+### 5. Raw replay EventSource is correct but not indexed yet
 
-That is probably the most important current state-coherence caveat for future
-refactors around paused tuning, seeking, and trustworthiness.
+Decoded replay files expose their shared `Arc<Vec<CdEvent>>` through a
+timestamp-based `EventSource`. Raw `.raw` replay has a cold-scan
+`RawReplayEventSource` for correctness, but it does not yet have sparse `.idx`
+checkpoints for efficient arbitrary timestamp-range fetches after the live ring
+evicts old windows.
 
 ## File Guide
 
 | File | Current role |
 |---|---|
-| `augur-core/src/pipeline.rs` | preview-frame creation, buffer pooling, optional raw-event capture |
+| `augur-core/src/pipeline.rs` | preview-frame creation, upstream live event source, buffer pooling, optional raw-event compatibility cache |
 | `augur-core/src/replay.rs` | raw EVT3 replay, reopen-at-offset behavior |
 | `augur-core/src/decoded_replay.rs` | decoded replay, whole-file shared event vector |
+| `augur-event-types/src/lib.rs` | shared compact event type, frame index, event ring, event-source trait, and cursor policy |
 | `augur-gui/src/app.rs` | queue drain policy, analysis execution, replay stepping, scene assembly |
 | `augur-gui/src/preview.rs` | CPU preview preparation and time-surface scratch state |
 | `augur-gui/src/preview_renderer.rs` | CPU/WGPU 2D preview rendering and GPU-side staging |
-| `augur-gui/src/point_cloud.rs` | GUI-owned retained raw-event history for 3D |
+| `augur-gui/src/point_cloud.rs` | GUI-owned 3D projection metadata over upstream event ranges |
 | `augur-gui/src/inspection_3d.rs` | WGPU 3D renderer and interaction |
 | `augur-gui/src/host_views.rs` | host dataset/view resolution, decoding, and rendering |
-| `augur-gui/src/plugin_loader.rs` | runtime plugin bridge from Rust traits to FFI |
-| `augur-plugin-api/src/event_store.rs` | retained-event store implementation |
+| `augur-gui/src/plugin_loader.rs` | runtime plugin bridge and GUI-hosted retained-history projection |
+| `augur-plugin-api/src/event_store.rs` | public retained-event helper / compatibility implementation for plugin-side tests |
 | `augur-plugin-api/src/helpers.rs` | safe plugin-side wrappers (`PluginFrame`, `EventStoreHandle`, `HostContext`) |
 | `augur-plugin-api/src/context.rs` | host-view registry and dataset/view/action schema |
 
@@ -490,4 +565,5 @@ refactors around paused tuning, seeking, and trustworthiness.
   - replay seek / step behavior in `augur-gui/src/app.rs`
   - replay reopen behavior in `augur-core/src/replay.rs` and
     `augur-core/src/decoded_replay.rs`
-  - `EventStore` retention tests in `augur-plugin-api/src/event_store.rs`
+  - plugin retained-history callback tests in `augur-gui/src/plugin_loader.rs`
+  - compatibility `EventStore` retention tests in `augur-plugin-api/src/event_store.rs`

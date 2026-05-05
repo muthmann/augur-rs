@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::{BufWriter, Write},
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -11,6 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use augur_event_types::{
+    BackpressureBehavior, CompactEvent, ConsumerCursor, CursorId, CursorPolicy, EventChunk,
+    EventRing, EventSource, FetchError, FrameWindowEntry, RingAppendError,
+};
 use crossbeam_channel::{
     bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
 };
@@ -32,6 +37,7 @@ pub const PREVIEW_PACKET_QUEUE_CAPACITY: usize = 4;
 pub const PREVIEW_FRAME_QUEUE_CAPACITY: usize = 4;
 const PREVIEW_FRAME_POOL_CAPACITY: usize = PREVIEW_FRAME_QUEUE_CAPACITY * 2;
 const DEFAULT_DISK_WRITER_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_EVENT_RING_CAPACITY_EVENTS: usize = 1_000_000;
 pub const N_BUFFERS: usize = RAW_BUFFER_POOL_CAPACITY;
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -41,6 +47,193 @@ pub struct CdEvent {
     pub y: u16,
     pub timestamp: u64,
     pub polarity: bool,
+}
+
+impl From<CdEvent> for CompactEvent {
+    fn from(event: CdEvent) -> Self {
+        Self::new(event.x, event.y, event.timestamp, u8::from(event.polarity))
+    }
+}
+
+impl From<CompactEvent> for CdEvent {
+    fn from(event: CompactEvent) -> Self {
+        Self {
+            x: event.x,
+            y: event.y,
+            timestamp: event.timestamp_us(),
+            polarity: event.is_on(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveEventSource {
+    ring: Arc<Mutex<EventRing>>,
+    capacity_events: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEventFrameBatch {
+    pub events: Vec<CompactEvent>,
+    pub event_range: Range<u64>,
+    pub window_start_us: u64,
+    pub window_end_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorDrainError {
+    MissingCursor,
+    OutOfTimeline,
+}
+
+impl std::fmt::Display for CursorDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingCursor => f.write_str("event cursor is not registered"),
+            Self::OutOfTimeline => f.write_str("event cursor points outside the resident timeline"),
+        }
+    }
+}
+
+impl std::error::Error for CursorDrainError {}
+
+impl LiveEventSource {
+    pub fn with_capacity(capacity_events: usize) -> Self {
+        let capacity_events = capacity_events.max(1);
+        Self {
+            ring: Arc::new(Mutex::new(EventRing::with_capacity(capacity_events))),
+            capacity_events,
+        }
+    }
+
+    pub fn capacity_events(&self) -> usize {
+        self.capacity_events
+    }
+
+    fn lock_ring(&self) -> std::sync::MutexGuard<'_, EventRing> {
+        self.ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ring, &other.ring)
+    }
+
+    pub fn next_event_idx(&self) -> u64 {
+        self.lock_ring().next_event_idx()
+    }
+
+    pub fn append_cd_frame(
+        &self,
+        events: &[CdEvent],
+        window_start_us: u64,
+        window_end_us: u64,
+    ) -> std::result::Result<Range<u64>, RingAppendError> {
+        let compact_events: Vec<_> = events.iter().copied().map(CompactEvent::from).collect();
+        let mut ring = self.lock_ring();
+        let handle = ring.append_frame(&compact_events, window_start_us, window_end_us)?;
+        debug_assert!(
+            ring.resident_byte_count()
+                <= self
+                    .capacity_events
+                    .saturating_mul(std::mem::size_of::<CompactEvent>())
+        );
+        Ok(handle.first_event_idx..handle.first_event_idx + u64::from(handle.event_count))
+    }
+
+    pub fn register_cursor(&self, label: impl Into<String>, policy: CursorPolicy) -> CursorId {
+        self.lock_ring().register_cursor(label, policy)
+    }
+
+    pub fn unregister_cursor(&self, id: CursorId) -> Option<ConsumerCursor> {
+        self.lock_ring().unregister_cursor(id)
+    }
+
+    pub fn advance_cursor(&self, id: CursorId, next_event_idx: u64) -> bool {
+        self.lock_ring().advance_cursor(id, next_event_idx)
+    }
+
+    pub fn cursor_next_event_idx(&self, id: CursorId) -> Option<u64> {
+        self.lock_ring()
+            .cursor(id)
+            .map(ConsumerCursor::next_event_idx)
+    }
+
+    pub fn frame_entries_from(&self, next_event_idx: u64) -> Option<Vec<FrameWindowEntry>> {
+        self.lock_ring().frame_entries_from(next_event_idx)
+    }
+
+    pub fn drain_cursor_frames(
+        &self,
+        cursor: CursorId,
+    ) -> std::result::Result<Vec<LiveEventFrameBatch>, CursorDrainError> {
+        let mut compact_events = Vec::new();
+        let mut batches = Vec::new();
+        let mut newest_drained_idx = None;
+        let ring = self.lock_ring();
+        let next_event_idx = ring
+            .cursor(cursor)
+            .ok_or(CursorDrainError::MissingCursor)?
+            .next_event_idx();
+        let entries = ring
+            .frame_entries_from(next_event_idx)
+            .ok_or(CursorDrainError::OutOfTimeline)?;
+
+        for entry in entries {
+            if next_event_idx > entry.first_event_idx {
+                return Err(CursorDrainError::OutOfTimeline);
+            }
+            let range = entry.first_event_idx..entry.end_event_idx();
+            if !ring.collect_event_range(range.clone(), &mut compact_events) {
+                return Err(CursorDrainError::OutOfTimeline);
+            }
+            newest_drained_idx = Some(range.end);
+            batches.push(LiveEventFrameBatch {
+                events: compact_events.clone(),
+                event_range: range,
+                window_start_us: entry.window_start_us,
+                window_end_us: entry.window_end_us,
+            });
+        }
+
+        if let Some(next) = newest_drained_idx {
+            ring.advance_cursor(cursor, next);
+        }
+        Ok(batches)
+    }
+
+    pub fn compact_events_for_range(&self, range: Range<u64>) -> Option<Vec<CompactEvent>> {
+        let mut events = Vec::new();
+        if !self.lock_ring().collect_event_range(range, &mut events) {
+            return None;
+        }
+        Some(events)
+    }
+
+    pub fn events_for_range(&self, range: Range<u64>) -> Option<Vec<CdEvent>> {
+        let compact_events = self.compact_events_for_range(range)?;
+        Some(compact_events.into_iter().map(CdEvent::from).collect())
+    }
+}
+
+impl Default for LiveEventSource {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_EVENT_RING_CAPACITY_EVENTS)
+    }
+}
+
+impl EventSource for LiveEventSource {
+    fn fetch_range(
+        &self,
+        start_us: u64,
+        end_us: u64,
+    ) -> std::result::Result<EventChunk, FetchError> {
+        self.ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fetch_range(start_us, end_us)
+    }
 }
 
 pub trait PreviewDecoder: Send + 'static {
@@ -123,8 +316,32 @@ pub struct PreviewFrame {
     pub on_count: u64,
     pub off_count: u64,
     pub events: Option<Vec<CdEvent>>,
+    pub event_range: Option<Range<u64>>,
+    pub event_source: Option<LiveEventSource>,
     pub window_start_us: u64,
     pub window_end_us: u64,
+}
+
+impl PreviewFrame {
+    pub fn raw_events_available(&self) -> bool {
+        self.events.is_some() || (self.event_source.is_some() && self.event_range.is_some())
+    }
+
+    pub fn event_count(&self) -> Option<usize> {
+        if let Some(events) = &self.events {
+            return Some(events.len());
+        }
+        let range = self.event_range.as_ref()?;
+        usize::try_from(range.end.saturating_sub(range.start)).ok()
+    }
+
+    pub fn events_snapshot(&self) -> Option<Vec<CdEvent>> {
+        if let Some(events) = &self.events {
+            return Some(events.clone());
+        }
+        let source = self.event_source.as_ref()?;
+        source.events_for_range(self.event_range.clone()?)
+    }
 }
 
 impl Drop for PreviewFrame {
@@ -148,6 +365,8 @@ pub struct PipelineOptions {
     pub sensor_height: u16,
     pub write_evt3_header: bool,
     pub disk_writer_buffer_bytes: usize,
+    pub event_ring_capacity_events: usize,
+    pub plugin_event_history: bool,
     pub metadata: Option<RecordingMetadata>,
 }
 
@@ -159,6 +378,8 @@ impl PipelineOptions {
             sensor_height: 720,
             write_evt3_header: true,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
+            event_ring_capacity_events: DEFAULT_EVENT_RING_CAPACITY_EVENTS,
+            plugin_event_history: false,
             metadata: None,
         }
     }
@@ -170,6 +391,8 @@ impl PipelineOptions {
             sensor_height: height,
             write_evt3_header: false,
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
+            event_ring_capacity_events: DEFAULT_EVENT_RING_CAPACITY_EVENTS,
+            plugin_event_history: false,
             metadata: None,
         }
     }
@@ -481,6 +704,8 @@ fn reset_preview_frame_accumulators(
 fn emit_preview_frame(
     frame_tx: &Sender<PreviewFrame>,
     stats_preview: &Arc<Mutex<PipelineStatsInner>>,
+    event_source: &LiveEventSource,
+    recording_cursor: Option<CursorId>,
     frame_buffers: &mut PreviewFrameBuffers,
     frame_events: &mut Vec<CdEvent>,
     capture_raw_events: bool,
@@ -491,9 +716,19 @@ fn emit_preview_frame(
     height: u16,
     pixel_count: usize,
     window_end_us: u64,
-) {
+) -> std::result::Result<(), RingAppendError> {
     let Some(window_start_us) = *frame_start_ts else {
-        return;
+        return Ok(());
+    };
+
+    let event_range = if frame_events.is_empty() {
+        None
+    } else {
+        let range = event_source.append_cd_frame(frame_events, window_start_us, window_end_us)?;
+        if let Some(cursor) = recording_cursor {
+            event_source.advance_cursor(cursor, range.end);
+        }
+        Some(range)
     };
 
     if frame_tx.is_full() {
@@ -507,7 +742,7 @@ fn emit_preview_frame(
         if let Ok(mut s) = stats_preview.lock() {
             s.record_preview_frame_drop();
         }
-        return;
+        return Ok(());
     }
 
     let frame_send_started = Instant::now();
@@ -533,6 +768,8 @@ fn emit_preview_frame(
         on_count: *on_count,
         off_count: *off_count,
         events: raw_events,
+        event_range,
+        event_source: Some(event_source.clone()),
         window_start_us,
         window_end_us,
     };
@@ -553,6 +790,7 @@ fn emit_preview_frame(
     *on_count = 0;
     *off_count = 0;
     *frame_start_ts = None;
+    Ok(())
 }
 
 fn histogram_index(value: u16) -> usize {
@@ -609,6 +847,8 @@ pub struct PipelineController {
     pub settings_tx: Sender<CameraConfig>,
     pub acq_time_us: Arc<AtomicU64>,
     pub raw_events_needed: Arc<AtomicBool>,
+    pub event_source: LiveEventSource,
+    pub plugin_event_cursor: Option<CursorId>,
     error_rx: Receiver<String>,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStatsInner>>,
@@ -689,6 +929,8 @@ where
         sensor_height,
         write_evt3_header,
         disk_writer_buffer_bytes,
+        event_ring_capacity_events,
+        plugin_event_history,
         metadata,
     } = options;
     let recording = output_path.is_some();
@@ -754,6 +996,23 @@ where
     let raw_events_needed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(PipelineStatsInner::new()));
+    let event_source = LiveEventSource::with_capacity(event_ring_capacity_events);
+    let recording_event_cursor = recording.then(|| {
+        event_source.register_cursor(
+            "recorder",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::BlockWriter { max_block_us: 0 },
+            },
+        )
+    });
+    let plugin_event_cursor = plugin_event_history.then(|| {
+        event_source.register_cursor(
+            "plugin-runtime",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::FailLoud,
+            },
+        )
+    });
 
     let stop_usb = Arc::clone(&stop);
     let stop_preview = Arc::clone(&stop);
@@ -994,6 +1253,7 @@ where
     let height = sensor_height;
     let pixel_count = width as usize * height as usize;
     let preview_pool_tx_preview = preview_pool_tx.clone();
+    let event_source_preview = event_source.clone();
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
@@ -1064,18 +1324,18 @@ where
                             new_on.abs_diff(new_off),
                         );
                         frame_start_ts.get_or_insert(ev.timestamp);
-                        if capture_raw_events {
-                            let raw_event_copy_started = Instant::now();
-                            frame_events.push(*ev);
-                            raw_event_copy_elapsed += raw_event_copy_started.elapsed();
-                        }
+                        let raw_event_copy_started = Instant::now();
+                        frame_events.push(*ev);
+                        raw_event_copy_elapsed += raw_event_copy_started.elapsed();
 
                         if frame_start_ts.is_some_and(|t0| {
                             ev.timestamp.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed)
                         }) {
-                            emit_preview_frame(
+                            if let Err(err) = emit_preview_frame(
                                 &frame_tx,
                                 &stats_preview,
+                                &event_source_preview,
+                                recording_event_cursor,
                                 &mut frame_buffers,
                                 &mut frame_events,
                                 capture_raw_events,
@@ -1086,13 +1346,18 @@ where
                                 height,
                                 pixel_count,
                                 ev.timestamp,
-                            );
+                            ) {
+                                report_pipeline_error(
+                                    &error_preview,
+                                    &stop_preview,
+                                    "preview",
+                                    format!("event ring append failed: {err}"),
+                                );
+                                break;
+                            }
                         }
                     }
                     let accumulate_elapsed = accumulate_started.elapsed();
-                    if !capture_raw_events && !frame_events.is_empty() {
-                        frame_events.clear();
-                    }
                     if let Ok(mut s) = stats_preview.lock() {
                         s.record_preview_accumulate_time(accumulate_elapsed);
                         if raw_event_copy_elapsed > Duration::ZERO {
@@ -1126,6 +1391,8 @@ where
         settings_tx,
         acq_time_us,
         raw_events_needed,
+        event_source,
+        plugin_event_cursor,
         error_rx,
         stop,
         stats,
@@ -1308,6 +1575,15 @@ mod tests {
             .frame_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("preview frame must arrive")
+    }
+
+    fn test_event(timestamp: u64, x: u16) -> CdEvent {
+        CdEvent {
+            x,
+            y: 0,
+            timestamp,
+            polarity: true,
+        }
     }
 
     fn words_to_bytes(words: &[u16]) -> Vec<u8> {
@@ -1640,6 +1916,8 @@ mod tests {
             on_count: 2,
             off_count: 2,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 10,
             window_end_us: 20,
         };
@@ -1672,6 +1950,127 @@ mod tests {
 
         assert_eq!(controller.acq_time_us.load(Ordering::Relaxed), 123_000);
         controller.shutdown().expect("pipeline must shut down");
+    }
+
+    #[test]
+    fn preview_frame_can_resolve_events_from_upstream_source_without_inline_copy() {
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 1;
+        let events = vec![test_event(0, 1), test_event(1_000, 2)];
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![vec![1]],
+                next_packet: 0,
+                release_after_first: None,
+            },
+            TaggedEventDecoder::new(vec![(1, events.clone())]),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        let frame = recv_preview_frame(&controller);
+
+        assert!(frame.events.is_none());
+        assert_eq!(frame.event_range, Some(0..2));
+        assert_eq!(frame.events_snapshot(), Some(events));
+
+        controller.shutdown().expect("shutdown must succeed");
+    }
+
+    #[test]
+    fn live_event_source_drains_lossless_cursor_by_frame() {
+        let source = LiveEventSource::with_capacity(4);
+        let cursor = source.register_cursor(
+            "plugin:test",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::FailLoud,
+            },
+        );
+        source
+            .append_cd_frame(&[test_event(10, 1), test_event(20, 2)], 10, 20)
+            .expect("first frame fits");
+        source
+            .append_cd_frame(&[test_event(30, 3)], 30, 30)
+            .expect("second frame fits");
+
+        let batches = source
+            .drain_cursor_frames(cursor)
+            .expect("cursor drain succeeds");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].event_range, 0..2);
+        assert_eq!(
+            batches[0].events,
+            vec![
+                CompactEvent::from(test_event(10, 1)),
+                CompactEvent::from(test_event(20, 2))
+            ]
+        );
+        assert_eq!(batches[1].event_range, 2..3);
+        assert_eq!(
+            source
+                .drain_cursor_frames(cursor)
+                .expect("second drain succeeds"),
+            Vec::new()
+        );
+
+        source
+            .append_cd_frame(&[test_event(40, 4), test_event(50, 5)], 40, 50)
+            .expect("advanced cursor permits eviction");
+    }
+
+    #[test]
+    fn preview_frame_drop_keeps_events_in_upstream_source() {
+        let (frame_tx, frame_rx) = bounded(1);
+        let mut buffers = take_preview_frame_buffers(4);
+        let mut events = vec![test_event(10, 1)];
+        let mut on_count = 1;
+        let mut off_count = 0;
+        let mut frame_start_ts = Some(10);
+        let stats = Arc::new(Mutex::new(test_stats(Instant::now())));
+        let source = LiveEventSource::default();
+        frame_tx
+            .send(PreviewFrame {
+                width: 2,
+                height: 2,
+                pixels: Vec::new(),
+                pixels_on: Vec::new(),
+                pixels_off: Vec::new(),
+                cached_total_histogram: Vec::new(),
+                cached_signed_histogram: Vec::new(),
+                on_count: 0,
+                off_count: 0,
+                events: None,
+                event_range: None,
+                event_source: None,
+                window_start_us: 0,
+                window_end_us: 0,
+            })
+            .expect("queue seed succeeds");
+
+        emit_preview_frame(
+            &frame_tx,
+            &stats,
+            &source,
+            None,
+            &mut buffers,
+            &mut events,
+            false,
+            &mut on_count,
+            &mut off_count,
+            &mut frame_start_ts,
+            2,
+            2,
+            4,
+            10,
+        )
+        .expect("drop path still succeeds");
+
+        assert_eq!(frame_rx.len(), 1);
+        assert_eq!(source.events_for_range(0..1), Some(vec![test_event(10, 1)]));
+        assert_eq!(stats.lock().expect("stats").preview_frame_drops, 1);
     }
 
     #[test]

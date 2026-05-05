@@ -421,11 +421,11 @@ fn ensure_time_surface_state(frame: &PreviewFrame, scratch: &mut PreviewRenderSc
         return true;
     }
 
-    let Some(events) = frame.events.as_deref() else {
+    let Some(events) = frame.events_snapshot() else {
         return false;
     };
     update_time_surface(
-        events,
+        &events,
         frame.width,
         frame.height,
         &mut scratch.time_surface_ticks,
@@ -582,6 +582,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -603,6 +605,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -634,6 +638,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -667,6 +673,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -698,6 +706,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -725,6 +735,8 @@ mod tests {
                 timestamp: 10,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 10,
         };
@@ -753,6 +765,8 @@ mod tests {
                 timestamp: 25,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 25,
         };
@@ -787,6 +801,8 @@ mod tests {
                 timestamp: 25,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 25,
         };
@@ -813,6 +829,8 @@ mod tests {
                 timestamp: 10,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 10,
         };
@@ -838,6 +856,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };

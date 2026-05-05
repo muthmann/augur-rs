@@ -163,7 +163,7 @@ impl InvestigationTableViewState {
             return 1;
         }
         let per_page = self.page_size.rows_per_page(total_rows).max(1);
-        (total_rows + per_page - 1) / per_page
+        total_rows.div_ceil(per_page)
     }
 
     pub fn clamp_page(&mut self, total_rows: usize) {

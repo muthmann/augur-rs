@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "augur-event-types",
   "augur-core",
   "augur-prophesee",
   "augur-cli",
@@ -17,6 +18,7 @@ authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
 
 [workspace.dependencies]
 anyhow = "1"
+augur-event-types = { path = "augur-event-types" }
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"

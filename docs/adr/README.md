@@ -32,3 +32,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 016: Host-Owned Generic Investigation Workspace](./016-generic-investigation-workspace.md)
 - [ADR 017: Declarative TableV1 Provenance And Display Metadata](./017-declarative-tablev1-metadata.md)
 - [ADR 018: Host Action Bus For Plugin-Declared Actions](./018-host-action-bus.md)
+- [ADR 020: Unified Upstream Event Source](./020-unified-upstream-event-source.md)

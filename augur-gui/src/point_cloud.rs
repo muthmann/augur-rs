@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range};
 
-use augur_core::pipeline::CdEvent;
+use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
 
 const DEFAULT_TIME_WINDOW_MS: f32 = 120.0;
 const MIN_TIME_WINDOW_MS: f32 = 5.0;
@@ -11,24 +11,34 @@ const MAX_POINT_LIMIT: usize = 100_000;
 const MAX_HISTORY_POINTS: usize = 400_000;
 const MAX_HISTORY_MS: f32 = 5_000.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VisibleHistoryWindow {
-    lo: usize,
-    hi: usize,
-    step: usize,
+#[derive(Debug, Clone)]
+struct RetainedEventFrame {
+    source: LiveEventSource,
+    event_range: Range<u64>,
+    window_start_us: u64,
+    window_end_us: u64,
+    event_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct PointCloudState {
-    history: VecDeque<CdEvent>,
+    frames: VecDeque<RetainedEventFrame>,
     pub time_window_ms: f32,
     pub point_limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisiblePointCloudEvents {
+    pub events: Vec<CdEvent>,
+    pub retained_time_span_ms: Option<f32>,
+    pub sampled_count: usize,
+    pub effective_time_window_ms: f32,
 }
 
 impl Default for PointCloudState {
     fn default() -> Self {
         Self {
-            history: VecDeque::with_capacity(32_768),
+            frames: VecDeque::with_capacity(512),
             time_window_ms: DEFAULT_TIME_WINDOW_MS,
             point_limit: DEFAULT_POINT_LIMIT,
         }
@@ -37,22 +47,36 @@ impl Default for PointCloudState {
 
 impl PointCloudState {
     pub fn clear(&mut self) {
-        self.history.clear();
+        self.frames.clear();
     }
 
-    pub fn push_events(&mut self, events: &[CdEvent]) {
-        if events.is_empty() {
+    pub fn push_frame(&mut self, frame: &PreviewFrame) {
+        let Some(source) = frame.event_source.clone() else {
+            return;
+        };
+        let Some(event_range) = frame.event_range.clone() else {
+            return;
+        };
+        let Some(event_count) = frame.event_count() else {
+            return;
+        };
+        if event_count == 0 {
             return;
         }
 
-        let events = if events.len() >= MAX_HISTORY_POINTS {
-            self.history.clear();
-            &events[events.len() - MAX_HISTORY_POINTS..]
+        if event_count >= MAX_HISTORY_POINTS {
+            self.frames.clear();
         } else {
-            events
-        };
+            self.trim_to_point_budget(MAX_HISTORY_POINTS.saturating_sub(event_count));
+        }
 
-        self.history.extend(events.iter().copied());
+        self.frames.push_back(RetainedEventFrame {
+            source,
+            event_range,
+            window_start_us: frame.window_start_us,
+            window_end_us: frame.window_end_us,
+            event_count,
+        });
         self.trim_history();
     }
 
@@ -63,79 +87,90 @@ impl PointCloudState {
         self.point_limit = self.point_limit.clamp(MIN_POINT_LIMIT, MAX_POINT_LIMIT);
     }
 
-    pub fn visible_events(&self) -> Vec<CdEvent> {
-        let Some(window) = self.visible_history_window() else {
-            return Vec::new();
-        };
-        self.history
-            .range(window.lo..window.hi)
-            .step_by(window.step)
-            .copied()
-            .collect()
-    }
+    pub fn visible_summary(&self) -> VisiblePointCloudEvents {
+        let mut events = self.visible_event_candidates();
+        if events.is_empty() {
+            return VisiblePointCloudEvents {
+                events,
+                retained_time_span_ms: None,
+                sampled_count: 0,
+                effective_time_window_ms: self.time_window_ms.max(1.0),
+            };
+        }
 
-    pub fn visible_event_count(&self) -> usize {
-        self.visible_history_window()
-            .map(|window| (window.hi - window.lo).div_ceil(window.step))
-            .unwrap_or(0)
-    }
-
-    pub fn visible_time_span_ms(&self) -> Option<f32> {
-        let window = self.visible_history_window()?;
-        let first = self.history.get(window.lo)?;
-        let last = self.history.get(window.hi.saturating_sub(1))?;
-        Some(last.timestamp.saturating_sub(first.timestamp) as f32 / 1_000.0)
-    }
-
-    pub fn effective_time_window_ms(&self) -> f32 {
-        self.visible_time_span_ms()
-            .unwrap_or(self.time_window_ms)
-            .max(1.0)
+        let retained_time_span_ms = events
+            .first()
+            .zip(events.last())
+            .map(|(first, last)| last.timestamp.saturating_sub(first.timestamp) as f32 / 1_000.0);
+        let step = events.len().div_ceil(self.point_limit.max(1)).max(1);
+        if step > 1 {
+            events = events.drain(..).step_by(step).collect();
+        }
+        let sampled_count = events.len();
+        VisiblePointCloudEvents {
+            events,
+            retained_time_span_ms,
+            sampled_count,
+            effective_time_window_ms: retained_time_span_ms
+                .unwrap_or(self.time_window_ms)
+                .max(1.0),
+        }
     }
 
     fn trim_history(&mut self) {
-        let len = self.history.len();
-        if len > MAX_HISTORY_POINTS {
-            self.history.drain(..len - MAX_HISTORY_POINTS);
-        }
+        self.trim_to_point_budget(MAX_HISTORY_POINTS);
 
-        let Some(latest) = self.history.back() else {
+        let Some(latest) = self.frames.back() else {
             return;
         };
         let cutoff = latest
-            .timestamp
+            .window_end_us
             .saturating_sub((MAX_HISTORY_MS * 1_000.0).round() as u64);
-        let cutoff_idx = self
-            .history
-            .partition_point(|event| event.timestamp < cutoff);
-        if cutoff_idx > 0 {
-            self.history.drain(..cutoff_idx);
+        while self
+            .frames
+            .front()
+            .is_some_and(|frame| frame.window_end_us < cutoff)
+        {
+            self.frames.pop_front();
         }
     }
 
-    fn visible_history_window(&self) -> Option<VisibleHistoryWindow> {
-        let latest = self.history.back()?;
-        let end_ts = latest.timestamp;
-        let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
-        let lo = self
-            .history
-            .partition_point(|event| event.timestamp < start_ts);
-        let hi = self
-            .history
-            .partition_point(|event| event.timestamp <= end_ts);
-        if lo >= hi {
-            return None;
+    fn trim_to_point_budget(&mut self, max_points: usize) {
+        while self.frames.len() > 1 && self.retained_event_count() > max_points {
+            self.frames.pop_front();
         }
+    }
 
-        let step = (hi - lo).div_ceil(self.point_limit.max(1)).max(1);
-        Some(VisibleHistoryWindow { lo, hi, step })
+    fn retained_event_count(&self) -> usize {
+        self.frames.iter().map(|frame| frame.event_count).sum()
+    }
+
+    fn visible_event_candidates(&self) -> Vec<CdEvent> {
+        let Some(latest) = self.frames.back() else {
+            return Vec::new();
+        };
+        let end_ts = latest.window_end_us;
+        let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
+        let mut events = Vec::new();
+        for frame in &self.frames {
+            if frame.window_end_us < start_ts || frame.window_start_us > end_ts {
+                continue;
+            }
+            let Some(mut frame_events) = frame.source.events_for_range(frame.event_range.clone())
+            else {
+                continue;
+            };
+            frame_events.retain(|event| event.timestamp >= start_ts && event.timestamp <= end_ts);
+            events.extend(frame_events);
+        }
+        events
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::PointCloudState;
-    use augur_core::pipeline::CdEvent;
+    use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
 
     fn event(timestamp: u64, x: u16, y: u16) -> CdEvent {
         CdEvent {
@@ -143,6 +178,33 @@ mod tests {
             x,
             y,
             polarity: true,
+        }
+    }
+
+    fn frame(events: &[CdEvent]) -> PreviewFrame {
+        let source = LiveEventSource::default();
+        let window_start_us = events.first().map_or(0, |event| event.timestamp);
+        let window_end_us = events
+            .last()
+            .map_or(window_start_us, |event| event.timestamp);
+        let event_range = source
+            .append_cd_frame(events, window_start_us, window_end_us)
+            .expect("frame events must append");
+        PreviewFrame {
+            width: 1280,
+            height: 720,
+            pixels: Vec::new(),
+            pixels_on: Vec::new(),
+            pixels_off: Vec::new(),
+            cached_total_histogram: Vec::new(),
+            cached_signed_histogram: Vec::new(),
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            event_range: Some(event_range),
+            event_source: Some(source),
+            window_start_us,
+            window_end_us,
         }
     }
 
@@ -167,15 +229,15 @@ mod tests {
             point_limit: 2,
             ..PointCloudState::default()
         };
-        state.push_events(&[
+        state.push_frame(&frame(&[
             event(0, 0, 0),
             event(500, 1, 0),
             event(1_000, 2, 0),
             event(1_250, 3, 0),
             event(1_500, 4, 0),
-        ]);
+        ]));
 
-        let visible = state.visible_events();
+        let visible = state.visible_summary().events;
 
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().all(|event| event.timestamp >= 500));
@@ -184,12 +246,13 @@ mod tests {
     #[test]
     fn clear_drops_history() {
         let mut state = PointCloudState::default();
-        state.push_events(&[event(10, 1, 1), event(20, 2, 2)]);
+        state.push_frame(&frame(&[event(10, 1, 1), event(20, 2, 2)]));
 
         state.clear();
 
-        assert!(state.visible_events().is_empty());
-        assert_eq!(state.visible_event_count(), 0);
+        let summary = state.visible_summary();
+        assert!(summary.events.is_empty());
+        assert_eq!(summary.sampled_count, 0);
     }
 
     #[test]
@@ -199,13 +262,14 @@ mod tests {
             point_limit: 8,
             ..PointCloudState::default()
         };
-        state.push_events(&[
+        state.push_frame(&frame(&[
             event(10_000, 0, 0),
             event(10_500, 1, 0),
             event(11_000, 2, 0),
-        ]);
+        ]));
 
-        assert_eq!(state.visible_time_span_ms(), Some(1.0));
-        assert_eq!(state.effective_time_window_ms(), 1.0);
+        let summary = state.visible_summary();
+        assert_eq!(summary.retained_time_span_ms, Some(1.0));
+        assert_eq!(summary.effective_time_window_ms, 1.0);
     }
 }

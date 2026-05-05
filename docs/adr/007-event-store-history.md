@@ -4,6 +4,12 @@
 
 Accepted
 
+Planned successor: ADR 020, `Unified Upstream Event Source`, is Proposed and
+will supersede this decision once the plugin-runtime cutover is accepted. The
+GUI host has already moved its runtime retained history to a projection over
+upstream event ranges; the public `EventStoreHandle` contract remains in force
+until ADR 020 is accepted.
+
 ## Context
 
 Runtime plugins increasingly need more than the current frame:

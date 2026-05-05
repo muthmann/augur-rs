@@ -595,6 +595,7 @@ dependencies = [
 name = "augur-core"
 version = "1.0.0"
 dependencies = [
+ "augur-event-types",
  "crossbeam-channel",
  "evt3-core",
  "gethostname",
@@ -606,10 +607,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "augur-event-types"
+version = "1.0.0"
+dependencies = [
+ "bytemuck",
+ "serde",
+]
+
+[[package]]
 name = "augur-gui"
 version = "1.0.0"
 dependencies = [
  "augur-core",
+ "augur-event-types",
  "augur-plugin-api",
  "augur-prophesee",
  "bytemuck",
@@ -636,6 +646,7 @@ dependencies = [
 name = "augur-plugin-api"
 version = "1.0.0"
 dependencies = [
+ "augur-event-types",
  "serde",
  "serde_json",
 ]

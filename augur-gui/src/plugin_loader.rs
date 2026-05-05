@@ -1,7 +1,9 @@
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
     ffi::c_void,
     fs,
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -12,10 +14,11 @@ use augur_core::{
         AnalysisOutput, AnalysisSeverity as CoreSeverity, AnalysisWarning, MarkerOverlayItem,
         MarkerShape, Overlay, Pixel, SubpixelMarker,
     },
-    pipeline::PreviewFrame,
+    pipeline::{LiveEventFrameBatch, LiveEventSource, PreviewFrame},
 };
+use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
 use augur_plugin_api::{
-    AnalysisSeverity, EventStore, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
+    AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
     FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
     FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostViewRegistry, PluginCapabilities,
     PluginEntry, PluginInput, PluginVTable, SettingsSchema, StatusEntry, PLUGIN_ABI_VERSION,
@@ -27,6 +30,265 @@ use serde_json::Value;
 
 pub const PLUGIN_UI_CACHE_INTERVAL: Duration = Duration::from_millis(250);
 const MIN_PLAUSIBLE_FUNCTION_POINTER: usize = 4096;
+const DEFAULT_EVENT_HISTORY_BUDGET_BYTES: usize = 100 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+enum PluginEventFrameData {
+    Upstream {
+        source: LiveEventSource,
+        event_range: Range<u64>,
+    },
+    Inline(Box<[FfiCdEvent]>),
+}
+
+#[derive(Debug, Clone)]
+struct PluginEventFrame {
+    data: PluginEventFrameData,
+    window_start_us: u64,
+    window_end_us: u64,
+    byte_len: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct PluginEventHistory {
+    frames: VecDeque<PluginEventFrame>,
+    memory_budget_bytes: usize,
+    memory_usage_bytes: usize,
+    upstream: Option<LiveEventSource>,
+    upstream_cursor: Option<CursorId>,
+}
+
+impl Default for PluginEventHistory {
+    fn default() -> Self {
+        Self {
+            frames: VecDeque::new(),
+            memory_budget_bytes: DEFAULT_EVENT_HISTORY_BUDGET_BYTES,
+            memory_usage_bytes: 0,
+            upstream: None,
+            upstream_cursor: None,
+        }
+    }
+}
+
+impl PluginEventHistory {
+    pub(crate) fn attach_upstream(&mut self, source: LiveEventSource, cursor: Option<CursorId>) {
+        if self
+            .upstream
+            .as_ref()
+            .is_some_and(|existing| existing.ptr_eq(&source))
+        {
+            if self.upstream_cursor.is_none() {
+                self.upstream_cursor = cursor.or_else(|| Some(register_plugin_cursor(&source)));
+            }
+            return;
+        }
+
+        self.detach_upstream();
+        let cursor = cursor.unwrap_or_else(|| register_plugin_cursor(&source));
+        self.upstream = Some(source);
+        self.upstream_cursor = Some(cursor);
+    }
+
+    pub(crate) fn detach_upstream(&mut self) {
+        if let (Some(source), Some(cursor)) = (&self.upstream, self.upstream_cursor) {
+            source.unregister_cursor(cursor);
+        }
+        self.upstream = None;
+        self.upstream_cursor = None;
+    }
+
+    pub(crate) fn sync_from_upstream(&mut self) -> Result<(), String> {
+        let (Some(source), Some(cursor)) = (&self.upstream, self.upstream_cursor) else {
+            return Ok(());
+        };
+        let batches = source
+            .drain_cursor_frames(cursor)
+            .map_err(|err| format!("plugin retained history fell behind upstream events: {err}"))?;
+        for batch in batches {
+            self.push_upstream_batch(batch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_frame(&mut self, frame: &PreviewFrame) {
+        let Some(event_count) = frame.event_count() else {
+            return;
+        };
+        if event_count == 0 {
+            return;
+        }
+
+        let data = if let (Some(source), Some(event_range)) =
+            (frame.event_source.clone(), frame.event_range.clone())
+        {
+            PluginEventFrameData::Upstream {
+                source,
+                event_range,
+            }
+        } else {
+            let Some(events) = frame.events_snapshot() else {
+                return;
+            };
+            PluginEventFrameData::Inline(
+                events
+                    .iter()
+                    .copied()
+                    .map(FfiCdEvent::from)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        };
+
+        let byte_len = event_count.saturating_mul(std::mem::size_of::<FfiCdEvent>());
+        self.frames.push_back(PluginEventFrame {
+            data,
+            window_start_us: frame.window_start_us,
+            window_end_us: frame.window_end_us,
+            byte_len,
+        });
+        self.memory_usage_bytes = self.memory_usage_bytes.saturating_add(byte_len);
+        self.enforce_memory_budget();
+    }
+
+    fn push_upstream_batch(&mut self, batch: LiveEventFrameBatch) {
+        if batch.events.is_empty() {
+            return;
+        }
+        let byte_len = batch.events.len() * std::mem::size_of::<FfiCdEvent>();
+        self.frames.push_back(PluginEventFrame {
+            data: PluginEventFrameData::Inline(batch.events.into_boxed_slice()),
+            window_start_us: batch.window_start_us,
+            window_end_us: batch.window_end_us,
+            byte_len,
+        });
+        self.memory_usage_bytes = self.memory_usage_bytes.saturating_add(byte_len);
+        self.enforce_memory_budget();
+    }
+
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn oldest_timestamp_us(&self) -> Option<u64> {
+        self.frames.front().map(|frame| frame.window_start_us)
+    }
+
+    pub(crate) fn frame_window(&self, index: usize) -> Option<(u64, u64)> {
+        let frame = self.frames.get(index)?;
+        Some((frame.window_start_us, frame.window_end_us))
+    }
+
+    pub(crate) fn materialize_frame(&self, index: usize) -> Option<Box<[FfiCdEvent]>> {
+        let frame = self.frames.get(index)?;
+        match &frame.data {
+            PluginEventFrameData::Upstream {
+                source,
+                event_range,
+            } => {
+                let events = source.events_for_range(event_range.clone())?;
+                Some(
+                    events
+                        .iter()
+                        .copied()
+                        .map(FfiCdEvent::from)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )
+            }
+            PluginEventFrameData::Inline(events) => Some(events.clone()),
+        }
+    }
+
+    pub(crate) fn frame_range_for_timestamps(
+        &self,
+        start_timestamp_us: u64,
+        end_timestamp_us: u64,
+    ) -> Option<(usize, usize)> {
+        if self.frames.is_empty() || start_timestamp_us > end_timestamp_us {
+            return None;
+        }
+
+        let start_index = self.first_frame_with_window_end_at_or_after(start_timestamp_us)?;
+        let end_index = self.first_frame_with_window_start_after(end_timestamp_us);
+        if start_index >= end_index {
+            None
+        } else {
+            Some((start_index, end_index))
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.frames.clear();
+        self.memory_usage_bytes = 0;
+    }
+
+    pub(crate) fn set_memory_budget(&mut self, memory_budget_bytes: usize) {
+        self.memory_budget_bytes = memory_budget_bytes;
+        self.enforce_memory_budget();
+    }
+
+    pub(crate) fn memory_budget_bytes(&self) -> usize {
+        self.memory_budget_bytes
+    }
+
+    pub(crate) fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage_bytes
+    }
+
+    fn first_frame_with_window_end_at_or_after(&self, timestamp_us: u64) -> Option<usize> {
+        let mut left = 0usize;
+        let mut right = self.frames.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.frames[mid].window_end_us < timestamp_us {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        (left < self.frames.len()).then_some(left)
+    }
+
+    fn first_frame_with_window_start_after(&self, timestamp_us: u64) -> usize {
+        let mut left = 0usize;
+        let mut right = self.frames.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.frames[mid].window_start_us <= timestamp_us {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+
+        left
+    }
+
+    fn enforce_memory_budget(&mut self) {
+        while self.frames.len() > 1 && self.memory_usage_bytes > self.memory_budget_bytes {
+            let Some(frame) = self.frames.pop_front() else {
+                break;
+            };
+            self.memory_usage_bytes = self.memory_usage_bytes.saturating_sub(frame.byte_len);
+        }
+    }
+}
+
+impl Drop for PluginEventHistory {
+    fn drop(&mut self) {
+        self.detach_upstream();
+    }
+}
+
+fn register_plugin_cursor(source: &LiveEventSource) -> CursorId {
+    source.register_cursor(
+        "plugin-runtime",
+        CursorPolicy::Lossless {
+            backpressure: BackpressureBehavior::FailLoud,
+        },
+    )
+}
 
 #[derive(Debug, Clone)]
 struct CachedSettingValue {
@@ -341,7 +603,7 @@ impl DynPlugin {
         &mut self,
         frame: &PreviewFrame,
         raw_events: &[FfiCdEvent],
-        event_store: &EventStore,
+        event_store: &PluginEventHistory,
         analysis_output: &mut AnalysisOutput,
         context_data: &mut HashMap<String, Vec<u8>>,
         persistent_data: &mut HashMap<String, Vec<u8>>,
@@ -362,7 +624,10 @@ impl DynPlugin {
             data: context_data,
             persistent_data,
         };
-        let store_bridge = EventStoreBridge { store: event_store };
+        let store_bridge = EventStoreBridge {
+            store: event_store,
+            materialized_frames: RefCell::new(Vec::new()),
+        };
         let mut callbacks = FfiOutputCallbacks {
             ctx: (&mut output_bridge as *mut OutputBridge).cast(),
             add_highlight_pixels,
@@ -622,7 +887,8 @@ struct ContextBridge<'a> {
 }
 
 struct EventStoreBridge<'a> {
-    store: &'a EventStore,
+    store: &'a PluginEventHistory,
+    materialized_frames: RefCell<Vec<Box<[FfiCdEvent]>>>,
 }
 
 unsafe extern "C" fn add_highlight_pixels(
@@ -856,10 +1122,19 @@ unsafe extern "C" fn frame_at_callback(
     let Some(slot) = out_frame.as_mut() else {
         return false;
     };
-    let frame = ctx
-        .cast::<EventStoreBridge>()
-        .as_ref()
-        .and_then(|bridge| bridge.store.frame(index));
+    let bridge = ctx.cast::<EventStoreBridge>().as_ref();
+    let frame = bridge.and_then(|bridge| {
+        let events = bridge.store.materialize_frame(index)?;
+        let (window_start_us, window_end_us) = bridge.store.frame_window(index)?;
+        let mut materialized = bridge.materialized_frames.borrow_mut();
+        materialized.push(events);
+        let events = materialized.last()?;
+        Some(FfiEventFrame::from_slice(
+            events,
+            window_start_us,
+            window_end_us,
+        ))
+    });
     match frame {
         Some(frame) => {
             *slot = frame;
@@ -1099,23 +1374,60 @@ pub fn plugin_phase_label(input: PluginInput) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use augur_core::pipeline::CdEvent;
     use std::ffi::c_void;
 
     fn event(timestamp: u64, x: u16) -> FfiCdEvent {
-        FfiCdEvent {
-            timestamp,
-            x,
-            y: 0,
-            polarity: 1,
+        FfiCdEvent::new(x, 0, timestamp, 1)
+    }
+
+    fn retained_frame(
+        events: &[FfiCdEvent],
+        window_start_us: u64,
+        window_end_us: u64,
+    ) -> PreviewFrame {
+        let source = LiveEventSource::default();
+        let cd_events: Vec<_> = events
+            .iter()
+            .copied()
+            .map(|event| CdEvent {
+                x: event.x,
+                y: event.y,
+                timestamp: event.timestamp_us(),
+                polarity: event.is_on(),
+            })
+            .collect();
+        let event_range = source
+            .append_cd_frame(&cd_events, window_start_us, window_end_us)
+            .expect("test events fit in default live event source");
+
+        PreviewFrame {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 16],
+            pixels_on: vec![0; 16],
+            pixels_off: vec![0; 16],
+            cached_total_histogram: vec![0; 1],
+            cached_signed_histogram: vec![0; 1],
+            on_count: events.len() as u64,
+            off_count: 0,
+            events: None,
+            event_range: Some(event_range),
+            event_source: Some(source),
+            window_start_us,
+            window_end_us,
         }
     }
 
     #[test]
     fn event_store_callbacks_expose_retained_history() {
-        let mut store = EventStore::default();
-        store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
-        store.push_frame(&[event(30, 3)], 30, 30);
-        let bridge = EventStoreBridge { store: &store };
+        let mut store = PluginEventHistory::default();
+        store.push_frame(&retained_frame(&[event(10, 1), event(20, 2)], 10, 20));
+        store.push_frame(&retained_frame(&[event(30, 3)], 30, 30));
+        let bridge = EventStoreBridge {
+            store: &store,
+            materialized_frames: RefCell::new(Vec::new()),
+        };
         let mut out = FfiEventFrame::empty();
 
         unsafe {
@@ -1136,10 +1448,13 @@ mod tests {
 
     #[test]
     fn range_callback_filters_event_history() {
-        let mut store = EventStore::default();
-        store.push_frame(&[event(10, 1), event(20, 2)], 10, 20);
-        store.push_frame(&[event(30, 3), event(40, 4)], 30, 40);
-        let bridge = EventStoreBridge { store: &store };
+        let mut store = PluginEventHistory::default();
+        store.push_frame(&retained_frame(&[event(10, 1), event(20, 2)], 10, 20));
+        store.push_frame(&retained_frame(&[event(30, 3), event(40, 4)], 30, 40));
+        let bridge = EventStoreBridge {
+            store: &store,
+            materialized_frames: RefCell::new(Vec::new()),
+        };
         let mut out_start = usize::MAX;
         let mut out_end = usize::MAX;
 
@@ -1154,6 +1469,109 @@ mod tests {
         }
 
         assert_eq!((out_start, out_end), (0, 2));
+    }
+
+    #[test]
+    fn sync_from_upstream_captures_frames_without_preview_delivery() {
+        let source = LiveEventSource::default();
+        let cursor = source.register_cursor(
+            "plugin:test",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::FailLoud,
+            },
+        );
+        let first = [CdEvent {
+            timestamp: 10,
+            x: 1,
+            y: 0,
+            polarity: true,
+        }];
+        let second = [CdEvent {
+            timestamp: 20,
+            x: 2,
+            y: 0,
+            polarity: false,
+        }];
+        source
+            .append_cd_frame(&first, 10, 10)
+            .expect("first frame fits");
+        source
+            .append_cd_frame(&second, 20, 20)
+            .expect("second frame fits");
+        let mut store = PluginEventHistory::default();
+        store.attach_upstream(source, Some(cursor));
+
+        store.sync_from_upstream().expect("sync succeeds");
+
+        assert_eq!(store.frame_count(), 2);
+        assert_eq!(
+            store.materialize_frame(0).as_deref(),
+            Some(&[event(10, 1)][..])
+        );
+        assert_eq!(
+            store.materialize_frame(1).as_deref(),
+            Some(&[FfiCdEvent::new(2, 0, 20, 0)][..])
+        );
+    }
+
+    #[test]
+    fn synced_upstream_frames_survive_ring_eviction_after_cursor_advance() {
+        let source = LiveEventSource::with_capacity(3);
+        let cursor = source.register_cursor(
+            "plugin:test",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::FailLoud,
+            },
+        );
+        source
+            .append_cd_frame(
+                &[
+                    CdEvent {
+                        timestamp: 10,
+                        x: 1,
+                        y: 0,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        timestamp: 20,
+                        x: 2,
+                        y: 0,
+                        polarity: true,
+                    },
+                ],
+                10,
+                20,
+            )
+            .expect("seed frame fits");
+        let mut store = PluginEventHistory::default();
+        store.attach_upstream(source.clone(), Some(cursor));
+        store.sync_from_upstream().expect("sync advances cursor");
+
+        source
+            .append_cd_frame(
+                &[
+                    CdEvent {
+                        timestamp: 30,
+                        x: 3,
+                        y: 0,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        timestamp: 40,
+                        x: 4,
+                        y: 0,
+                        polarity: true,
+                    },
+                ],
+                30,
+                40,
+            )
+            .expect("advanced cursor permits eviction");
+
+        assert_eq!(
+            store.materialize_frame(0).as_deref(),
+            Some(&[event(10, 1), event(20, 2)][..])
+        );
     }
 
     #[test]

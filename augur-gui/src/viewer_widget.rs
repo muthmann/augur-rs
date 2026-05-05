@@ -606,7 +606,10 @@ fn draw_display_strip(
                             output.time_surface_tau_changed = true;
                         }
                     });
-                    if input.frame.is_some_and(|frame| frame.events.is_none()) {
+                    if input
+                        .frame
+                        .is_some_and(|frame| !frame.raw_events_available())
+                    {
                         ui.small(
                             "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
                         );
@@ -2504,6 +2507,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 0,
         }

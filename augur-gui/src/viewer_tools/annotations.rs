@@ -394,6 +394,8 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
             window_start_us: 0,
             window_end_us: 1,
         };

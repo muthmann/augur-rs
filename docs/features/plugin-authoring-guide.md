@@ -121,13 +121,18 @@ Raw-event delivery and retained history are now separate concerns:
 - `PluginInput::RawEvents` means the plugin needs current-frame raw events
 - `PluginCapabilities { retained_event_history: true }` means the plugin needs host-retained history
 
-`augur-gui` only appends decoded events into the host-owned `EventStore` when at least one enabled
-plugin declares `retained_event_history: true`.
+When at least one enabled plugin declares `retained_event_history: true`,
+`augur-gui` registers a dedicated lossless upstream cursor for runtime plugin
+history. The host copies complete decoded frame windows from that cursor into
+the ABI-stable `EventStoreHandle` history, so bounded preview-frame drops do
+not silently remove frames from retained plugin history.
 
 Empty-event frames are not retained.
 
-This keeps the default preview/record path cheap when no plugin actually needs historical event
-access.
+This keeps the default preview/record path cheap when no plugin actually needs
+historical event access. If the plugin-history cursor falls behind the resident
+upstream ring, the host surfaces an analysis error instead of continuing with
+missing retained frames.
 
 ## Example
 

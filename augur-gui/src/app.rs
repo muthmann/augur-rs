@@ -13,7 +13,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use augur_core::{
-    analysis::{AnalysisOutput, AnalysisWarning, Overlay},
+    analysis::{AnalysisOutput, AnalysisSeverity, AnalysisWarning, Overlay},
     camera::{DeviceInfo, EventCamera},
     config::{CameraConfig, GlobalSettingsConfig},
     metadata::{RecordingAnnotations, RecordingMetadata},
@@ -25,9 +25,9 @@ use augur_core::{
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
 use augur_plugin_api::{
-    EventStore, FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue,
-    HostActionScope, HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginInput,
-    Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1, CTX_GLOBAL_SETTINGS,
+    FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
+    HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginInput, Series1dV1,
+    SettingsSchema, TableColumnValues, TableDatasetV1, CTX_GLOBAL_SETTINGS,
     CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
@@ -62,7 +62,7 @@ use crate::{
         retain_rows_in_frame_span, row_key_for_row, stable_row_id_value, AnalysisRoi,
         Investigation2dPoint, InvestigationLayout, StableRowKey,
     },
-    plugin_loader::PluginManager,
+    plugin_loader::{PluginEventHistory, PluginManager},
     plugin_settings_ui::render_plugin_settings,
     preview::{
         cached_frame_histogram, compute_auto_contrast_max, compute_frame_histogram,
@@ -382,6 +382,14 @@ struct ReplayFrameSnapshot {
     bytes_read: u64,
 }
 
+fn replay_snapshot_frame(frame: &PreviewFrame) -> PreviewFrame {
+    let mut snapshot = frame.clone();
+    if snapshot.event_source.is_some() && snapshot.event_range.is_some() {
+        snapshot.events = None;
+    }
+    snapshot
+}
+
 /// Extract a table reference from a cached dataset entry.
 /// Returns `Ok(Some(table))` if data is available, `Ok(None)` if absent, or
 /// `Err(message)` if loading failed.
@@ -634,7 +642,7 @@ pub struct CameraApp {
     plugin_manager: PluginManager,
     plugin_context_data: HashMap<String, Vec<u8>>,
     persistent_context_data: HashMap<String, Vec<u8>>,
-    event_store: EventStore,
+    event_store: PluginEventHistory,
     nm_per_pixel: f64,
     sensor_width: u16,
     sensor_height: u16,
@@ -746,7 +754,7 @@ impl CameraApp {
             plugin_manager,
             plugin_context_data: HashMap::new(),
             persistent_context_data: HashMap::new(),
-            event_store: EventStore::default(),
+            event_store: PluginEventHistory::default(),
             nm_per_pixel: global_defaults.nm_per_pixel,
             sensor_width: global_defaults.sensor_width,
             sensor_height: global_defaults.sensor_height,
@@ -1342,7 +1350,7 @@ impl CameraApp {
         }
 
         self.replay_frame_history.push_back(ReplayFrameSnapshot {
-            frame: frame.clone(),
+            frame: replay_snapshot_frame(frame),
             analysis_output: self.analysis_output.clone(),
             bytes_read: self.replay_controller_bytes_read(),
         });
@@ -1377,9 +1385,7 @@ impl CameraApp {
                 viewer.line_profile_tool.recompute(&snapshot.frame);
             }
             viewer.workspace.point_cloud.clear();
-            if let Some(events) = snapshot.frame.events.as_deref() {
-                viewer.workspace.point_cloud.push_events(events);
-            }
+            viewer.workspace.point_cloud.push_frame(&snapshot.frame);
         });
 
         if !self.external_tool_status().is_streaming()
@@ -2279,9 +2285,10 @@ impl CameraApp {
         if raw_layers_visible {
             let (raw_events, effective_time_window_ms, active_roi, on_style, off_style) = self
                 .with_active_viewer(|viewer| {
+                    let raw_summary = viewer.workspace.point_cloud.visible_summary();
                     (
-                        viewer.workspace.point_cloud.visible_events(),
-                        viewer.workspace.point_cloud.effective_time_window_ms(),
+                        raw_summary.events,
+                        raw_summary.effective_time_window_ms,
                         viewer.investigation.active_analysis_roi.clone(),
                         viewer
                             .investigation
@@ -2546,9 +2553,7 @@ impl CameraApp {
                 let schema = resolved.descriptor.kind.table_schema()?;
                 let row_id_column = schema.row_id_column.as_deref()?;
                 let entry = self.host_view_dataset_cache.get(dataset_id)?;
-                let table = match cached_table(Some(entry)).ok()?? {
-                    table => table,
-                };
+                let table = cached_table(Some(entry)).ok()??;
                 let id_col = table.column(row_id_column)?;
                 let group_col = table.column(group_column)?;
                 let mut group_value: Option<String> = None;
@@ -3854,15 +3859,18 @@ impl CameraApp {
 
         let extension = replay_file_extension(&path);
         let replay_acq_time_ms = self.acq_time_ms;
+        let plugin_event_history = self.plugins_need_retained_event_history();
         let open_result = match extension.as_deref() {
             Some("raw") => match RawFileCamera::open(&path) {
                 Ok((camera, controls, info)) => {
                     let replay_info = camera.device_info();
+                    let mut options = PipelineOptions::preview_only(info.width, info.height);
+                    options.plugin_event_history = plugin_event_history;
                     spawn_pipeline(
                         camera,
                         Evt3CorePreviewDecoder::default(),
                         replay_pipeline_config(&info, replay_acq_time_ms),
-                        PipelineOptions::preview_only(info.width, info.height),
+                        options,
                     )
                     .map(|controller| OpenedReplay {
                         controller,
@@ -3882,11 +3890,14 @@ impl CameraApp {
                     let result = match DecodedEventFileCamera::open(&path_for_thread) {
                         Ok((camera, controls, info, decoded_events)) => {
                             let replay_info = camera.device_info();
+                            let mut options =
+                                PipelineOptions::preview_only(info.width, info.height);
+                            options.plugin_event_history = plugin_event_history;
                             spawn_pipeline(
                                 camera,
                                 PackedEventPreviewDecoder::default(),
                                 replay_pipeline_config(&info, replay_acq_time_ms),
-                                PipelineOptions::preview_only(info.width, info.height),
+                                options,
                             )
                             .map(|controller| OpenedReplay {
                                 controller,
@@ -4175,6 +4186,7 @@ impl CameraApp {
         let camera_info = camera.device_info();
         self.camera_info = Some(camera_info.clone());
         let mut options = options;
+        options.plugin_event_history = self.plugins_need_retained_event_history();
         if !preview_only {
             options.metadata = Some(
                 RecordingMetadata::from_context(&camera_info, &self.config)
@@ -4509,6 +4521,7 @@ impl CameraApp {
         self.clear_replay_frame_history();
 
         if let Some(controller) = self.controller.take() {
+            self.event_store.detach_upstream();
             if let Err(err) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {err}"));
             }
@@ -4522,14 +4535,18 @@ impl CameraApp {
         let reopen_result = if let Some(decoded_events) = decoded_events {
             let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
             match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
-                Ok((camera, controls)) => spawn_pipeline(
-                    camera,
-                    PackedEventPreviewDecoder::default(),
-                    replay_pipeline_config(&info, self.acq_time_ms),
-                    PipelineOptions::preview_only(info.width, info.height),
-                )
-                .map(|controller| (controller, controls))
-                .map_err(|err| format!("seek pipeline start failed: {err}")),
+                Ok((camera, controls)) => {
+                    let mut options = PipelineOptions::preview_only(info.width, info.height);
+                    options.plugin_event_history = self.plugins_need_retained_event_history();
+                    spawn_pipeline(
+                        camera,
+                        PackedEventPreviewDecoder::default(),
+                        replay_pipeline_config(&info, self.acq_time_ms),
+                        options,
+                    )
+                    .map(|controller| (controller, controls))
+                    .map_err(|err| format!("seek pipeline start failed: {err}"))
+                }
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         } else {
@@ -4537,14 +4554,18 @@ impl CameraApp {
             let target_byte = info.data_offset + target_data_bytes;
             let timestamp_hint_us = info.estimated_timestamp_us_for_data_bytes(target_data_bytes);
             match RawFileCamera::open_at(&path, &info, target_byte) {
-                Ok((camera, controls)) => spawn_pipeline(
-                    camera,
-                    Evt3CorePreviewDecoder::with_expected_timestamp(timestamp_hint_us),
-                    replay_pipeline_config(&info, self.acq_time_ms),
-                    PipelineOptions::preview_only(info.width, info.height),
-                )
-                .map(|controller| (controller, controls))
-                .map_err(|err| format!("seek pipeline start failed: {err}")),
+                Ok((camera, controls)) => {
+                    let mut options = PipelineOptions::preview_only(info.width, info.height);
+                    options.plugin_event_history = self.plugins_need_retained_event_history();
+                    spawn_pipeline(
+                        camera,
+                        Evt3CorePreviewDecoder::with_expected_timestamp(timestamp_hint_us),
+                        replay_pipeline_config(&info, self.acq_time_ms),
+                        options,
+                    )
+                    .map(|controller| (controller, controls))
+                    .map_err(|err| format!("seek pipeline start failed: {err}"))
+                }
                 Err(err) => Err(format!("seek failed: {err}")),
             }
         };
@@ -4627,6 +4648,7 @@ impl CameraApp {
         let was_replaying = self.mode == AppMode::Replaying;
         self.disconnect_external_tool();
         if let Some(controller) = self.controller.take() {
+            self.event_store.detach_upstream();
             if let Err(e) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {e}"));
             }
@@ -4655,6 +4677,7 @@ impl CameraApp {
 
     fn finish_replay(&mut self) {
         if let Some(controller) = self.controller.take() {
+            self.event_store.detach_upstream();
             if let Err(err) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {err}"));
             }
@@ -4785,31 +4808,42 @@ impl CameraApp {
             .iter()
             .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()));
         let ffi_events = if runtime_plugins_enabled {
-            let ffi_events: Vec<FfiCdEvent> = frame
-                .events
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|event| FfiCdEvent {
-                    timestamp: event.timestamp,
-                    x: event.x,
-                    y: event.y,
-                    polarity: u8::from(event.polarity),
-                })
-                .collect();
+            let raw_events = frame.events_snapshot().unwrap_or_default();
+            let ffi_events: Vec<FfiCdEvent> =
+                raw_events.iter().copied().map(FfiCdEvent::from).collect();
             if retained_history_needed {
-                if append_current_frame_to_event_store {
-                    self.event_store.push_frame(
-                        &ffi_events,
-                        frame.window_start_us,
-                        frame.window_end_us,
-                    );
+                let mut synced_upstream = false;
+                if let Some((source, cursor)) = self.controller.as_ref().map(|controller| {
+                    (
+                        controller.event_source.clone(),
+                        controller.plugin_event_cursor,
+                    )
+                }) {
+                    self.event_store.attach_upstream(source, cursor);
+                    match self.event_store.sync_from_upstream() {
+                        Ok(()) => {
+                            synced_upstream = cursor.is_some();
+                        }
+                        Err(err) => {
+                            self.analysis_output.warnings.push(AnalysisWarning {
+                                source: "Plugin history".into(),
+                                severity: AnalysisSeverity::Error,
+                                message: err,
+                            });
+                        }
+                    }
+                }
+
+                if !synced_upstream && append_current_frame_to_event_store {
+                    self.event_store.push_frame(frame);
                 }
             } else {
+                self.event_store.detach_upstream();
                 self.event_store.clear();
             }
             ffi_events
         } else {
+            self.event_store.detach_upstream();
             self.event_store.clear();
             Vec::new()
         };
@@ -4933,17 +4967,14 @@ impl CameraApp {
     }
 
     fn update_preview_texture(&mut self, ctx: &egui::Context) {
-        let Some(ctrl) = &self.controller else {
+        let Some(frame_rx) = self.controller.as_ref().map(|ctrl| ctrl.frame_rx.clone()) else {
             return;
         };
 
         let dequeue_started = Instant::now();
         let mut newest_frame = None;
-        let mut drained_point_cloud_events = Vec::new();
-        while let Ok(frame) = ctrl.frame_rx.try_recv() {
-            if let Some(events) = frame.events.as_deref() {
-                drained_point_cloud_events.extend_from_slice(events);
-            }
+        while let Ok(frame) = frame_rx.try_recv() {
+            self.with_active_viewer_mut(|viewer| viewer.workspace.point_cloud.push_frame(&frame));
             newest_frame = Some(frame);
         }
 
@@ -4951,14 +4982,6 @@ impl CameraApp {
             return;
         };
         self.preview_perf.record_dequeue(dequeue_started.elapsed());
-        if !drained_point_cloud_events.is_empty() {
-            self.with_active_viewer_mut(|viewer| {
-                viewer
-                    .workspace
-                    .point_cloud
-                    .push_events(drained_point_cloud_events.as_slice());
-            });
-        }
 
         let external_streaming = self.external_tool_status().is_streaming();
         let needs_texture = !external_streaming && self.active_investigation_layout().shows_2d();
@@ -7281,7 +7304,7 @@ mod tests {
         investigation_split_ratio_bounds, pipeline_stream_active, raw_event_focus_volume,
         raw_event_point_position, replay_fraction_from_time, replay_history_has_display_override,
         replay_history_step_target, replay_pipeline_config, replay_seek_target_reached,
-        replay_step_target_time_us, replay_step_uses_current_controller,
+        replay_snapshot_frame, replay_step_target_time_us, replay_step_uses_current_controller,
         replay_time_from_position_sources, roi_is_effectively_full_frame, sync_acq_time_atomic,
         viewport_stream_active,
     };
@@ -7294,7 +7317,11 @@ mod tests {
         investigation::AnalysisRoi,
         viewer_widget::{AppMode, ViewerReplayState},
     };
-    use augur_core::{metadata::RecordingMetadata, pipeline::CdEvent, replay::ReplayFileInfo};
+    use augur_core::{
+        metadata::RecordingMetadata,
+        pipeline::{CdEvent, LiveEventSource, PreviewFrame},
+        replay::ReplayFileInfo,
+    };
 
     #[test]
     fn replay_preview_interval_scales_with_speed() {
@@ -7368,6 +7395,41 @@ mod tests {
         assert_eq!(replay_history_step_target(4, Some(1), 2), Some(3));
         assert_eq!(replay_history_step_target(4, Some(0), -1), None);
         assert_eq!(replay_history_step_target(4, Some(3), 1), None);
+    }
+
+    #[test]
+    fn replay_snapshot_keeps_upstream_events_without_inline_cache() {
+        let events = vec![CdEvent {
+            x: 2,
+            y: 3,
+            timestamp: 42,
+            polarity: true,
+        }];
+        let source = LiveEventSource::default();
+        let event_range = source
+            .append_cd_frame(&events, 40, 45)
+            .expect("test frame fits in default source");
+        let frame = PreviewFrame {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 16],
+            pixels_on: vec![0; 16],
+            pixels_off: vec![0; 16],
+            cached_total_histogram: vec![0; 1],
+            cached_signed_histogram: vec![0; 1],
+            on_count: 1,
+            off_count: 0,
+            events: Some(events.clone()),
+            event_range: Some(event_range),
+            event_source: Some(source),
+            window_start_us: 40,
+            window_end_us: 45,
+        };
+
+        let snapshot = replay_snapshot_frame(&frame);
+
+        assert!(snapshot.events.is_none());
+        assert_eq!(snapshot.events_snapshot(), Some(events));
     }
 
     #[test]

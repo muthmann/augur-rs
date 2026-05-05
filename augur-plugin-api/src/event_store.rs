@@ -137,10 +137,10 @@ impl EventStore {
             let frame = &self.frames[index];
             let start = frame
                 .events
-                .partition_point(|event| event.timestamp < start_timestamp_us);
+                .partition_point(|event| event.timestamp_us() < start_timestamp_us);
             let end = frame
                 .events
-                .partition_point(|event| event.timestamp <= end_timestamp_us);
+                .partition_point(|event| event.timestamp_us() <= end_timestamp_us);
             out.extend_from_slice(&frame.events[start..end]);
         }
     }
@@ -209,12 +209,7 @@ mod tests {
     use crate::FfiCdEvent;
 
     fn event(timestamp: u64, x: u16) -> FfiCdEvent {
-        FfiCdEvent {
-            timestamp,
-            x,
-            y: 0,
-            polarity: 1,
-        }
+        FfiCdEvent::new(x, 0, timestamp, 1)
     }
 
     #[test]

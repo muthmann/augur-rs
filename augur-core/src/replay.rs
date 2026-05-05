@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use augur_event_types::{CompactEvent, EventChunk, EventSource, FetchError};
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
@@ -105,6 +106,93 @@ pub struct RawFileCamera {
     paused_at: Option<Instant>,
     total_paused: Duration,
     timestamp_hint_active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawReplayEventSource {
+    path: PathBuf,
+    info: ReplayFileInfo,
+}
+
+impl RawReplayEventSource {
+    pub fn new(path: impl Into<PathBuf>, info: ReplayFileInfo) -> Self {
+        Self {
+            path: path.into(),
+            info,
+        }
+    }
+
+    pub fn info(&self) -> &ReplayFileInfo {
+        &self.info
+    }
+}
+
+impl EventSource for RawReplayEventSource {
+    fn fetch_range(
+        &self,
+        start_us: u64,
+        end_us: u64,
+    ) -> std::result::Result<EventChunk, FetchError> {
+        if start_us > end_us {
+            return Err(FetchError::OutOfTimeline);
+        }
+
+        let mut file = File::open(&self.path).map_err(FetchError::Io)?;
+        file.seek(SeekFrom::Start(self.info.data_offset))
+            .map_err(FetchError::Io)?;
+
+        let mut decoder = Evt3Decoder::default();
+        let mut timestamp_unwrapper = Evt3TimestampUnwrapper::default();
+        let mut cd_events = Vec::<Evt3CdEvent>::with_capacity(4_096);
+        let mut trigger_events = Vec::<Evt3TriggerEvent>::with_capacity(256);
+        let mut compact_events = Vec::new();
+        let mut buf = vec![0_u8; 128 * 1024];
+
+        loop {
+            let read = file.read(&mut buf).map_err(FetchError::Io)?;
+            if read == 0 {
+                break;
+            }
+            decoder
+                .decode_bytes(&buf[..read], &mut cd_events, &mut trigger_events)
+                .map_err(|err| FetchError::Decode(err.to_string()))?;
+
+            for event in &cd_events {
+                let timestamp = timestamp_unwrapper.map_timestamp(event.timestamp);
+                if timestamp > end_us {
+                    decoder.finish_stream_lenient();
+                    return finish_raw_replay_fetch(compact_events, start_us, end_us);
+                }
+                if timestamp >= start_us {
+                    compact_events.push(CompactEvent::new(
+                        event.x,
+                        event.y,
+                        timestamp,
+                        event.polarity,
+                    ));
+                }
+            }
+        }
+        decoder.finish_stream_lenient();
+
+        finish_raw_replay_fetch(compact_events, start_us, end_us)
+    }
+}
+
+fn finish_raw_replay_fetch(
+    events: Vec<CompactEvent>,
+    start_us: u64,
+    end_us: u64,
+) -> std::result::Result<EventChunk, FetchError> {
+    if events.is_empty() {
+        Err(FetchError::OutOfTimeline)
+    } else {
+        Ok(EventChunk {
+            events,
+            start_us,
+            end_us,
+        })
+    }
 }
 
 impl RawFileCamera {
@@ -850,6 +938,26 @@ mod tests {
             info.metadata.extra.get("custom_field").map(String::as_str),
             Some("retained")
         );
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn raw_replay_event_source_fetches_timestamp_ranges_by_cold_scan() {
+        let path = temp_path("event-source");
+        write_sample_raw(&path);
+        let (_camera, _controls, info) = RawFileCamera::open(&path).expect("raw file must open");
+        let source = RawReplayEventSource::new(&path, info);
+
+        let chunk = source
+            .fetch_range(4_120, 4_140)
+            .expect("range fetch succeeds");
+
+        assert_eq!(chunk.events, vec![CompactEvent::new(101, 7, 4_128, 0)]);
+        assert!(matches!(
+            source.fetch_range(5_000, 6_000),
+            Err(FetchError::OutOfTimeline)
+        ));
 
         fs::remove_file(path).expect("temp file must be removed");
     }

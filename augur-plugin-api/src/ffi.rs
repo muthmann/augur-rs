@@ -2,6 +2,8 @@ use std::{ffi::c_void, str::Utf8Error};
 
 use serde::{Deserialize, Serialize};
 
+pub type FfiCdEvent = augur_event_types::CompactEvent;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FfiSlice<T> {
@@ -115,15 +117,6 @@ pub enum AnalysisSeverity {
     Info = 0,
     Warning = 1,
     Error = 2,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FfiCdEvent {
-    pub timestamp: u64,
-    pub x: u16,
-    pub y: u16,
-    pub polarity: u8,
 }
 
 #[repr(C)]
@@ -274,7 +267,7 @@ pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 
-pub const PLUGIN_ABI_VERSION: u64 = 4;
+pub const PLUGIN_ABI_VERSION: u64 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

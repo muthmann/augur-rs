@@ -88,6 +88,8 @@ fn synthetic_frame(width: u16, height: u16, density: FixtureDensity) -> PreviewF
         on_count: 0,
         off_count: 0,
         events: Some(events),
+        event_range: None,
+        event_source: None,
         window_start_us: 0,
         window_end_us: timestamp.max(1),
     }
