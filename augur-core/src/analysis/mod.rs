@@ -35,6 +35,10 @@ pub struct MarkerOverlayItem {
     pub color: [u8; 4],
     pub timestamp_us: Option<u64>,
     pub stable_id: Option<String>,
+    /// Explicit `(dataset_id, row_id)` that backs this marker. When set,
+    /// the host uses it as the selection key on click; otherwise it falls
+    /// back to `(overlay.dataset_id, stable_id)`.
+    pub source_row: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

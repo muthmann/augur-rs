@@ -92,10 +92,48 @@ impl InvestigationSortDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePageSize {
+    Rows25,
+    Rows100,
+    Rows500,
+    All,
+}
+
+impl Default for TablePageSize {
+    fn default() -> Self {
+        Self::Rows100
+    }
+}
+
+impl TablePageSize {
+    pub const ALL: [TablePageSize; 4] = [Self::Rows25, Self::Rows100, Self::Rows500, Self::All];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rows25 => "25",
+            Self::Rows100 => "100",
+            Self::Rows500 => "500",
+            Self::All => "All",
+        }
+    }
+
+    pub fn rows_per_page(self, total: usize) -> usize {
+        match self {
+            Self::Rows25 => 25,
+            Self::Rows100 => 100,
+            Self::Rows500 => 500,
+            Self::All => total.max(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvestigationTableViewState {
     pub sort_column: Option<String>,
     pub sort_direction: InvestigationSortDirection,
+    pub page_size: TablePageSize,
+    pub page_index: usize,
 }
 
 impl Default for InvestigationTableViewState {
@@ -103,6 +141,8 @@ impl Default for InvestigationTableViewState {
         Self {
             sort_column: None,
             sort_direction: InvestigationSortDirection::Ascending,
+            page_size: TablePageSize::default(),
+            page_index: 0,
         }
     }
 }
@@ -115,6 +155,29 @@ impl InvestigationTableViewState {
             self.sort_column = Some(column_id.to_owned());
             self.sort_direction = InvestigationSortDirection::Ascending;
         }
+        self.page_index = 0;
+    }
+
+    pub fn page_count(&self, total_rows: usize) -> usize {
+        if total_rows == 0 {
+            return 1;
+        }
+        let per_page = self.page_size.rows_per_page(total_rows).max(1);
+        (total_rows + per_page - 1) / per_page
+    }
+
+    pub fn clamp_page(&mut self, total_rows: usize) {
+        let max_index = self.page_count(total_rows).saturating_sub(1);
+        if self.page_index > max_index {
+            self.page_index = max_index;
+        }
+    }
+
+    pub fn visible_slice(&self, total_rows: usize) -> (usize, usize) {
+        let per_page = self.page_size.rows_per_page(total_rows).max(1);
+        let start = self.page_index * per_page;
+        let end = (start + per_page).min(total_rows);
+        (start, end)
     }
 }
 
@@ -233,6 +296,18 @@ impl InvestigationState {
         }
     }
 
+    pub fn upsert_authoritative_layer(
+        &mut self,
+        layer_id: impl Into<String>,
+        mut style: InvestigationLayerStyle,
+    ) {
+        let layer_id = layer_id.into();
+        if let Some(existing) = self.layer_styles.get(&layer_id) {
+            style.visible = existing.visible;
+        }
+        self.layer_styles.insert(layer_id, style);
+    }
+
     pub fn sync_dataset_layer(
         &mut self,
         descriptor: &HostDatasetDescriptor,
@@ -346,6 +421,24 @@ pub fn filtered_row_indices(
     rows
 }
 
+/// Retain only rows whose declared time span overlaps the given frame window.
+/// Rows without declared provenance (i.e. no resolvable span) are kept so
+/// plugins that have not opted into provenance remain visible.
+pub fn retain_rows_in_frame_span(
+    rows: Vec<usize>,
+    schema: &TableSchema,
+    dataset: &TableDatasetV1,
+    window: (u64, u64),
+) -> Vec<usize> {
+    let (window_start, window_end) = window;
+    rows.into_iter()
+        .filter(|row| match schema.row_span_us(dataset, *row) {
+            Some((start, end)) => start <= window_end && end >= window_start,
+            None => true,
+        })
+        .collect()
+}
+
 pub fn row_matches_roi(
     roi: Option<&AnalysisRoi>,
     schema: &TableSchema,
@@ -436,6 +529,8 @@ mod tests {
             time_column: None,
             layer_id: Some("layer.a".into()),
             semantic_label: Some("points".into()),
+            provenance: None,
+            column_display: Vec::new(),
         }
     }
 
@@ -469,6 +564,74 @@ mod tests {
     }
 
     #[test]
+    fn span_filter_keeps_rows_overlapping_frame_window() {
+        use augur_plugin_api::TableRowProvenance;
+        let mut schema = schema();
+        schema.columns.push(TableColumn {
+            id: "span_start".into(),
+            title: "Span Start".into(),
+            value_type: TableValueType::U64,
+        });
+        schema.columns.push(TableColumn {
+            id: "span_end".into(),
+            title: "Span End".into(),
+            value_type: TableValueType::U64,
+        });
+        schema.provenance = Some(TableRowProvenance {
+            anchor_time_column: None,
+            span_start_column: Some("span_start".into()),
+            span_end_column: Some("span_end".into()),
+            anchor_frame_column: None,
+        });
+        let dataset = TableDatasetV1::new(vec![
+            TableColumnData {
+                column_id: "id".into(),
+                values: TableColumnValues::String(vec!["a".into(), "b".into()]),
+            },
+            TableColumnData {
+                column_id: "x".into(),
+                values: TableColumnValues::F64(vec![2.0, 18.0]),
+            },
+            TableColumnData {
+                column_id: "y".into(),
+                values: TableColumnValues::F64(vec![3.0, 19.0]),
+            },
+            TableColumnData {
+                column_id: "z".into(),
+                values: TableColumnValues::F64(vec![4.0, 17.0]),
+            },
+            TableColumnData {
+                column_id: "span_start".into(),
+                values: TableColumnValues::U64(vec![100, 500]),
+            },
+            TableColumnData {
+                column_id: "span_end".into(),
+                values: TableColumnValues::U64(vec![200, 600]),
+            },
+        ])
+        .expect("dataset must validate");
+
+        // Window fully inside row 0's span only.
+        let kept = retain_rows_in_frame_span(vec![0, 1], &schema, &dataset, (150, 180));
+        assert_eq!(kept, vec![0]);
+
+        // Window covers both rows.
+        let kept = retain_rows_in_frame_span(vec![0, 1], &schema, &dataset, (50, 1000));
+        assert_eq!(kept, vec![0, 1]);
+
+        // Window after both spans.
+        let kept = retain_rows_in_frame_span(vec![0, 1], &schema, &dataset, (700, 800));
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn span_filter_keeps_rows_without_provenance() {
+        // No provenance, no time column → all rows kept regardless of window.
+        let kept = retain_rows_in_frame_span(vec![0, 1], &schema(), &dataset(), (0, 1));
+        assert_eq!(kept, vec![0, 1]);
+    }
+
+    #[test]
     fn filtered_rows_follow_active_roi() {
         let state = InvestigationState {
             active_analysis_roi: Some(AnalysisRoi {
@@ -481,6 +644,52 @@ mod tests {
         };
         let rows = filtered_row_indices(&state, "table.points", &schema(), &dataset());
         assert_eq!(rows, vec![0]);
+    }
+
+    #[test]
+    fn authoritative_layer_overwrites_color_but_preserves_visibility() {
+        let mut state = InvestigationState::default();
+
+        // Simulate a prior frame where a dataset-derived sync (or a stale
+        // entry) wrote a default-coloured style into the raw ON layer id
+        // and the user had toggled the raw ON layer off.
+        state.layer_styles.insert(
+            "host.raw_events.on".into(),
+            InvestigationLayerStyle {
+                title: "stale".into(),
+                visible: false,
+                color: DEFAULT_LAYER_COLOR,
+                marker_shape: HostMarkerShape::Circle,
+                size: 1.0,
+            },
+        );
+
+        let raw_on_color = [255, 186, 92, 240];
+        state.upsert_authoritative_layer(
+            "host.raw_events.on",
+            InvestigationLayerStyle {
+                title: "Raw Events ON".into(),
+                visible: true,
+                color: raw_on_color,
+                marker_shape: HostMarkerShape::Point,
+                size: 2.0,
+            },
+        );
+
+        let style = state
+            .layer_styles
+            .get("host.raw_events.on")
+            .expect("raw ON style must exist");
+        assert_eq!(
+            style.color, raw_on_color,
+            "raw ON color must not fall back to DEFAULT_LAYER_COLOR"
+        );
+        assert_ne!(style.color, DEFAULT_LAYER_COLOR);
+        assert_eq!(style.marker_shape, HostMarkerShape::Point);
+        assert!(
+            !style.visible,
+            "prior user-chosen visibility must be preserved across authoritative seeding"
+        );
     }
 
     #[test]

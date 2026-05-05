@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -25,8 +25,10 @@ use augur_core::{
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
 use augur_plugin_api::{
-    EventStore, FfiCdEvent, GlobalSettings, HostDatasetKind, HostViewKind, Image2dV1, PluginInput,
-    Series1dV1, TableDatasetV1, CTX_GLOBAL_SETTINGS,
+    EventStore, FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue,
+    HostActionScope, HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginInput,
+    Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1, CTX_GLOBAL_SETTINGS,
+    CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
 
@@ -39,15 +41,16 @@ use crate::{
     },
     host_views::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
-        render_compact_table, render_density2d_view, render_density_window_viewport,
-        render_image2d_view, render_image_window_viewport, render_line_series_view,
-        render_linked_table_view, render_scatter2d_view, render_scatter_window_viewport,
-        render_series_window_viewport, render_table_window_viewport, reset_provider_for_dataset,
+        render_density2d_view, render_density_window_viewport, render_image2d_view,
+        render_image_window_viewport, render_line_series_view, render_linked_table_view,
+        render_scatter2d_view, render_scatter_window_viewport, render_series_window_viewport,
+        render_summary_card, render_table_window_viewport, reset_provider_for_dataset,
         resolve_host_view_registry, DensityWindowViewportData, HostDatasetSnapshot,
         HostRegistryContribution, HostViewImageFormat, HostViewProviderKey, HostViewRenderState,
         HostViewUiActions, ImageWindowViewportData, LinkedTableViewOptions, ResolvedHostView,
         ResolvedHostViewRegistry, Scatter2dViewOptions, ScatterWindowViewportData,
-        SeriesWindowViewportData, TableWindowViewportData,
+        SeriesWindowViewportData, SummaryCardOptions, TableCellFormatOptions,
+        TableWindowViewportData,
     },
     hotpixel::BuiltInHotpixelDetection,
     inspection_3d::{
@@ -56,7 +59,8 @@ use crate::{
     },
     investigation::{
         coordinate_2d_for_row, coordinate_3d_for_row, dataset_layer_id, filtered_row_indices,
-        row_key_for_row, AnalysisRoi, Investigation2dPoint, InvestigationLayout,
+        retain_rows_in_frame_span, row_key_for_row, stable_row_id_value, AnalysisRoi,
+        Investigation2dPoint, InvestigationLayout, StableRowKey,
     },
     plugin_loader::PluginManager,
     plugin_settings_ui::render_plugin_settings,
@@ -666,6 +670,18 @@ pub struct CameraApp {
     host_view_render_state: HashMap<String, HostViewRenderState>,
     host_view_dataset_cache: HashMap<String, HostDatasetCacheEntry>,
     host_view_resolution_warnings: Vec<String>,
+    pending_action_requests: Vec<HostActionRequest>,
+    next_action_request_id: u64,
+    action_modal: Option<ActionModalState>,
+}
+
+#[derive(Debug, Clone)]
+struct ActionModalState {
+    action_id: String,
+    title: String,
+    scope_payload: HostActionScopePayload,
+    schema: Option<SettingsSchema>,
+    params: serde_json::Value,
 }
 
 impl CameraApp {
@@ -766,6 +782,9 @@ impl CameraApp {
             host_view_render_state: HashMap::new(),
             host_view_dataset_cache: HashMap::new(),
             host_view_resolution_warnings: Vec::new(),
+            pending_action_requests: Vec::new(),
+            next_action_request_id: 1,
+            action_modal: None,
         };
         app.event_store
             .set_memory_budget(mib_to_bytes(global_defaults.event_store_budget_mib));
@@ -905,6 +924,59 @@ impl CameraApp {
         });
     }
 
+    fn render_investigation_actions(&mut self, ui: &mut egui::Ui) {
+        let actions: Vec<(String, String, HostActionScope, Option<serde_json::Value>)> = self
+            .host_view_registry
+            .actions()
+            .map(|action| {
+                (
+                    action.descriptor.id.clone(),
+                    action.descriptor.title.clone(),
+                    action.descriptor.scope.clone(),
+                    action.descriptor.param_schema.clone(),
+                )
+            })
+            .collect();
+        if actions.is_empty() {
+            return;
+        }
+        ui.collapsing("Actions", |ui| {
+            ui.small(
+                "Row- and cluster-scoped actions published by plugins. Apply to queue; the plugin consumes on the next frame.",
+            );
+            for (id, title, scope, param_schema) in actions {
+                let payload = self.resolve_action_scope_payload(&scope);
+                let enabled = payload.is_some();
+                let hover = match &scope {
+                    HostActionScope::Dataset { dataset_id } => {
+                        format!("Dataset-wide action on {dataset_id}.")
+                    }
+                    HostActionScope::Row { dataset_id } => format!(
+                        "Select exactly one row on {dataset_id} to enable.",
+                    ),
+                    HostActionScope::Cluster {
+                        dataset_id,
+                        group_column,
+                    } => format!(
+                        "Select rows on {dataset_id} sharing the same {group_column} value.",
+                    ),
+                };
+                ui.horizontal(|ui| {
+                    let response = ui.add_enabled(enabled, egui::Button::new(&title));
+                    let response = response.on_hover_text(&hover);
+                    if response.clicked() {
+                        if let Some(payload) = payload {
+                            let schema = param_schema
+                                .as_ref()
+                                .and_then(|v| serde_json::from_value::<SettingsSchema>(v.clone()).ok());
+                            self.open_action_modal(&id, &title, payload, schema);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     fn render_investigation_inspector(&mut self, ui: &mut egui::Ui) {
         let current_layout = self.active_investigation_layout();
         let (
@@ -1003,6 +1075,9 @@ impl CameraApp {
             }
             ui.small("Shortcuts: 1/2/3 layout, L link ROI, Esc clear selection, F focus 3D");
         });
+
+        ui.separator();
+        self.render_investigation_actions(ui);
 
         ui.separator();
         ui.collapsing("Layers", |ui| {
@@ -1475,8 +1550,9 @@ impl CameraApp {
         }
         if let Some(selected) = investigation_select_row {
             self.with_active_viewer_mut(|viewer| {
-                viewer.investigation.set_single_selection(selected);
+                viewer.investigation.set_single_selection(selected.clone());
             });
+            self.maybe_auto_seek_to_row(&selected);
         }
         if let Some(hovered) = investigation_hover_row {
             self.with_active_viewer_mut(|viewer| {
@@ -1870,6 +1946,26 @@ impl CameraApp {
     fn sync_investigation_layers(&mut self) {
         let datasets: Vec<_> = self.host_view_registry.datasets().cloned().collect();
         self.with_active_viewer_mut(|viewer| {
+            viewer.investigation.upsert_authoritative_layer(
+                RAW_EVENTS_ON_LAYER_ID,
+                crate::investigation::InvestigationLayerStyle {
+                    title: "Raw Events ON".into(),
+                    visible: true,
+                    color: RAW_EVENTS_ON_COLOR,
+                    marker_shape: augur_plugin_api::HostMarkerShape::Point,
+                    size: 2.0,
+                },
+            );
+            viewer.investigation.upsert_authoritative_layer(
+                RAW_EVENTS_OFF_LAYER_ID,
+                crate::investigation::InvestigationLayerStyle {
+                    title: "Raw Events OFF".into(),
+                    visible: true,
+                    color: RAW_EVENTS_OFF_COLOR,
+                    marker_shape: augur_plugin_api::HostMarkerShape::Point,
+                    size: 2.0,
+                },
+            );
             for dataset in &datasets {
                 let schema = match &dataset.descriptor.kind {
                     HostDatasetKind::TableV1(schema) => Some(schema),
@@ -1879,28 +1975,6 @@ impl CameraApp {
                     .investigation
                     .sync_dataset_layer(&dataset.descriptor, schema);
             }
-            viewer
-                .investigation
-                .layer_styles
-                .entry(RAW_EVENTS_ON_LAYER_ID.into())
-                .or_insert_with(|| crate::investigation::InvestigationLayerStyle {
-                    title: "Raw Events ON".into(),
-                    visible: true,
-                    color: RAW_EVENTS_ON_COLOR,
-                    marker_shape: augur_plugin_api::HostMarkerShape::Point,
-                    size: 2.0,
-                });
-            viewer
-                .investigation
-                .layer_styles
-                .entry(RAW_EVENTS_OFF_LAYER_ID.into())
-                .or_insert_with(|| crate::investigation::InvestigationLayerStyle {
-                    title: "Raw Events OFF".into(),
-                    visible: true,
-                    color: RAW_EVENTS_OFF_COLOR,
-                    marker_shape: augur_plugin_api::HostMarkerShape::Point,
-                    size: 2.0,
-                });
         });
     }
 
@@ -1909,6 +1983,10 @@ impl CameraApp {
         self.sync_investigation_layers();
 
         let investigation = self.with_active_viewer(|viewer| viewer.investigation.clone());
+        let frame_window = self
+            .latest_frame
+            .as_ref()
+            .map(|frame| (frame.window_start_us, frame.window_end_us));
         let datasets: Vec<_> = self.host_view_registry.datasets().cloned().collect();
         let mut points = Vec::new();
 
@@ -1935,7 +2013,12 @@ impl CameraApp {
                 continue;
             };
 
-            for row in filtered_row_indices(&investigation, &dataset.descriptor.id, schema, table) {
+            let rows = filtered_row_indices(&investigation, &dataset.descriptor.id, schema, table);
+            let rows = match frame_window {
+                Some(window) => retain_rows_in_frame_span(rows, schema, table, window),
+                None => rows,
+            };
+            for row in rows {
                 let Some([x, y]) = coordinate_2d_for_row(schema, table, row) else {
                     continue;
                 };
@@ -1960,11 +2043,154 @@ impl CameraApp {
         points
     }
 
+    fn candidate_event_id(timestamp: u64, x: u16, y: u16, polarity: bool, occurrence: u32) -> u64 {
+        timestamp
+            ^ u64::from(x).rotate_left(11)
+            ^ u64::from(y).rotate_left(23)
+            ^ u64::from(polarity as u8).rotate_left(37)
+            ^ u64::from(occurrence).rotate_left(47)
+    }
+
+    fn row_index_for_key(
+        dataset_id: &str,
+        generation: u64,
+        schema: &augur_plugin_api::TableSchema,
+        table: &TableDatasetV1,
+        key: &StableRowKey,
+    ) -> Option<usize> {
+        (0..table.row_count())
+            .find(|row| row_key_for_row(dataset_id, generation, schema, table, *row) == *key)
+    }
+
+    fn resolve_related_event_ids_for_row(
+        &mut self,
+        row_key: &StableRowKey,
+        visited: &mut HashSet<StableRowKey>,
+        out: &mut HashSet<u64>,
+    ) {
+        if !visited.insert(row_key.clone()) {
+            return;
+        }
+        self.ensure_host_view_dataset_cached(&row_key.dataset_id);
+        let Some(dataset) = self
+            .host_view_registry
+            .dataset(&row_key.dataset_id)
+            .cloned()
+        else {
+            return;
+        };
+        let HostDatasetKind::TableV1(schema) = &dataset.descriptor.kind else {
+            return;
+        };
+        let cache_entry = self.host_view_dataset_cache.get(&row_key.dataset_id);
+        let generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+        let Ok(Some(table)) = cached_table(cache_entry) else {
+            return;
+        };
+        let Some(row_idx) =
+            Self::row_index_for_key(&row_key.dataset_id, generation, schema, table, row_key)
+        else {
+            return;
+        };
+
+        if let Some(event_ids) = table
+            .column("event_id")
+            .and_then(|column| match &column.values {
+                TableColumnValues::U64(values) => values.get(row_idx).copied(),
+                _ => None,
+            })
+        {
+            out.insert(event_ids);
+            return;
+        }
+
+        let pending_relations: Vec<_> = dataset
+            .descriptor
+            .relations
+            .iter()
+            .filter_map(|relation| {
+                let source_values = table
+                    .column(&relation.via_column)
+                    .map(|column| &column.values)?;
+                let source_value = Self::table_value_key(source_values, row_idx)?;
+                Some((
+                    relation.target_dataset_id.clone(),
+                    relation.target_column.clone(),
+                    source_value,
+                ))
+            })
+            .collect();
+
+        for (target_dataset_id, target_column, source_value) in pending_relations {
+            self.ensure_host_view_dataset_cached(&target_dataset_id);
+            let Some(target_dataset) = self.host_view_registry.dataset(&target_dataset_id).cloned()
+            else {
+                continue;
+            };
+            let HostDatasetKind::TableV1(target_schema) = &target_dataset.descriptor.kind else {
+                continue;
+            };
+            let target_cache = self.host_view_dataset_cache.get(&target_dataset_id);
+            let target_generation = target_cache.map(|entry| entry.generation).unwrap_or(0);
+            let Ok(Some(target_table)) = cached_table(target_cache) else {
+                continue;
+            };
+            let Some(target_values) = target_table
+                .column(&target_column)
+                .map(|column| &column.values)
+            else {
+                continue;
+            };
+            let target_keys: Vec<_> = (0..target_table.row_count())
+                .filter(|target_row| {
+                    Self::table_value_key(target_values, *target_row).as_deref()
+                        == Some(source_value.as_str())
+                })
+                .map(|target_row| {
+                    row_key_for_row(
+                        &target_dataset_id,
+                        target_generation,
+                        target_schema,
+                        target_table,
+                        target_row,
+                    )
+                })
+                .collect();
+            for target_key in target_keys {
+                self.resolve_related_event_ids_for_row(&target_key, visited, out);
+            }
+        }
+    }
+
+    /// Resolve the current selection to stable accepted-event ids. Row types
+    /// that already expose `event_id` contribute directly; derived rows walk
+    /// their declared `HostDatasetRelation`s until they reach event rows.
+    fn resolve_selection_event_ids(&mut self) -> HashSet<u64> {
+        let selected: Vec<StableRowKey> = self.with_active_viewer(|viewer| {
+            viewer.investigation.selected_rows.iter().cloned().collect()
+        });
+        if selected.is_empty() {
+            return HashSet::new();
+        }
+
+        let mut result = HashSet::new();
+        let mut visited = HashSet::new();
+        for key in selected {
+            self.resolve_related_event_ids_for_row(&key, &mut visited, &mut result);
+        }
+        result
+    }
+
     fn build_investigation_scene_3d(&mut self) -> Investigation3dScene {
         self.sync_active_analysis_roi();
         self.sync_investigation_layers();
 
+        let selected_event_ids = self.resolve_selection_event_ids();
         let investigation = self.with_active_viewer(|viewer| viewer.investigation.clone());
+        let frame_window = self
+            .latest_frame
+            .as_ref()
+            .map(|frame| (frame.window_start_us, frame.window_end_us));
         let views: Vec<_> = self.host_view_registry.views().cloned().collect();
         let mut layers = Vec::new();
         let mut focus_volume = None;
@@ -2008,9 +2234,13 @@ impl CameraApp {
             }
 
             let mut points = Vec::new();
-            for row in
-                filtered_row_indices(&investigation, &view.descriptor.dataset_id, schema, table)
-            {
+            let rows =
+                filtered_row_indices(&investigation, &view.descriptor.dataset_id, schema, table);
+            let rows = match frame_window {
+                Some(window) => retain_rows_in_frame_span(rows, schema, table, window),
+                None => rows,
+            };
+            for row in rows {
                 let Some([x, y, z]) = coordinate_3d_for_row(
                     schema,
                     table,
@@ -2100,16 +2330,39 @@ impl CameraApp {
                     continue;
                 }
 
-                let points: Vec<_> = raw_events
+                let selection_active = !selected_event_ids.is_empty();
+                let mut seen_occurrences = HashMap::new();
+                let raw_events_with_ids: Vec<_> = raw_events
                     .iter()
                     .copied()
-                    .filter(|event| event.polarity == polarity)
                     .map(|event| {
+                        let occurrence = seen_occurrences
+                            .entry((event.timestamp, event.x, event.y, event.polarity))
+                            .or_insert(0u32);
+                        let event_id = Self::candidate_event_id(
+                            event.timestamp,
+                            event.x,
+                            event.y,
+                            event.polarity,
+                            *occurrence,
+                        );
+                        *occurrence = occurrence.saturating_add(1);
+                        (event, event_id)
+                    })
+                    .collect();
+                let points: Vec<_> = raw_events_with_ids
+                    .iter()
+                    .copied()
+                    .filter(|(event, _)| event.polarity == polarity)
+                    .map(|(event, event_id)| {
                         let inside_focus = focus_roi
                             .as_ref()
                             .is_none_or(|roi| roi.contains(f64::from(event.x), f64::from(event.y)));
+                        let is_selected =
+                            selection_active && selected_event_ids.contains(&event_id);
+                        let emphasised = inside_focus && (!selection_active || is_selected);
                         let mut color = style.color;
-                        color[3] = if inside_focus {
+                        color[3] = if emphasised {
                             style.color[3]
                         } else {
                             style.color[3].min(36)
@@ -2122,7 +2375,7 @@ impl CameraApp {
                                 effective_time_window_ms,
                             ),
                             color,
-                            size: if inside_focus {
+                            size: if emphasised {
                                 style.size.max(1.5) * 1.05
                             } else {
                                 style.size.max(1.0) * 0.85
@@ -2250,6 +2503,236 @@ impl CameraApp {
         self.refresh_host_view_registry();
     }
 
+    /// Resolve the concrete [`HostActionScopePayload`] for a declared scope
+    /// against the currently selected rows. Returns `None` if the selection
+    /// does not satisfy the scope (button should be hidden / disabled).
+    fn resolve_action_scope_payload(
+        &self,
+        scope: &HostActionScope,
+    ) -> Option<HostActionScopePayload> {
+        let selected: Vec<StableRowKey> = self.with_active_viewer(|viewer| {
+            viewer.investigation.selected_rows.iter().cloned().collect()
+        });
+        match scope {
+            HostActionScope::Dataset { dataset_id } => Some(HostActionScopePayload::Dataset {
+                dataset_id: dataset_id.clone(),
+            }),
+            HostActionScope::Row { dataset_id } => {
+                let matches: Vec<_> = selected
+                    .iter()
+                    .filter(|key| key.dataset_id == *dataset_id)
+                    .collect();
+                if matches.len() == 1 {
+                    Some(HostActionScopePayload::Row {
+                        dataset_id: dataset_id.clone(),
+                        row_id: matches[0].row_id.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            HostActionScope::Cluster {
+                dataset_id,
+                group_column,
+            } => {
+                let matches: Vec<_> = selected
+                    .iter()
+                    .filter(|key| key.dataset_id == *dataset_id)
+                    .collect();
+                if matches.is_empty() {
+                    return None;
+                }
+                let resolved = self.host_view_registry.dataset(dataset_id)?;
+                let schema = resolved.descriptor.kind.table_schema()?;
+                let row_id_column = schema.row_id_column.as_deref()?;
+                let entry = self.host_view_dataset_cache.get(dataset_id)?;
+                let table = match cached_table(Some(entry)).ok()?? {
+                    table => table,
+                };
+                let id_col = table.column(row_id_column)?;
+                let group_col = table.column(group_column)?;
+                let mut group_value: Option<String> = None;
+                for key in &matches {
+                    let mut found_row: Option<usize> = None;
+                    for row in 0..table.row_count() {
+                        if stable_row_id_value(&id_col.values, row).as_deref()
+                            == Some(key.row_id.as_str())
+                        {
+                            found_row = Some(row);
+                            break;
+                        }
+                    }
+                    let row = found_row?;
+                    let value = match &group_col.values {
+                        TableColumnValues::U64(v) => v.get(row)?.to_string(),
+                        TableColumnValues::I64(v) => v.get(row)?.to_string(),
+                        TableColumnValues::F64(v) => v.get(row)?.to_string(),
+                        TableColumnValues::String(v) => v.get(row)?.clone(),
+                        TableColumnValues::Bool(v) => v.get(row)?.to_string(),
+                    };
+                    match &group_value {
+                        Some(existing) if existing != &value => return None,
+                        Some(_) => {}
+                        None => group_value = Some(value),
+                    }
+                }
+                group_value.map(|value| HostActionScopePayload::Cluster {
+                    dataset_id: dataset_id.clone(),
+                    group_column: group_column.clone(),
+                    group_value: value,
+                })
+            }
+        }
+    }
+
+    fn table_value_key(values: &TableColumnValues, row: usize) -> Option<String> {
+        match values {
+            TableColumnValues::U64(v) => v.get(row).map(ToString::to_string),
+            TableColumnValues::I64(v) => v.get(row).map(ToString::to_string),
+            TableColumnValues::F64(v) => v.get(row).map(ToString::to_string),
+            TableColumnValues::String(v) => v.get(row).cloned(),
+            TableColumnValues::Bool(v) => v.get(row).map(ToString::to_string),
+        }
+    }
+
+    fn table_row_snapshot_json(
+        schema: &augur_plugin_api::TableSchema,
+        table: &TableDatasetV1,
+        row: usize,
+    ) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for column in &schema.columns {
+            let Some(column_data) = table.column(&column.id) else {
+                continue;
+            };
+            let value = match &column_data.values {
+                TableColumnValues::U64(v) => v.get(row).copied().map(serde_json::Value::from),
+                TableColumnValues::I64(v) => v.get(row).copied().map(serde_json::Value::from),
+                TableColumnValues::F64(v) => v
+                    .get(row)
+                    .and_then(|value| serde_json::Number::from_f64(*value))
+                    .map(serde_json::Value::Number),
+                TableColumnValues::String(v) => v.get(row).cloned().map(serde_json::Value::String),
+                TableColumnValues::Bool(v) => v.get(row).copied().map(serde_json::Value::from),
+            };
+            if let Some(value) = value {
+                object.insert(column.id.clone(), value);
+            }
+        }
+        serde_json::Value::Object(object)
+    }
+
+    fn cluster_scope_row_snapshots(
+        &mut self,
+        dataset_id: &str,
+        group_column: &str,
+        group_value: &str,
+    ) -> Option<Vec<serde_json::Value>> {
+        self.ensure_host_view_dataset_cached(dataset_id);
+        let resolved = self.host_view_registry.dataset(dataset_id)?;
+        let schema = resolved.descriptor.kind.table_schema()?;
+        let entry = self.host_view_dataset_cache.get(dataset_id)?;
+        let table = cached_table(Some(entry)).ok()??;
+        let group_values = &table.column(group_column)?.values;
+        let mut rows = Vec::new();
+        for row in 0..table.row_count() {
+            if Self::table_value_key(group_values, row).as_deref() == Some(group_value) {
+                rows.push(Self::table_row_snapshot_json(schema, table, row));
+            }
+        }
+        (!rows.is_empty()).then_some(rows)
+    }
+
+    fn augment_action_request_params(
+        &mut self,
+        scope_payload: &HostActionScopePayload,
+        params: &mut serde_json::Value,
+    ) {
+        let HostActionScopePayload::Cluster {
+            dataset_id,
+            group_column,
+            group_value,
+        } = scope_payload
+        else {
+            return;
+        };
+        let Some(rows) = self.cluster_scope_row_snapshots(dataset_id, group_column, group_value)
+        else {
+            return;
+        };
+        if !params.is_object() {
+            *params = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                HOST_ACTION_CLUSTER_ROWS_PARAM.into(),
+                serde_json::Value::Array(rows),
+            );
+        }
+    }
+
+    fn open_action_modal(
+        &mut self,
+        action_id: &str,
+        title: &str,
+        scope_payload: HostActionScopePayload,
+        schema: Option<SettingsSchema>,
+    ) {
+        let params = schema
+            .as_ref()
+            .map(seed_default_params)
+            .unwrap_or(serde_json::Value::Null);
+        self.action_modal = Some(ActionModalState {
+            action_id: action_id.to_owned(),
+            title: title.to_owned(),
+            scope_payload,
+            schema,
+            params,
+        });
+    }
+
+    fn render_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(modal) = self.action_modal.as_ref().cloned() else {
+            return;
+        };
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let mut updated_params = modal.params.clone();
+        egui::Window::new(&modal.title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Configure this action, then Apply to queue it.");
+                ui.separator();
+                if let Some(schema) = &modal.schema {
+                    render_action_modal_schema(ui, schema, &mut updated_params);
+                } else {
+                    ui.label("No parameters — the plugin will use defaults.");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(modal) = self.action_modal.as_mut() {
+            modal.params = updated_params;
+        }
+        if apply {
+            if let Some(modal) = self.action_modal.take() {
+                self.enqueue_action_request(modal.action_id, modal.scope_payload, modal.params);
+            }
+        } else if cancel || !open {
+            self.action_modal = None;
+        }
+    }
+
     fn handle_host_view_actions(&mut self, view: &ResolvedHostView, actions: HostViewUiActions) {
         if actions.clear_requested {
             self.clear_host_view_provider(&view.descriptor.dataset_id);
@@ -2288,14 +2771,45 @@ impl CameraApp {
 
         match (&view.descriptor.kind, &dataset.descriptor.kind) {
             (HostViewKind::CompactTable, HostDatasetKind::TableV1(schema)) => {
-                match cached_table(cache_entry) {
-                    Ok(table) => {
-                        render_compact_table(ui, schema, table, &dataset.descriptor.empty_message);
-                    }
+                let selected_row = self
+                    .with_active_viewer(|viewer| viewer.investigation.primary_selection().cloned());
+                let replay_origin_us = self
+                    .replay_file_info
+                    .as_ref()
+                    .map(|info| info.first_timestamp_us);
+                let output = match cached_table(cache_entry) {
+                    Ok(table) => render_summary_card(
+                        ui,
+                        schema,
+                        table,
+                        &dataset.descriptor.empty_message,
+                        SummaryCardOptions {
+                            dataset_id: &view.descriptor.dataset_id,
+                            generation: dataset_generation,
+                            selected_row: selected_row.as_ref(),
+                            format: TableCellFormatOptions { replay_origin_us },
+                            allow_export: true,
+                        },
+                    ),
                     Err(err) => {
                         ui.colored_label(ui.visuals().error_fg_color, err);
+                        Default::default()
+                    }
+                };
+                if output.open_full_table {
+                    if let Some(table_view_id) = self
+                        .host_view_registry
+                        .window_views()
+                        .find(|v| {
+                            v.descriptor.dataset_id == view.descriptor.dataset_id
+                                && matches!(v.descriptor.kind, HostViewKind::TableWindow)
+                        })
+                        .map(|v| v.descriptor.id.clone())
+                    {
+                        self.host_view_window_open.insert(table_view_id, true);
                     }
                 }
+                self.handle_host_view_actions(view, output.actions);
             }
             (HostViewKind::TableWindow, HostDatasetKind::TableV1(schema)) => {
                 let table_state = self.with_active_viewer(|viewer| {
@@ -2338,6 +2852,12 @@ impl CameraApp {
                                 hovered_row: hovered_row.as_ref(),
                                 allow_export: true,
                                 allow_clear: false,
+                                format: TableCellFormatOptions {
+                                    replay_origin_us: self
+                                        .replay_file_info
+                                        .as_ref()
+                                        .map(|info| info.first_timestamp_us),
+                                },
                             },
                         )
                     }
@@ -2348,8 +2868,11 @@ impl CameraApp {
                 };
                 if let Some(selected_row) = output.selected_row {
                     self.with_active_viewer_mut(|viewer| {
-                        viewer.investigation.set_single_selection(selected_row);
+                        viewer
+                            .investigation
+                            .set_single_selection(selected_row.clone());
                     });
+                    self.maybe_auto_seek_to_row(&selected_row);
                 }
                 if let Some(sort_column) = output.sort_column {
                     self.with_active_viewer_mut(|viewer| {
@@ -2357,6 +2880,23 @@ impl CameraApp {
                             .investigation
                             .table_view_state_mut(&view.descriptor.dataset_id)
                             .toggle_sort(&sort_column);
+                    });
+                }
+                if let Some(page_size) = output.page_size {
+                    self.with_active_viewer_mut(|viewer| {
+                        let state = viewer
+                            .investigation
+                            .table_view_state_mut(&view.descriptor.dataset_id);
+                        state.page_size = page_size;
+                        state.page_index = 0;
+                    });
+                }
+                if let Some(page_index) = output.page_index {
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer
+                            .investigation
+                            .table_view_state_mut(&view.descriptor.dataset_id)
+                            .page_index = page_index;
                     });
                 }
                 self.handle_host_view_actions(view, output.actions);
@@ -2595,6 +3135,12 @@ impl CameraApp {
                         export_csv_requested: false,
                         selected_row_requested: None,
                         sort_column_requested: None,
+                        page_size_requested: None,
+                        page_index_requested: None,
+                        replay_origin_us: self
+                            .replay_file_info
+                            .as_ref()
+                            .map(|info| info.first_timestamp_us),
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let window_title = title.clone();
@@ -2636,7 +3182,7 @@ impl CameraApp {
                         },
                     );
 
-                    let (close, export_csv, selected_row, sort_column) = {
+                    let (close, export_csv, selected_row, sort_column, page_size, page_index) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
@@ -2645,6 +3191,8 @@ impl CameraApp {
                             data.export_csv_requested,
                             data.selected_row_requested.take(),
                             data.sort_column_requested.take(),
+                            data.page_size_requested.take(),
+                            data.page_index_requested.take(),
                         );
                         data.close_requested = false;
                         data.export_csv_requested = false;
@@ -2659,8 +3207,11 @@ impl CameraApp {
                     }
                     if let Some(selected_row) = selected_row {
                         self.with_active_viewer_mut(|viewer| {
-                            viewer.investigation.set_single_selection(selected_row);
+                            viewer
+                                .investigation
+                                .set_single_selection(selected_row.clone());
                         });
+                        self.maybe_auto_seek_to_row(&selected_row);
                     }
                     if let Some(sort_column) = sort_column {
                         self.with_active_viewer_mut(|viewer| {
@@ -2668,6 +3219,23 @@ impl CameraApp {
                                 .investigation
                                 .table_view_state_mut(&view.descriptor.dataset_id)
                                 .toggle_sort(&sort_column);
+                        });
+                    }
+                    if let Some(page_size) = page_size {
+                        self.with_active_viewer_mut(|viewer| {
+                            let state = viewer
+                                .investigation
+                                .table_view_state_mut(&view.descriptor.dataset_id);
+                            state.page_size = page_size;
+                            state.page_index = 0;
+                        });
+                    }
+                    if let Some(page_index) = page_index {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer
+                                .investigation
+                                .table_view_state_mut(&view.descriptor.dataset_id)
+                                .page_index = page_index;
                         });
                     }
                 }
@@ -3893,6 +4461,41 @@ impl CameraApp {
         self.reopen_replay_at_fraction(fraction, desired_paused);
     }
 
+    /// When replay is paused, seek the transport to the anchor timestamp of
+    /// the selected row so the 2D/3D and plugin frames align with it.
+    fn maybe_auto_seek_to_row(&mut self, row_key: &StableRowKey) {
+        if self.mode != AppMode::Replaying || !self.replay_paused {
+            return;
+        }
+        let Some(info) = self.replay_file_info.clone() else {
+            return;
+        };
+        let schema = {
+            let Some(dataset) = self.host_view_registry.dataset(&row_key.dataset_id) else {
+                return;
+            };
+            match &dataset.descriptor.kind {
+                HostDatasetKind::TableV1(schema) => schema.clone(),
+                _ => return,
+            }
+        };
+        self.ensure_host_view_dataset_cached(&row_key.dataset_id);
+        let fraction = (|| -> Option<f32> {
+            let entry = self.host_view_dataset_cache.get(&row_key.dataset_id);
+            let generation = entry.map(|entry| entry.generation).unwrap_or(0);
+            let table = cached_table(entry).ok().flatten()?;
+            let row = (0..table.row_count()).find(|row| {
+                row_key_for_row(&row_key.dataset_id, generation, &schema, table, *row) == *row_key
+            })?;
+            let anchor_us = schema.row_anchor_timestamp_us(table, row)?;
+            let relative = anchor_us.saturating_sub(info.first_timestamp_us);
+            Some(replay_fraction_from_time(relative, info.total_duration_us))
+        })();
+        if let Some(fraction) = fraction {
+            self.seek_replay(fraction);
+        }
+    }
+
     fn reopen_replay_at_fraction(&mut self, fraction: f32, desired_paused: bool) {
         let Some(path) = self.replay_path.as_ref().map(PathBuf::from) else {
             self.last_error = Some("replay path is missing".into());
@@ -4123,6 +4726,39 @@ impl CameraApp {
         self.last_error = None;
     }
 
+    fn publish_pending_action_requests(&mut self) {
+        if self.pending_action_requests.is_empty() {
+            self.persistent_context_data
+                .remove(CTX_INVESTIGATION_ACTION_REQUESTS);
+            return;
+        }
+        let queue = HostActionRequestQueue {
+            requests: self.pending_action_requests.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&queue) {
+            self.persistent_context_data
+                .insert(CTX_INVESTIGATION_ACTION_REQUESTS.to_owned(), bytes);
+        }
+    }
+
+    fn enqueue_action_request(
+        &mut self,
+        action_id: String,
+        scope_payload: HostActionScopePayload,
+        mut params: serde_json::Value,
+    ) {
+        self.augment_action_request_params(&scope_payload, &mut params);
+        let request_id = self.next_action_request_id;
+        self.next_action_request_id = self.next_action_request_id.saturating_add(1);
+        self.pending_action_requests.push(HostActionRequest {
+            request_id,
+            action_id,
+            scope_payload,
+            params,
+        });
+        self.publish_pending_action_requests();
+    }
+
     fn run_analysis(&mut self, frame: &PreviewFrame, append_current_frame_to_event_store: bool) {
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
@@ -4141,6 +4777,7 @@ impl CameraApp {
             self.plugin_context_data
                 .insert(CTX_GLOBAL_SETTINGS.to_owned(), json);
         }
+        self.publish_pending_action_requests();
         let retained_history_needed = self.plugins_need_retained_event_history();
         let runtime_plugins_enabled = self
             .plugin_manager
@@ -5837,7 +6474,10 @@ impl eframe::App for CameraApp {
                 self.viewer.investigation_3d.focus_on(target);
             }
             if let Some(selected) = output.selected {
-                self.viewer.investigation.set_single_selection(selected);
+                self.viewer
+                    .investigation
+                    .set_single_selection(selected.clone());
+                self.maybe_auto_seek_to_row(&selected);
             }
             self.viewer.investigation.hovered_row = output.hovered;
         }
@@ -6245,6 +6885,7 @@ impl eframe::App for CameraApp {
         }
 
         self.render_host_view_windows(ctx);
+        self.render_action_modal(ctx);
 
         self.sync_active_pipeline_requirements();
 
@@ -6476,6 +7117,160 @@ fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
 impl Drop for CameraApp {
     fn drop(&mut self) {
         self.stop_pipeline();
+    }
+}
+
+fn seed_default_params(schema: &SettingsSchema) -> serde_json::Value {
+    use augur_plugin_api::SettingKind;
+
+    let mut map = serde_json::Map::new();
+    for section in &schema.sections {
+        for item in &section.items {
+            let default = match &item.kind {
+                SettingKind::Bool { default } => serde_json::json!(*default),
+                SettingKind::F64Slider { default, .. } | SettingKind::F64Drag { default, .. } => {
+                    serde_json::json!(*default)
+                }
+                SettingKind::I64Slider { default, .. } | SettingKind::I64Drag { default, .. } => {
+                    serde_json::json!(*default)
+                }
+                SettingKind::Enum { default, .. } => serde_json::json!(*default as u64),
+            };
+            map.insert(item.key.clone(), default);
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn render_action_modal_schema(
+    ui: &mut egui::Ui,
+    schema: &SettingsSchema,
+    params: &mut serde_json::Value,
+) {
+    use augur_plugin_api::SettingKind;
+    use serde_json::json;
+
+    let object = match params.as_object_mut() {
+        Some(object) => object,
+        None => {
+            *params = serde_json::Value::Object(serde_json::Map::new());
+            params.as_object_mut().unwrap()
+        }
+    };
+
+    for section in &schema.sections {
+        egui::CollapsingHeader::new(&section.label)
+            .default_open(section.default_open)
+            .show(ui, |ui| {
+                if let Some(description) = &section.description {
+                    ui.weak(description);
+                }
+                for item in &section.items {
+                    match &item.kind {
+                        SettingKind::Bool { default } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(*default);
+                            if ui.checkbox(&mut value, &item.label).changed() {
+                                object.insert(item.key.clone(), json!(value));
+                            }
+                        }
+                        SettingKind::F64Slider {
+                            min,
+                            max,
+                            default,
+                            suffix,
+                        } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(*default);
+                            let mut slider =
+                                egui::Slider::new(&mut value, *min..=*max).text(&item.label);
+                            if let Some(suffix) = suffix {
+                                slider = slider.suffix(suffix);
+                            }
+                            if ui.add(slider).changed() {
+                                object.insert(item.key.clone(), json!(value));
+                            }
+                        }
+                        SettingKind::I64Slider {
+                            min,
+                            max,
+                            default,
+                            suffix,
+                        } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(*default);
+                            let mut slider =
+                                egui::Slider::new(&mut value, *min..=*max).text(&item.label);
+                            if let Some(suffix) = suffix {
+                                slider = slider.suffix(suffix);
+                            }
+                            if ui.add(slider).changed() {
+                                object.insert(item.key.clone(), json!(value));
+                            }
+                        }
+                        SettingKind::F64Drag {
+                            min,
+                            max,
+                            speed,
+                            default,
+                        } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(*default);
+                            let old = value;
+                            ui.horizontal(|ui| {
+                                ui.label(&item.label);
+                                ui.add(
+                                    egui::DragValue::new(&mut value)
+                                        .clamp_range(*min..=*max)
+                                        .speed(*speed),
+                                );
+                            });
+                            if value != old {
+                                object.insert(item.key.clone(), json!(value));
+                            }
+                        }
+                        SettingKind::I64Drag { min, max, default } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(*default);
+                            let old = value;
+                            ui.horizontal(|ui| {
+                                ui.label(&item.label);
+                                ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max));
+                            });
+                            if value != old {
+                                object.insert(item.key.clone(), json!(value));
+                            }
+                        }
+                        SettingKind::Enum { variants, default } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_u64())
+                                .and_then(|v| usize::try_from(v).ok())
+                                .unwrap_or(*default);
+                            let old = value;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(&item.label);
+                                for (index, variant) in variants.iter().enumerate() {
+                                    ui.radio_value(&mut value, index, variant);
+                                }
+                            });
+                            if value != old {
+                                object.insert(item.key.clone(), json!(value as u64));
+                            }
+                        }
+                    }
+                }
+            });
     }
 }
 

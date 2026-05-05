@@ -1575,11 +1575,17 @@ fn pick_overlay_candidate(
                 ..
             } => {
                 for marker in markers {
-                    let item_key = marker.stable_id.as_ref().and_then(|stable_id| {
-                        dataset_id.as_ref().map(|dataset_id| {
-                            StableRowKey::new(dataset_id.clone(), stable_id.clone())
-                        })
-                    });
+                    let item_key = marker
+                        .source_row
+                        .as_ref()
+                        .map(|(dataset, row)| StableRowKey::new(dataset.clone(), row.clone()))
+                        .or_else(|| {
+                            marker.stable_id.as_ref().and_then(|stable_id| {
+                                dataset_id.as_ref().map(|dataset_id| {
+                                    StableRowKey::new(dataset_id.clone(), stable_id.clone())
+                                })
+                            })
+                        });
                     consider(
                         egui::pos2(marker.x, marker.y),
                         marker.size.max(5.0),
@@ -2638,6 +2644,7 @@ mod tests {
                     color: [0, 255, 0, 255],
                     timestamp_us: None,
                     stable_id: Some("row-7".into()),
+                    source_row: None,
                 }],
                 dataset_id: Some("dataset-a".into()),
                 layer_id: None,
@@ -2653,5 +2660,32 @@ mod tests {
             Some(StableRowKey::new("dataset-a", "row-7"))
         );
         assert_eq!(candidate.sensor_position, egui::pos2(102.0, 100.0));
+    }
+
+    #[test]
+    fn overlay_picker_prefers_explicit_source_row_over_layer_dataset_id() {
+        let overlays = vec![Overlay::MarkerOverlay {
+            markers: vec![MarkerOverlayItem {
+                x: 42.0,
+                y: 42.0,
+                shape: MarkerShape::Diamond,
+                size: 5.0,
+                color: [255, 90, 90, 200],
+                timestamp_us: None,
+                stable_id: Some("marker-3".into()),
+                source_row: Some(("augur.evesmlm.rejected_fits".into(), "row-3".into())),
+            }],
+            dataset_id: Some("augur.evesmlm.rejected_fits_layer".into()),
+            layer_id: None,
+            source_label: None,
+        }];
+
+        let candidate =
+            pick_overlay_candidate(&overlays, (42, 42)).expect("candidate should exist");
+
+        assert_eq!(
+            candidate.item_key,
+            Some(StableRowKey::new("augur.evesmlm.rejected_fits", "row-3"))
+        );
     }
 }

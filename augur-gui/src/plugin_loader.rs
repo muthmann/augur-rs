@@ -694,23 +694,38 @@ unsafe extern "C" fn add_marker_overlay(
     let markers = markers
         .as_slice()
         .iter()
-        .map(|marker| MarkerOverlayItem {
-            x: marker.x,
-            y: marker.y,
-            shape: match marker.shape {
-                FfiMarkerShape::Point => MarkerShape::Point,
-                FfiMarkerShape::Cross => MarkerShape::Cross,
-                FfiMarkerShape::Box => MarkerShape::Box,
-                FfiMarkerShape::Ellipse => MarkerShape::Ellipse,
-                FfiMarkerShape::Diamond => MarkerShape::Diamond,
-                FfiMarkerShape::FilledCircle => MarkerShape::FilledCircle,
-            },
-            size: marker.size,
-            color: marker.color.to_rgba(),
-            timestamp_us: marker.has_timestamp.then_some(marker.timestamp_us),
-            stable_id: ffi_string_to_option(marker.stable_id, "marker overlay stable_id")
-                .ok()
-                .flatten(),
+        .map(|marker| {
+            let source_dataset =
+                ffi_string_to_option(marker.source_dataset_id, "marker overlay source_dataset_id")
+                    .ok()
+                    .flatten();
+            let source_row_id =
+                ffi_string_to_option(marker.source_row_id, "marker overlay source_row_id")
+                    .ok()
+                    .flatten();
+            let source_row = match (source_dataset, source_row_id) {
+                (Some(dataset_id), Some(row_id)) => Some((dataset_id, row_id)),
+                _ => None,
+            };
+            MarkerOverlayItem {
+                x: marker.x,
+                y: marker.y,
+                shape: match marker.shape {
+                    FfiMarkerShape::Point => MarkerShape::Point,
+                    FfiMarkerShape::Cross => MarkerShape::Cross,
+                    FfiMarkerShape::Box => MarkerShape::Box,
+                    FfiMarkerShape::Ellipse => MarkerShape::Ellipse,
+                    FfiMarkerShape::Diamond => MarkerShape::Diamond,
+                    FfiMarkerShape::FilledCircle => MarkerShape::FilledCircle,
+                },
+                size: marker.size,
+                color: marker.color.to_rgba(),
+                timestamp_us: marker.has_timestamp.then_some(marker.timestamp_us),
+                stable_id: ffi_string_to_option(marker.stable_id, "marker overlay stable_id")
+                    .ok()
+                    .flatten(),
+                source_row,
+            }
         })
         .collect();
     bridge.output.overlays.push(Overlay::MarkerOverlay {

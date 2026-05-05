@@ -6,11 +6,15 @@ mod macros;
 mod settings;
 
 pub use context::{
-    GlobalSettings, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
-    HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
-    Image2dV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
-    TableColumnValues, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
-    TableValueType, CTX_GLOBAL_SETTINGS,
+    GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
+    HostActionScope, HostActionScopePayload, HostDatasetDescriptor, HostDatasetDisplayMetadata,
+    HostDatasetKind, HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind,
+    HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine, Series1dPoint, Series1dV1,
+    TableColumn, TableColumnData, TableColumnDisplayEntry, TableColumnDisplayFormat,
+    TableColumnDisplayMetadata, TableColumnValues, TableColumnWidthPriority,
+    TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableRowProvenance,
+    TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+    HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 pub use event_store::EventStore;
 pub use ffi::{
@@ -68,11 +72,14 @@ pub mod __private {
 mod tests {
     use super::{
         context::{
-            GlobalSettings, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
-            HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry,
-            Image2dV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
-            TableColumnValues, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1,
-            TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+            GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
+            HostActionScope, HostActionScopePayload, HostDatasetDescriptor,
+            HostDatasetDisplayMetadata, HostDatasetKind, HostMarkerShape, HostViewDescriptor,
+            HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine,
+            Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
+            TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
+            TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+            HOST_ACTION_CLUSTER_ROWS_PARAM,
         },
         settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
@@ -91,7 +98,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
         assert_eq!(std::mem::size_of::<FfiMarkerShape>(), 4);
-        assert_eq!(std::mem::size_of::<FfiMarkerOverlayItem>(), 56);
+        assert_eq!(std::mem::size_of::<FfiMarkerOverlayItem>(), 88);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
         assert_eq!(std::mem::size_of::<PluginVTable>(), 168);
         assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
@@ -101,7 +108,7 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
-        assert_eq!(PLUGIN_ABI_VERSION, 3);
+        assert_eq!(PLUGIN_ABI_VERSION, 4);
     }
 
     #[test]
@@ -233,6 +240,8 @@ mod tests {
                         time_column: Some("frame".into()),
                         layer_id: Some("reconstruction".into()),
                         semantic_label: Some("localization".into()),
+                        provenance: None,
+                        column_display: Vec::new(),
                     }),
                     empty_message: "No rows yet".into(),
                     display: Some(HostDatasetDisplayMetadata {
@@ -242,6 +251,7 @@ mod tests {
                         default_marker_shape: Some(HostMarkerShape::Circle),
                         default_size: Some(3.5),
                     }),
+                    relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
                     id: "image.preview".into(),
@@ -249,6 +259,7 @@ mod tests {
                     kind: HostDatasetKind::Image2dV1,
                     empty_message: "No image yet".into(),
                     display: None,
+                    relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
                     id: "series.focus".into(),
@@ -256,6 +267,7 @@ mod tests {
                     kind: HostDatasetKind::Series1dV1,
                     empty_message: "No samples yet".into(),
                     display: None,
+                    relations: Vec::new(),
                 },
             ],
             views: vec![
@@ -312,12 +324,66 @@ mod tests {
                     kind: HostViewKind::LineSeriesWindow,
                 },
             ],
+            actions: vec![HostActionDescriptor {
+                id: "refit_cluster".into(),
+                title: "Tune fit on this cluster".into(),
+                scope: HostActionScope::Cluster {
+                    dataset_id: "table.candidates".into(),
+                    group_column: "cluster_id".into(),
+                },
+                param_schema: Some(serde_json::json!({
+                    "sections": [{
+                        "label": "Fit",
+                        "items": [{
+                            "key": "sigma_max",
+                            "label": "σ max",
+                            "kind": { "type": "f64", "default": 3.0 }
+                        }]
+                    }]
+                })),
+            }],
         };
 
         let json = serde_json::to_vec(&registry).expect("registry must serialize");
         let decoded: HostViewRegistry =
             serde_json::from_slice(&json).expect("registry must deserialize");
         assert_eq!(decoded, registry);
+    }
+
+    #[test]
+    fn host_action_request_queue_round_trips_through_json() {
+        let queue = HostActionRequestQueue {
+            requests: vec![
+                HostActionRequest {
+                    request_id: 1,
+                    action_id: "refit_cluster".into(),
+                    scope_payload: HostActionScopePayload::Cluster {
+                        dataset_id: "table.candidates".into(),
+                        group_column: "cluster_id".into(),
+                        group_value: "7".into(),
+                    },
+                    params: serde_json::json!({ "sigma_max": 3.5 }),
+                },
+                HostActionRequest {
+                    request_id: 2,
+                    action_id: "commit_refit".into(),
+                    scope_payload: HostActionScopePayload::Row {
+                        dataset_id: "table.refit_preview".into(),
+                        row_id: "refit-42".into(),
+                    },
+                    params: serde_json::Value::Null,
+                },
+            ],
+        };
+
+        let json = serde_json::to_vec(&queue).expect("queue must serialize");
+        let decoded: HostActionRequestQueue =
+            serde_json::from_slice(&json).expect("queue must deserialize");
+        assert_eq!(decoded, queue);
+        assert_eq!(
+            CTX_INVESTIGATION_ACTION_REQUESTS,
+            "augur.investigation.action_requests"
+        );
     }
 
     #[test]

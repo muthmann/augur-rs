@@ -31,6 +31,10 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Collapsible GUI Panels](./collapsible-panels.md) — separator-edge collapse arrows plus scrollable settings and analysis panels
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, idle launch shortcuts, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Investigation Workspace](./investigation-workspace.md) — host-owned 2D/3D layouts, linked selection, stable row identities, generic layer styling, and popup/shared inspection state
+- [Investigation Dataflow And Memory Model](./investigation-dataflow-and-memory-model.md) — end-to-end ownership, allocation, 2D/3D render data flow, replay seeking interactions, and plugin boundaries
+- [Investigation Table Trustworthiness](./investigation-table-trustworthiness.md) — declarative TableV1 provenance/display metadata, summary card, paginated TableWindow, auto-seek on row selection
+- [Clickable 2D Overlays And Failed-Fit Inspection](./investigation-clickable-overlays.md) — marker `source_row`, rejected-fit diamond selection, reason-first inspector, cross-span persistence
+- [Investigation Action Requests](./investigation-action-requests.md) — plugin-declared dataset/row/cluster actions, host-rendered modal, request bus, re-fit/commit/discard flow
 - [Viewer Tools And ImageJ Bridge](./viewer-tools-and-imagej.md) — host-side histogram/colormap/measurement tools plus the bundled Augur Bridge handoff path for ImageJ/Fiji
 - [Reusable Viewer Widget](./reusable-viewer-widget.md) — one shared central viewer component for the main window and popup host
 - [Viewer Toolbar And Status Layout](./viewer-toolbar-and-status-layout.md) — consistent toolbar/display-strip/footer structure across the 2D and 3D viewers

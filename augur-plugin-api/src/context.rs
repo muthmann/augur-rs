@@ -1,6 +1,15 @@
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 pub const CTX_GLOBAL_SETTINGS: &str = "augur.global_settings";
+/// Reserved JSON key inside [`HostActionRequest::params`] that the host uses
+/// to attach raw table-row snapshots for cluster-scoped actions.
+pub const HOST_ACTION_CLUSTER_ROWS_PARAM: &str = "__augur_cluster_rows";
+
+/// Persistent context bus key where the host publishes pending
+/// [`HostActionRequest`]s for plugins to consume. Single-writer: only the
+/// host appends or clears this queue; plugins treat it as read-only and
+/// dedupe by monotonic `request_id`.
+pub const CTX_INVESTIGATION_ACTION_REQUESTS: &str = "augur.investigation.action_requests";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalSettings {
@@ -15,6 +24,93 @@ pub struct GlobalSettings {
 pub struct HostViewRegistry {
     pub datasets: Vec<HostDatasetDescriptor>,
     pub views: Vec<HostViewDescriptor>,
+    /// Row/dataset/cluster-scoped actions plugins offer to the host. The host
+    /// renders buttons + modals from `param_schema` and publishes selections
+    /// to [`CTX_INVESTIGATION_ACTION_REQUESTS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<HostActionDescriptor>,
+}
+
+/// Declarative descriptor for a plugin-owned action the host should offer
+/// alongside a dataset or a selected row/cluster.
+///
+/// The host renders a button whose enabled state is driven by `scope`, and
+/// — if `param_schema` is set — a modal generated from the schema. Apply
+/// publishes a [`HostActionRequest`] to [`CTX_INVESTIGATION_ACTION_REQUESTS`];
+/// the plugin consumes it on its next frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostActionDescriptor {
+    pub id: String,
+    pub title: String,
+    pub scope: HostActionScope,
+    /// Optional JSON-encoded [`SettingsSchema`](crate::SettingsSchema) used
+    /// to drive the action modal. When absent, the host renders a confirm
+    /// dialog with no parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param_schema: Option<serde_json::Value>,
+}
+
+/// When an action applies.
+///
+/// - `Dataset` — always applicable once the dataset exists.
+/// - `Row` — applicable when exactly one row of the named dataset is selected.
+/// - `Cluster` — applicable when selected rows share a common `group_column`
+///   value on the named dataset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostActionScope {
+    Dataset {
+        dataset_id: String,
+    },
+    Row {
+        dataset_id: String,
+    },
+    Cluster {
+        dataset_id: String,
+        group_column: String,
+    },
+}
+
+/// A host-issued action invocation the plugin should consume on its next
+/// frame. Plugins dedupe on `request_id` — the host never reuses an id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostActionRequest {
+    /// Monotonically increasing id assigned by the host. Plugins treat the
+    /// queue as read-only and skip any id they have already consumed.
+    pub request_id: u64,
+    pub action_id: String,
+    pub scope_payload: HostActionScopePayload,
+    /// Parameters captured from the action modal, keyed by `SettingItem.key`.
+    /// Empty object when the descriptor has no `param_schema`.
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// Concrete scope the user clicked on when invoking the action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostActionScopePayload {
+    None,
+    Dataset {
+        dataset_id: String,
+    },
+    Row {
+        dataset_id: String,
+        row_id: String,
+    },
+    Cluster {
+        dataset_id: String,
+        group_column: String,
+        group_value: String,
+    },
+}
+
+/// Queue payload published at [`CTX_INVESTIGATION_ACTION_REQUESTS`]. The
+/// host owns the queue; plugins read and skip already-processed ids.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HostActionRequestQueue {
+    #[serde(default)]
+    pub requests: Vec<HostActionRequest>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -24,6 +120,21 @@ pub struct HostDatasetDescriptor {
     pub kind: HostDatasetKind,
     pub empty_message: String,
     pub display: Option<HostDatasetDisplayMetadata>,
+    /// Declarative relations that let the host resolve row-to-row links
+    /// across datasets without hand-wired joins (e.g., a localization's
+    /// `cluster_id` → the matching candidate-event row).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<HostDatasetRelation>,
+}
+
+/// Declares that rows of *this* dataset can be linked to rows of
+/// `target_dataset_id` by matching `via_column` (on this dataset) against
+/// `target_column` (on the target).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostDatasetRelation {
+    pub target_dataset_id: String,
+    pub via_column: String,
+    pub target_column: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -109,12 +220,144 @@ pub struct TableSchema {
     pub time_column: Option<String>,
     pub layer_id: Option<String>,
     pub semantic_label: Option<String>,
+    /// Declarative provenance used by the host to derive a per-row anchor
+    /// timestamp and visibility span from column values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<TableRowProvenance>,
+    /// Per-column display hints keyed by column `id`. Additive — unknown
+    /// entries are ignored. Exports always operate on raw column values,
+    /// never on the formatted display strings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_display: Vec<TableColumnDisplayEntry>,
 }
 
 impl TableSchema {
     pub fn column(&self, id: &str) -> Option<&TableColumn> {
         self.columns.iter().find(|column| column.id == id)
     }
+
+    /// Returns the display metadata registered for the given column id, if any.
+    pub fn column_display(&self, column_id: &str) -> Option<&TableColumnDisplayMetadata> {
+        self.column_display
+            .iter()
+            .find(|entry| entry.column_id == column_id)
+            .map(|entry| &entry.display)
+    }
+
+    /// Resolve an anchor timestamp for a row using the declared provenance.
+    /// Fallback order: `anchor_time_column` → midpoint of span → `time_column`.
+    pub fn row_anchor_timestamp_us(&self, dataset: &TableDatasetV1, row: usize) -> Option<u64> {
+        let provenance = self.provenance.as_ref();
+        let column_u64 = |name: &str| -> Option<u64> {
+            let column = dataset.column(name)?;
+            match &column.values {
+                TableColumnValues::U64(values) => values.get(row).copied(),
+                other => other.numeric_value(row).map(|v| v.round().max(0.0) as u64),
+            }
+        };
+        if let Some(column) = provenance.and_then(|p| p.anchor_time_column.as_deref()) {
+            if let Some(ts) = column_u64(column) {
+                return Some(ts);
+            }
+        }
+        if let (Some(start_col), Some(end_col)) = (
+            provenance.and_then(|p| p.span_start_column.as_deref()),
+            provenance.and_then(|p| p.span_end_column.as_deref()),
+        ) {
+            if let (Some(start), Some(end)) = (column_u64(start_col), column_u64(end_col)) {
+                return Some(start + (end.saturating_sub(start)) / 2);
+            }
+        }
+        if let Some(column) = self.time_column.as_deref() {
+            return column_u64(column);
+        }
+        None
+    }
+
+    /// Span of a row `(start_us, end_us)` if declared; else `(anchor, anchor)`
+    /// if the anchor resolves; else `None`. Both bounds inclusive.
+    pub fn row_span_us(&self, dataset: &TableDatasetV1, row: usize) -> Option<(u64, u64)> {
+        let provenance = self.provenance.as_ref();
+        let column_u64 = |name: &str| -> Option<u64> {
+            let column = dataset.column(name)?;
+            match &column.values {
+                TableColumnValues::U64(values) => values.get(row).copied(),
+                other => other.numeric_value(row).map(|v| v.round().max(0.0) as u64),
+            }
+        };
+        if let (Some(start_col), Some(end_col)) = (
+            provenance.and_then(|p| p.span_start_column.as_deref()),
+            provenance.and_then(|p| p.span_end_column.as_deref()),
+        ) {
+            if let (Some(start), Some(end)) = (column_u64(start_col), column_u64(end_col)) {
+                return Some((start, end));
+            }
+        }
+        let anchor = self.row_anchor_timestamp_us(dataset, row)?;
+        Some((anchor, anchor))
+    }
+}
+
+/// Provenance hints that let the host derive anchor timestamps and spans
+/// from row data without hard-coded column conventions. All columns are
+/// referenced by id and are optional; the host falls back to
+/// `TableSchema::time_column` when provenance is absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TableRowProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_time_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_start_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_end_column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_frame_column: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TableColumnDisplayEntry {
+    pub column_id: String,
+    pub display: TableColumnDisplayMetadata,
+}
+
+/// UI-only display hints. Formatting never leaks into exports.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TableColumnDisplayMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<TableColumnDisplayFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_priority: Option<TableColumnWidthPriority>,
+    #[serde(default)]
+    pub hide_in_compact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Render this column as the summary card's headline field when a row
+    /// is selected. At most one headline column is expected per schema.
+    #[serde(default)]
+    pub headline: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TableColumnDisplayFormat {
+    /// u64/i64/f64 interpreted as µs. UI renders relative `mm:ss.uuu` (or
+    /// absolute when the replay origin is unknown); raw value on hover and
+    /// in CSV.
+    TimestampMicros,
+    /// f64 with a fixed number of decimal digits in the UI.
+    FixedPrecision { digits: u8 },
+    /// Opaque identifier — no thousands separators, monospace in UI.
+    Identifier,
+    /// Short category label — hoverable full value when truncated.
+    Category,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableColumnWidthPriority {
+    High,
+    Medium,
+    Low,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

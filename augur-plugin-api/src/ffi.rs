@@ -187,6 +187,12 @@ pub struct FfiMarkerOverlayItem {
     pub timestamp_us: u64,
     pub has_timestamp: bool,
     pub stable_id: FfiString,
+    /// Optional pointer to the row that backs this marker. When set, a
+    /// click on the marker selects `(source_dataset_id, source_row_id)`
+    /// instead of falling back to `(overlay.dataset_id, stable_id)`.
+    /// Empty `FfiString`s mean "no explicit source row".
+    pub source_dataset_id: FfiString,
+    pub source_row_id: FfiString,
 }
 
 #[repr(C)]
@@ -268,7 +274,7 @@ pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 
-pub const PLUGIN_ABI_VERSION: u64 = 3;
+pub const PLUGIN_ABI_VERSION: u64 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

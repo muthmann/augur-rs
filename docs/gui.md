@@ -95,6 +95,9 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 The center panel is an interactive investigation workspace where 2D preview, GPU-accelerated 3D point cloud, data tables, and plugin overlays are linked views of the same data. The embedded viewer and the enlarged popup share the same layout model and investigation state.
 
+For the current ownership and buffer model behind those linked views, see
+[Investigation Dataflow And Memory Model](./features/investigation-dataflow-and-memory-model.md).
+
 - the entire central viewer, including the heading strip, toolbar, canvas, replay transport, and
   lower control area, is rendered by one shared viewer component
 - when the popup is open, that same viewer state moves into the popup host and the main window
@@ -189,9 +192,9 @@ The 3D view renders raw events and plugin data on a GPU-accelerated WGPU point c
 - the footer reports both requested and retained history
 
 **Plugin data in 3D:**
-- datasets with `coordinate_columns_3d` are projected into the point cloud with distinct layer styling
-- `MarkerOverlay` markers with timestamps are placed at their true 3D coordinates
-- per-layer visibility and style controls in the investigation inspector
+- datasets exposed through `HostViewKind::Scatter3dFromTable` are projected into the point cloud with distinct layer styling
+- marker overlays remain a 2D annotation / hit-testing path; they are not the current source of 3D plugin points
+- per-layer visibility and style controls live in the investigation inspector
 
 **Linked ROI focus:**
 - when ROI linking is active, the 3D view draws a focus cuboid across the retained time span
