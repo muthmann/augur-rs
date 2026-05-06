@@ -32,6 +32,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Interactive Preview Workbench](./interactive-preview-workbench.md) — shared 2D/3D preview state, idle launch shortcuts, ROI drag tool, zoom/crop, popup enlarge, point cloud
 - [Investigation Workspace](./investigation-workspace.md) — host-owned 2D/3D layouts, linked selection, stable row identities, generic layer styling, and popup/shared inspection state
 - [Investigation Dataflow And Memory Model](./investigation-dataflow-and-memory-model.md) — end-to-end ownership, allocation, upstream raw-event source target, 2D/3D render data flow, replay seeking interactions, and plugin boundaries
+- [Investigation Thread And Execution Model](./investigation-thread-and-execution-model.md) — OS thread inventory, channel/atomic map, where calculations vs rendering vs plugins actually run, and hot-path bottlenecks
 - [Investigation Table Trustworthiness](./investigation-table-trustworthiness.md) — declarative TableV1 provenance/display metadata, summary card, paginated TableWindow, auto-seek on row selection
 - [Clickable 2D Overlays And Failed-Fit Inspection](./investigation-clickable-overlays.md) — marker `source_row`, rejected-fit diamond selection, reason-first inspector, cross-span persistence
 - [Investigation Action Requests](./investigation-action-requests.md) — plugin-declared dataset/row/cluster actions, host-rendered modal, request bus, re-fit/commit/discard flow
