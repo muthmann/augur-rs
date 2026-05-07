@@ -70,6 +70,10 @@ use crate::{
     },
     preview_perf::{PerfMetricSnapshot, PreviewPerfStats},
     preview_renderer::{PreviewDisplayTexture, PreviewRenderRequest, PreviewRenderer},
+    python_ingress::{
+        PythonIngressDatasetInfo, PythonIngressServer, PythonIngressStartRequest,
+        PythonIngressStatus, DEFAULT_PYTHON_INGRESS_PORT,
+    },
     render_backend::ActiveRendererInfo,
     settings::draw_settings,
     viewer_widget::{
@@ -678,6 +682,8 @@ pub struct CameraApp {
     export_dialog: ExportDialog,
     export_task: Option<TiffStackExportTask>,
     external_tool: Option<Box<dyn ExternalTool>>,
+    python_ingress: Option<PythonIngressServer>,
+    python_stream_name: Option<String>,
     host_view_registry: ResolvedHostViewRegistry,
     host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
@@ -819,6 +825,8 @@ impl CameraApp {
             export_dialog: ExportDialog::default(),
             export_task: None,
             external_tool: None,
+            python_ingress: None,
+            python_stream_name: None,
             host_view_registry: ResolvedHostViewRegistry::default(),
             host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
@@ -1645,6 +1653,144 @@ impl CameraApp {
         if let Some(mut tool) = self.external_tool.take() {
             tool.disconnect();
         }
+    }
+
+    fn python_ingress_status(&self) -> Option<PythonIngressStatus> {
+        self.python_ingress
+            .as_ref()
+            .map(PythonIngressServer::status)
+    }
+
+    fn start_python_ingress_listener(&mut self, ctx: &egui::Context) {
+        if self.python_ingress.is_some() {
+            return;
+        }
+
+        match PythonIngressServer::start(ctx.clone(), DEFAULT_PYTHON_INGRESS_PORT) {
+            Ok(server) => {
+                let port = server.port();
+                self.python_ingress = Some(server);
+                self.last_error = None;
+                self.camera_status = format!("Python ingress listening on 127.0.0.1:{port}.");
+            }
+            Err(err) => {
+                self.last_error = Some(err);
+            }
+        }
+    }
+
+    fn stop_python_ingress_listener(&mut self) {
+        if let Some(mut server) = self.python_ingress.take() {
+            server.stop();
+        }
+        if self.python_stream_name.is_none() {
+            self.camera_status = "Python ingress stopped.".into();
+        }
+    }
+
+    fn poll_python_ingress_requests(&mut self) {
+        loop {
+            let Some(request) = self
+                .python_ingress
+                .as_ref()
+                .and_then(PythonIngressServer::try_recv_request)
+            else {
+                break;
+            };
+            self.handle_python_ingress_request(request);
+        }
+    }
+
+    fn handle_python_ingress_request(&mut self, request: PythonIngressStartRequest) {
+        let PythonIngressStartRequest {
+            info,
+            camera,
+            reply_tx,
+        } = request;
+        let result = self.start_python_ingress_stream(info, camera);
+        let _ = reply_tx.send(result);
+    }
+
+    fn can_start_python_ingress_stream(&self) -> bool {
+        if self.mode == AppMode::Idle {
+            return true;
+        }
+        self.mode == AppMode::Previewing
+            && self.python_stream_name.is_some()
+            && self
+                .controller
+                .as_ref()
+                .is_some_and(|controller| controller.is_stopped() && controller.frame_rx.is_empty())
+    }
+
+    fn start_python_ingress_stream(
+        &mut self,
+        info: PythonIngressDatasetInfo,
+        camera: crate::python_ingress::PythonIngressCamera,
+    ) -> std::result::Result<(), String> {
+        if !self.can_start_python_ingress_stream() {
+            return Err(
+                "Augur is busy; stop the current preview, recording, or replay before publishing Python events"
+                    .into(),
+            );
+        }
+
+        if let Some(controller) = self.controller.take() {
+            self.event_store.detach_upstream();
+            if let Err(err) = controller.shutdown() {
+                self.last_error = Some(format!("pipeline shutdown failed: {err}"));
+            }
+        }
+
+        let mut options = PipelineOptions::preview_only(info.width, info.height);
+        options.plugin_event_history = self.plugins_need_retained_event_history();
+        let config = python_ingress_pipeline_config(&info, self.acq_time_ms, self.nm_per_pixel);
+        let controller = spawn_pipeline(
+            camera,
+            PackedEventPreviewDecoder::default(),
+            config.clone(),
+            options,
+        )
+        .map_err(|err| format!("Python ingress pipeline start failed: {err}"))?;
+        sync_acq_time_atomic(&controller.acq_time_us, self.acq_time_ms);
+        self.sync_pipeline_requirements(&controller);
+
+        let stream_label = info
+            .name
+            .clone()
+            .unwrap_or_else(|| "NumPy event stream".into());
+        self.controller = Some(controller);
+        self.mode = AppMode::Previewing;
+        self.python_stream_name = Some(stream_label.clone());
+        self.clear_replay_state();
+        self.config = config;
+        let global = self.config.global.clone();
+        self.apply_global_config(&global);
+        self.camera_info = Some(DeviceInfo {
+            vendor: "Python".into(),
+            model: stream_label.clone(),
+            serial: None,
+            firmware: None,
+            compatible: Some("packed_xypt_v1".into()),
+        });
+        self.with_active_viewer_mut(ViewerState::clear_session_state);
+        self.reset_analysis();
+        self.texture = None;
+        self.latest_frame = None;
+        self.last_preview_process_at = None;
+        reset_preview_render_cache();
+        self.config_dirty = false;
+        self.acq_dirty = false;
+        self.last_error = None;
+        self.camera_status = format!(
+            "Receiving Python events: {stream_label} ({} events, {}x{}, {}..{} us).",
+            info.event_count,
+            info.width,
+            info.height,
+            info.timestamp_start_us,
+            info.timestamp_end_us
+        );
+        Ok(())
     }
 
     fn show_imagej_dialog(&mut self, ctx: &egui::Context) {
@@ -5056,6 +5202,7 @@ impl CameraApp {
         if was_replaying {
             self.clear_replay_state();
         }
+        self.python_stream_name = None;
         self.texture = None;
         self.preview_renderer.reset();
         self.preview_perf.reset();
@@ -5119,6 +5266,21 @@ impl CameraApp {
         if replay_finished {
             self.last_error = None;
             self.finish_replay();
+            return;
+        }
+
+        let python_finished = self.mode == AppMode::Previewing
+            && self.python_stream_name.is_some()
+            && self
+                .controller
+                .as_ref()
+                .is_some_and(|ctrl| ctrl.is_stopped() && ctrl.frame_rx.is_empty());
+        if python_finished && self.last_error.is_none() {
+            let name = self
+                .python_stream_name
+                .as_deref()
+                .unwrap_or("Python event stream");
+            self.camera_status = format!("{name} finished. Last frame remains visible.");
         }
     }
 
@@ -5610,6 +5772,7 @@ impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme_to_ctx(ctx);
         self.poll_replay_open_task();
+        self.poll_python_ingress_requests();
         self.poll_tiff_stack_export_task();
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
@@ -6174,6 +6337,25 @@ impl eframe::App for CameraApp {
 
                 // ── Tools ─────────────────────────────────────────────────────
                 ui.menu_button("Tools", |ui| {
+                    match self.python_ingress_status() {
+                        Some(status) => {
+                            ui.label(egui::RichText::new(format!(
+                                "Python ingress: {}",
+                                status.label()
+                            )));
+                            if ui.button("Stop Python Ingress").clicked() {
+                                self.stop_python_ingress_listener();
+                                ui.close_menu();
+                            }
+                        }
+                        None => {
+                            if ui.button("Listen for Python Events...").clicked() {
+                                self.start_python_ingress_listener(ctx);
+                                ui.close_menu();
+                            }
+                        }
+                    }
+                    ui.separator();
                     match self.external_tool_status() {
                         ExternalToolStatus::Streaming | ExternalToolStatus::Connecting => {
                             if ui.button("Disconnect ImageJ").clicked() {
@@ -6298,6 +6480,17 @@ impl eframe::App for CameraApp {
                             ui,
                             &format!("ImageJ: {}", external_status.label()),
                             crate::theme::Tone::Info,
+                        );
+                        ui.separator();
+                    }
+                    if let Some(status) = self.python_ingress_status() {
+                        crate::theme::chip(
+                            ui,
+                            &format!("Python: {}", status.label()),
+                            match status {
+                                PythonIngressStatus::Error(_) => crate::theme::Tone::Error,
+                                _ => crate::theme::Tone::Info,
+                            },
                         );
                         ui.separator();
                     }
@@ -7492,7 +7685,7 @@ impl eframe::App for CameraApp {
             self.replay_pause_after_seek_frame,
         );
         let process_interval = self.active_preview_process_interval();
-        if self.replay_open_task.is_some() {
+        if self.replay_open_task.is_some() || self.python_ingress.is_some() {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);
@@ -7749,6 +7942,21 @@ fn replay_pipeline_config(info: &ReplayFileInfo, acq_time_ms: u64) -> CameraConf
     config
 }
 
+fn python_ingress_pipeline_config(
+    info: &PythonIngressDatasetInfo,
+    acq_time_ms: u64,
+    nm_per_pixel: f64,
+) -> CameraConfig {
+    let mut config = CameraConfig::default();
+    config.roi.width = info.width;
+    config.roi.height = info.height;
+    config.global.sensor_width = info.width;
+    config.global.sensor_height = info.height;
+    config.global.acq_time_ms = acq_time_ms.max(1);
+    config.global.nm_per_pixel = nm_per_pixel;
+    config
+}
+
 fn replay_file_extension(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -7950,12 +8158,12 @@ fn render_action_modal_schema(
 mod tests {
     use super::{
         acq_time_us_from_ms, clipped_ui_width, derived_replay_preview_interval_ms,
-        investigation_split_ratio_bounds, pipeline_stream_active, raw_event_focus_volume,
-        raw_event_point_position, replay_fraction_from_time, replay_history_has_display_override,
-        replay_history_step_target, replay_pipeline_config, replay_seek_target_reached,
-        replay_snapshot_frame, replay_step_target_time_us, replay_step_uses_current_controller,
-        replay_time_from_position_sources, roi_is_effectively_full_frame, sync_acq_time_atomic,
-        viewport_stream_active,
+        investigation_split_ratio_bounds, pipeline_stream_active, python_ingress_pipeline_config,
+        raw_event_focus_volume, raw_event_point_position, replay_fraction_from_time,
+        replay_history_has_display_override, replay_history_step_target, replay_pipeline_config,
+        replay_seek_target_reached, replay_snapshot_frame, replay_step_target_time_us,
+        replay_step_uses_current_controller, replay_time_from_position_sources,
+        roi_is_effectively_full_frame, sync_acq_time_atomic, viewport_stream_active,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -7964,6 +8172,7 @@ mod tests {
 
     use crate::{
         investigation::AnalysisRoi,
+        python_ingress::PythonIngressDatasetInfo,
         viewer_widget::{AppMode, ViewerReplayState},
     };
     use augur_core::{
@@ -8188,6 +8397,27 @@ mod tests {
         assert_eq!(config.global.acq_time_ms, 125);
         assert_eq!(config.global.sensor_width, 640);
         assert_eq!(config.global.sensor_height, 480);
+    }
+
+    #[test]
+    fn python_ingress_pipeline_config_uses_published_geometry() {
+        let info = PythonIngressDatasetInfo {
+            name: Some("python".into()),
+            width: 320,
+            height: 240,
+            event_count: 10,
+            timestamp_start_us: 1,
+            timestamp_end_us: 9,
+        };
+
+        let config = python_ingress_pipeline_config(&info, 25, 42.0);
+
+        assert_eq!(config.roi.width, 320);
+        assert_eq!(config.roi.height, 240);
+        assert_eq!(config.global.sensor_width, 320);
+        assert_eq!(config.global.sensor_height, 240);
+        assert_eq!(config.global.acq_time_ms, 25);
+        assert_eq!(config.global.nm_per_pixel, 42.0);
     }
 
     #[test]

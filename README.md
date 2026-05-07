@@ -121,6 +121,7 @@ This repository ships the runtime plugin host and API crates. Plugin implementat
 - **Hotpixel Detection** — persistent hotpixel detection with DEM-mask copy
 - **ROI-Grid Overlay** — configurable grid overlay for spatial analysis
 - **ImageJ/Fiji Bridge** — stream live frames to ImageJ for external analysis
+- **Python Event Ingress** — publish NumPy event arrays from `evt3.augur` into the Augur preview and investigation pipeline
 
 ---
 

@@ -13,6 +13,7 @@ mod point_cloud;
 mod preview;
 mod preview_perf;
 mod preview_renderer;
+mod python_ingress;
 mod render_backend;
 mod settings;
 mod theme;
