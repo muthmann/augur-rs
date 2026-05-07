@@ -95,7 +95,7 @@ impl Default for PreviewMode {
 impl PreviewMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::RedBlue => "Red-Blue Polarity",
+            Self::RedBlue => "Polarity",
             Self::SignedCount => "Signed Count",
             Self::Intensity(colormap) => colormap.label(),
             Self::TimeSurface => "Time Surface",
@@ -108,7 +108,7 @@ impl PreviewMode {
 
     pub fn ramp_label(self) -> &'static str {
         match self {
-            Self::RedBlue => "Red-blue polarity ramp",
+            Self::RedBlue => "Polarity (magenta/cyan)",
             Self::SignedCount => "Signed-count diverging ramp",
             Self::Intensity(_) => "Intensity display ramp",
             Self::TimeSurface => "Time-surface decay ramp",
@@ -180,11 +180,13 @@ impl CpuPreviewImageCache {
                         } else {
                             let brightness = self.brightness_lut[total as usize];
                             match on.cmp(&off) {
-                                std::cmp::Ordering::Greater => Color32::from_rgb(brightness, 0, 0),
-                                std::cmp::Ordering::Less => Color32::from_rgb(0, 0, brightness),
-                                std::cmp::Ordering::Equal => {
-                                    Color32::from_rgb(brightness, 0, brightness)
+                                std::cmp::Ordering::Greater => {
+                                    polarity_color(brightness, crate::theme::POLARITY_ON_RGB)
                                 }
+                                std::cmp::Ordering::Less => {
+                                    polarity_color(brightness, crate::theme::POLARITY_OFF_RGB)
+                                }
+                                std::cmp::Ordering::Equal => polarity_balanced_color(brightness),
                             }
                         };
                     }
@@ -239,6 +241,30 @@ impl CpuPreviewImageCache {
             self.image = ColorImage::new(size, Color32::BLACK);
         }
     }
+}
+
+/// Modulate a fully-saturated polarity tint by a brightness in `[0, 255]`.
+fn polarity_color(brightness: u8, tint: [u8; 3]) -> Color32 {
+    let scale = brightness as f32 / 255.0;
+    let scale_channel = |c: u8| ((c as f32) * scale).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(
+        scale_channel(tint[0]),
+        scale_channel(tint[1]),
+        scale_channel(tint[2]),
+    )
+}
+
+/// Pixel where the ON / OFF counts are exactly equal — average the two
+/// polarity tints so the colour is unmistakably between the two endpoints.
+fn polarity_balanced_color(brightness: u8) -> Color32 {
+    let on = crate::theme::POLARITY_ON_RGB;
+    let off = crate::theme::POLARITY_OFF_RGB;
+    let tint = [
+        ((on[0] as u16 + off[0] as u16) / 2) as u8,
+        ((on[1] as u16 + off[1] as u16) / 2) as u8,
+        ((on[2] as u16 + off[2] as u16) / 2) as u8,
+    ];
+    polarity_color(brightness, tint)
 }
 
 pub fn reset_preview_render_cache() {
@@ -652,12 +678,16 @@ mod tests {
 
         assert_eq!(image.size, [2, 1]);
         assert_eq!(image.pixels.len(), 2);
-        assert!(image.pixels[0].to_array()[0] > 0);
-        assert_eq!(image.pixels[0].to_array()[1], 0);
-        assert_eq!(image.pixels[0].to_array()[2], 0);
-        assert_eq!(image.pixels[1].to_array()[0], 0);
-        assert_eq!(image.pixels[1].to_array()[1], 0);
-        assert!(image.pixels[1].to_array()[2] > 0);
+        // ON-dominant pixel: hot magenta tint — strong R+B, weaker G.
+        let on_px = image.pixels[0].to_array();
+        assert!(on_px[0] > 0, "ON pixel red channel should be lit");
+        assert!(on_px[2] > 0, "ON pixel blue channel should be lit");
+        assert!(on_px[0] >= on_px[1], "magenta R should dominate over G");
+        // OFF-dominant pixel: arctic cyan tint — no R, strong G+B.
+        let off_px = image.pixels[1].to_array();
+        assert_eq!(off_px[0], 0, "OFF pixel red channel should be dark");
+        assert!(off_px[1] > 0, "OFF pixel green channel should be lit");
+        assert!(off_px[2] > 0, "OFF pixel blue channel should be lit");
     }
 
     #[test]

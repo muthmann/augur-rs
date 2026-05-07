@@ -408,17 +408,55 @@ pub(crate) fn draw_viewer(
     // This prevents the canvas from resizing when hover info or toolbar state changes.
     let total_available_height = ui.available_size().y.min(ui.clip_rect().height());
 
-    ui.heading(preview_heading(input.mode));
+    // Viewer head row: compact title + bus / resolution / firmware meta,
+    // matching the design's `.viewer-head` strip
+    // (`Viewer  EVK3 / IMX636  1280 × 720  firmware 3.2.3`).
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
+    let head_height = ui.spacing().interact_size.y.max(20.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), head_height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
+            ui.label(
+                egui::RichText::new(preview_heading(input.mode))
+                    .size(13.0)
+                    .strong()
+                    .color(palette.ink),
+            );
+            if let Some(info) = input.camera_info {
+                let bus = info.compatible.as_deref().unwrap_or(&info.model);
+                let firmware = info.firmware.as_deref().unwrap_or("\u{2014}");
+                let resolution = format!(
+                    "{} \u{00D7} {}",
+                    input.config.roi.width, input.config.roi.height
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{bus}  \u{00B7}  {resolution}  \u{00B7}  firmware {firmware}"
+                    ))
+                    .monospace()
+                    .size(11.0)
+                    .color(palette.fg_2),
+                );
+            }
+            // Right-aligned hint row: matches the design's
+            // `Hover preview for pixel values · Esc clears tool` caption.
+            // Use a nested right-to-left layout filling the remaining width
+            // so the hint truly anchors to the right edge regardless of the
+            // header's measured size.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Hover preview for pixel values  \u{00B7}  Esc clears tool",
+                    )
+                    .size(11.0)
+                    .color(palette.fg_3),
+                );
+            });
+        },
+    );
     ui.separator();
-
-    if let Some(info) = input.camera_info {
-        ui.label(format!(
-            "{} | serial: {} | firmware: {}",
-            info.compatible.as_deref().unwrap_or(&info.model),
-            info.serial.as_deref().unwrap_or("-"),
-            info.firmware.as_deref().unwrap_or("-"),
-        ));
-    }
 
     let display_strip_reserve = 88.0;
     let status_footer_reserve = 96.0;
@@ -696,39 +734,39 @@ fn draw_status_footer(
             .auto_shrink([true, true])
             .show(ui, |ui| {
                 constrain_section_width(ui);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let mut first = true;
-                    if let Some(stats) = input.pipeline_stats {
-                        draw_inline_separator(ui, &mut first);
-                        ui.small(format!("{:.2} Mev/s", stats.mev_per_s));
+                // Single `·`-separated diagnostics line under the transport,
+                // matching the design's
+                // `24.8 Mev/s · 9.1 MB/s · 00:01:23 elapsed · ON 54.3% OFF 45.7% · 1,192,227 ev/frame · Diagnostics ▾`.
+                // Hover readout / ruler measurement chip live on the same row
+                // when the user is interacting with the canvas.
+                draw_unified_diagnostics_row(
+                    ui,
+                    input.pipeline_stats,
+                    preview_polarity_split(input.frame).as_ref(),
+                );
+                if let Some(hover_summary) = preview_hover_status_text(state, input) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(
+                            egui::RichText::new(hover_summary)
+                                .monospace()
+                                .size(11.0)
+                                .color(crate::theme::palette_for_visuals(ui.visuals()).fg_2),
+                        );
+                    });
+                }
+                if state.workspace.tool == PreviewTool::Ruler {
+                    if let Some(measurement) =
+                        state.ruler_tool.measurement(input.nm_per_pixel)
+                    {
+                        ui.small(format!(
+                            "{:.1} px  \u{00B7}  {:.2} \u{00B5}m",
+                            measurement.pixel_distance, measurement.micrometers
+                        ));
                     }
-                    if let Some(frame_summary) = preview_frame_status_summary(input.frame) {
-                        draw_inline_separator(ui, &mut first);
-                        ui.small(frame_summary);
-                    }
+                }
 
-                    draw_inline_separator(ui, &mut first);
-                    if let Some(hover_summary) = preview_hover_status_text(state, input) {
-                        ui.monospace(hover_summary);
-                    } else {
-                        ui.weak("Hover preview for pixel values");
-                    }
-
-                    if state.workspace.tool == PreviewTool::Ruler {
-                        if let Some(measurement) =
-                            state.ruler_tool.measurement(input.nm_per_pixel)
-                        {
-                            draw_inline_separator(ui, &mut first);
-                            ui.small(format!(
-                                "{:.1} px | {:.2} \u{00B5}m",
-                                measurement.pixel_distance, measurement.micrometers
-                            ));
-                        }
-                    }
-                });
-
-                egui::CollapsingHeader::new("Pipeline details")
+                egui::CollapsingHeader::new("Diagnostics")
                     .id_source((input.viewer_id, "pipeline_details"))
                     .default_open(emphasize_details)
                     .show(ui, |ui| {
@@ -883,11 +921,190 @@ fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
     width
 }
 
-fn draw_inline_separator(ui: &mut egui::Ui, first: &mut bool) {
-    if !*first {
-        ui.label(egui::RichText::new("\u{2022}").weak().size(10.0));
+/// Single-row, `·`-separated diagnostics line that runs beneath the
+/// transport scrubber. Matches the design's
+/// `24.8 Mev/s · 9.1 MB/s · 00:01:23 elapsed · ON 54.3% OFF 45.7% · 1,192,227 ev/frame · Diagnostics ▾`.
+/// The trailing `Diagnostics ▾` chevron is provided by the
+/// `CollapsingHeader` rendered just below this row.
+fn draw_unified_diagnostics_row(
+    ui: &mut egui::Ui,
+    stats: Option<&augur_core::pipeline::PipelineStatsSnapshot>,
+    polarity: Option<&PolaritySplit>,
+) {
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
+    let bullet = || {
+        egui::RichText::new("\u{00B7}")
+            .size(11.0)
+            .color(palette.fg_4)
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let mut wrote_left = false;
+        if let Some(stats) = stats {
+            let elapsed = stats.elapsed_s as u64;
+            let elapsed_str = format!(
+                "{:02}:{:02}:{:02}",
+                elapsed / 3600,
+                (elapsed % 3600) / 60,
+                elapsed % 60
+            );
+            ui.label(
+                egui::RichText::new(format!("{:.2} Mev/s", stats.mev_per_s))
+                    .monospace()
+                    .size(11.0)
+                    .color(palette.fg_1),
+            );
+            ui.label(bullet());
+            ui.label(
+                egui::RichText::new(format!("{:.2} MB/s", stats.mb_per_s))
+                    .monospace()
+                    .size(11.0)
+                    .color(palette.fg_1),
+            );
+            ui.label(bullet());
+            ui.label(
+                egui::RichText::new(format!("{elapsed_str} elapsed"))
+                    .monospace()
+                    .size(11.0)
+                    .color(palette.fg_1),
+            );
+            wrote_left = true;
+        }
+        if let Some(split) = polarity {
+            if wrote_left {
+                ui.label(bullet());
+            }
+            let on_color = egui::Color32::from_rgb(
+                crate::theme::POLARITY_ON_RGB[0],
+                crate::theme::POLARITY_ON_RGB[1],
+                crate::theme::POLARITY_ON_RGB[2],
+            );
+            let off_color = egui::Color32::from_rgb(
+                crate::theme::POLARITY_OFF_RGB[0],
+                crate::theme::POLARITY_OFF_RGB[1],
+                crate::theme::POLARITY_OFF_RGB[2],
+            );
+            ui.label(
+                egui::RichText::new(format!("ON {:.1}%", split.on_pct))
+                    .monospace()
+                    .size(11.0)
+                    .color(on_color),
+            );
+            ui.label(
+                egui::RichText::new(format!("OFF {:.1}%", split.off_pct))
+                    .monospace()
+                    .size(11.0)
+                    .color(off_color),
+            );
+            ui.label(bullet());
+            ui.label(
+                egui::RichText::new(format_thousands(split.total))
+                    .monospace()
+                    .size(11.0)
+                    .color(palette.fg_1),
+            );
+            ui.label(
+                egui::RichText::new("ev/frame")
+                    .size(11.0)
+                    .color(palette.fg_3),
+            );
+        } else if !wrote_left {
+            ui.label(
+                egui::RichText::new("No live pipeline.")
+                    .size(11.0)
+                    .color(palette.fg_3),
+            );
+        }
+    });
+}
+
+/// Format a `u64` with `,` thousands separators — e.g. `1192227 → 1,192,227`.
+/// Matches the design's `1,192,227 ev/frame` rendering.
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
     }
-    *first = false;
+    out
+}
+
+/// (Legacy) Render the design-system "metric pill" row. Kept as a
+/// reusable helper for surfaces other than the unified diagnostics row.
+#[allow(dead_code)]
+fn draw_status_metric_row(
+    ui: &mut egui::Ui,
+    stats: Option<&augur_core::pipeline::PipelineStatsSnapshot>,
+) {
+    use crate::theme::{metric_pill, Tone};
+    let Some(stats) = stats else {
+        ui.horizontal(|ui| ui.weak("No live pipeline."));
+        return;
+    };
+    let elapsed = stats.elapsed_s as u64;
+    let elapsed_str = format!(
+        "{:02}:{:02}:{:02}",
+        elapsed / 3600,
+        (elapsed % 3600) / 60,
+        elapsed % 60
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        metric_pill(
+            ui,
+            &format!("{:.2}", stats.mev_per_s),
+            "Mev/s",
+            Tone::Neutral,
+        );
+        metric_pill(ui, &format!("{:.2}", stats.mb_per_s), "MB/s", Tone::Neutral);
+        metric_pill(ui, &elapsed_str, "elapsed", Tone::Neutral);
+    });
+}
+
+/// ON / OFF percentage split with the polarity colour tints. Mirrors the
+/// design's coloured `ON 54.3%` / `OFF 45.7%` chips.
+struct PolaritySplit {
+    on_pct: f64,
+    off_pct: f64,
+    total: u64,
+}
+
+fn preview_polarity_split(frame: Option<&PreviewFrame>) -> Option<PolaritySplit> {
+    let frame = frame?;
+    let total = frame.on_count + frame.off_count;
+    if total == 0 {
+        return None;
+    }
+    Some(PolaritySplit {
+        on_pct: frame.on_count as f64 * 100.0 / total as f64,
+        off_pct: frame.off_count as f64 * 100.0 / total as f64,
+        total,
+    })
+}
+
+#[allow(dead_code)]
+fn draw_polarity_split_row(ui: &mut egui::Ui, split: PolaritySplit) {
+    use crate::theme::{metric_pill, Tone};
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        metric_pill(ui, &format!("{:.1}%", split.on_pct), "ON", Tone::PolarityOn);
+        metric_pill(
+            ui,
+            &format!("{:.1}%", split.off_pct),
+            "OFF",
+            Tone::PolarityOff,
+        );
+        ui.label(
+            egui::RichText::new(format!("{} ev/frame", split.total))
+                .monospace()
+                .size(10.0)
+                .weak(),
+        );
+    });
 }
 
 fn preview_frame_status_summary(frame: Option<&PreviewFrame>) -> Option<String> {
@@ -1509,6 +1726,50 @@ fn draw_preview_canvas(
             viewport,
             &scale_bar_settings,
             nm_per_pixel,
+        );
+    }
+
+    // Glass-morphism preview readout overlay anchored to the canvas
+    // (bottom-left). Shows the current hover x/y and the per-pixel ON/OFF
+    // counts when available — matches the design's `.preview-readout` box.
+    if let Some((sx, sy)) = workspace.hover_sensor {
+        let width = usize::from(frame.width.max(1));
+        let idx = usize::from(sy) * width + usize::from(sx);
+        let total = frame.pixels.get(idx).copied();
+        let on = frame.pixels_on.get(idx).copied();
+        let off = frame.pixels_off.get(idx).copied();
+        let mut parts = vec![format!("x {sx} \u{00B7} y {sy}")];
+        if let (Some(on), Some(off)) = (on, off) {
+            parts.push(format!("ON {on}"));
+            parts.push(format!("OFF {off}"));
+        }
+        if let Some(total) = total {
+            parts.push(format!("total {total}"));
+        }
+        let text = parts.join("   ");
+        let pad = egui::vec2(8.0, 4.0);
+        let font = egui::FontId::monospace(11.0);
+        let galley = ui.fonts(|f| {
+            f.layout_no_wrap(
+                text.clone(),
+                font.clone(),
+                egui::Color32::from_rgb(0xe9, 0xeb, 0xef),
+            )
+        });
+        let box_size = egui::vec2(galley.size().x + pad.x * 2.0, galley.size().y + pad.y * 2.0);
+        let box_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                image_rect.left() + 8.0,
+                image_rect.bottom() - box_size.y - 8.0,
+            ),
+            box_size,
+        );
+        ui.painter()
+            .rect_filled(box_rect, 4.0, egui::Color32::from_black_alpha(180));
+        ui.painter().galley(
+            egui::pos2(box_rect.left() + pad.x, box_rect.top() + pad.y),
+            galley,
+            egui::Color32::from_rgb(0xe9, 0xeb, 0xef),
         );
     }
 
@@ -2338,6 +2599,29 @@ pub(crate) fn draw_replay_transport(
             phosphor::PAUSE
         };
         if ui
+            .add(
+                egui::Button::new(toolbar_icon(phosphor::SKIP_BACK))
+                    .min_size(transport_button_size),
+            )
+            .on_hover_text("Restart replay")
+            .clicked()
+        {
+            output.replay_restart = true;
+        }
+
+        if ui
+            .add_enabled(
+                replay.paused,
+                egui::Button::new(toolbar_icon(phosphor::CARET_LEFT))
+                    .min_size(transport_button_size),
+            )
+            .on_hover_text("Step back one frame (\u{2190})")
+            .clicked()
+        {
+            output.replay_step_frames = Some(-1);
+        }
+
+        if ui
             .add_enabled(
                 !replay.finished,
                 egui::Button::new(toolbar_icon(play_pause)).min_size(transport_button_size),
@@ -2353,14 +2637,15 @@ pub(crate) fn draw_replay_transport(
         }
 
         if ui
-            .add(
-                egui::Button::new(toolbar_icon(phosphor::SKIP_BACK))
+            .add_enabled(
+                !replay.finished,
+                egui::Button::new(toolbar_icon(phosphor::CARET_RIGHT))
                     .min_size(transport_button_size),
             )
-            .on_hover_text("Restart replay")
+            .on_hover_text("Step forward one frame (\u{2192})")
             .clicked()
         {
-            output.replay_restart = true;
+            output.replay_step_frames = Some(1);
         }
 
         if ui
@@ -2401,16 +2686,49 @@ pub(crate) fn draw_replay_transport(
             .x + ui.spacing().item_spacing.x * 2.0;
 
         let mut timeline_fraction = state.replay_seek_drag.unwrap_or(replay.fraction);
-        let slider = egui::Slider::new(&mut timeline_fraction, 0.0..=1.0).show_value(false);
         let slider_width = (ui.available_width() - time_width).max(80.0);
-        let response = ui.add_sized([slider_width, ui.spacing().interact_size.y], slider);
-        if response.dragged() {
-            state.replay_seek_drag = Some(timeline_fraction);
+        let track_height: f32 = 14.0;
+        let (track_rect, response) = ui.allocate_exact_size(
+            egui::vec2(slider_width, track_height),
+            egui::Sense::click_and_drag(),
+        );
+        if let Some(pos) = response.interact_pointer_pos() {
+            if response.dragged() || response.clicked() {
+                let f = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
+                timeline_fraction = f;
+                state.replay_seek_drag = Some(f);
+            }
         }
-        if response.drag_stopped() || (response.changed() && !response.dragged()) {
+        if response.drag_stopped() || response.clicked() {
             state.replay_seek_drag = None;
             output.replay_seek_to = Some(timeline_fraction);
         }
+        // Custom track: 4 px ink-filled bar with circular thumb on top.
+        let palette = crate::theme::palette_for_visuals(ui.visuals());
+        let bar_height = 4.0;
+        let bar_y = track_rect.center().y - bar_height * 0.5;
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(track_rect.left(), bar_y),
+            egui::vec2(track_rect.width(), bar_height),
+        );
+        ui.painter().rect_filled(bar_rect, 2.0, palette.bg_3);
+        let fill_rect = egui::Rect::from_min_size(
+            bar_rect.min,
+            egui::vec2(bar_rect.width() * timeline_fraction, bar_height),
+        );
+        ui.painter().rect_filled(fill_rect, 2.0, palette.ink);
+        let thumb_x = bar_rect.left() + bar_rect.width() * timeline_fraction;
+        let thumb_radius = 6.0;
+        ui.painter().circle_filled(
+            egui::pos2(thumb_x, track_rect.center().y),
+            thumb_radius,
+            palette.bg_1,
+        );
+        ui.painter().circle_stroke(
+            egui::pos2(thumb_x, track_rect.center().y),
+            thumb_radius,
+            egui::Stroke::new(2.0, palette.ink),
+        );
 
         ui.label(&time_text);
         ui.separator();

@@ -83,11 +83,13 @@ const COLLAPSED_PANEL_WIDTH: f32 = 22.0;
 const EVENT_STORE_MEBIBYTE: usize = 1024 * 1024;
 pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const UI_THEME_STORAGE_KEY: &str = "augur_gui.theme_preference";
+const DOCK_HEIGHT_STORAGE_KEY: &str = "augur_gui.dock_height";
+const DOCK_OPEN_STORAGE_KEY: &str = "augur_gui.dock_open";
 const REPLAY_FRAME_HISTORY_CAPACITY: usize = 8;
 const RAW_EVENTS_ON_LAYER_ID: &str = "host.raw_events.on";
 const RAW_EVENTS_OFF_LAYER_ID: &str = "host.raw_events.off";
-const RAW_EVENTS_ON_COLOR: [u8; 4] = [255, 186, 92, 240];
-const RAW_EVENTS_OFF_COLOR: [u8; 4] = [92, 214, 201, 220];
+const RAW_EVENTS_ON_COLOR: [u8; 4] = crate::theme::RAW_EVENT_ON_RGBA;
+const RAW_EVENTS_OFF_COLOR: [u8; 4] = crate::theme::RAW_EVENT_OFF_RGBA;
 
 type CachedHostDataset = Result<Option<HostDatasetSnapshot>, String>;
 
@@ -110,11 +112,15 @@ impl UiThemePreference {
         matches!(self, Self::Dark)
     }
 
-    fn visuals(self) -> egui::Visuals {
+    fn theme_mode(self) -> crate::theme::ThemeMode {
         match self {
-            Self::Dark => egui::Visuals::dark(),
-            Self::Light => egui::Visuals::light(),
+            Self::Dark => crate::theme::ThemeMode::Dark,
+            Self::Light => crate::theme::ThemeMode::Light,
         }
+    }
+
+    fn visuals(self) -> egui::Visuals {
+        crate::theme::visuals(self.theme_mode())
     }
 }
 
@@ -678,6 +684,17 @@ pub struct CameraApp {
     host_view_render_state: HashMap<String, HostViewRenderState>,
     host_view_dataset_cache: HashMap<String, HostDatasetCacheEntry>,
     host_view_resolution_warnings: Vec<String>,
+    /// IDs of host views currently embedded in the bottom dock (in tab order).
+    dock_tabs: Vec<String>,
+    /// Currently visible dock tab.
+    dock_active: Option<String>,
+    /// Whether the dock area is shown when it has tabs.
+    dock_open: bool,
+    /// Drag-resizable dock height in points.
+    dock_height: f32,
+    /// Owl brand mark texture (loaded once at startup); `None` if the asset
+    /// could not be read.
+    brand_logo: Option<egui::TextureHandle>,
     pending_action_requests: Vec<HostActionRequest>,
     next_action_request_id: u64,
     action_modal: Option<ActionModalState>,
@@ -705,6 +722,24 @@ impl CameraApp {
                 UiThemePreference::from_dark_mode(cc.egui_ctx.style().visuals.dark_mode)
             });
         cc.egui_ctx.set_visuals(theme_preference.visuals());
+        cc.egui_ctx.style_mut(crate::theme::apply_style);
+
+        // Load the owl brand mark once. Falls back to None if the asset is
+        // missing — the menubar wordmark still renders without it.
+        let logo_texture = load_brand_logo(&cc.egui_ctx);
+
+        // Restore persisted dock layout (size + collapsed state).
+        let dock_height = cc
+            .storage
+            .and_then(|s| s.get_string(DOCK_HEIGHT_STORAGE_KEY))
+            .and_then(|s| s.parse::<f32>().ok())
+            .map(|h| h.clamp(160.0, 800.0))
+            .unwrap_or(280.0);
+        let dock_open = cc
+            .storage
+            .and_then(|s| s.get_string(DOCK_OPEN_STORAGE_KEY))
+            .map(|s| s != "false")
+            .unwrap_or(true);
 
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
@@ -790,6 +825,11 @@ impl CameraApp {
             host_view_render_state: HashMap::new(),
             host_view_dataset_cache: HashMap::new(),
             host_view_resolution_warnings: Vec::new(),
+            dock_tabs: Vec::new(),
+            dock_active: None,
+            dock_open,
+            dock_height,
+            brand_logo: logo_texture,
             pending_action_requests: Vec::new(),
             next_action_request_id: 1,
             action_modal: None,
@@ -810,6 +850,7 @@ impl CameraApp {
 
     fn apply_theme_to_ctx(&self, ctx: &egui::Context) {
         ctx.set_visuals(self.theme_preference.visuals());
+        ctx.style_mut(crate::theme::apply_style);
     }
 
     fn set_theme_preference(&mut self, ctx: &egui::Context, theme_preference: UiThemePreference) {
@@ -948,7 +989,7 @@ impl CameraApp {
         if actions.is_empty() {
             return;
         }
-        ui.collapsing("Actions", |ui| {
+        crate::theme::collapse(ui, "ws_actions", "Actions", false, None, |ui| {
             ui.small(
                 "Row- and cluster-scoped actions published by plugins. Apply to queue; the plugin consumes on the next frame.",
             );
@@ -959,9 +1000,9 @@ impl CameraApp {
                     HostActionScope::Dataset { dataset_id } => {
                         format!("Dataset-wide action on {dataset_id}.")
                     }
-                    HostActionScope::Row { dataset_id } => format!(
-                        "Select exactly one row on {dataset_id} to enable.",
-                    ),
+                    HostActionScope::Row { dataset_id } => {
+                        format!("Select exactly one row on {dataset_id} to enable.",)
+                    }
                     HostActionScope::Cluster {
                         dataset_id,
                         group_column,
@@ -974,9 +1015,9 @@ impl CameraApp {
                     let response = response.on_hover_text(&hover);
                     if response.clicked() {
                         if let Some(payload) = payload {
-                            let schema = param_schema
-                                .as_ref()
-                                .and_then(|v| serde_json::from_value::<SettingsSchema>(v.clone()).ok());
+                            let schema = param_schema.as_ref().and_then(|v| {
+                                serde_json::from_value::<SettingsSchema>(v.clone()).ok()
+                            });
                             self.open_action_modal(&id, &title, payload, schema);
                         }
                     }
@@ -1018,16 +1059,9 @@ impl CameraApp {
                 )
             });
 
-        ui.collapsing("Workspace", |ui| {
-            ui.small(
-                "Use the top bar to switch between 2D, split, and 3D. This panel keeps the linked ROI, selection, and layer styling together.",
-            );
-            ui.small(format!("Current layout: {}", current_layout.label()));
+        crate::theme::collapse(ui, "ws_workspace", "Workspace", true, None, |ui| {
             if ui
-                .checkbox(
-                    &mut link_roi_between_2d_and_3d,
-                    "Link 2D ROI into the 3D focus volume",
-                )
+                .checkbox(&mut link_roi_between_2d_and_3d, "Link 2D ROI \u{2192} 3D & tables")
                 .on_hover_text(
                     "Use the selected 2D ROI to drive linked table filtering and the highlighted 3D focus box.",
                 )
@@ -1039,19 +1073,7 @@ impl CameraApp {
                 self.sync_active_analysis_roi();
             }
 
-            match active_roi {
-                Some(roi) => {
-                    ui.small(format!(
-                        "Linked ROI: x {:.1}..{:.1}, y {:.1}..{:.1}",
-                        roi.x_min, roi.x_max, roi.y_min, roi.y_max
-                    ));
-                }
-                None => {
-                    ui.small("Linked ROI: off");
-                }
-            }
-
-            if let Some(selected) = &selected_row {
+            let selected_text = if let Some(selected) = &selected_row {
                 let layer_title = self.with_active_viewer(|viewer| {
                     viewer
                         .investigation
@@ -1061,127 +1083,138 @@ impl CameraApp {
                         .map(|(_, s)| s.title.clone())
                 });
                 let label = layer_title.unwrap_or_else(|| selected.dataset_id.clone());
-                ui.label(format!("Selected item: {label} row {}", selected.row_id));
+                format!("row #{} \u{00B7} {}", selected.row_id, label)
             } else {
-                ui.small("Selected item: none");
-            }
+                "\u{2014}".to_owned()
+            };
+            crate::theme::inspector_row(ui, "Selected", &selected_text);
 
-            if let Some(hovered) = &hovered_row {
-                ui.small(format!("Hovered row: {}", hovered.row_id));
-            }
+            let hovered_text = if let Some(hovered) = &hovered_row {
+                format!("row #{}", hovered.row_id)
+            } else {
+                "\u{2014}".to_owned()
+            };
+            crate::theme::inspector_row(ui, "Hover", &hovered_text);
 
-            if (selected_row.is_some() || hovered_row.is_some())
-                && ui
-                    .small_button("Clear selection")
-                    .on_hover_text("Clear the current linked 2D/3D/table selection.")
-                    .clicked()
-            {
-                self.with_active_viewer_mut(|viewer| {
-                    viewer.investigation.clear_selection();
-                    viewer.investigation.hovered_row = None;
-                });
-            }
-            ui.small("Shortcuts: 1/2/3 layout, L link ROI, Esc clear selection, F focus 3D");
+            // Suppress unused-binding warnings: `current_layout` and
+            // `active_roi` were displayed in earlier passes via Layout /
+            // Linked ROI inspector rows; the design dropped those rows but
+            // the data fetch is still done in one go to keep the
+            // viewer-state borrow tidy.
+            let _ = (&current_layout, &active_roi);
         });
 
         ui.separator();
         self.render_investigation_actions(ui);
 
         ui.separator();
-        ui.collapsing("Layers", |ui| {
-            ui.small(
-                "Raw event ON/OFF layers style the current point cloud. Extra analysis layers only affect the 3D scene when a plugin publishes a 3D scatter view.",
-            );
-            if !focused_layers.is_empty() {
-                ui.small(format!(
-                    "Isolated: {}",
-                    focused_layers
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if ui.button("Show all layers").clicked() {
-                self.with_active_viewer_mut(|viewer| {
-                    viewer.investigation.focused_layers.clear();
-                    let layer_ids: Vec<String> =
-                        viewer.investigation.layer_styles.keys().cloned().collect();
-                    for layer_id in layer_ids {
-                        viewer.investigation.set_layer_visible(layer_id, true);
-                    }
-                });
-            }
-            ui.separator();
-            if !raw_layer_ids.is_empty() {
-                ui.strong("Point Cloud");
-                self.render_investigation_layer_cards(ui, raw_layer_ids.as_slice());
-            }
-            if !analysis_layer_ids.is_empty() {
-                if !raw_layer_ids.is_empty() {
-                    ui.separator();
+        // Flatten the layer list: raw events and analysis layers share one
+        // ordered list; the right-of-header counter shows visible/total. The
+        // verbose paragraphs and the "Show all layers" button were removed —
+        // visibility per row is the eye toggle, isolation is in the per-row
+        // overflow menu (DOTS_THREE).
+        let ordered_layer_ids: Vec<String> = raw_layer_ids
+            .iter()
+            .chain(analysis_layer_ids.iter())
+            .cloned()
+            .collect();
+        let visible_total = ordered_layer_ids
+            .iter()
+            .filter(|id| {
+                self.with_active_viewer(|viewer| {
+                    viewer
+                        .investigation
+                        .layer_styles
+                        .get(*id)
+                        .is_some_and(|s| viewer.investigation.layer_visible(id, s.visible))
+                })
+            })
+            .count();
+        let layer_count_chip = format!("{visible_total}/{}", ordered_layer_ids.len());
+        crate::theme::collapse(
+            ui,
+            "ws_layers",
+            "Layers",
+            true,
+            Some(&layer_count_chip),
+            |ui| {
+                if ordered_layer_ids.is_empty() {
+                    ui.small("No layers yet.");
+                } else {
+                    self.render_investigation_layer_cards(ui, &ordered_layer_ids);
                 }
-                ui.strong("Analysis Layers");
-                self.render_investigation_layer_cards(ui, analysis_layer_ids.as_slice());
-            } else {
-                ui.small("No additional analysis layers are active.");
-            }
+                if !focused_layers.is_empty() {
+                    ui.add_space(crate::theme::sp::SP_1);
+                    ui.small(format!(
+                        "Isolated: {}",
+                        focused_layers
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            },
+        );
 
-            ui.separator();
-            ui.small(
-                "Raw-event history controls now live in the 3D toolbar so the time span can be widened while you inspect the cloud.",
-            );
-        });
-
+        // Notices collapse — design wants `▾ Notices  N` header with rows
+        // below, severity-iconed and wrapped to the panel width.
         ui.separator();
-        ui.collapsing("Status & warnings", |ui| {
-            ui.small(format!("Mode: {}", self.mode_label()));
-            if self.config_dirty || self.acq_dirty {
-                let mut dirty = Vec::new();
-                if self.config_dirty {
-                    dirty.push("settings");
-                }
-                if self.acq_dirty {
-                    dirty.push("acquisition timing");
-                }
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    format!("Apply pending changes: {}", dirty.join(", ")),
+        let warning_count = self.analysis_output.warnings.len();
+        let notice_count = warning_count
+            + usize::from(self.last_error.is_some())
+            + usize::from(self.analysis_notice.is_some());
+        let count_text = format!("{notice_count}");
+        crate::theme::collapse(ui, "ws_notices", "Notices", true, Some(&count_text), |ui| {
+            if let Some(error) = &self.last_error {
+                notice_row(
+                    ui,
+                    egui_phosphor::regular::WARNING_OCTAGON,
+                    ui.visuals().error_fg_color,
+                    error,
                 );
-            } else {
-                ui.small("Host settings and current outputs are in sync.");
             }
-
-            if self.analysis_output.warnings.is_empty() {
-                ui.small("No analysis warnings.");
+            if warning_count == 0 && self.last_error.is_none() {
+                ui.small("All clear.");
             } else {
-                for warning in self.analysis_output.warnings.iter().take(6) {
-                    let color = match warning.severity {
+                use egui_phosphor::regular as ph;
+                for warning in self.analysis_output.warnings.iter().take(8) {
+                    let (color, glyph) = match warning.severity {
                         augur_core::analysis::AnalysisSeverity::Info => {
-                            ui.visuals().weak_text_color()
+                            (ui.visuals().weak_text_color(), ph::INFO)
                         }
                         augur_core::analysis::AnalysisSeverity::Warning => {
-                            ui.visuals().warn_fg_color
+                            (ui.visuals().warn_fg_color, ph::WARNING)
                         }
                         augur_core::analysis::AnalysisSeverity::Error => {
-                            ui.visuals().error_fg_color
+                            (ui.visuals().error_fg_color, ph::WARNING_OCTAGON)
                         }
                     };
-                    ui.colored_label(color, format!("{}: {}", warning.source, warning.message));
+                    notice_row(
+                        ui,
+                        glyph,
+                        color,
+                        &format!("{} \u{00B7} {}", warning.source, warning.message),
+                    );
                 }
-                let remaining = self.analysis_output.warnings.len().saturating_sub(6);
+                let remaining = warning_count.saturating_sub(8);
                 if remaining > 0 {
-                    ui.small(format!("{remaining} more warning(s) remain."));
+                    ui.small(format!("{remaining} more \u{2014} see Diagnostics."));
                 }
             }
-
             if let Some(notice) = &self.analysis_notice {
-                ui.label(format!("Notice: {notice}"));
-            }
-            if let Some(error) = &self.last_error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
+                notice_row(
+                    ui,
+                    egui_phosphor::regular::INFO,
+                    ui.visuals().weak_text_color(),
+                    notice,
+                );
             }
         });
+
+        // Status & warnings has moved to the viewer footer's `Diagnostics`
+        // collapse. The Mode + dirty pending pill is surfaced via the menubar
+        // status chip's tooltip; warnings live in `Notices` above.
     }
 
     fn render_investigation_layer_cards(&mut self, ui: &mut egui::Ui, layer_ids: &[String]) {
@@ -1198,80 +1231,106 @@ impl CameraApp {
             });
             let mut changed = false;
 
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let swatch = egui::Color32::from_rgba_unmultiplied(
-                        style.color[0],
-                        style.color[1],
-                        style.color[2],
-                        style.color[3],
-                    );
-                    ui.colored_label(swatch, "■");
-                    changed |= ui
-                        .checkbox(&mut visible, &style.title)
-                        .on_hover_text("Show or hide this layer in linked investigation views.")
-                        .changed();
-                    if ui
-                        .small_button("Only")
-                        .on_hover_text("Hide all other layers so this one is easier to inspect.")
-                        .clicked()
-                    {
-                        self.with_active_viewer_mut(|viewer| {
-                            viewer.investigation.isolate_layer(layer_id);
-                        });
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Color")
-                        .on_hover_text("Tint used for this layer in 2D and 3D.");
-                    changed |= ui
-                        .color_edit_button_srgba_unmultiplied(&mut style.color)
-                        .on_hover_text("Tint used for this layer in 2D and 3D.")
-                        .changed();
-
-                    let is_raw_event_layer = matches!(
-                        layer_id.as_str(),
-                        RAW_EVENTS_ON_LAYER_ID | RAW_EVENTS_OFF_LAYER_ID
-                    );
-                    ui.label("Shape").on_hover_text(
-                        "Marker shape affects linked 2D markers. The current 3D point cloud uses round billboards.",
-                    );
-                    if is_raw_event_layer {
-                        ui.small("3D round sprites only").on_hover_text(
-                            "Raw-event point clouds currently support color and size, but not alternate 3D marker shapes.",
-                        );
-                    } else {
-                        egui::ComboBox::from_id_source(("investigation_layer_shape", layer_id))
-                            .selected_text(host_marker_shape_label(style.marker_shape))
-                            .show_ui(ui, |ui| {
-                                for shape in [
-                                    augur_plugin_api::HostMarkerShape::Point,
-                                    augur_plugin_api::HostMarkerShape::Cross,
-                                    augur_plugin_api::HostMarkerShape::Box,
-                                    augur_plugin_api::HostMarkerShape::Ellipse,
-                                    augur_plugin_api::HostMarkerShape::Diamond,
-                                    augur_plugin_api::HostMarkerShape::FilledCircle,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut style.marker_shape,
-                                        shape,
-                                        host_marker_shape_label(shape),
-                                    );
-                                }
-                            });
-                    }
-
-                    ui.label("Size").on_hover_text(
-                        "Base marker size. The 3D view also uses this for the point-cloud sprite radius.",
-                    );
-                    changed |= ui
-                        .add(egui::Slider::new(&mut style.size, 1.0..=12.0))
-                        .on_hover_text(
-                            "Base marker size. The 3D view also uses this for the point-cloud sprite radius.",
-                        )
-                        .changed();
-                });
+            // Compact one-line row matching the design: eye toggle + 10×10
+            // swatch + layer title + right-aligned count. The whole row is
+            // a fixed-width strip so the right-aligned count anchors right
+            // without the parent SidePanel growing to fit content.
+            // Right-click opens the colour / shape / size / isolate detail
+            // panel below the row.
+            let row_width = ui.available_width();
+            let row_response = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(row_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if let Some(new_visible) =
+                            crate::theme::layer_row(ui, visible, style.color, &style.title, "")
+                        {
+                            visible = new_visible;
+                            changed = true;
+                        }
+                    },
+                )
+                .response
+                .interact(egui::Sense::click());
+            row_response.clone().context_menu(|ui| {
+                if ui.button("Layer style…").clicked() {
+                    ui.memory_mut(|mem| {
+                        let key = egui::Id::new(("layer_expand", layer_id));
+                        mem.data.insert_temp(key, true);
+                    });
+                    ui.close_menu();
+                }
+                if ui.button("Isolate").clicked() {
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer.investigation.isolate_layer(layer_id);
+                    });
+                    ui.close_menu();
+                }
             });
+
+            // Detail editor: only visible when the … toggle is on.
+            let detail_open = ui.memory(|mem| {
+                mem.data
+                    .get_temp::<bool>(egui::Id::new(("layer_expand", layer_id)))
+                    .unwrap_or(false)
+            });
+            if detail_open {
+                ui.indent(egui::Id::new(("layer_detail", layer_id)), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
+                        ui.label("Color");
+                        changed |= ui
+                            .color_edit_button_srgba_unmultiplied(&mut style.color)
+                            .changed();
+
+                        let is_raw_event_layer = matches!(
+                            layer_id.as_str(),
+                            RAW_EVENTS_ON_LAYER_ID | RAW_EVENTS_OFF_LAYER_ID
+                        );
+                        ui.label("Shape");
+                        if is_raw_event_layer {
+                            ui.weak("3D sprites");
+                        } else {
+                            egui::ComboBox::from_id_source(("investigation_layer_shape", layer_id))
+                                .selected_text(host_marker_shape_label(style.marker_shape))
+                                .show_ui(ui, |ui| {
+                                    for shape in [
+                                        augur_plugin_api::HostMarkerShape::Point,
+                                        augur_plugin_api::HostMarkerShape::Cross,
+                                        augur_plugin_api::HostMarkerShape::Box,
+                                        augur_plugin_api::HostMarkerShape::Ellipse,
+                                        augur_plugin_api::HostMarkerShape::Diamond,
+                                        augur_plugin_api::HostMarkerShape::FilledCircle,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut style.marker_shape,
+                                            shape,
+                                            host_marker_shape_label(shape),
+                                        );
+                                    }
+                                });
+                        }
+
+                        ui.label("Size");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut style.size, 1.0..=12.0).show_value(true))
+                            .changed();
+
+                        if ui
+                            .small_button("Only")
+                            .on_hover_text(
+                                "Hide all other layers so this one is easier to inspect.",
+                            )
+                            .clicked()
+                        {
+                            self.with_active_viewer_mut(|viewer| {
+                                viewer.investigation.isolate_layer(layer_id);
+                            });
+                        }
+                    });
+                });
+            }
 
             if changed {
                 self.with_active_viewer_mut(|viewer| {
@@ -3025,6 +3084,347 @@ impl CameraApp {
                 );
             }
         }
+    }
+
+    /// Add a host view to the dock (or focus it if already present).
+    /// Drops stale tab IDs whose view no longer exists in the registry.
+    fn dock_open_view(&mut self, view_id: &str) {
+        if !self.dock_tabs.iter().any(|id| id == view_id) {
+            self.dock_tabs.push(view_id.to_owned());
+        }
+        self.dock_active = Some(view_id.to_owned());
+        self.dock_open = true;
+    }
+
+    /// Remove a tab from the dock; if the active tab was closed, fall back
+    /// to the previous tab.
+    fn dock_close_view(&mut self, view_id: &str) {
+        let prev_index = self.dock_tabs.iter().position(|id| id == view_id);
+        self.dock_tabs.retain(|id| id != view_id);
+        if self.dock_active.as_deref() == Some(view_id) {
+            self.dock_active = prev_index
+                .and_then(|i| {
+                    let next = i
+                        .saturating_sub(1)
+                        .min(self.dock_tabs.len().saturating_sub(1));
+                    self.dock_tabs.get(next).cloned()
+                })
+                .or_else(|| self.dock_tabs.last().cloned());
+        }
+    }
+
+    fn dock_contains(&self, view_id: &str) -> bool {
+        self.dock_tabs.iter().any(|id| id == view_id)
+    }
+
+    /// Render the bottom multi-view dock — a tab strip plus the active
+    /// tab's body. Only renders when at least one tab exists and the dock
+    /// is not collapsed. Drops tabs whose host view has disappeared.
+    fn render_host_view_dock(&mut self, ctx: &egui::Context) {
+        // Drop stale tabs whose view IDs no longer resolve.
+        let known_ids: std::collections::HashSet<String> = self
+            .host_view_registry
+            .views()
+            .map(|v| v.descriptor.id.clone())
+            .collect();
+        self.dock_tabs.retain(|id| known_ids.contains(id));
+        if let Some(active) = &self.dock_active {
+            if !self.dock_tabs.iter().any(|id| id == active) {
+                self.dock_active = self.dock_tabs.first().cloned();
+            }
+        } else {
+            self.dock_active = self.dock_tabs.first().cloned();
+        }
+
+        if self.dock_tabs.is_empty() {
+            return;
+        }
+
+        if !self.dock_open {
+            // Collapsed: render a thin strip with tab names so the user can
+            // see what's docked at a glance.
+            egui::TopBottomPanel::bottom("host_view_dock_collapsed")
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
+                        if ui
+                            .small_button(egui_phosphor::regular::CARET_UP)
+                            .on_hover_text("Expand host-view dock")
+                            .clicked()
+                        {
+                            self.dock_open = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} host view{} docked",
+                                self.dock_tabs.len(),
+                                if self.dock_tabs.len() == 1 { "" } else { "s" }
+                            ))
+                            .size(11.0),
+                        );
+                        let names: Vec<String> = self
+                            .dock_tabs
+                            .iter()
+                            .filter_map(|id| {
+                                self.host_view_registry
+                                    .view(id)
+                                    .map(|v| v.descriptor.title.clone())
+                            })
+                            .collect();
+                        if !names.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "\u{00B7} {}",
+                                    names.join(" \u{00B7} ")
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
+                });
+            return;
+        }
+
+        let dock_height = self.dock_height.clamp(160.0, 800.0);
+        let mut new_height = None;
+        let panel_response = egui::TopBottomPanel::bottom("host_view_dock")
+            .resizable(true)
+            .min_height(160.0)
+            .default_height(dock_height)
+            .show(ctx, |ui| {
+                new_height = Some(ui.available_size().y + 0.0);
+                self.render_dock_tab_strip(ui);
+                ui.separator();
+                let active_view: Option<ResolvedHostView> = self
+                    .dock_active
+                    .as_ref()
+                    .and_then(|id| self.host_view_registry.view(id).cloned());
+                if let Some(view) = active_view {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_host_view_content(ctx, ui, &view);
+                        });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("No active dock tab.");
+                    });
+                }
+            });
+        if let Some(height) = new_height {
+            // Track the user-resized height between frames.
+            let _ = panel_response;
+            self.dock_height = height.max(160.0);
+        }
+    }
+
+    /// Tab strip atop the host-view dock. Each tab carries an icon, kind
+    /// tag, title, and close button. A "collapse" affordance on the right
+    /// hides the dock body so the central viewport can reclaim the space.
+    fn render_dock_tab_strip(&mut self, ui: &mut egui::Ui) {
+        let palette = crate::theme::palette_for_visuals(ui.visuals());
+        // Tabs carry an optional plugin tag derived from the resolved
+        // view's provider. Runtime providers map to plugin-manager records;
+        // built-in providers carry a static tag.
+        let tabs: Vec<DockTab> = self
+            .dock_tabs
+            .iter()
+            .filter_map(|id| {
+                self.host_view_registry.view(id).map(|v| DockTab {
+                    id: v.descriptor.id.clone(),
+                    title: v.descriptor.title.clone(),
+                    kind: v.descriptor.kind.clone(),
+                    plugin_tag: self.provider_plugin_tag(v.provider),
+                    dataset_id: v.descriptor.dataset_id.clone(),
+                })
+            })
+            .collect();
+        let active = self.dock_active.clone();
+        let mut activate: Option<String> = None;
+        let mut close: Option<String> = None;
+        let mut popout: Option<String> = None;
+        let mut collapse_dock = false;
+        let mut maximize_dock = false;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+            for tab in &tabs {
+                let is_active = active.as_deref() == Some(tab.id.as_str());
+                let label_color = if is_active {
+                    palette.fg_0
+                } else {
+                    palette.fg_2
+                };
+                let bg = if is_active {
+                    palette.bg_1
+                } else {
+                    palette.bg_2
+                };
+                egui::Frame::none()
+                    .fill(bg)
+                    .rounding(egui::Rounding {
+                        nw: crate::theme::radius::R_2,
+                        ne: crate::theme::radius::R_2,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .inner_margin(egui::Margin::symmetric(
+                        crate::theme::sp::SP_2,
+                        crate::theme::sp::SP_1,
+                    ))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+                            let icon = host_view_kind_icon(&tab.kind);
+                            let kind_tag = host_view_kind_tag(&tab.kind);
+                            let label = format!("{icon}  {}", tab.title);
+                            let tooltip = format!("{} \u{00B7} {}", kind_tag, tab.dataset_id);
+                            let response = ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&label).color(label_color),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(&tooltip);
+                            if response.clicked() {
+                                activate = Some(tab.id.clone());
+                            }
+                            crate::theme::chip(ui, kind_tag, crate::theme::Tone::Neutral);
+                            if let Some(plugin) = &tab.plugin_tag {
+                                ui.label(
+                                    egui::RichText::new(format!("\u{00B7} {plugin}"))
+                                        .monospace()
+                                        .size(10.0)
+                                        .color(palette.fg_3),
+                                );
+                            }
+                            if ui
+                                .small_button(egui_phosphor::regular::X)
+                                .on_hover_text("Close tab")
+                                .clicked()
+                            {
+                                close = Some(tab.id.clone());
+                            }
+                        });
+                    });
+            }
+            ui.add_space(crate::theme::sp::SP_2);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(egui_phosphor::regular::CARET_DOWN)
+                    .on_hover_text("Collapse host-view dock")
+                    .clicked()
+                {
+                    collapse_dock = true;
+                }
+                if ui
+                    .small_button(egui_phosphor::regular::ARROWS_OUT)
+                    .on_hover_text("Maximize host-view dock")
+                    .clicked()
+                {
+                    maximize_dock = true;
+                }
+                if let Some(active_id) = &active {
+                    if ui
+                        .small_button(egui_phosphor::regular::ARROW_SQUARE_OUT)
+                        .on_hover_text("Pop out active tab to OS window")
+                        .clicked()
+                    {
+                        popout = Some(active_id.clone());
+                    }
+                }
+            });
+        });
+
+        if let Some(id) = activate {
+            self.dock_active = Some(id);
+        }
+        if let Some(id) = close {
+            self.dock_close_view(&id);
+        }
+        if let Some(id) = popout {
+            self.dock_close_view(&id);
+            self.host_view_window_open.insert(id, true);
+        }
+        if collapse_dock {
+            self.dock_open = false;
+        }
+        if maximize_dock {
+            // Bump dock to ~70 % of viewport height; clamped to the dock max.
+            self.dock_height = (ui.ctx().screen_rect().height() * 0.7).clamp(160.0, 800.0);
+        }
+    }
+
+    fn provider_plugin_tag(&self, provider: HostViewProviderKey) -> Option<String> {
+        match provider {
+            HostViewProviderKey::Runtime(idx) => self
+                .plugin_manager
+                .records()
+                .get(idx)
+                .and_then(|r| r.plugin())
+                .map(|p| p.name().to_owned()),
+        }
+    }
+
+    /// Render a horizontal row of "view chips" for every window-placement
+    /// host view this plugin exposes. Each chip is a one-click affordance
+    /// to open the corresponding deferred viewport (the OS window for that
+    /// view). The active chip flips style when its window is open.
+    fn render_provider_view_chips(&mut self, ui: &mut egui::Ui, provider: HostViewProviderKey) {
+        let chips: Vec<(String, String, augur_plugin_api::HostViewKind)> = self
+            .host_view_registry
+            .window_views_for_provider(provider)
+            .map(|view| {
+                (
+                    view.descriptor.id.clone(),
+                    view.descriptor.title.clone(),
+                    view.descriptor.kind.clone(),
+                )
+            })
+            .collect();
+        if chips.is_empty() {
+            return;
+        }
+        let palette = crate::theme::palette_for_visuals(ui.visuals());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing =
+                egui::vec2(crate::theme::sp::SP_1, crate::theme::sp::SP_1);
+            for (id, title, kind) in chips {
+                let in_dock = self.dock_contains(&id);
+                let in_window = *self.host_view_window_open.get(&id).unwrap_or(&false);
+                let active = in_dock || in_window;
+                let icon = host_view_kind_icon(&kind);
+                let label = format!("{icon}  {title}");
+                let response = if active {
+                    ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(&label)
+                                .monospace()
+                                .size(11.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(palette.ink),
+                    )
+                } else {
+                    ui.add(egui::Button::new(
+                        egui::RichText::new(&label).monospace().size(11.0),
+                    ))
+                }
+                .on_hover_text("Click: dock here · Right-click: open in window");
+                if response.clicked() {
+                    self.dock_open_view(&id);
+                }
+                if response.secondary_clicked() {
+                    let next = !in_window;
+                    self.host_view_window_open.insert(id, next);
+                }
+            }
+        });
     }
 
     fn render_provider_host_views(
@@ -5224,6 +5624,20 @@ impl eframe::App for CameraApp {
         let mut disconnect_external_tool_requested = false;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
+                // ── Brand ─────────────────────────────────────────────────────
+                let palette = crate::theme::palette_for_visuals(ui.visuals());
+                if let Some(handle) = &self.brand_logo {
+                    let size = egui::vec2(22.0, 22.0);
+                    ui.add(egui::Image::new((handle.id(), size)).fit_to_exact_size(size));
+                }
+                ui.label(
+                    egui::RichText::new("AugurRS")
+                        .strong()
+                        .size(14.0)
+                        .color(palette.ink),
+                );
+                ui.add(egui::Separator::default().vertical().spacing(crate::theme::sp::SP_2));
+
                 // ── File ──────────────────────────────────────────────────────
                 ui.menu_button("File", |ui| {
                     if mode == AppMode::Replaying {
@@ -5396,7 +5810,7 @@ impl eframe::App for CameraApp {
                         .add_enabled(
                             (mode == AppMode::Previewing || mode == AppMode::Recording)
                                 && !settings_locked,
-                            egui::Button::new("Apply Settings"),
+                            crate::theme::primary_button("Apply Settings"),
                         )
                         .clicked()
                     {
@@ -5831,44 +6245,79 @@ impl eframe::App for CameraApp {
 
                 // ── Right-aligned status area ────────────────────────────────
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.camera_status);
+                    // Mode status pill — coloured dot + label, present in
+                    // every mode (not just Recording). The detailed
+                    // `camera_status` text and dirty-apply state surface as a
+                    // hover tooltip so the menubar stays uncluttered.
+                    let mode_tone = match mode {
+                        AppMode::Idle => crate::theme::Tone::Neutral,
+                        AppMode::Previewing => crate::theme::Tone::Info,
+                        AppMode::Recording => crate::theme::Tone::Error,
+                        AppMode::Replaying => crate::theme::Tone::Success,
+                    };
+                    let mut tooltip = self.camera_status.clone();
+                    if self.config_dirty || self.acq_dirty {
+                        let mut dirty = Vec::new();
+                        if self.config_dirty {
+                            dirty.push("settings");
+                        }
+                        if self.acq_dirty {
+                            dirty.push("acq timing");
+                        }
+                        tooltip.push_str(&format!("\nApply pending: {}", dirty.join(", ")));
+                    }
+                    let chip_response = ui
+                        .scope(|ui| {
+                            if mode == AppMode::Recording {
+                                let phase = (ctx.input(|i| i.time) * 0.83).fract();
+                                let pulse = if phase < 0.5 { "● REC" } else { "○ REC" };
+                                crate::theme::chip(ui, pulse, crate::theme::Tone::Error);
+                                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                            } else if mode == AppMode::Replaying && self.replay_finished {
+                                crate::theme::chip(ui, "● Finished", crate::theme::Tone::Success);
+                            } else if mode == AppMode::Idle {
+                                // Bare dot — no "Idle" label. The detailed
+                                // camera_status text lives in the tooltip.
+                                crate::theme::chip(ui, "●", mode_tone);
+                            } else {
+                                crate::theme::chip(
+                                    ui,
+                                    &format!("● {}", self.mode_label()),
+                                    mode_tone,
+                                );
+                            }
+                        })
+                        .response;
+                    if !tooltip.is_empty() {
+                        chip_response.on_hover_text(tooltip);
+                    }
                     ui.separator();
                     let external_status = self.external_tool_status();
                     if !matches!(external_status, ExternalToolStatus::Disconnected) {
-                        ui.label(format!("ImageJ: {}", external_status.label()));
+                        crate::theme::chip(
+                            ui,
+                            &format!("ImageJ: {}", external_status.label()),
+                            crate::theme::Tone::Info,
+                        );
                         ui.separator();
                     }
+                    // Layout pill cluster — single connected segmented control.
                     let mut layout = self.active_investigation_layout();
-                    let split = ui.selectable_value(
-                        &mut layout,
-                        InvestigationLayout::Split2d3d,
-                        "2D+3D",
-                    );
-                    let only_3d = ui.add_enabled(
-                        self.investigation_renderer.is_wgpu(),
-                        egui::SelectableLabel::new(
-                            layout == InvestigationLayout::Inspection3dOnly,
-                            "3D",
-                        ),
-                    );
-                    if only_3d.clicked() {
-                        layout = InvestigationLayout::Inspection3dOnly;
-                    }
-                    let only_2d = ui.selectable_value(
-                        &mut layout,
+                    let labels = ["2D", "Split", "3D"];
+                    let layouts = [
                         InvestigationLayout::Preview2dOnly,
-                        "2D",
-                    );
-                    if only_2d.changed() || only_3d.clicked() || split.changed() {
+                        InvestigationLayout::Split2d3d,
+                        InvestigationLayout::Inspection3dOnly,
+                    ];
+                    let selected = layouts.iter().position(|l| *l == layout).unwrap_or(0);
+                    let enabled = [
+                        true,
+                        self.investigation_renderer.is_wgpu(),
+                        self.investigation_renderer.is_wgpu(),
+                    ];
+                    if let Some(i) = crate::theme::pill_cluster(ui, &labels, selected, &enabled) {
+                        layout = layouts[i];
                         self.set_active_investigation_layout(layout);
-                    }
-                    if mode == AppMode::Recording {
-                        ui.separator();
-                        ui.colored_label(egui::Color32::from_rgb(220, 50, 50), "● REC");
-                    }
-                    if mode == AppMode::Replaying && self.replay_finished {
-                        ui.separator();
-                        ui.colored_label(status_success_color(), "Finished");
                     }
                 });
             });
@@ -5923,25 +6372,17 @@ impl eframe::App for CameraApp {
             egui::SidePanel::left("settings")
                 .min_width(340.0)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("Settings");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("◀")
-                                            .size(14.0)
-                                            .color(ui.visuals().weak_text_color()),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                self.settings_panel_open = false;
-                            }
-                        });
-                    });
-                    ui.separator();
+                    if crate::theme::panel_header(
+                        ui,
+                        Some(egui_phosphor::regular::SLIDERS_HORIZONTAL),
+                        "Camera Settings",
+                        Some(crate::theme::PanelToggle {
+                            glyph: egui_phosphor::regular::CARET_LEFT,
+                            tooltip: "Collapse settings panel",
+                        }),
+                    ) {
+                        self.settings_panel_open = false;
+                    }
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -6026,43 +6467,35 @@ impl eframe::App for CameraApp {
         let has_analysis_extensions = hotpixel_enabled || !enabled_plugin_names.is_empty();
         if self.analysis_panel_open {
             egui::SidePanel::right("analysis")
+                .resizable(true)
                 .min_width(320.0)
-                .default_width(380.0)
-                .max_width(500.0)
+                .default_width(360.0)
+                .max_width(480.0)
                 .show_separator_line(true)
                 .show(ctx, |ui| {
                     let _panel_width = constrain_ui_to_clip_width(ui);
                     ui.style_mut().wrap = Some(true);
                     ui.vertical(|ui| {
                         constrain_ui_to_clip_width(ui);
-                        ui.horizontal(|ui| {
-                            ui.heading("Investigation Inspector");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("▶")
-                                                    .size(14.0)
-                                                    .color(ui.visuals().weak_text_color()),
-                                            )
-                                            .frame(false)
-                                            .min_size(egui::vec2(20.0, 20.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.analysis_panel_open = false;
-                                    }
-                                },
-                            );
-                        });
-                        ui.separator();
+                        if crate::theme::panel_header(
+                            ui,
+                            Some(egui_phosphor::regular::STACK),
+                            "Analysis",
+                            Some(crate::theme::PanelToggle {
+                                glyph: egui_phosphor::regular::CARET_RIGHT,
+                                tooltip: "Collapse analysis panel",
+                            }),
+                        ) {
+                            self.analysis_panel_open = false;
+                        }
                         egui::ScrollArea::vertical()
                             .id_source("analysis_panel_scroll")
                             .hscroll(false)
                             .horizontal_scroll_offset(0.0)
-                            .auto_shrink([true, false])
+                            // `auto_shrink: [false, false]` — keep the
+                            // panel's horizontal extent stable when content
+                            // height changes (e.g. when a collapse opens).
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 constrain_ui_to_clip_width(ui);
                                 ui.style_mut().wrap = Some(true);
@@ -6070,28 +6503,66 @@ impl eframe::App for CameraApp {
 
                                 if has_analysis_extensions {
                                     ui.separator();
-                                    ui.heading("Analysis Extensions");
-                                    ui.small(
-                                        "Only enabled analysis modules appear here. Hidden modules stay out of the way.",
-                                    );
-                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(egui_phosphor::regular::LIGHTNING)
+                                                .size(12.0)
+                                                .color(
+                                                    crate::theme::palette_for_visuals(ui.visuals())
+                                                        .fg_2,
+                                                ),
+                                        );
+                                        crate::theme::section_subhead(ui, "Extensions");
+                                    });
+                                    ui.add_space(crate::theme::sp::SP_1);
 
                                     if hotpixel_enabled {
                                         let mut stage_changed = false;
-                                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.heading("Hotpixel Detection");
-                                                stage_dirty_badge(
-                                                    ui,
-                                                    self.hotpixel_detection.is_dirty(),
-                                                );
-                                            });
-                                            ui.small("Phase: host frame analysis");
-                                            ui.small(format!(
-                                                "Metrics: {} hot pixels detected in the last frame",
-                                                self.hotpixel_detection.detected_pixels().len()
-                                            ));
-                                            ui.separator();
+                                        crate::theme::card_frame(ui).show(ui, |ui| {
+                                            // Compact one-row title: eye toggle + plugin name +
+                                            // right-aligned `● active` status chip. Matches the
+                                            // design's `.plugin-card-title` row.
+                                            let row_width = ui.available_width();
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(row_width, 22.0),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    let palette =
+                                                        crate::theme::palette_for_visuals(
+                                                            ui.visuals(),
+                                                        );
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            egui_phosphor::regular::EYE,
+                                                        )
+                                                        .size(13.0)
+                                                        .color(palette.fg_2),
+                                                    );
+                                                    ui.add_space(crate::theme::sp::SP_1);
+                                                    ui.label(
+                                                        egui::RichText::new("hotpixel-detection")
+                                                            .strong()
+                                                            .size(13.0)
+                                                            .color(palette.ink),
+                                                    );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            crate::theme::chip(
+                                                                ui,
+                                                                "\u{25CF} active",
+                                                                crate::theme::Tone::Success,
+                                                            );
+                                                            if self.hotpixel_detection.is_dirty() {
+                                                                stage_dirty_badge(ui, true);
+                                                            }
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                            ui.add_space(crate::theme::sp::SP_1);
                                             stage_changed =
                                                 self.hotpixel_detection.render_ui(ui, false);
                                         });
@@ -6122,6 +6593,57 @@ impl eframe::App for CameraApp {
                                                 continue;
                                             };
                                             if !plugin.enabled() {
+                                                // Render a dimmed compact card so users can see
+                                                // disabled plugins exist (and toggle them from
+                                                // the Analysis menu). Opacity ~0.72 mirrors the
+                                                // design's `.is-off` card style.
+                                                let plugin_name = plugin.name().to_owned();
+                                                ui.scope(|ui| {
+                                                    ui.set_opacity(0.72);
+                                                    crate::theme::card_frame(ui).show(ui, |ui| {
+                                                        let row_w = ui.available_width();
+                                                        ui.allocate_ui_with_layout(
+                                                            egui::vec2(row_w, 22.0),
+                                                            egui::Layout::left_to_right(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                let p = crate::theme::palette_for_visuals(
+                                                                    ui.visuals(),
+                                                                );
+                                                                ui.label(
+                                                                    egui::RichText::new(
+                                                                        egui_phosphor::regular::EYE_SLASH,
+                                                                    )
+                                                                    .size(13.0)
+                                                                    .color(p.fg_3),
+                                                                );
+                                                                ui.add_space(crate::theme::sp::SP_1);
+                                                                ui.label(
+                                                                    egui::RichText::new(&plugin_name)
+                                                                        .strong()
+                                                                        .size(13.0)
+                                                                        .color(p.fg_2),
+                                                                );
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        crate::theme::chip(
+                                                                            ui,
+                                                                            "off",
+                                                                            crate::theme::Tone::Neutral,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            },
+                                                        );
+                                                        ui.small(
+                                                            "Enable from Analysis \u{203A} \u{2611} to configure.",
+                                                        );
+                                                    });
+                                                });
                                                 continue;
                                             }
 
@@ -6136,17 +6658,60 @@ impl eframe::App for CameraApp {
                                                 .cloned()
                                                 .collect();
                                             let mut stage_changed = false;
-                                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.heading(plugin.name());
-                                                    stage_dirty_badge(ui, plugin.is_dirty());
-                                                });
+                                            crate::theme::card_frame(ui).show(ui, |ui| {
+                                                let row_w = ui.available_width();
+                                                let plugin_name = plugin.name().to_owned();
+                                                let plugin_dirty = plugin.is_dirty();
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(row_w, 22.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        let p = crate::theme::palette_for_visuals(
+                                                            ui.visuals(),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                egui_phosphor::regular::EYE,
+                                                            )
+                                                            .size(13.0)
+                                                            .color(p.fg_2),
+                                                        );
+                                                        ui.add_space(crate::theme::sp::SP_1);
+                                                        ui.label(
+                                                            egui::RichText::new(&plugin_name)
+                                                                .strong()
+                                                                .size(13.0)
+                                                                .color(p.ink),
+                                                        );
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                crate::theme::chip(
+                                                                    ui,
+                                                                    "\u{25CF} active",
+                                                                    crate::theme::Tone::Success,
+                                                                );
+                                                                if plugin_dirty {
+                                                                    stage_dirty_badge(ui, true);
+                                                                }
+                                                                crate::theme::chip(
+                                                                    ui,
+                                                                    phase_label,
+                                                                    crate::theme::Tone::Info,
+                                                                );
+                                                            },
+                                                        );
+                                                    },
+                                                );
                                                 if !plugin.description().is_empty() {
                                                     ui.weak(plugin.description());
                                                 }
-                                                ui.small(format!("Phase: {phase_label}"));
                                                 ui.small(format!(
-                                                    "Metrics: {dataset_count} datasets, {panel_view_count} panel views"
+                                                    "{dataset_count} datasets · {panel_view_count} panel views"
                                                 ));
                                                 ui.small(format!(
                                                     "Dependencies: {}",
@@ -6185,6 +6750,10 @@ impl eframe::App for CameraApp {
                                         };
 
                                         if rendered {
+                                            self.render_provider_view_chips(
+                                                ui,
+                                                HostViewProviderKey::Runtime(index),
+                                            );
                                             self.render_provider_host_views(
                                                 ctx,
                                                 ui,
@@ -6373,6 +6942,10 @@ impl eframe::App for CameraApp {
                 &investigation_points_2d,
                 &investigation_scene_3d,
             );
+        }
+
+        if !self.popup_open {
+            self.render_host_view_dock(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -6930,6 +7503,8 @@ impl eframe::App for CameraApp {
         if let Ok(value) = serde_json::to_string(&self.theme_preference) {
             storage.set_string(UI_THEME_STORAGE_KEY, value);
         }
+        storage.set_string(DOCK_HEIGHT_STORAGE_KEY, format!("{:.0}", self.dock_height));
+        storage.set_string(DOCK_OPEN_STORAGE_KEY, self.dock_open.to_string());
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -6949,13 +7524,87 @@ fn host_marker_shape_label(shape: augur_plugin_api::HostMarkerShape) -> &'static
     }
 }
 
+/// Short uppercase tag for a host view kind ("TABLE", "DENSITY", etc.).
+/// Used by the dock tab strip to telegraph the rendering kind without
+/// reading the title.
+fn host_view_kind_tag(kind: &augur_plugin_api::HostViewKind) -> &'static str {
+    use augur_plugin_api::HostViewKind;
+    match kind {
+        HostViewKind::CompactTable => "compact",
+        HostViewKind::TableWindow => "table",
+        HostViewKind::Density2dFromTable { .. } => "density",
+        HostViewKind::Scatter2dFromTable { .. } => "scatter 2d",
+        HostViewKind::Scatter3dFromTable { .. } => "scatter 3d",
+        HostViewKind::ImageWindow => "image",
+        HostViewKind::LineSeriesWindow => "line",
+    }
+}
+
+/// Resolved metadata for a single dock tab — built once per frame from
+/// the host-view registry so the strip render path stays light.
+struct DockTab {
+    id: String,
+    title: String,
+    kind: augur_plugin_api::HostViewKind,
+    plugin_tag: Option<String>,
+    dataset_id: String,
+}
+
+/// Load the bundled owl brand mark from `assets/logo.png`. Returns `None`
+/// if the asset is missing or fails to decode — the menubar wordmark
+/// still renders in that case.
+fn load_brand_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes: &[u8] = include_bytes!("../../assets/logo.png");
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = image.dimensions();
+    let pixels = image.into_raw();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+    Some(ctx.load_texture(
+        "augur.brand.logo",
+        color_image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// Map a host view kind to a phosphor glyph used in plugin "view chips".
+fn host_view_kind_icon(kind: &augur_plugin_api::HostViewKind) -> &'static str {
+    use augur_plugin_api::HostViewKind;
+    use egui_phosphor::regular as ph;
+    match kind {
+        HostViewKind::CompactTable | HostViewKind::TableWindow => ph::TABLE,
+        HostViewKind::Density2dFromTable { .. } => ph::IMAGE_SQUARE,
+        HostViewKind::Scatter2dFromTable { .. } | HostViewKind::Scatter3dFromTable { .. } => {
+            ph::CHART_SCATTER
+        }
+        HostViewKind::ImageWindow => ph::IMAGE,
+        HostViewKind::LineSeriesWindow => ph::CHART_LINE,
+    }
+}
+
 fn stage_dirty_badge(ui: &mut egui::Ui, dirty: bool) {
-    let (text, color) = if dirty {
-        ("dirty", ui.visuals().warn_fg_color)
+    let (text, tone) = if dirty {
+        ("dirty", crate::theme::Tone::Warn)
     } else {
-        ("ready", status_success_color())
+        ("ready", crate::theme::Tone::Success)
     };
-    ui.label(egui::RichText::new(text).small().color(color).monospace());
+    crate::theme::chip(ui, text, tone);
+}
+
+/// Notice-list row: severity glyph + wrapped message, the whole line sized
+/// to the available width so long messages wrap inside the panel instead
+/// of pushing the panel wider. Matches the design's `.notice-row`.
+fn notice_row(ui: &mut egui::Ui, glyph: &str, color: egui::Color32, message: &str) {
+    let row_width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, 0.0),
+        egui::Layout::left_to_right(egui::Align::TOP),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+            ui.label(egui::RichText::new(glyph).color(color));
+            ui.style_mut().wrap = Some(true);
+            ui.colored_label(color, message);
+        },
+    );
 }
 
 fn show_investigation_split(
@@ -7080,11 +7729,11 @@ fn scene_point_for_selection(
 }
 
 fn status_success_color() -> egui::Color32 {
-    egui::Color32::from_rgb(0, 160, 60)
+    crate::theme::Palette::light().status_success
 }
 
 fn analysis_info_color() -> egui::Color32 {
-    egui::Color32::from_rgb(30, 100, 220)
+    crate::theme::Palette::light().status_info
 }
 
 fn replay_pipeline_config(info: &ReplayFileInfo, acq_time_ms: u64) -> CameraConfig {

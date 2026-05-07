@@ -116,13 +116,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let brightness = normalize_value(total);
+        let polarity_on = vec3<f32>(0.9098, 0.2431, 0.6902);
+        let polarity_off = vec3<f32>(0.0000, 0.7216, 0.8314);
         if on > off {
-            return vec4<f32>(brightness, 0.0, 0.0, 1.0);
+            return vec4<f32>(polarity_on * brightness, 1.0);
         }
         if off > on {
-            return vec4<f32>(0.0, 0.0, brightness, 1.0);
+            return vec4<f32>(polarity_off * brightness, 1.0);
         }
-        return vec4<f32>(brightness, 0.0, brightness, 1.0);
+        return vec4<f32>(((polarity_on + polarity_off) * 0.5) * brightness, 1.0);
     }
     if uniforms.mode == 2u {
         let counts = textureLoad(polarity_tex, coord, 0).rg;
@@ -323,13 +325,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if uniforms.mode == 1u {
         let brightness = normalize_value(total);
+        let polarity_on = vec3<f32>(0.9098, 0.2431, 0.6902);
+        let polarity_off = vec3<f32>(0.0000, 0.7216, 0.8314);
         if on > off {
-            return vec4<f32>(brightness, 0.0, 0.0, 1.0);
+            return vec4<f32>(polarity_on * brightness, 1.0);
         }
         if off > on {
-            return vec4<f32>(0.0, 0.0, brightness, 1.0);
+            return vec4<f32>(polarity_off * brightness, 1.0);
         }
-        return vec4<f32>(brightness, 0.0, brightness, 1.0);
+        return vec4<f32>(((polarity_on + polarity_off) * 0.5) * brightness, 1.0);
     }
 
     let magnitude = normalize_value(u32(abs(i32(on) - i32(off))));
@@ -2830,10 +2834,35 @@ mod tests {
                     let brightness = (normalize_value(total, settings) * 255.0)
                         .round()
                         .clamp(0.0, 255.0) as u8;
+                    let scale = |c: u8| {
+                        ((c as f32) * (brightness as f32 / 255.0))
+                            .round()
+                            .clamp(0.0, 255.0) as u8
+                    };
+                    let mix = |a: [u8; 3], b: [u8; 3]| -> [u8; 3] {
+                        [
+                            ((a[0] as u16 + b[0] as u16) / 2) as u8,
+                            ((a[1] as u16 + b[1] as u16) / 2) as u8,
+                            ((a[2] as u16 + b[2] as u16) / 2) as u8,
+                        ]
+                    };
+                    let on_tint = crate::theme::POLARITY_ON_RGB;
+                    let off_tint = crate::theme::POLARITY_OFF_RGB;
                     match on[index].cmp(&off[index]) {
-                        std::cmp::Ordering::Greater => Color32::from_rgb(brightness, 0, 0),
-                        std::cmp::Ordering::Less => Color32::from_rgb(0, 0, brightness),
-                        std::cmp::Ordering::Equal => Color32::from_rgb(brightness, 0, brightness),
+                        std::cmp::Ordering::Greater => Color32::from_rgb(
+                            scale(on_tint[0]),
+                            scale(on_tint[1]),
+                            scale(on_tint[2]),
+                        ),
+                        std::cmp::Ordering::Less => Color32::from_rgb(
+                            scale(off_tint[0]),
+                            scale(off_tint[1]),
+                            scale(off_tint[2]),
+                        ),
+                        std::cmp::Ordering::Equal => {
+                            let m = mix(on_tint, off_tint);
+                            Color32::from_rgb(scale(m[0]), scale(m[1]), scale(m[2]))
+                        }
                     }
                 }
             }

@@ -119,6 +119,15 @@ impl ResolvedHostViewRegistry {
             .filter(|view| view.descriptor.placement == HostViewPlacement::Window)
     }
 
+    pub fn window_views_for_provider(
+        &self,
+        provider: HostViewProviderKey,
+    ) -> impl Iterator<Item = &ResolvedHostView> {
+        self.views.iter().filter(move |view| {
+            view.provider == provider && view.descriptor.placement == HostViewPlacement::Window
+        })
+    }
+
     pub fn actions(&self) -> impl Iterator<Item = &ResolvedHostAction> {
         self.actions.iter()
     }

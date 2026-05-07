@@ -835,29 +835,24 @@ pub fn draw_investigation_3d(
                     output.focus_target = selected_focus_target;
                 }
                 ui.separator();
-                for (preset, label) in [
-                    (AxisPreset::Xy, "XY"),
-                    (AxisPreset::Xz, "XZ"),
-                    (AxisPreset::Yz, "YZ"),
-                    (AxisPreset::Isometric, "ISO"),
-                ] {
-                    let tooltip = match preset {
-                        AxisPreset::Xy => "Look straight onto the sensor plane.",
-                        AxisPreset::Xz => {
-                            "Look along the vertical sensor axis to compare horizontal position against time depth."
-                        }
-                        AxisPreset::Yz => {
-                            "Look along the horizontal sensor axis to compare vertical position against time depth."
-                        }
-                        AxisPreset::Isometric => "Return to the default angled inspection view.",
-                    };
-                    if ui
-                        .selectable_label(state.preset == preset, label)
-                        .on_hover_text(tooltip)
-                        .clicked()
-                    {
-                        state.set_axis_preset(preset);
-                    }
+                // Connected orientation pill cluster — matches the design's
+                // `.preview-3d-tb` strip (ISO / XY / XZ / YZ) instead of the
+                // older loose selectable-labels.
+                let presets = [
+                    AxisPreset::Isometric,
+                    AxisPreset::Xy,
+                    AxisPreset::Xz,
+                    AxisPreset::Yz,
+                ];
+                let labels = ["ISO", "XY", "XZ", "YZ"];
+                let selected = presets
+                    .iter()
+                    .position(|p| *p == state.preset)
+                    .unwrap_or(0);
+                if let Some(i) =
+                    crate::theme::pill_cluster(ui, &labels, selected, &[true, true, true, true])
+                {
+                    state.set_axis_preset(presets[i]);
                 }
             });
         });

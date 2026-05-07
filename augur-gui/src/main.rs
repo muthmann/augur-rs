@@ -15,6 +15,7 @@ mod preview_perf;
 mod preview_renderer;
 mod render_backend;
 mod settings;
+mod theme;
 mod viewer_tools;
 mod viewer_widget;
 

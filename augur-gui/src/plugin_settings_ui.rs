@@ -126,7 +126,7 @@ fn render_setting_item(
                 .unwrap_or(*default);
             let old_value = value;
             let response = ui.horizontal(|ui| {
-                ui.label(&item.label);
+                crate::theme::field_label(ui, &item.label, None);
                 ui.add(
                     egui::DragValue::new(&mut value)
                         .clamp_range(*min..=*max)
@@ -145,7 +145,7 @@ fn render_setting_item(
                 .unwrap_or(*default);
             let old_value = value;
             let response = ui.horizontal(|ui| {
-                ui.label(&item.label);
+                crate::theme::field_label(ui, &item.label, None);
                 ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max))
             });
             maybe_add_tooltip(&response.response, item.tooltip.as_deref());
@@ -216,12 +216,10 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
     let desired_size = egui::vec2(ui.available_width().max(180.0), 110.0);
     let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(18, 22, 28));
-    painter.rect_stroke(
-        rect,
-        6.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
-    );
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
+    let radius = crate::theme::radius::R_3;
+    painter.rect_filled(rect, radius, palette.bg_2);
+    painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, palette.line));
 
     if values.len() < 2 {
         painter.text(
@@ -229,7 +227,7 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
             egui::Align2::CENTER_CENTER,
             "Collecting history",
             egui::FontId::proportional(12.0),
-            egui::Color32::from_gray(180),
+            palette.fg_3,
         );
         return;
     }
@@ -240,9 +238,9 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
     let width = rect.width().max(1.0);
     let height = rect.height().max(1.0);
     let stroke_color = if lower_is_better {
-        egui::Color32::from_rgb(255, 196, 84)
+        crate::theme::ROI_AMBER
     } else {
-        egui::Color32::from_rgb(110, 206, 255)
+        crate::theme::ROI_CYAN
     };
 
     let mut points = Vec::with_capacity(values.len());
