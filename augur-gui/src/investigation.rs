@@ -16,6 +16,7 @@ pub enum InvestigationLayout {
 }
 
 impl InvestigationLayout {
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Preview2dOnly => "2D only",
@@ -292,7 +293,8 @@ impl InvestigationState {
         self.focused_layers.insert(layer_id.to_owned());
         let all_layer_ids: Vec<String> = self.layer_styles.keys().cloned().collect();
         for candidate in all_layer_ids {
-            self.set_layer_visible(candidate.clone(), candidate == layer_id);
+            let visible = candidate == layer_id;
+            self.set_layer_visible(candidate, visible);
         }
     }
 
@@ -360,6 +362,42 @@ pub fn stable_row_id_value(values: &TableColumnValues, index: usize) -> Option<S
     }
 }
 
+/// Reverse lookup: find the row index that corresponds to a `StableRowKey`.
+/// This avoids the O(n) linear search with repeated `row_key_for_row` calls.
+pub fn row_index_for_key(
+    dataset: &TableDatasetV1,
+    schema: &TableSchema,
+    generation: u64,
+    key: &StableRowKey,
+) -> Option<usize> {
+    if let Some(column_id) = schema.row_id_column.as_deref() {
+        if let Some(column) = dataset.column(column_id) {
+            return match &column.values {
+                TableColumnValues::U64(values) => {
+                    let target = key.row_id.parse::<u64>().ok()?;
+                    values.iter().position(|&v| v == target)
+                }
+                TableColumnValues::I64(values) => {
+                    let target = key.row_id.parse::<i64>().ok()?;
+                    values.iter().position(|&v| v == target)
+                }
+                TableColumnValues::String(values) => values.iter().position(|v| v == &key.row_id),
+                TableColumnValues::F64(_) | TableColumnValues::Bool(_) => None,
+            };
+        }
+    }
+    // Fallback: parse the synthetic key format "gen:{generation}:row:{row}"
+    let rest = key.row_id.strip_prefix("gen:")?;
+    let colon_pos = rest.find(':')?;
+    let gen: u64 = rest[..colon_pos].parse().ok()?;
+    if gen != generation {
+        return None;
+    }
+    let rest = &rest[colon_pos..];
+    let rest = rest.strip_prefix(":row:")?;
+    rest.parse().ok()
+}
+
 pub fn coordinate_2d_for_row(
     schema: &TableSchema,
     dataset: &TableDatasetV1,
@@ -408,13 +446,15 @@ pub fn filtered_row_indices(
 
     if let Some(table_state) = state.table_views.get(dataset_id) {
         if let Some(column_id) = table_state.sort_column.as_deref() {
-            rows.sort_by(|left, right| {
-                let ordering = compare_rows_by_column(dataset, column_id, *left, *right);
-                match table_state.sort_direction {
-                    InvestigationSortDirection::Ascending => ordering,
-                    InvestigationSortDirection::Descending => ordering.reverse(),
-                }
-            });
+            if let Some(column) = dataset.column(column_id) {
+                rows.sort_by(|left, right| {
+                    let ordering = compare_column_values(&column.values, *left, *right);
+                    match table_state.sort_direction {
+                        InvestigationSortDirection::Ascending => ordering,
+                        InvestigationSortDirection::Descending => ordering.reverse(),
+                    }
+                });
+            }
         }
     }
 
@@ -454,23 +494,20 @@ pub fn row_matches_roi(
     roi.contains(x, y)
 }
 
-fn compare_rows_by_column(
-    dataset: &TableDatasetV1,
-    column_id: &str,
+fn compare_column_values(
+    values: &TableColumnValues,
     left_row: usize,
     right_row: usize,
 ) -> std::cmp::Ordering {
-    let Some(column) = dataset.column(column_id) else {
-        return std::cmp::Ordering::Equal;
-    };
-
-    match &column.values {
+    match values {
         TableColumnValues::U64(values) => values.get(left_row).cmp(&values.get(right_row)),
         TableColumnValues::I64(values) => values.get(left_row).cmp(&values.get(right_row)),
-        TableColumnValues::F64(values) => values
-            .get(left_row)
-            .partial_cmp(&values.get(right_row))
-            .unwrap_or(std::cmp::Ordering::Equal),
+        TableColumnValues::F64(values) => match (values.get(left_row), values.get(right_row)) {
+            (Some(left), Some(right)) => left.total_cmp(right),
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
         TableColumnValues::String(values) => values.get(left_row).cmp(&values.get(right_row)),
         TableColumnValues::Bool(values) => values.get(left_row).cmp(&values.get(right_row)),
     }

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use egui_wgpu::wgpu;
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
@@ -64,7 +62,7 @@ fn quad_corner(vertex_index: u32) -> vec2<f32> {
 fn vs_main(vertex: VertexInput, @builtin(vertex_index) vertex_index: u32) -> VsOut {
     let clip = uniforms.view_proj * vec4<f32>(vertex.position, 1.0);
     let corner = quad_corner(vertex_index);
-    let clip_w = max(abs(clip.w), 0.0001);
+    let clip_w = max(clip.w, 0.0001);
     let radius_px = max(1.5, vertex.size * uniforms.point_scale / clip_w);
     let offset_ndc = corner * radius_px * vec2<f32>(
         2.0 / max(uniforms.viewport.x, 1.0),
@@ -260,11 +258,7 @@ impl Investigation3dState {
             (min[1] + max[1]) * 0.5,
             (min[2] + max[2]) * 0.5,
         ];
-        let extent = [
-            (max[0] - min[0]).abs(),
-            (max[1] - min[1]).abs(),
-            (max[2] - min[2]).abs(),
-        ];
+        let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
         let max_extent = extent[0].max(extent[1]).max(extent[2]).max(1.0);
         let half_extent = (max_extent * 0.5).max(1.0);
         let fov_y = 45.0_f32.to_radians();
@@ -339,16 +333,16 @@ pub struct Investigation3dOutput {
     pub focus_target: Option<[f32; 3]>,
 }
 
-#[derive(Debug, Clone)]
-struct PreparedPoint {
+#[derive(Debug, Clone, Copy)]
+struct PreparedPoint<'a> {
     raw: PointInstanceRaw,
-    item_key: Option<StableRowKey>,
-    label: String,
+    item_key: Option<&'a StableRowKey>,
+    label: &'a str,
     position: Vec3,
 }
 
-type RenderTextureOutput = (PreviewDisplayTexture, Arc<Vec<PreparedPoint>>);
-type RenderTextureResult = Result<Option<RenderTextureOutput>, String>;
+type RenderTextureOutput<'a> = (PreviewDisplayTexture, Vec<PreparedPoint<'a>>);
+type RenderTextureResult<'a> = Result<Option<RenderTextureOutput<'a>>, String>;
 
 #[derive(Debug, Clone, Copy)]
 struct RawHistoryFooterStatus {
@@ -409,13 +403,13 @@ impl Investigation3dRenderer {
         matches!(self, Self::Wgpu(_))
     }
 
-    fn render_texture(
+    fn render_texture<'a>(
         &mut self,
-        scene: &Investigation3dScene,
+        scene: &'a Investigation3dScene,
         state: &Investigation3dState,
         size: [usize; 2],
         selected: Option<&StableRowKey>,
-    ) -> RenderTextureResult {
+    ) -> RenderTextureResult<'a> {
         match self {
             Self::Disabled => Ok(None),
             Self::Wgpu(renderer) => renderer.render(scene, state, size, selected),
@@ -454,7 +448,9 @@ impl WgpuInvestigation3dRenderer {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: None,
+                    min_binding_size: std::num::NonZeroU64::new(
+                        std::mem::size_of::<SceneUniforms>() as u64,
+                    ),
                 },
                 count: None,
             }],
@@ -645,16 +641,16 @@ impl WgpuInvestigation3dRenderer {
         }));
     }
 
-    fn render(
+    fn render<'a>(
         &mut self,
-        scene: &Investigation3dScene,
+        scene: &'a Investigation3dScene,
         state: &Investigation3dState,
         size: [usize; 2],
         selected: Option<&StableRowKey>,
-    ) -> RenderTextureResult {
+    ) -> RenderTextureResult<'a> {
         self.ensure_target(size);
 
-        let prepared = Arc::new(prepare_scene_points(scene, state, selected));
+        let prepared = prepare_scene_points(scene, state, selected);
         self.ensure_instance_capacity(prepared.len().max(1));
 
         let view_proj = state.view_projection(egui::vec2(size[0] as f32, size[1] as f32));
@@ -734,11 +730,11 @@ impl WgpuInvestigation3dRenderer {
     }
 }
 
-fn prepare_scene_points(
-    scene: &Investigation3dScene,
+fn prepare_scene_points<'a>(
+    scene: &'a Investigation3dScene,
     state: &Investigation3dState,
     selected: Option<&StableRowKey>,
-) -> Vec<PreparedPoint> {
+) -> Vec<PreparedPoint<'a>> {
     let view = state.view_matrix();
     let mut prepared = Vec::new();
 
@@ -773,8 +769,8 @@ fn prepare_scene_points(
                         0.0
                     },
                 },
-                item_key: point.item_key.clone(),
-                label: point.label.clone(),
+                item_key: point.item_key.as_ref(),
+                label: &point.label,
                 position,
             });
         }
@@ -871,7 +867,8 @@ pub fn draw_investigation_3d(
         desired,
         egui::Sense::click_and_drag().union(egui::Sense::hover()),
     );
-    response.clone().on_hover_text(
+    let response_id = response.id;
+    let response = response.on_hover_text(
         "Drag to orbit. Shift-drag or right-drag to pan. Scroll to zoom. Double-click to fit the visible cloud.",
     );
 
@@ -921,7 +918,7 @@ pub fn draw_investigation_3d(
             let hovered = response
                 .hover_pos()
                 .and_then(|pos| pick_point(rect, pos, state, prepared.as_slice()));
-            output.hovered = hovered.and_then(|point| point.item_key.clone());
+            output.hovered = hovered.and_then(|point| point.item_key.cloned());
             if let Some(point) = hovered {
                 let label_rect = egui::Rect::from_min_size(
                     rect.left_top() + egui::vec2(10.0, 10.0),
@@ -930,7 +927,7 @@ pub fn draw_investigation_3d(
                 ui.painter_at(paint_rect).text(
                     label_rect.left_top(),
                     egui::Align2::LEFT_TOP,
-                    &point.label,
+                    point.label,
                     egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
@@ -940,7 +937,7 @@ pub fn draw_investigation_3d(
                     .interact_pointer_pos()
                     .and_then(|pos| pick_point(rect, pos, state, prepared.as_slice()))
                 {
-                    output.selected = point.item_key.clone();
+                    output.selected = point.item_key.cloned();
                     output.focus_target = Some(point.position.to_array());
                 }
             }
@@ -968,7 +965,7 @@ pub fn draw_investigation_3d(
     }
 
     ui.add_space(2.0);
-    draw_3d_status_footer(ui, response.id, scene, raw_history_status, footer_height);
+    draw_3d_status_footer(ui, response_id, scene, raw_history_status, footer_height);
 
     output
 }
@@ -976,16 +973,15 @@ pub fn draw_investigation_3d(
 fn draw_3d_display_strip(
     ui: &mut egui::Ui,
     state: &mut Investigation3dState,
-    raw_history: Option<&mut PointCloudState>,
+    mut raw_history: Option<&mut PointCloudState>,
     _max_height: f32,
 ) -> Option<RawHistoryFooterStatus> {
-    let mut raw_history = raw_history;
-    if let Some(history) = raw_history.as_deref_mut() {
-        history.sanitize_controls();
-    }
     let mut raw_history_status = raw_history
         .as_deref()
         .map(RawHistoryFooterStatus::from_state);
+    if let Some(ref mut history) = raw_history {
+        history.sanitize_controls();
+    }
 
     ui.push_id(ui.id().with("display_strip"), |ui| {
         draw_section_toggle(ui, &mut state.display_strip_open, "Display");
@@ -1287,21 +1283,48 @@ fn pick_point<'a>(
     rect: egui::Rect,
     pointer: egui::Pos2,
     state: &Investigation3dState,
-    points: &'a [PreparedPoint],
-) -> Option<&'a PreparedPoint> {
+    points: &'a [PreparedPoint<'_>],
+) -> Option<&'a PreparedPoint<'a>> {
     let size = rect.size();
     let view_proj = state.view_projection(size);
-    let mut best: Option<(&PreparedPoint, f32, f32)> = None;
+    let pointer_ndc = {
+        let rel_x = (pointer.x - rect.left()) / rect.width();
+        let rel_y = (pointer.y - rect.top()) / rect.height();
+        Vec2::new(rel_x * 2.0 - 1.0, 1.0 - rel_y * 2.0)
+    };
+    let mut best: Option<(&PreparedPoint<'a>, f32, f32)> = None;
     for point in points {
-        let screen = project_point(rect, view_proj, point.position)?;
+        let clip: Vec4 = view_proj * point.position.extend(1.0);
+        if clip.w.abs() <= 1e-5 {
+            continue;
+        }
+        let ndc = clip.truncate() / clip.w;
+        if ndc.z < -1.2 || ndc.z > 1.2 {
+            continue;
+        }
+        // Fast NDC-space cull before computing screen distance.
+        let ndc_dx = ndc.x - pointer_ndc.x;
+        let ndc_dy = ndc.y - pointer_ndc.y;
+        let ndc_dist = (ndc_dx * ndc_dx + ndc_dy * ndc_dy).sqrt();
+        let radius_ndc = point.raw.size * state.point_scale / clip.w.abs().max(0.0001);
+        let radius_screen = radius_ndc.max(3.0);
+        // Convert the NDC distance to an approximate screen distance using
+        // the smaller of the two viewport dimensions to be conservative.
+        let viewport_scale = rect.width().min(rect.height()) * 0.5;
+        let approx_screen_dist = ndc_dist * viewport_scale;
+        if approx_screen_dist > radius_screen + 6.0 {
+            continue;
+        }
+        let screen = egui::pos2(
+            rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
+            rect.top() + (1.0 - (ndc.y + 1.0) * 0.5) * rect.height(),
+        );
         let distance = screen.distance(pointer);
-        let clip = view_proj * point.position.extend(1.0);
-        let radius = (point.raw.size * state.point_scale / clip.w.abs().max(0.0001)).max(3.0);
-        if distance > radius + 6.0 {
+        if distance > radius_screen + 6.0 {
             continue;
         }
 
-        let depth = clip.z / clip.w;
+        let depth = ndc.z;
         match best {
             Some((_, best_distance, best_depth))
                 if distance > best_distance && depth >= best_depth =>

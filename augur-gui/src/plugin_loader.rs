@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::UnsafeCell,
     collections::{HashMap, VecDeque},
     ffi::c_void,
     fs,
@@ -118,25 +118,27 @@ impl PluginEventHistory {
             return;
         }
 
-        let data = if let (Some(source), Some(event_range)) =
-            (frame.event_source.clone(), frame.event_range.clone())
-        {
-            PluginEventFrameData::Upstream {
-                source,
-                event_range,
+        let data = match (frame.event_source.as_ref(), frame.event_range.as_ref()) {
+            (Some(source), Some(event_range)) => PluginEventFrameData::Upstream {
+                source: source.clone(),
+                event_range: event_range.clone(),
+            },
+            (None, None) => {
+                let Some(events) = frame.events_snapshot() else {
+                    return;
+                };
+                PluginEventFrameData::Inline(
+                    events
+                        .iter()
+                        .copied()
+                        .map(FfiCdEvent::from)
+                        .collect::<Box<[FfiCdEvent]>>(),
+                )
             }
-        } else {
-            let Some(events) = frame.events_snapshot() else {
+            _ => {
+                eprintln!("inconsistent upstream metadata: event_source and event_range must both be present or both absent");
                 return;
-            };
-            PluginEventFrameData::Inline(
-                events
-                    .iter()
-                    .copied()
-                    .map(FfiCdEvent::from)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )
+            }
         };
 
         let byte_len = event_count.saturating_mul(std::mem::size_of::<FfiCdEvent>());
@@ -154,7 +156,10 @@ impl PluginEventHistory {
         if batch.events.is_empty() {
             return;
         }
-        let byte_len = batch.events.len() * std::mem::size_of::<FfiCdEvent>();
+        let byte_len = batch
+            .events
+            .len()
+            .saturating_mul(std::mem::size_of::<FfiCdEvent>());
         self.frames.push_back(PluginEventFrame {
             data: PluginEventFrameData::Inline(batch.events.into_boxed_slice()),
             window_start_us: batch.window_start_us,
@@ -191,8 +196,7 @@ impl PluginEventHistory {
                         .iter()
                         .copied()
                         .map(FfiCdEvent::from)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
+                        .collect::<Box<[FfiCdEvent]>>(),
                 )
             }
             PluginEventFrameData::Inline(events) => Some(events.clone()),
@@ -626,7 +630,7 @@ impl DynPlugin {
         };
         let store_bridge = EventStoreBridge {
             store: event_store,
-            materialized_frames: RefCell::new(Vec::new()),
+            materialized_frames: UnsafeCell::new(Vec::new()),
         };
         let mut callbacks = FfiOutputCallbacks {
             ctx: (&mut output_bridge as *mut OutputBridge).cast(),
@@ -651,6 +655,7 @@ impl DynPlugin {
             oldest_timestamp_us: oldest_timestamp_callback,
         };
 
+        self.ui_dirty = false;
         unsafe {
             (self.vtable.process_frame)(
                 self.instance,
@@ -660,7 +665,6 @@ impl DynPlugin {
                 &ffi_event_store,
             );
         }
-        self.ui_dirty = false;
     }
 }
 
@@ -888,7 +892,11 @@ struct ContextBridge<'a> {
 
 struct EventStoreBridge<'a> {
     store: &'a PluginEventHistory,
-    materialized_frames: RefCell<Vec<Box<[FfiCdEvent]>>>,
+    /// # Safety
+    /// This is only accessed from `frame_at_callback`, which is invoked
+    /// synchronously during `process_frame`. The host guarantees that
+    /// `process_frame` is not re-entrant.
+    materialized_frames: UnsafeCell<Vec<Box<[FfiCdEvent]>>>,
 }
 
 unsafe extern "C" fn add_highlight_pixels(
@@ -977,6 +985,8 @@ unsafe extern "C" fn add_marker_overlay(
                 x: marker.x,
                 y: marker.y,
                 shape: match marker.shape {
+                    FfiMarkerShape::Circle => MarkerShape::FilledCircle,
+                    FfiMarkerShape::Square => MarkerShape::Box,
                     FfiMarkerShape::Point => MarkerShape::Point,
                     FfiMarkerShape::Cross => MarkerShape::Cross,
                     FfiMarkerShape::Box => MarkerShape::Box,
@@ -1126,7 +1136,9 @@ unsafe extern "C" fn frame_at_callback(
     let frame = bridge.and_then(|bridge| {
         let events = bridge.store.materialize_frame(index)?;
         let (window_start_us, window_end_us) = bridge.store.frame_window(index)?;
-        let mut materialized = bridge.materialized_frames.borrow_mut();
+        // SAFETY: `frame_at_callback` is only called synchronously during
+        // `process_frame`, and the host guarantees non-reentrancy.
+        let materialized = unsafe { &mut *bridge.materialized_frames.get() };
         materialized.push(events);
         let events = materialized.last()?;
         Some(FfiEventFrame::from_slice(
@@ -1426,7 +1438,7 @@ mod tests {
         store.push_frame(&retained_frame(&[event(30, 3)], 30, 30));
         let bridge = EventStoreBridge {
             store: &store,
-            materialized_frames: RefCell::new(Vec::new()),
+            materialized_frames: UnsafeCell::new(Vec::new()),
         };
         let mut out = FfiEventFrame::empty();
 
@@ -1453,7 +1465,7 @@ mod tests {
         store.push_frame(&retained_frame(&[event(30, 3), event(40, 4)], 30, 40));
         let bridge = EventStoreBridge {
             store: &store,
-            materialized_frames: RefCell::new(Vec::new()),
+            materialized_frames: UnsafeCell::new(Vec::new()),
         };
         let mut out_start = usize::MAX;
         let mut out_end = usize::MAX;

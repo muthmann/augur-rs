@@ -240,23 +240,26 @@ impl TableSchema {
     pub fn column_display(&self, column_id: &str) -> Option<&TableColumnDisplayMetadata> {
         self.column_display
             .iter()
-            .find(|entry| entry.column_id == column_id)
-            .map(|entry| &entry.display)
+            .find_map(|entry| (entry.column_id == column_id).then_some(&entry.display))
+    }
+
+    /// Resolve a single u64 value from a column for the given row.
+    pub fn column_u64_at(&self, dataset: &TableDatasetV1, row: usize, name: &str) -> Option<u64> {
+        let column = dataset.column(name)?;
+        match &column.values {
+            TableColumnValues::U64(values) => values.get(row).copied(),
+            other => other
+                .numeric_value(row)
+                .map(|v| v.round().max(0.0).min(u64::MAX as f64) as u64),
+        }
     }
 
     /// Resolve an anchor timestamp for a row using the declared provenance.
     /// Fallback order: `anchor_time_column` → midpoint of span → `time_column`.
     pub fn row_anchor_timestamp_us(&self, dataset: &TableDatasetV1, row: usize) -> Option<u64> {
         let provenance = self.provenance.as_ref();
-        let column_u64 = |name: &str| -> Option<u64> {
-            let column = dataset.column(name)?;
-            match &column.values {
-                TableColumnValues::U64(values) => values.get(row).copied(),
-                other => other.numeric_value(row).map(|v| v.round().max(0.0) as u64),
-            }
-        };
         if let Some(column) = provenance.and_then(|p| p.anchor_time_column.as_deref()) {
-            if let Some(ts) = column_u64(column) {
+            if let Some(ts) = self.column_u64_at(dataset, row, column) {
                 return Some(ts);
             }
         }
@@ -264,12 +267,15 @@ impl TableSchema {
             provenance.and_then(|p| p.span_start_column.as_deref()),
             provenance.and_then(|p| p.span_end_column.as_deref()),
         ) {
-            if let (Some(start), Some(end)) = (column_u64(start_col), column_u64(end_col)) {
+            if let (Some(start), Some(end)) = (
+                self.column_u64_at(dataset, row, start_col),
+                self.column_u64_at(dataset, row, end_col),
+            ) {
                 return Some(start + (end.saturating_sub(start)) / 2);
             }
         }
         if let Some(column) = self.time_column.as_deref() {
-            return column_u64(column);
+            return self.column_u64_at(dataset, row, column);
         }
         None
     }
@@ -278,18 +284,14 @@ impl TableSchema {
     /// if the anchor resolves; else `None`. Both bounds inclusive.
     pub fn row_span_us(&self, dataset: &TableDatasetV1, row: usize) -> Option<(u64, u64)> {
         let provenance = self.provenance.as_ref();
-        let column_u64 = |name: &str| -> Option<u64> {
-            let column = dataset.column(name)?;
-            match &column.values {
-                TableColumnValues::U64(values) => values.get(row).copied(),
-                other => other.numeric_value(row).map(|v| v.round().max(0.0) as u64),
-            }
-        };
         if let (Some(start_col), Some(end_col)) = (
             provenance.and_then(|p| p.span_start_column.as_deref()),
             provenance.and_then(|p| p.span_end_column.as_deref()),
         ) {
-            if let (Some(start), Some(end)) = (column_u64(start_col), column_u64(end_col)) {
+            if let (Some(start), Some(end)) = (
+                self.column_u64_at(dataset, row, start_col),
+                self.column_u64_at(dataset, row, end_col),
+            ) {
                 return Some((start, end));
             }
         }
@@ -409,14 +411,14 @@ impl<'de> Deserialize<'de> for TableCoordinateSpace2d {
         }
 
         let raw = RawCoordinateSpace2d::deserialize(deserializer)?;
-        if raw.x_min > raw.x_max {
+        if !raw.x_min.is_finite() || !raw.x_max.is_finite() || raw.x_min > raw.x_max {
             return Err(D::Error::custom(
-                "x_min must be less than or equal to x_max",
+                "x_min and x_max must be finite and x_min <= x_max",
             ));
         }
-        if raw.y_min > raw.y_max {
+        if !raw.y_min.is_finite() || !raw.y_max.is_finite() || raw.y_min > raw.y_max {
             return Err(D::Error::custom(
-                "y_min must be less than or equal to y_max",
+                "y_min and y_max must be finite and y_min <= y_max",
             ));
         }
 
@@ -463,19 +465,19 @@ impl<'de> Deserialize<'de> for TableCoordinateSpace3d {
         }
 
         let raw = RawCoordinateSpace3d::deserialize(deserializer)?;
-        if raw.x_min > raw.x_max {
+        if !raw.x_min.is_finite() || !raw.x_max.is_finite() || raw.x_min > raw.x_max {
             return Err(D::Error::custom(
-                "x_min must be less than or equal to x_max",
+                "x_min and x_max must be finite and x_min <= x_max",
             ));
         }
-        if raw.y_min > raw.y_max {
+        if !raw.y_min.is_finite() || !raw.y_max.is_finite() || raw.y_min > raw.y_max {
             return Err(D::Error::custom(
-                "y_min must be less than or equal to y_max",
+                "y_min and y_max must be finite and y_min <= y_max",
             ));
         }
-        if raw.z_min > raw.z_max {
+        if !raw.z_min.is_finite() || !raw.z_max.is_finite() || raw.z_min > raw.z_max {
             return Err(D::Error::custom(
-                "z_min must be less than or equal to z_max",
+                "z_min and z_max must be finite and z_min <= z_max",
             ));
         }
 
@@ -556,8 +558,14 @@ impl TableDatasetV1 {
             ));
         }
 
+        let column_map: std::collections::HashMap<&str, &TableColumnData> = self
+            .columns
+            .iter()
+            .map(|c| (c.column_id.as_str(), c))
+            .collect();
+
         for schema_column in &schema.columns {
-            let Some(column) = self.column(&schema_column.id) else {
+            let Some(column) = column_map.get(schema_column.id.as_str()) else {
                 return Err(format!(
                     "dataset is missing schema column {}",
                     schema_column.id
@@ -573,8 +581,10 @@ impl TableDatasetV1 {
             }
         }
 
+        let schema_ids: std::collections::HashSet<&str> =
+            schema.columns.iter().map(|c| c.id.as_str()).collect();
         for column in &self.columns {
-            if schema.column(&column.column_id).is_none() {
+            if !schema_ids.contains(column.column_id.as_str()) {
                 return Err(format!(
                     "dataset contains unknown column {}",
                     column.column_id

@@ -104,7 +104,9 @@ impl PointCloudState {
             .map(|(first, last)| last.timestamp.saturating_sub(first.timestamp) as f32 / 1_000.0);
         let step = events.len().div_ceil(self.point_limit.max(1)).max(1);
         if step > 1 {
-            events = events.drain(..).step_by(step).collect();
+            let mut sampled = Vec::with_capacity(events.len() / step + 1);
+            sampled.extend(events.into_iter().step_by(step));
+            events = sampled;
         }
         let sampled_count = events.len();
         VisiblePointCloudEvents {
@@ -136,8 +138,9 @@ impl PointCloudState {
     }
 
     fn trim_to_point_budget(&mut self, max_points: usize) {
-        while self.frames.len() > 1 && self.retained_event_count() > max_points {
-            self.frames.pop_front();
+        let mut total = self.retained_event_count();
+        while self.frames.len() > 1 && total > max_points {
+            total -= self.frames.pop_front().map(|f| f.event_count).unwrap_or(0);
         }
     }
 

@@ -9,9 +9,9 @@ use egui_wgpu::wgpu;
 use crate::{
     colormap::Colormap,
     preview::{
-        encode_time_surface_tick, query_time_surface_value, time_surface_value_u8_from_tick,
-        with_prepared_preview_frame, CpuPreviewImageCache, PreparedPreviewFrame,
-        PreviewDisplaySettings, PreviewMode, TIME_SURFACE_BINS, TIME_SURFACE_TICK_US,
+        encode_time_surface_tick, query_time_surface_value, with_prepared_preview_frame,
+        CpuPreviewImageCache, PreparedPreviewFrame, PreviewDisplaySettings, PreviewMode,
+        TIME_SURFACE_BINS, TIME_SURFACE_TICK_US,
     },
     preview_perf::PreviewPerfStats,
     viewer_widget::PreviewHistogramRequest,
@@ -716,12 +716,6 @@ struct IntensityR16<'a> {
     values: &'a [u16],
 }
 
-#[derive(Debug, Default, Clone)]
-struct PolarityRg16 {
-    size: [usize; 2],
-    values: Vec<[u16; 2]>,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum PackedPreviewPayload<'a> {
     Intensity(IntensityR16<'a>),
@@ -864,7 +858,6 @@ pub struct WgpuPreviewRenderer {
     time_surface_tick_buffer: Option<wgpu::Buffer>,
     time_surface_histogram_buffer: wgpu::Buffer,
     time_surface_histogram_readback: wgpu::Buffer,
-    time_surface_hover_readback: wgpu::Buffer,
     time_surface_packed_events: Vec<u32>,
     time_surface_accumulation_key: Option<TimeSurfaceAccumulationKey>,
     time_surface_hover_cache: Option<TimeSurfaceHoverCache>,
@@ -887,7 +880,7 @@ pub struct WgpuPreviewRenderer {
     display_view: Option<wgpu::TextureView>,
     display_texture_id: Option<egui::TextureId>,
     size: Option<[usize; 2]>,
-    polarity_payload: PolarityRg16,
+    polarity_payload: Vec<[u16; 2]>,
 }
 
 impl WgpuPreviewRenderer {
@@ -1298,12 +1291,6 @@ impl WgpuPreviewRenderer {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let time_surface_hover_readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("augur_time_surface_hover_readback"),
-            size: std::mem::size_of::<u32>() as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         Ok(Self {
             render_state,
@@ -1344,7 +1331,6 @@ impl WgpuPreviewRenderer {
             time_surface_tick_buffer: None,
             time_surface_histogram_buffer,
             time_surface_histogram_readback,
-            time_surface_hover_readback,
             time_surface_packed_events: Vec::new(),
             time_surface_accumulation_key: None,
             time_surface_hover_cache: None,
@@ -1367,7 +1353,7 @@ impl WgpuPreviewRenderer {
             display_view: None,
             display_texture_id: None,
             size: None,
-            polarity_payload: PolarityRg16::default(),
+            polarity_payload: Vec::new(),
         })
     }
 
@@ -1437,12 +1423,9 @@ impl WgpuPreviewRenderer {
         time_surface_tau_us: u64,
         index: usize,
     ) -> Option<u8> {
-        if !frame.raw_events_available() {
-            return query_time_surface_value(frame, time_surface_tau_us, index);
-        }
-        self.query_time_surface_value_gpu(frame, time_surface_tau_us, index)
-            .ok()
-            .flatten()
+        // Use the CPU fallback for hover queries to avoid stalling the GPU
+        // pipeline with a single-pixel readback.
+        query_time_surface_value(frame, time_surface_tau_us, index)
     }
 
     fn render_time_surface_accumulated(
@@ -1659,7 +1642,7 @@ impl WgpuPreviewRenderer {
     ) -> Result<PreviewDisplayTexture, String> {
         let size = match payload {
             PackedPreviewPayload::Intensity(data) => data.size,
-            PackedPreviewPayload::Polarity { size } => size,
+            PackedPreviewPayload::Polarity { size, .. } => size,
         };
         self.ensure_textures(size)?;
         self.ensure_bind_group();
@@ -2166,56 +2149,6 @@ impl WgpuPreviewRenderer {
         Ok(())
     }
 
-    fn query_time_surface_value_gpu(
-        &mut self,
-        frame: &augur_core::pipeline::PreviewFrame,
-        time_surface_tau_us: u64,
-        index: usize,
-    ) -> Result<Option<u8>, String> {
-        let pixel_count = usize::from(frame.width.max(1)) * usize::from(frame.height.max(1));
-        if index >= pixel_count {
-            return Ok(None);
-        }
-        if let Some(cache) = self.time_surface_hover_cache {
-            if cache.frame_end_us == frame.window_end_us
-                && cache.tau_us == time_surface_tau_us
-                && cache.index == index
-            {
-                return Ok(Some(cache.value));
-            }
-        }
-
-        self.ensure_time_surface_accumulation(frame)?;
-        let mut encoder = self
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("augur_time_surface_hover_encoder"),
-            });
-        encoder.copy_buffer_to_buffer(
-            self.time_surface_tick_buffer
-                .as_ref()
-                .ok_or_else(|| "missing time-surface tick buffer".to_owned())?,
-            (index * std::mem::size_of::<u32>()) as u64,
-            &self.time_surface_hover_readback,
-            0,
-            std::mem::size_of::<u32>() as u64,
-        );
-        self.queue().submit(Some(encoder.finish()));
-        let tick = read_single_u32_buffer(self.device(), &self.time_surface_hover_readback)?;
-        let value = time_surface_value_u8_from_tick(
-            tick,
-            encode_time_surface_tick(frame.window_end_us),
-            time_surface_tau_us.max(1),
-        );
-        self.time_surface_hover_cache = Some(TimeSurfaceHoverCache {
-            frame_end_us: frame.window_end_us,
-            tau_us: time_surface_tau_us,
-            index,
-            value,
-        });
-        Ok(Some(value))
-    }
-
     fn reset(&mut self) {
         self.free_display_texture();
         self.bind_group = None;
@@ -2246,7 +2179,7 @@ impl WgpuPreviewRenderer {
         self.display_texture = None;
         self.display_view = None;
         self.size = None;
-        self.polarity_payload.values.clear();
+        self.polarity_payload.clear();
     }
 
     fn free_display_texture(&mut self) {
@@ -2266,13 +2199,8 @@ impl WgpuPreviewRenderer {
             }
             PreparedPreviewFrame::PolarityRg16 { size, on, off, .. } => {
                 let pixel_count = size[0].saturating_mul(size[1]);
-                self.polarity_payload.size = size;
-                self.polarity_payload
-                    .values
-                    .resize(pixel_count, [0_u16, 0_u16]);
-                for ((packed, &on), &off) in
-                    self.polarity_payload.values.iter_mut().zip(on).zip(off)
-                {
+                self.polarity_payload.resize(pixel_count, [0_u16, 0_u16]);
+                for ((packed, &on), &off) in self.polarity_payload.iter_mut().zip(on).zip(off) {
                     *packed = [on, off];
                 }
                 PackedPreviewPayload::Polarity { size }
@@ -2421,7 +2349,7 @@ impl WgpuPreviewRenderer {
                         queue,
                         texture,
                         size,
-                        bytemuck::cast_slice(&self.polarity_payload.values),
+                        bytemuck::cast_slice(&self.polarity_payload),
                         4,
                     );
                 }
@@ -2667,11 +2595,6 @@ fn read_histogram_buffer(
     Ok(histogram)
 }
 
-fn read_single_u32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<u32, String> {
-    let values = map_buffer_sync(device, buffer, std::mem::size_of::<u32>() as u64, "hover")?;
-    Ok(values.first().copied().unwrap_or(0))
-}
-
 fn create_dummy_texture(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("augur_preview_dummy"),
@@ -2768,8 +2691,8 @@ fn write_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        pack_time_surface_event, preview_uniforms, time_surface_histogram_uniforms, PolarityRg16,
-        MODE_INTENSITY, MODE_SIGNED_COUNT,
+        pack_time_surface_event, preview_uniforms, time_surface_histogram_uniforms, MODE_INTENSITY,
+        MODE_SIGNED_COUNT,
     };
     use crate::{
         colormap::Colormap,
@@ -2938,24 +2861,23 @@ mod tests {
     #[test]
     fn polarity_payload_packs_on_and_off_counts() {
         let frame = frame();
-        let mut payload = PolarityRg16 {
-            size: [0, 0],
-            values: Vec::new(),
-        };
+        let mut payload: Vec<[u16; 2]> = Vec::new();
+        let mut size = [0, 0];
         with_prepared_preview_frame(&frame, PreviewMode::SignedCount, 30_000, |prepared| {
-            if let crate::preview::PreparedPreviewFrame::PolarityRg16 { size, on, off, .. } =
-                prepared
+            if let crate::preview::PreparedPreviewFrame::PolarityRg16 {
+                size: s, on, off, ..
+            } = prepared
             {
-                payload.size = size;
-                payload.values.resize(size[0] * size[1], [0, 0]);
-                for ((packed, &on), &off) in payload.values.iter_mut().zip(on).zip(off) {
+                size = s;
+                payload.resize(s[0] * s[1], [0, 0]);
+                for ((packed, &on), &off) in payload.iter_mut().zip(on).zip(off) {
                     *packed = [on, off];
                 }
             }
         });
 
-        assert_eq!(payload.size, [2, 1]);
-        assert_eq!(payload.values, vec![[3, 1], [2, 4]]);
+        assert_eq!(size, [2, 1]);
+        assert_eq!(payload, vec![[3, 1], [2, 4]]);
     }
 
     #[test]

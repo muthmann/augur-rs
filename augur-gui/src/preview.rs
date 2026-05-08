@@ -354,7 +354,9 @@ pub fn compute_frame_histogram(
     mode: PreviewMode,
     time_surface_tau_us: u64,
 ) -> Vec<u64> {
-    with_frame_histogram(frame, mode, time_surface_tau_us, trimmed_histogram)
+    with_frame_histogram(frame, mode, time_surface_tau_us, |histogram| {
+        trimmed_histogram(histogram).to_vec()
+    })
 }
 
 pub fn compute_auto_contrast_max(
@@ -536,13 +538,13 @@ fn histogram_from_values(values: impl IntoIterator<Item = u16>) -> Vec<u64> {
     histogram
 }
 
-fn trimmed_histogram(histogram: &[u64]) -> Vec<u64> {
+fn trimmed_histogram(histogram: &[u64]) -> &[u64] {
     let len = histogram
         .iter()
         .rposition(|&count| count != 0)
         .map(|index| index + 1)
         .unwrap_or(1);
-    histogram[..len].to_vec()
+    &histogram[..len]
 }
 
 fn percentile_bin(histogram: &[u64], percentile: f32) -> u16 {

@@ -47,10 +47,10 @@ use crate::{
         render_summary_card, render_table_window_viewport, reset_provider_for_dataset,
         resolve_host_view_registry, DensityWindowViewportData, HostDatasetSnapshot,
         HostRegistryContribution, HostViewImageFormat, HostViewProviderKey, HostViewRenderState,
-        HostViewUiActions, ImageWindowViewportData, LinkedTableViewOptions, ResolvedHostView,
-        ResolvedHostViewRegistry, Scatter2dViewOptions, ScatterWindowViewportData,
-        SeriesWindowViewportData, SummaryCardOptions, TableCellFormatOptions,
-        TableWindowViewportData,
+        HostViewUiActions, ImageWindowViewportData, LinkedTableViewOptions, ResolvedHostAction,
+        ResolvedHostView, ResolvedHostViewRegistry, Scatter2dViewOptions,
+        ScatterWindowViewportData, SeriesWindowViewportData, SummaryCardOptions,
+        TableCellFormatOptions, TableWindowViewportData,
     },
     hotpixel::BuiltInHotpixelDetection,
     inspection_3d::{
@@ -60,7 +60,7 @@ use crate::{
     investigation::{
         coordinate_2d_for_row, coordinate_3d_for_row, dataset_layer_id, filtered_row_indices,
         retain_rows_in_frame_span, row_key_for_row, stable_row_id_value, AnalysisRoi,
-        Investigation2dPoint, InvestigationLayout, StableRowKey,
+        Investigation2dPoint, InvestigationLayout, InvestigationState, StableRowKey,
     },
     plugin_loader::{PluginEventHistory, PluginManager},
     plugin_settings_ui::render_plugin_settings,
@@ -71,8 +71,8 @@ use crate::{
     preview_perf::{PerfMetricSnapshot, PreviewPerfStats},
     preview_renderer::{PreviewDisplayTexture, PreviewRenderRequest, PreviewRenderer},
     python_ingress::{
-        PythonIngressDatasetInfo, PythonIngressServer, PythonIngressStartRequest,
-        PythonIngressStatus, DEFAULT_PYTHON_INGRESS_PORT,
+        PythonIngressDatasetInfo, PythonIngressDatasetRequest, PythonIngressServer,
+        PythonIngressStartRequest, PythonIngressStatus, DEFAULT_PYTHON_INGRESS_PORT,
     },
     render_backend::ActiveRendererInfo,
     settings::draw_settings,
@@ -393,11 +393,26 @@ struct ReplayFrameSnapshot {
 }
 
 fn replay_snapshot_frame(frame: &PreviewFrame) -> PreviewFrame {
-    let mut snapshot = frame.clone();
-    if snapshot.event_source.is_some() && snapshot.event_range.is_some() {
-        snapshot.events = None;
+    PreviewFrame {
+        width: frame.width,
+        height: frame.height,
+        pixels: frame.pixels.clone(),
+        pixels_on: frame.pixels_on.clone(),
+        pixels_off: frame.pixels_off.clone(),
+        cached_total_histogram: frame.cached_total_histogram.clone(),
+        cached_signed_histogram: frame.cached_signed_histogram.clone(),
+        on_count: frame.on_count,
+        off_count: frame.off_count,
+        events: if frame.event_source.is_some() && frame.event_range.is_some() {
+            None
+        } else {
+            frame.events.clone()
+        },
+        event_range: frame.event_range.clone(),
+        event_source: frame.event_source.clone(),
+        window_start_us: frame.window_start_us,
+        window_end_us: frame.window_end_us,
     }
-    snapshot
 }
 
 /// Extract a table reference from a cached dataset entry.
@@ -698,12 +713,17 @@ pub struct CameraApp {
     dock_open: bool,
     /// Drag-resizable dock height in points.
     dock_height: f32,
+    /// Cached 3D investigation scene to avoid rebuilding every frame.
+    cached_investigation_scene_3d: Option<Investigation3dScene>,
+    /// Simple cache key for the 3D scene: hash of frame ts + layer state.
+    cached_investigation_scene_3d_key: u64,
     /// Owl brand mark texture (loaded once at startup); `None` if the asset
     /// could not be read.
     brand_logo: Option<egui::TextureHandle>,
     pending_action_requests: Vec<HostActionRequest>,
     next_action_request_id: u64,
     action_modal: Option<ActionModalState>,
+    toast_queue: crate::toast::ToastQueue,
 }
 
 #[derive(Debug, Clone)]
@@ -836,11 +856,14 @@ impl CameraApp {
             dock_tabs: Vec::new(),
             dock_active: None,
             dock_open,
+            cached_investigation_scene_3d: None,
+            cached_investigation_scene_3d_key: 0,
             dock_height,
             brand_logo: logo_texture,
             pending_action_requests: Vec::new(),
             next_action_request_id: 1,
             action_modal: None,
+            toast_queue: crate::toast::ToastQueue::default(),
         };
         app.event_store
             .set_memory_budget(mib_to_bytes(global_defaults.event_store_budget_mib));
@@ -982,18 +1005,7 @@ impl CameraApp {
     }
 
     fn render_investigation_actions(&mut self, ui: &mut egui::Ui) {
-        let actions: Vec<(String, String, HostActionScope, Option<serde_json::Value>)> = self
-            .host_view_registry
-            .actions()
-            .map(|action| {
-                (
-                    action.descriptor.id.clone(),
-                    action.descriptor.title.clone(),
-                    action.descriptor.scope.clone(),
-                    action.descriptor.param_schema.clone(),
-                )
-            })
-            .collect();
+        let actions: Vec<ResolvedHostAction> = self.host_view_registry.actions().cloned().collect();
         if actions.is_empty() {
             return;
         }
@@ -1001,10 +1013,14 @@ impl CameraApp {
             ui.small(
                 "Row- and cluster-scoped actions published by plugins. Apply to queue; the plugin consumes on the next frame.",
             );
-            for (id, title, scope, param_schema) in actions {
-                let payload = self.resolve_action_scope_payload(&scope);
+            for action in actions {
+                let id = &action.descriptor.id;
+                let title = &action.descriptor.title;
+                let scope = &action.descriptor.scope;
+                let param_schema = &action.descriptor.param_schema;
+                let payload = self.resolve_action_scope_payload(scope);
                 let enabled = payload.is_some();
-                let hover = match &scope {
+                let hover = match scope {
                     HostActionScope::Dataset { dataset_id } => {
                         format!("Dataset-wide action on {dataset_id}.")
                     }
@@ -1019,14 +1035,14 @@ impl CameraApp {
                     ),
                 };
                 ui.horizontal(|ui| {
-                    let response = ui.add_enabled(enabled, egui::Button::new(&title));
+                    let response = ui.add_enabled(enabled, egui::Button::new(title));
                     let response = response.on_hover_text(&hover);
                     if response.clicked() {
                         if let Some(payload) = payload {
                             let schema = param_schema.as_ref().and_then(|v| {
                                 serde_json::from_value::<SettingsSchema>(v.clone()).ok()
                             });
-                            self.open_action_modal(&id, &title, payload, schema);
+                            self.open_action_modal(id, title, payload, schema);
                         }
                     }
                 });
@@ -1034,11 +1050,130 @@ impl CameraApp {
         });
     }
 
+    fn render_annotations_section(&mut self, ui: &mut egui::Ui) {
+        let (annotations, selected_id) = self.with_active_viewer(|viewer| {
+            let mgr = &viewer.annotation_manager;
+            (mgr.annotations().to_vec(), mgr.selected_id())
+        });
+        let count_text = format!("{}", annotations.len());
+        crate::theme::collapse(
+            ui,
+            "ws_annotations",
+            "Annotations",
+            true,
+            Some(&count_text),
+            |ui| {
+                if annotations.is_empty() {
+                    ui.small("No annotations. Use Rect / Ellipse / Line / Ruler in the toolbar.");
+                } else {
+                    let mut clicked_annotation = None;
+                    let mut delete_annotation = None;
+                    for (index, annotation) in annotations.iter().enumerate() {
+                        let selected = selected_id == Some(annotation.id);
+                        let p = crate::theme::palette_for_visuals(ui.visuals());
+                        let row_height = 22.0;
+                        let row_width = ui.available_width();
+                        let row_response = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(row_width, row_height),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
+                                    // Number
+                                    ui.label(
+                                        egui::RichText::new(format!("#{}", index + 1))
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(p.fg_3),
+                                    );
+                                    // Color swatch
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(9.0, 9.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        crate::theme::radius::R_1,
+                                        annotation.color,
+                                    );
+                                    // Kind
+                                    let (kind, geom) = match &annotation.shape {
+                                        crate::viewer_tools::AnnotationShape::Rectangle {
+                                            min,
+                                            max,
+                                        } => {
+                                            ("rect", format!("{}×{}", max.0 - min.0, max.1 - min.1))
+                                        }
+                                        crate::viewer_tools::AnnotationShape::Ellipse {
+                                            center: _,
+                                            radius_x,
+                                            radius_y,
+                                        } => (
+                                            "ellipse",
+                                            format!("{}×{}", radius_x * 2, radius_y * 2),
+                                        ),
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(kind)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(p.fg_1),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // Delete button
+                                            if crate::theme::icon_button(
+                                                ui,
+                                                egui_phosphor::regular::X,
+                                                "Delete annotation",
+                                            )
+                                            .clicked()
+                                            {
+                                                delete_annotation = Some(annotation.id);
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(geom)
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(p.fg_2),
+                                            );
+                                        },
+                                    );
+                                },
+                            )
+                            .response
+                            .interact(egui::Sense::click());
+                        if selected {
+                            ui.painter()
+                                .rect_filled(row_response.rect, 0.0, p.accent_weak);
+                        }
+                        if row_response.clicked() {
+                            clicked_annotation = Some(annotation.id);
+                        }
+                    }
+                    if let Some(id) = clicked_annotation {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer.annotation_manager.select(id);
+                        });
+                    }
+                    if let Some(id) = delete_annotation {
+                        self.with_active_viewer_mut(|viewer| {
+                            viewer.annotation_manager.select(id);
+                            if let Some(aid) = viewer.annotation_manager.delete_selected() {
+                                viewer.workspace.clear_crop_target_if_annotation(aid);
+                            }
+                        });
+                    }
+                }
+            },
+        );
+    }
+
     fn render_investigation_inspector(&mut self, ui: &mut egui::Ui) {
-        let current_layout = self.active_investigation_layout();
         let (
             mut link_roi_between_2d_and_3d,
-            active_roi,
+            _active_roi,
             selected_row,
             hovered_row,
             focused_layers,
@@ -1059,13 +1194,6 @@ impl CameraApp {
             )
         });
         layer_ids.sort();
-        let (raw_layer_ids, analysis_layer_ids): (Vec<_>, Vec<_>) =
-            layer_ids.into_iter().partition(|layer_id| {
-                matches!(
-                    layer_id.as_str(),
-                    RAW_EVENTS_ON_LAYER_ID | RAW_EVENTS_OFF_LAYER_ID
-                )
-            });
 
         crate::theme::collapse(ui, "ws_workspace", "Workspace", true, None, |ui| {
             if ui
@@ -1103,14 +1231,10 @@ impl CameraApp {
                 "\u{2014}".to_owned()
             };
             crate::theme::inspector_row(ui, "Hover", &hovered_text);
-
-            // Suppress unused-binding warnings: `current_layout` and
-            // `active_roi` were displayed in earlier passes via Layout /
-            // Linked ROI inspector rows; the design dropped those rows but
-            // the data fetch is still done in one go to keep the
-            // viewer-state borrow tidy.
-            let _ = (&current_layout, &active_roi);
         });
+
+        ui.separator();
+        self.render_annotations_section(ui);
 
         ui.separator();
         self.render_investigation_actions(ui);
@@ -1121,24 +1245,19 @@ impl CameraApp {
         // verbose paragraphs and the "Show all layers" button were removed —
         // visibility per row is the eye toggle, isolation is in the per-row
         // overflow menu (DOTS_THREE).
-        let ordered_layer_ids: Vec<String> = raw_layer_ids
-            .iter()
-            .chain(analysis_layer_ids.iter())
-            .cloned()
-            .collect();
-        let visible_total = ordered_layer_ids
-            .iter()
-            .filter(|id| {
-                self.with_active_viewer(|viewer| {
+        let visible_total = self.with_active_viewer(|viewer| {
+            layer_ids
+                .iter()
+                .filter(|id| {
                     viewer
                         .investigation
                         .layer_styles
                         .get(*id)
                         .is_some_and(|s| viewer.investigation.layer_visible(id, s.visible))
                 })
-            })
-            .count();
-        let layer_count_chip = format!("{visible_total}/{}", ordered_layer_ids.len());
+                .count()
+        });
+        let layer_count_chip = format!("{visible_total}/{}", layer_ids.len());
         crate::theme::collapse(
             ui,
             "ws_layers",
@@ -1146,21 +1265,22 @@ impl CameraApp {
             true,
             Some(&layer_count_chip),
             |ui| {
-                if ordered_layer_ids.is_empty() {
+                if layer_ids.is_empty() {
                     ui.small("No layers yet.");
                 } else {
-                    self.render_investigation_layer_cards(ui, &ordered_layer_ids);
+                    self.render_investigation_layer_cards(ui, &layer_ids);
                 }
                 if !focused_layers.is_empty() {
                     ui.add_space(crate::theme::sp::SP_1);
-                    ui.small(format!(
-                        "Isolated: {}",
-                        focused_layers
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
+                    let mut iter = focused_layers.iter();
+                    if let Some(first) = iter.next() {
+                        let mut text = format!("Isolated: {first}");
+                        for id in iter {
+                            text.push_str(", ");
+                            text.push_str(id);
+                        }
+                        ui.small(text);
+                    }
                 }
             },
         );
@@ -1459,7 +1579,9 @@ impl CameraApp {
             && self.active_investigation_layout().shows_2d()
         {
             if let Err(err) = self.render_preview_texture_from_frame(ctx, &snapshot.frame) {
-                self.last_error = Some(format!("preview render failed: {err}"));
+                let msg = format!("preview render failed: {err}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             }
         }
 
@@ -1544,6 +1666,13 @@ impl CameraApp {
             popup_tau_us,
             latest_frame_for_hover.as_ref(),
         );
+        let new_frame_ts = self.latest_frame.as_ref().map(|f| f.window_end_us);
+        {
+            let data = self.popup_shared.lock().unwrap();
+            if data.frame.as_ref().map(|f| f.window_end_us) == new_frame_ts {
+                return;
+            }
+        }
         let mut data = self.popup_shared.lock().unwrap();
         data.investigation_points_2d = investigation_points_2d.to_vec();
         data.investigation_scene_3d = investigation_scene_3d.clone();
@@ -1672,9 +1801,14 @@ impl CameraApp {
                 self.python_ingress = Some(server);
                 self.last_error = None;
                 self.camera_status = format!("Python ingress listening on 127.0.0.1:{port}.");
+                self.toast_queue.push(
+                    format!("Python ingress listening on port {port}"),
+                    crate::toast::ToastTone::Success,
+                );
             }
             Err(err) => {
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
             }
         }
     }
@@ -1685,6 +1819,8 @@ impl CameraApp {
         }
         if self.python_stream_name.is_none() {
             self.camera_status = "Python ingress stopped.".into();
+            self.toast_queue
+                .push("Python ingress stopped", crate::toast::ToastTone::Info);
         }
     }
 
@@ -1693,46 +1829,78 @@ impl CameraApp {
             let Some(request) = self
                 .python_ingress
                 .as_ref()
-                .and_then(PythonIngressServer::try_recv_request)
+                .and_then(PythonIngressServer::try_recv_start_request)
             else {
                 break;
             };
-            self.handle_python_ingress_request(request);
+            self.handle_python_ingress_start_request(request);
+        }
+
+        loop {
+            let Some(request) = self
+                .python_ingress
+                .as_ref()
+                .and_then(PythonIngressServer::try_recv_dataset_request)
+            else {
+                break;
+            };
+            self.handle_python_ingress_dataset_request(request);
         }
     }
 
-    fn handle_python_ingress_request(&mut self, request: PythonIngressStartRequest) {
-        let PythonIngressStartRequest {
-            info,
-            camera,
-            reply_tx,
-        } = request;
-        let result = self.start_python_ingress_stream(info, camera);
+    fn handle_python_ingress_start_request(&mut self, request: PythonIngressStartRequest) {
+        let PythonIngressStartRequest { info, reply_tx } = request;
+        let result = if self.can_accept_python_ingress_dataset() {
+            self.camera_status = format!(
+                "Receiving Python events: {} ({} events, {}x{}, {}..{} us).",
+                python_ingress_dataset_label(&info),
+                info.event_count,
+                info.width,
+                info.height,
+                info.timestamp_start_us,
+                info.timestamp_end_us
+            );
+            Ok(())
+        } else {
+            Err("Augur is busy; close the current camera preview, recording, or non-Python replay before publishing Python events".into())
+        };
         let _ = reply_tx.send(result);
     }
 
-    fn can_start_python_ingress_stream(&self) -> bool {
-        if self.mode == AppMode::Idle {
-            return true;
-        }
-        self.mode == AppMode::Previewing
-            && self.python_stream_name.is_some()
-            && self
-                .controller
-                .as_ref()
-                .is_some_and(|controller| controller.is_stopped() && controller.frame_rx.is_empty())
+    fn handle_python_ingress_dataset_request(&mut self, request: PythonIngressDatasetRequest) {
+        let PythonIngressDatasetRequest {
+            info,
+            events,
+            reply_tx,
+        } = request;
+        let result = self.open_python_ingress_replay(info, events);
+        let _ = reply_tx.send(result);
     }
 
-    fn start_python_ingress_stream(
+    fn can_accept_python_ingress_dataset(&self) -> bool {
+        self.replay_open_task.is_none()
+            && self.export_task.is_none()
+            && (self.mode == AppMode::Idle
+                || (self.mode == AppMode::Replaying && self.python_stream_name.is_some()))
+    }
+
+    fn open_python_ingress_replay(
         &mut self,
         info: PythonIngressDatasetInfo,
-        camera: crate::python_ingress::PythonIngressCamera,
+        events: Vec<CdEvent>,
     ) -> std::result::Result<(), String> {
-        if !self.can_start_python_ingress_stream() {
-            return Err(
-                "Augur is busy; stop the current preview, recording, or replay before publishing Python events"
-                    .into(),
-            );
+        if !self.can_accept_python_ingress_dataset() {
+            return Err("Augur is busy; close the current camera preview, recording, or non-Python replay before publishing Python events".into());
+        }
+        if u64::try_from(events.len()).unwrap_or(u64::MAX) != info.event_count {
+            return Err(format!(
+                "Python ingress received {} events, but start_events declared {}",
+                events.len(),
+                info.event_count
+            ));
+        }
+        if events.is_empty() {
+            return Err("Python ingress dataset is empty".into());
         }
 
         if let Some(controller) = self.controller.take() {
@@ -1742,7 +1910,14 @@ impl CameraApp {
             }
         }
 
-        let mut options = PipelineOptions::preview_only(info.width, info.height);
+        let stream_label = python_ingress_dataset_label(&info);
+        let replay_info = python_ingress_replay_info(&info, events.as_slice());
+        let events = Arc::new(events);
+        let (camera, controls) =
+            DecodedEventFileCamera::open_at(Arc::clone(&events), &replay_info, 0)
+                .map_err(|err| format!("Python ingress replay open failed: {err}"))?;
+
+        let mut options = PipelineOptions::preview_only(replay_info.width, replay_info.height);
         options.plugin_event_history = self.plugins_need_retained_event_history();
         let config = python_ingress_pipeline_config(&info, self.acq_time_ms, self.nm_per_pixel);
         let controller = spawn_pipeline(
@@ -1755,14 +1930,18 @@ impl CameraApp {
         sync_acq_time_atomic(&controller.acq_time_us, self.acq_time_ms);
         self.sync_pipeline_requirements(&controller);
 
-        let stream_label = info
-            .name
-            .clone()
-            .unwrap_or_else(|| "NumPy event stream".into());
+        if self.saved_live_state.is_none() {
+            self.saved_live_state = Some(SavedLiveState {
+                config: self.config.clone(),
+                mask_file: self.mask_file.clone(),
+                camera_info: self.camera_info.clone(),
+            });
+        }
+        self.set_replay_paused_internal(&controls, false);
+        self.set_replay_speed_internal(&controls, 1.0);
         self.controller = Some(controller);
-        self.mode = AppMode::Previewing;
+        self.mode = AppMode::Replaying;
         self.python_stream_name = Some(stream_label.clone());
-        self.clear_replay_state();
         self.config = config;
         let global = self.config.global.clone();
         self.apply_global_config(&global);
@@ -1775,6 +1954,18 @@ impl CameraApp {
         });
         self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.reset_analysis();
+        self.replay_path = Some(format!("Python: {stream_label}"));
+        self.replay_controls = Some(controls);
+        self.replay_file_info = Some(replay_info);
+        self.replay_decoded_events = Some(events);
+        self.replay_paused = true;
+        self.replay_finished = false;
+        self.replay_pause_after_seek_frame = true;
+        self.replay_pause_after_seek_target_timestamp_us = None;
+        self.replay_pending_fraction = Some(0.0);
+        self.clear_replay_frame_history();
+        self.replay_speed = 1.0;
+        self.replay_notice = Some("Python dataset opened as an in-memory replay.".into());
         self.texture = None;
         self.latest_frame = None;
         self.last_preview_process_at = None;
@@ -1783,7 +1974,7 @@ impl CameraApp {
         self.acq_dirty = false;
         self.last_error = None;
         self.camera_status = format!(
-            "Receiving Python events: {stream_label} ({} events, {}x{}, {}..{} us).",
+            "Loaded Python events: {stream_label} ({} events, {}x{}, {}..{} us). Paused at the first frame.",
             info.event_count,
             info.width,
             info.height,
@@ -2059,6 +2250,8 @@ impl CameraApp {
         if warnings != self.host_view_resolution_warnings {
             for warning in &warnings {
                 eprintln!("host view registry warning: {warning}");
+                self.toast_queue
+                    .push(warning.clone(), crate::toast::ToastTone::Warn);
             }
             self.host_view_resolution_warnings = warnings;
         }
@@ -2193,7 +2386,29 @@ impl CameraApp {
         self.sync_active_analysis_roi();
         self.sync_investigation_layers();
 
-        let investigation = self.with_active_viewer(|viewer| viewer.investigation.clone());
+        let (layer_styles, layer_visibility, active_analysis_roi, table_views) = self
+            .with_active_viewer(|viewer| {
+                let inv = &viewer.investigation;
+                (
+                    inv.layer_styles.clone(),
+                    inv.layer_visibility.clone(),
+                    inv.active_analysis_roi.clone(),
+                    inv.table_views.clone(),
+                )
+            });
+        let investigation = InvestigationState {
+            layout: InvestigationLayout::default(),
+            split_ratio: 0.0,
+            active_analysis_roi,
+            selected_rows: Default::default(),
+            hovered_row: None,
+            focused_layers: Default::default(),
+            link_roi_between_2d_and_3d: true,
+            camera_focus_target: None,
+            table_views,
+            layer_visibility,
+            layer_styles,
+        };
         let frame_window = self
             .latest_frame
             .as_ref()
@@ -2392,12 +2607,63 @@ impl CameraApp {
         result
     }
 
+    fn investigation_scene_3d_cache_key(&self) -> u64 {
+        let frame_ts = self
+            .latest_frame
+            .as_ref()
+            .map(|f| f.window_end_us)
+            .unwrap_or(0);
+        let (layer_count, selected_count, roi_present) = self.with_active_viewer(|viewer| {
+            (
+                viewer.investigation.layer_styles.len() as u64,
+                viewer.investigation.selected_rows.len() as u64,
+                viewer.investigation.active_analysis_roi.is_some() as u64,
+            )
+        });
+        frame_ts
+            .wrapping_mul(31)
+            .wrapping_add(layer_count)
+            .wrapping_mul(31)
+            .wrapping_add(selected_count)
+            .wrapping_mul(31)
+            .wrapping_add(roi_present)
+    }
+
     fn build_investigation_scene_3d(&mut self) -> Investigation3dScene {
         self.sync_active_analysis_roi();
         self.sync_investigation_layers();
 
+        let cache_key = self.investigation_scene_3d_cache_key();
+        if self.cached_investigation_scene_3d_key == cache_key {
+            if let Some(ref scene) = self.cached_investigation_scene_3d {
+                return scene.clone();
+            }
+        }
+
         let selected_event_ids = self.resolve_selection_event_ids();
-        let investigation = self.with_active_viewer(|viewer| viewer.investigation.clone());
+        let (layer_styles, layer_visibility, active_analysis_roi, table_views) = self
+            .with_active_viewer(|viewer| {
+                let inv = &viewer.investigation;
+                (
+                    inv.layer_styles.clone(),
+                    inv.layer_visibility.clone(),
+                    inv.active_analysis_roi.clone(),
+                    inv.table_views.clone(),
+                )
+            });
+        let investigation = InvestigationState {
+            layout: InvestigationLayout::default(),
+            split_ratio: 0.0,
+            active_analysis_roi,
+            selected_rows: Default::default(),
+            hovered_row: None,
+            focused_layers: Default::default(),
+            link_roi_between_2d_and_3d: true,
+            camera_focus_target: None,
+            table_views,
+            layer_visibility,
+            layer_styles,
+        };
         let frame_window = self
             .latest_frame
             .as_ref()
@@ -2607,10 +2873,13 @@ impl CameraApp {
             }
         }
 
-        Investigation3dScene {
+        let scene = Investigation3dScene {
             layers,
             focus_volume,
-        }
+        };
+        self.cached_investigation_scene_3d = Some(scene.clone());
+        self.cached_investigation_scene_3d_key = self.investigation_scene_3d_cache_key();
+        scene
     }
 
     fn export_host_view_csv(&mut self, view: &ResolvedHostView) {
@@ -2810,7 +3079,7 @@ impl CameraApp {
         table: &TableDatasetV1,
         row: usize,
     ) -> serde_json::Value {
-        let mut object = serde_json::Map::new();
+        let mut object = serde_json::Map::with_capacity(schema.columns.len());
         for column in &schema.columns {
             let Some(column_data) = table.column(&column.id) else {
                 continue;
@@ -2994,7 +3263,6 @@ impl CameraApp {
                         table,
                         &dataset.descriptor.empty_message,
                         SummaryCardOptions {
-                            dataset_id: &view.descriptor.dataset_id,
                             generation: dataset_generation,
                             selected_row: selected_row.as_ref(),
                             format: TableCellFormatOptions { replay_origin_us },
@@ -3268,12 +3536,11 @@ impl CameraApp {
     /// is not collapsed. Drops tabs whose host view has disappeared.
     fn render_host_view_dock(&mut self, ctx: &egui::Context) {
         // Drop stale tabs whose view IDs no longer resolve.
-        let known_ids: std::collections::HashSet<String> = self
-            .host_view_registry
-            .views()
-            .map(|v| v.descriptor.id.clone())
-            .collect();
-        self.dock_tabs.retain(|id| known_ids.contains(id));
+        self.dock_tabs.retain(|id| {
+            self.host_view_registry
+                .views()
+                .any(|v| v.descriptor.id == *id)
+        });
         if let Some(active) = &self.dock_active {
             if !self.dock_tabs.iter().any(|id| id == active) {
                 self.dock_active = self.dock_tabs.first().cloned();
@@ -3342,6 +3609,18 @@ impl CameraApp {
             .default_height(dock_height)
             .show(ctx, |ui| {
                 new_height = Some(ui.available_size().y + 0.0);
+                // Resizer handle: centered 28×2 px bar at the top edge.
+                let palette = crate::theme::palette_for_visuals(ui.visuals());
+                let handle_rect = egui::Rect::from_center_size(
+                    egui::pos2(
+                        ui.available_rect_before_wrap().center().x,
+                        ui.cursor().top() + 3.0,
+                    ),
+                    egui::vec2(28.0, 2.0),
+                );
+                ui.painter()
+                    .rect_filled(handle_rect, 1.0, palette.line_strong);
+                ui.add_space(4.0);
                 self.render_dock_tab_strip(ui);
                 ui.separator();
                 let active_view: Option<ResolvedHostView> = self
@@ -3372,22 +3651,6 @@ impl CameraApp {
     /// hides the dock body so the central viewport can reclaim the space.
     fn render_dock_tab_strip(&mut self, ui: &mut egui::Ui) {
         let palette = crate::theme::palette_for_visuals(ui.visuals());
-        // Tabs carry an optional plugin tag derived from the resolved
-        // view's provider. Runtime providers map to plugin-manager records;
-        // built-in providers carry a static tag.
-        let tabs: Vec<DockTab> = self
-            .dock_tabs
-            .iter()
-            .filter_map(|id| {
-                self.host_view_registry.view(id).map(|v| DockTab {
-                    id: v.descriptor.id.clone(),
-                    title: v.descriptor.title.clone(),
-                    kind: v.descriptor.kind.clone(),
-                    plugin_tag: self.provider_plugin_tag(v.provider),
-                    dataset_id: v.descriptor.dataset_id.clone(),
-                })
-            })
-            .collect();
         let active = self.dock_active.clone();
         let mut activate: Option<String> = None;
         let mut close: Option<String> = None;
@@ -3397,8 +3660,16 @@ impl CameraApp {
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
-            for tab in &tabs {
-                let is_active = active.as_deref() == Some(tab.id.as_str());
+            for id in &self.dock_tabs {
+                let Some(view) = self.host_view_registry.view(id) else {
+                    continue;
+                };
+                let tab_id = &view.descriptor.id;
+                let tab_title = &view.descriptor.title;
+                let tab_kind = &view.descriptor.kind;
+                let tab_dataset_id = &view.descriptor.dataset_id;
+                let tab_plugin_tag = self.provider_plugin_tag(view.provider);
+                let is_active = active.as_deref() == Some(tab_id.as_str());
                 let label_color = if is_active {
                     palette.fg_0
                 } else {
@@ -3409,7 +3680,7 @@ impl CameraApp {
                 } else {
                     palette.bg_2
                 };
-                egui::Frame::none()
+                let tab_frame = egui::Frame::none()
                     .fill(bg)
                     .rounding(egui::Rounding {
                         nw: crate::theme::radius::R_2,
@@ -3420,14 +3691,15 @@ impl CameraApp {
                     .inner_margin(egui::Margin::symmetric(
                         crate::theme::sp::SP_2,
                         crate::theme::sp::SP_1,
-                    ))
+                    ));
+                let tab_rect = tab_frame
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
-                            let icon = host_view_kind_icon(&tab.kind);
-                            let kind_tag = host_view_kind_tag(&tab.kind);
-                            let label = format!("{icon}  {}", tab.title);
-                            let tooltip = format!("{} \u{00B7} {}", kind_tag, tab.dataset_id);
+                            let icon = host_view_kind_icon(tab_kind);
+                            let kind_tag = host_view_kind_tag(tab_kind);
+                            let label = format!("{icon}  {}", tab_title);
+                            let tooltip = format!("{} \u{00B7} {}", kind_tag, tab_dataset_id);
                             let response = ui
                                 .add(
                                     egui::Label::new(
@@ -3438,10 +3710,10 @@ impl CameraApp {
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .on_hover_text(&tooltip);
                             if response.clicked() {
-                                activate = Some(tab.id.clone());
+                                activate = Some(tab_id.clone());
                             }
                             crate::theme::chip(ui, kind_tag, crate::theme::Tone::Neutral);
-                            if let Some(plugin) = &tab.plugin_tag {
+                            if let Some(plugin) = tab_plugin_tag {
                                 ui.label(
                                     egui::RichText::new(format!("\u{00B7} {plugin}"))
                                         .monospace()
@@ -3454,10 +3726,20 @@ impl CameraApp {
                                 .on_hover_text("Close tab")
                                 .clicked()
                             {
-                                close = Some(tab.id.clone());
+                                close = Some(tab_id.clone());
                             }
                         });
-                    });
+                    })
+                    .response
+                    .rect;
+                // Active tab accent: 2px bottom ink line.
+                if is_active {
+                    let accent_rect = egui::Rect::from_min_size(
+                        egui::pos2(tab_rect.left(), tab_rect.bottom() - 2.0),
+                        egui::vec2(tab_rect.width(), 2.0),
+                    );
+                    ui.painter().rect_filled(accent_rect, 0.0, palette.ink);
+                }
             }
             ui.add_space(crate::theme::sp::SP_2);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3674,9 +3956,9 @@ impl CameraApp {
                     let shared = Arc::new(Mutex::new(TableWindowViewportData {
                         dataset_id: view.descriptor.dataset_id.clone(),
                         generation,
-                        schema: schema.clone(),
+                        schema: Arc::new(schema.clone()),
                         dataset: table_arc,
-                        filtered_rows,
+                        filtered_rows: Arc::new(filtered_rows),
                         table_state,
                         selected_row,
                         hovered_row,
@@ -4333,7 +4615,9 @@ impl CameraApp {
             Err(e) => {
                 self.camera_status = format!("Probe failed: {e}");
                 self.camera_info = None;
-                self.last_error = Some(format!("camera probe failed: {e}"));
+                let msg = format!("camera probe failed: {e}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             }
         }
     }
@@ -4354,8 +4638,13 @@ impl CameraApp {
                 self.acq_dirty = false;
                 self.last_error = None;
                 self.camera_status = "Previewing.".into();
+                self.toast_queue
+                    .push("Preview started", crate::toast::ToastTone::Info);
             }
-            Err(e) => self.last_error = Some(e),
+            Err(e) => {
+                self.last_error = Some(e.clone());
+                self.toast_queue.push(e, crate::toast::ToastTone::Error);
+            }
         }
     }
 
@@ -4378,8 +4667,15 @@ impl CameraApp {
                 self.acq_dirty = false;
                 self.last_error = None;
                 self.camera_status = "Recording in progress.".into();
+                self.toast_queue.push(
+                    format!("Recording started: {}", self.output_path),
+                    crate::toast::ToastTone::Info,
+                );
             }
-            Err(e) => self.last_error = Some(e),
+            Err(e) => {
+                self.last_error = Some(e.clone());
+                self.toast_queue.push(e, crate::toast::ToastTone::Error);
+            }
         }
     }
 
@@ -4479,7 +4775,8 @@ impl CameraApp {
         let opened = match open_result {
             Ok(result) => result,
             Err(err) => {
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
                 return;
             }
         };
@@ -4534,6 +4831,14 @@ impl CameraApp {
         self.config_dirty = false;
         self.acq_dirty = false;
         self.last_error = None;
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.toast_queue.push(
+            format!("Loaded replay: {filename}"),
+            crate::toast::ToastTone::Success,
+        );
         self.camera_status = format!(
             "Replaying {}.",
             path.file_name()
@@ -4553,7 +4858,8 @@ impl CameraApp {
             }
             Ok(Err(err)) => {
                 self.replay_notice = None;
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
                 self.camera_status =
                     "Camera idle. Current local settings will be used for the next recording."
                         .into();
@@ -4562,8 +4868,10 @@ impl CameraApp {
                 self.replay_open_task = Some(task);
             }
             Err(mpsc::TryRecvError::Disconnected) => {
+                let msg = "replay open worker disconnected unexpectedly".to_owned();
                 self.replay_notice = None;
-                self.last_error = Some("replay open worker disconnected unexpectedly".into());
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
                 self.camera_status =
                     "Camera idle. Current local settings will be used for the next recording."
                         .into();
@@ -4594,11 +4902,15 @@ impl CameraApp {
 
     fn open_tiff_stack_export_dialog(&mut self) {
         let Some(path) = self.replay_path.as_ref().map(PathBuf::from) else {
-            self.last_error = Some("replay path is missing".into());
+            let msg = "replay path is missing".to_owned();
+            self.last_error = Some(msg.clone());
+            self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             return;
         };
         let Some(info) = self.replay_file_info.as_ref() else {
-            self.last_error = Some("replay file metadata is missing".into());
+            let msg = "replay file metadata is missing".to_owned();
+            self.last_error = Some(msg.clone());
+            self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             return;
         };
 
@@ -4615,7 +4927,8 @@ impl CameraApp {
             Ok(source) => source,
             Err(err) => {
                 self.export_dialog.finish_error(err.clone());
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
                 return;
             }
         };
@@ -4642,10 +4955,18 @@ impl CameraApp {
                 self.export_dialog
                     .finish_success(frame_count, &task.output_path);
                 self.last_error = None;
+                self.toast_queue.push(
+                    format!(
+                        "Exported {frame_count} frame(s) to {}",
+                        task.output_path.display()
+                    ),
+                    crate::toast::ToastTone::Success,
+                );
             }
             Ok(Err(err)) => {
                 self.export_dialog.finish_error(err.clone());
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.export_task = Some(task);
@@ -4841,7 +5162,9 @@ impl CameraApp {
             return;
         };
         if let Err(err) = self.render_preview_texture_from_frame(ctx, &frame) {
-            self.last_error = Some(format!("preview render failed: {err}"));
+            let msg = format!("preview render failed: {err}");
+            self.last_error = Some(msg.clone());
+            self.toast_queue.push(msg, crate::toast::ToastTone::Error);
         }
     }
 
@@ -5196,7 +5519,9 @@ impl CameraApp {
         if let Some(controller) = self.controller.take() {
             self.event_store.detach_upstream();
             if let Err(e) = controller.shutdown() {
-                self.last_error = Some(format!("pipeline shutdown failed: {e}"));
+                let msg = format!("pipeline shutdown failed: {e}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             }
         }
         if was_replaying {
@@ -5220,13 +5545,17 @@ impl CameraApp {
         self.mode = AppMode::Idle;
         self.camera_status =
             "Camera idle. Current local settings will be used for the next recording.".into();
+        self.toast_queue
+            .push("Stopped", crate::toast::ToastTone::Info);
     }
 
     fn finish_replay(&mut self) {
         if let Some(controller) = self.controller.take() {
             self.event_store.detach_upstream();
             if let Err(err) = controller.shutdown() {
-                self.last_error = Some(format!("pipeline shutdown failed: {err}"));
+                let msg = format!("pipeline shutdown failed: {err}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             }
         }
 
@@ -5244,6 +5573,8 @@ impl CameraApp {
         self.replay_pending_fraction = None;
         if self.last_error.is_none() {
             self.camera_status = "Replay finished.".into();
+            self.toast_queue
+                .push("Replay finished", crate::toast::ToastTone::Info);
         }
     }
 
@@ -5253,7 +5584,8 @@ impl CameraApp {
             .as_ref()
             .and_then(|ctrl| ctrl.try_recv_error());
         if let Some(err) = maybe_error {
-            self.last_error = Some(err);
+            self.last_error = Some(err.clone());
+            self.toast_queue.push(err, crate::toast::ToastTone::Error);
             self.stop_pipeline();
             return;
         }
@@ -5293,11 +5625,15 @@ impl CameraApp {
 
         if self.config_dirty {
             if let Err(e) = self.config.validate(self.sensor_width, self.sensor_height) {
-                self.last_error = Some(format!("settings invalid: {e}"));
+                let msg = format!("settings invalid: {e}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
                 return;
             }
             if let Err(e) = ctrl.settings_tx.try_send(self.config.clone()) {
-                self.last_error = Some(format!("failed sending runtime settings: {e}"));
+                let msg = format!("failed sending runtime settings: {e}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
                 return;
             }
             self.config_dirty = false;
@@ -5309,6 +5645,8 @@ impl CameraApp {
         }
 
         self.last_error = None;
+        self.toast_queue
+            .push("Settings applied", crate::toast::ToastTone::Success);
     }
 
     fn publish_pending_action_requests(&mut self) {
@@ -5616,13 +5954,16 @@ impl CameraApp {
             None
         };
         if let Some(err) = external_tool_error {
-            self.last_error = Some(err);
+            self.last_error = Some(err.clone());
+            self.toast_queue.push(err, crate::toast::ToastTone::Error);
             self.disconnect_external_tool();
         }
 
         if needs_texture {
             if let Err(err) = self.render_preview_texture_from_frame(ctx, &frame) {
-                self.last_error = Some(format!("preview render failed: {err}"));
+                let msg = format!("preview render failed: {err}");
+                self.last_error = Some(msg.clone());
+                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             }
         }
         if self.mode == AppMode::Replaying {
@@ -5738,6 +6079,10 @@ impl CameraApp {
         let detected = self.latest_detected_hotpixels();
         if detected.is_empty() {
             self.analysis_notice = Some("No detected hotpixels are available to copy.".into());
+            self.toast_queue.push(
+                "No hotpixels available to copy",
+                crate::toast::ToastTone::Warn,
+            );
             return;
         }
 
@@ -5762,9 +6107,11 @@ impl CameraApp {
             self.config_dirty = self.controller.is_some();
         }
 
-        self.analysis_notice = Some(format!(
+        let msg = format!(
             "Mask copy: added {added}, duplicates {duplicates}, skipped by DEM limit {capacity_skipped}."
-        ));
+        );
+        self.analysis_notice = Some(msg.clone());
+        self.toast_queue.push(msg, crate::toast::ToastTone::Success);
     }
 }
 
@@ -5891,7 +6238,14 @@ impl eframe::App for CameraApp {
                             .save_file()
                         {
                             if let Err(e) = self.config.save_to_path(&path) {
-                                self.last_error = Some(format!("save config failed: {e}"));
+                                let msg = format!("save config failed: {e}");
+                                self.last_error = Some(msg.clone());
+                                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
+                            } else {
+                                self.toast_queue.push(
+                                    format!("Config saved to {}", path.display()),
+                                    crate::toast::ToastTone::Success,
+                                );
                             }
                         }
                         ui.close_menu();
@@ -5922,9 +6276,15 @@ impl eframe::App for CameraApp {
                                     self.config_dirty = false;
                                     self.acq_dirty = false;
                                     self.last_error = None;
+                                    self.toast_queue.push(
+                                        format!("Config loaded from {}", path.display()),
+                                        crate::toast::ToastTone::Success,
+                                    );
                                 }
                                 Err(e) => {
-                                    self.last_error = Some(format!("load config failed: {e}"));
+                                    let msg = format!("load config failed: {e}");
+                                    self.last_error = Some(msg.clone());
+                                    self.toast_queue.push(msg, crate::toast::ToastTone::Error);
                                 }
                             }
                         }
@@ -6315,16 +6675,17 @@ impl eframe::App for CameraApp {
                     }
                     ui.separator();
                     let mut layout = self.active_investigation_layout();
-                    for candidate in [
-                        InvestigationLayout::Preview2dOnly,
-                        InvestigationLayout::Split2d3d,
-                        InvestigationLayout::Inspection3dOnly,
-                    ] {
+                    let layout_items = [
+                        (InvestigationLayout::Preview2dOnly, "1 · 2D only", "1"),
+                        (InvestigationLayout::Split2d3d, "2 · Split 2D + 3D", "2"),
+                        (InvestigationLayout::Inspection3dOnly, "3 · 3D only", "3"),
+                    ];
+                    for (candidate, label, _kbd) in layout_items {
                         let enabled = self.investigation_renderer.is_wgpu()
                             || candidate == InvestigationLayout::Preview2dOnly;
                         let response = ui.add_enabled(
                             enabled,
-                            egui::RadioButton::new(layout == candidate, candidate.label()),
+                            egui::RadioButton::new(layout == candidate, label),
                         );
                         if response.clicked() {
                             layout = candidate;
@@ -6349,7 +6710,7 @@ impl eframe::App for CameraApp {
                             }
                         }
                         None => {
-                            if ui.button("Listen for Python Events...").clicked() {
+                            if ui.button("Listen for Python Events…").clicked() {
                                 self.start_python_ingress_listener(ctx);
                                 ui.close_menu();
                             }
@@ -6358,13 +6719,13 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     match self.external_tool_status() {
                         ExternalToolStatus::Streaming | ExternalToolStatus::Connecting => {
-                            if ui.button("Disconnect ImageJ").clicked() {
+                            if ui.button("Disconnect ImageJ bridge").clicked() {
                                 disconnect_external_tool_requested = true;
                                 ui.close_menu();
                             }
                         }
                         _ => {
-                            if ui.button("Stream to ImageJ...").clicked() {
+                            if ui.button("Connect to ImageJ / Fiji…").clicked() {
                                 self.imagej_dialog.open = true;
                                 ui.close_menu();
                             }
@@ -6375,11 +6736,7 @@ impl eframe::App for CameraApp {
                 // ── Plugins ───────────────────────────────────────────────────
                 ui.menu_button("Plugins", |ui| {
                     if ui
-                        .button(if self.plugins_window_open {
-                            "Hide Plugin Manager"
-                        } else {
-                            "Show Plugin Manager"
-                        })
+                        .button("Plugin Manager…")
                         .clicked()
                     {
                         self.plugins_window_open = !self.plugins_window_open;
@@ -6476,10 +6833,14 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     let external_status = self.external_tool_status();
                     if !matches!(external_status, ExternalToolStatus::Disconnected) {
+                        let bridge_tone = match external_status {
+                            ExternalToolStatus::Streaming => crate::theme::Tone::Success,
+                            _ => crate::theme::Tone::Info,
+                        };
                         crate::theme::chip(
                             ui,
                             &format!("ImageJ: {}", external_status.label()),
-                            crate::theme::Tone::Info,
+                            bridge_tone,
                         );
                         ui.separator();
                     }
@@ -6522,14 +6883,23 @@ impl eframe::App for CameraApp {
                     self.last_error = None;
                     self.reset_analysis();
                     analysis_toggle_changed = true;
+                    let count = self.plugin_manager.records().len();
+                    self.toast_queue.push(
+                        format!("Scanned {count} plugin(s)"),
+                        crate::toast::ToastTone::Success,
+                    );
                 }
-                Err(err) => self.last_error = Some(err),
+                Err(err) => {
+                    self.last_error = Some(err.clone());
+                    self.toast_queue.push(err, crate::toast::ToastTone::Error);
+                }
             }
         }
 
         if open_plugins_dir_requested {
             if let Err(err) = self.plugin_manager.open_plugins_dir() {
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
             }
         }
 
@@ -6579,43 +6949,35 @@ impl eframe::App for CameraApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if mode != AppMode::Replaying {
-                                ui.checkbox(
-                                    &mut self.lock_settings_while_recording,
-                                    "Lock settings while recording",
-                                );
-                            }
-
+                            // Mode note banner — styled as panel-note.
                             match mode {
+                                AppMode::Replaying => {
+                                    ui.vertical(|ui| {
+                                        ui.small("Replay mode — camera controls shown as read-only reference.");
+                                        if let Some(notice) = &self.replay_notice {
+                                            ui.colored_label(ui.visuals().warn_fg_color, notice);
+                                        }
+                                    });
+                                    ui.separator();
+                                }
                                 AppMode::Recording if settings_locked => {
-                                    ui.label("Recording: settings are locked.");
+                                    ui.small("Recording: settings are locked.");
+                                    ui.separator();
                                 }
                                 AppMode::Recording => {
-                                    ui.label(
-                                        "Recording: edits stay local until you click Apply Settings.",
-                                    );
+                                    ui.small("Recording: edits stay local until you click Apply Settings.");
+                                    ui.separator();
                                 }
                                 AppMode::Previewing => {
-                                    ui.label(
-                                        "Previewing: edits stay local until you click Apply Settings.",
-                                    );
-                                }
-                                AppMode::Replaying => {
-                                    ui.label(
-                                        "Replay mode: camera settings are shown as read-only reference data.",
-                                    );
-                                    if let Some(notice) = &self.replay_notice {
-                                        ui.colored_label(ui.visuals().warn_fg_color, notice);
-                                    }
+                                    ui.small("Previewing: edits stay local until you click Apply Settings.");
+                                    ui.separator();
                                 }
                                 AppMode::Idle => {
-                                    ui.label(
-                                        "Idle: edits change the local config for the next recording.",
-                                    );
+                                    ui.small("Idle: edits change the local config for the next recording.");
+                                    ui.separator();
                                 }
                             }
 
-                            ui.separator();
                             ui.add_enabled_ui(!settings_locked, |ui| {
                                 let changed = draw_settings(
                                     ui,
@@ -6631,6 +6993,26 @@ impl eframe::App for CameraApp {
                                 }
                             });
                         });
+
+                    // Panel footer — only when not replaying.
+                    if mode != AppMode::Replaying {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(crate::theme::primary_button("Apply Settings"))
+                                .on_hover_text("Apply current settings to the camera")
+                                .clicked()
+                            {
+                                self.apply_runtime_changes();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.checkbox(
+                                &mut self.lock_settings_while_recording,
+                                "Lock settings while recording",
+                            );
+                        });
+                    }
                 });
         } else {
             egui::SidePanel::left("settings-collapsed")
@@ -7685,6 +8067,8 @@ impl eframe::App for CameraApp {
             self.replay_pause_after_seek_frame,
         );
         let process_interval = self.active_preview_process_interval();
+        self.toast_queue.show(ctx);
+
         if self.replay_open_task.is_some() || self.python_ingress.is_some() {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
@@ -7731,16 +8115,6 @@ fn host_view_kind_tag(kind: &augur_plugin_api::HostViewKind) -> &'static str {
         HostViewKind::ImageWindow => "image",
         HostViewKind::LineSeriesWindow => "line",
     }
-}
-
-/// Resolved metadata for a single dock tab — built once per frame from
-/// the host-view registry so the strip render path stays light.
-struct DockTab {
-    id: String,
-    title: String,
-    kind: augur_plugin_api::HostViewKind,
-    plugin_tag: Option<String>,
-    dataset_id: String,
 }
 
 /// Load the bundled owl brand mark from `assets/logo.png`. Returns `None`
@@ -7957,6 +8331,42 @@ fn python_ingress_pipeline_config(
     config
 }
 
+fn python_ingress_dataset_label(info: &PythonIngressDatasetInfo) -> String {
+    info.name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "NumPy event stream".into())
+}
+
+fn python_ingress_replay_info(
+    info: &PythonIngressDatasetInfo,
+    events: &[CdEvent],
+) -> ReplayFileInfo {
+    let first_timestamp_us = events
+        .first()
+        .map(|event| event.timestamp)
+        .unwrap_or(info.timestamp_start_us);
+    let last_timestamp_us = events
+        .last()
+        .map(|event| event.timestamp)
+        .unwrap_or(first_timestamp_us);
+    let total_bytes = events.len() as u64 * PACKED_EVENT_RECORD_BYTES as u64;
+    let total_duration_us = last_timestamp_us.saturating_sub(first_timestamp_us);
+    let nominal_bytes_per_sec = (total_duration_us > 0)
+        .then_some(total_bytes as f64 / (total_duration_us as f64 / 1_000_000.0));
+
+    ReplayFileInfo {
+        file_size: total_bytes,
+        data_offset: 0,
+        width: info.width,
+        height: info.height,
+        metadata: RecordingMetadata::default(),
+        total_duration_us,
+        first_timestamp_us,
+        nominal_bytes_per_sec,
+    }
+}
+
 fn replay_file_extension(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -8159,11 +8569,12 @@ mod tests {
     use super::{
         acq_time_us_from_ms, clipped_ui_width, derived_replay_preview_interval_ms,
         investigation_split_ratio_bounds, pipeline_stream_active, python_ingress_pipeline_config,
-        raw_event_focus_volume, raw_event_point_position, replay_fraction_from_time,
-        replay_history_has_display_override, replay_history_step_target, replay_pipeline_config,
-        replay_seek_target_reached, replay_snapshot_frame, replay_step_target_time_us,
-        replay_step_uses_current_controller, replay_time_from_position_sources,
-        roi_is_effectively_full_frame, sync_acq_time_atomic, viewport_stream_active,
+        python_ingress_replay_info, raw_event_focus_volume, raw_event_point_position,
+        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
+        replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
+        replay_step_target_time_us, replay_step_uses_current_controller,
+        replay_time_from_position_sources, roi_is_effectively_full_frame, sync_acq_time_atomic,
+        viewport_stream_active,
     };
     use std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -8179,6 +8590,7 @@ mod tests {
         metadata::RecordingMetadata,
         pipeline::{CdEvent, LiveEventSource, PreviewFrame},
         replay::ReplayFileInfo,
+        PACKED_EVENT_RECORD_BYTES,
     };
 
     #[test]
@@ -8418,6 +8830,40 @@ mod tests {
         assert_eq!(config.global.sensor_height, 240);
         assert_eq!(config.global.acq_time_ms, 25);
         assert_eq!(config.global.nm_per_pixel, 42.0);
+    }
+
+    #[test]
+    fn python_ingress_replay_info_uses_actual_event_timestamps() {
+        let info = PythonIngressDatasetInfo {
+            name: Some("python".into()),
+            width: 320,
+            height: 240,
+            event_count: 2,
+            timestamp_start_us: 1,
+            timestamp_end_us: 999,
+        };
+        let events = vec![
+            CdEvent {
+                x: 1,
+                y: 2,
+                timestamp: 100,
+                polarity: true,
+            },
+            CdEvent {
+                x: 3,
+                y: 4,
+                timestamp: 400,
+                polarity: false,
+            },
+        ];
+
+        let replay = python_ingress_replay_info(&info, &events);
+
+        assert_eq!(replay.width, 320);
+        assert_eq!(replay.height, 240);
+        assert_eq!(replay.first_timestamp_us, 100);
+        assert_eq!(replay.total_duration_us, 300);
+        assert_eq!(replay.data_len(), 2 * PACKED_EVENT_RECORD_BYTES as u64);
     }
 
     #[test]

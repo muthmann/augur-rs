@@ -107,7 +107,7 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
-        assert_eq!(PLUGIN_ABI_VERSION, 1);
+        assert_eq!(PLUGIN_ABI_VERSION, 3);
     }
 
     #[test]

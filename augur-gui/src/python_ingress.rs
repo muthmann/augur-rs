@@ -9,12 +9,7 @@ use std::{
     time::Duration,
 };
 
-use augur_core::{
-    camera::{DeviceInfo, EventCamera, PacketStreamCamera},
-    config::CameraConfig,
-    CameraError, Result,
-};
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender};
+use augur_core::pipeline::CdEvent;
 use eframe::egui;
 use serde_json::{json, Value};
 
@@ -23,11 +18,9 @@ pub const PYTHON_INGRESS_PROTOCOL_VERSION: u64 = 1;
 pub const PACKED_XYPT_RECORD_BYTES: usize = 14;
 pub const MAX_CHUNK_EVENTS: usize = 1_048_576;
 
-const PACKET_QUEUE_CAPACITY: usize = 8;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STREAM_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const START_ACK_TIMEOUT: Duration = Duration::from_secs(30);
-const CAMERA_RECV_TIMEOUT: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PythonIngressStatus {
@@ -58,7 +51,12 @@ pub struct PythonIngressDatasetInfo {
 
 pub struct PythonIngressStartRequest {
     pub info: PythonIngressDatasetInfo,
-    pub camera: PythonIngressCamera,
+    pub(crate) reply_tx: mpsc::Sender<std::result::Result<(), String>>,
+}
+
+pub struct PythonIngressDatasetRequest {
+    pub info: PythonIngressDatasetInfo,
+    pub events: Vec<CdEvent>,
     pub(crate) reply_tx: mpsc::Sender<std::result::Result<(), String>>,
 }
 
@@ -66,7 +64,8 @@ pub struct PythonIngressServer {
     port: u16,
     status: Arc<Mutex<PythonIngressStatus>>,
     stop: Arc<AtomicBool>,
-    request_rx: mpsc::Receiver<PythonIngressStartRequest>,
+    start_rx: mpsc::Receiver<PythonIngressStartRequest>,
+    dataset_rx: mpsc::Receiver<PythonIngressDatasetRequest>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -84,18 +83,27 @@ impl PythonIngressServer {
 
         let status = Arc::new(Mutex::new(PythonIngressStatus::Listening { port }));
         let stop = Arc::new(AtomicBool::new(false));
-        let (request_tx, request_rx) = mpsc::channel();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (dataset_tx, dataset_rx) = mpsc::channel();
         let worker_status = Arc::clone(&status);
         let worker_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            run_listener(listener, request_tx, worker_status, worker_stop, ctx);
+            run_listener(
+                listener,
+                start_tx,
+                dataset_tx,
+                worker_status,
+                worker_stop,
+                ctx,
+            );
         });
 
         Ok(Self {
             port,
             status,
             stop,
-            request_rx,
+            start_rx,
+            dataset_rx,
             handle: Some(handle),
         })
     }
@@ -111,8 +119,12 @@ impl PythonIngressServer {
             .unwrap_or_else(|_| PythonIngressStatus::Error("status lock poisoned".into()))
     }
 
-    pub fn try_recv_request(&self) -> Option<PythonIngressStartRequest> {
-        self.request_rx.try_recv().ok()
+    pub fn try_recv_start_request(&self) -> Option<PythonIngressStartRequest> {
+        self.start_rx.try_recv().ok()
+    }
+
+    pub fn try_recv_dataset_request(&self) -> Option<PythonIngressDatasetRequest> {
+        self.dataset_rx.try_recv().ok()
     }
 
     pub fn stop(&mut self) {
@@ -129,94 +141,10 @@ impl Drop for PythonIngressServer {
     }
 }
 
-pub struct PythonIngressCamera {
-    rx: Receiver<Vec<u8>>,
-    current: Vec<u8>,
-    offset: usize,
-    stopped: Arc<AtomicBool>,
-    info: PythonIngressDatasetInfo,
-}
-
-impl PythonIngressCamera {
-    fn new(
-        rx: Receiver<Vec<u8>>,
-        stopped: Arc<AtomicBool>,
-        info: PythonIngressDatasetInfo,
-    ) -> Self {
-        Self {
-            rx,
-            current: Vec::new(),
-            offset: 0,
-            stopped,
-            info,
-        }
-    }
-}
-
-impl EventCamera for PythonIngressCamera {
-    fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
-        Ok(())
-    }
-
-    fn start_streaming(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn stop_streaming(&mut self) -> Result<()> {
-        self.stopped.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn device_info(&self) -> DeviceInfo {
-        DeviceInfo {
-            vendor: "Python".into(),
-            model: self
-                .info
-                .name
-                .clone()
-                .unwrap_or_else(|| "NumPy event ingress".into()),
-            serial: None,
-            firmware: None,
-            compatible: Some("packed_xypt_v1".into()),
-        }
-    }
-}
-
-impl PacketStreamCamera for PythonIngressCamera {
-    fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        while self.offset >= self.current.len() {
-            if self.stopped.load(Ordering::Relaxed) {
-                return Err(CameraError::Eof);
-            }
-            match self.rx.recv_timeout(CAMERA_RECV_TIMEOUT) {
-                Ok(packet) => {
-                    self.current = packet;
-                    self.offset = 0;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(CameraError::Timeout(
-                        "waiting for Python ingress event batch".into(),
-                    ));
-                }
-                Err(RecvTimeoutError::Disconnected) => return Err(CameraError::Eof),
-            }
-        }
-
-        let remaining = self.current.len() - self.offset;
-        let copied = remaining.min(buf.len());
-        buf[..copied].copy_from_slice(&self.current[self.offset..self.offset + copied]);
-        self.offset += copied;
-        Ok(copied)
-    }
-}
-
 fn run_listener(
     listener: TcpListener,
-    request_tx: mpsc::Sender<PythonIngressStartRequest>,
+    start_tx: mpsc::Sender<PythonIngressStartRequest>,
+    dataset_tx: mpsc::Sender<PythonIngressDatasetRequest>,
     status: Arc<Mutex<PythonIngressStatus>>,
     stop: Arc<AtomicBool>,
     ctx: egui::Context,
@@ -231,7 +159,9 @@ fn run_listener(
                     },
                 );
                 ctx.request_repaint();
-                if let Err(err) = handle_connection(stream, &request_tx, &status, &stop, &ctx) {
+                if let Err(err) =
+                    handle_connection(stream, &start_tx, &dataset_tx, &status, &stop, &ctx)
+                {
                     set_status(&status, PythonIngressStatus::Error(err));
                     ctx.request_repaint();
                 }
@@ -258,7 +188,8 @@ fn run_listener(
 
 fn handle_connection(
     mut stream: TcpStream,
-    request_tx: &mpsc::Sender<PythonIngressStartRequest>,
+    start_tx: &mpsc::Sender<PythonIngressStartRequest>,
+    dataset_tx: &mpsc::Sender<PythonIngressDatasetRequest>,
     status: &Arc<Mutex<PythonIngressStatus>>,
     stop: &Arc<AtomicBool>,
     ctx: &egui::Context,
@@ -305,20 +236,16 @@ fn handle_connection(
         };
         require_type(&start, "start_events")?;
         let info = parse_dataset_info(&start)?;
-        let (packet_tx, packet_rx) = bounded(PACKET_QUEUE_CAPACITY);
-        let stream_stopped = Arc::new(AtomicBool::new(false));
-        let camera = PythonIngressCamera::new(packet_rx, Arc::clone(&stream_stopped), info.clone());
         let (reply_tx, reply_rx) = mpsc::channel();
-        request_tx
+        start_tx
             .send(PythonIngressStartRequest {
-                info,
-                camera,
+                info: info.clone(),
                 reply_tx,
             })
             .map_err(|_| "GUI is no longer accepting Python ingress streams".to_owned())?;
         ctx.request_repaint();
 
-        match wait_for_start_reply(&reply_rx, stop) {
+        match wait_for_gui_reply(&reply_rx, stop) {
             Ok(Ok(())) => write_json(&mut stream, &json!({"type": "start_ok"}))?,
             Ok(Err(message)) => {
                 write_json(
@@ -340,7 +267,38 @@ fn handle_connection(
             }
         }
 
-        receive_batches(&mut reader, &mut stream, packet_tx, &stream_stopped, stop)?;
+        let events = receive_batches(&info, &mut reader, &mut stream, stop)?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        dataset_tx
+            .send(PythonIngressDatasetRequest {
+                info,
+                events,
+                reply_tx,
+            })
+            .map_err(|_| "GUI is no longer accepting Python ingress datasets".to_owned())?;
+        ctx.request_repaint();
+
+        match wait_for_gui_reply(&reply_rx, stop) {
+            Ok(Ok(())) => write_json(&mut stream, &json!({"type": "finish_ok"}))?,
+            Ok(Err(message)) => {
+                write_json(
+                    &mut stream,
+                    &json!({"type": "error", "code": "dataset_rejected", "message": message}),
+                )?;
+                continue;
+            }
+            Err(_) => {
+                write_json(
+                    &mut stream,
+                    &json!({
+                        "type": "error",
+                        "code": "dataset_timeout",
+                        "message": "Augur did not open the Python dataset in time",
+                    }),
+                )?;
+                continue;
+            }
+        }
         set_status(
             status,
             PythonIngressStatus::Connected {
@@ -357,70 +315,86 @@ fn handle_connection(
 }
 
 fn receive_batches(
+    info: &PythonIngressDatasetInfo,
     reader: &mut BufReader<TcpStream>,
     writer: &mut TcpStream,
-    packet_tx: Sender<Vec<u8>>,
-    stream_stopped: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Vec<CdEvent>, String> {
+    let capacity = usize::try_from(info.event_count)
+        .unwrap_or(usize::MAX)
+        .min(MAX_CHUNK_EVENTS);
+    let mut events = Vec::with_capacity(capacity);
     while !stop.load(Ordering::Relaxed) {
         let Some(message) = read_json_line(reader, stop)? else {
-            return Ok(());
+            return Err("client closed before finish_events".to_owned());
         };
         match message.get("type").and_then(Value::as_str) {
             Some("finish_events") => {
-                drop(packet_tx);
-                write_json(writer, &json!({"type": "finish_ok"}))?;
-                return Ok(());
-            }
-            Some("event_batch") => {
-                let events = required_u64(&message, "events")?;
-                if events as usize > MAX_CHUNK_EVENTS {
+                if u64::try_from(events.len()).unwrap_or(u64::MAX) != info.event_count {
                     return send_protocol_error(
                         writer,
+                        "event_count_mismatch",
+                        format!(
+                            "received {} events, expected {}",
+                            events.len(),
+                            info.event_count
+                        ),
+                    )
+                    .and_then(|()| Err("Python ingress event count mismatch".to_owned()));
+                }
+                return Ok(events);
+            }
+            Some("event_batch") => {
+                let batch_events = required_u64(&message, "events")?;
+                if batch_events as usize > MAX_CHUNK_EVENTS {
+                    send_protocol_error(
+                        writer,
                         "chunk_too_large",
-                        format!("batch has {events} events; max is {MAX_CHUNK_EVENTS}"),
-                    );
+                        format!("batch has {batch_events} events; max is {MAX_CHUNK_EVENTS}"),
+                    )?;
+                    return Err("Python ingress batch exceeds maximum chunk size".to_owned());
                 }
                 let bytes = required_u64(&message, "bytes")?;
-                let expected_bytes = events
+                let expected_bytes = batch_events
                     .checked_mul(PACKED_XYPT_RECORD_BYTES as u64)
                     .ok_or_else(|| "event batch byte count overflow".to_owned())?;
                 if bytes != expected_bytes {
-                    return send_protocol_error(
+                    send_protocol_error(
                         writer,
                         "invalid_batch_size",
                         format!("batch declares {bytes} bytes, expected {expected_bytes}"),
-                    );
+                    )?;
+                    return Err("Python ingress batch byte size mismatch".to_owned());
                 }
                 let bytes = usize::try_from(bytes)
                     .map_err(|_| "batch byte count does not fit this platform".to_owned())?;
                 let mut payload = vec![0_u8; bytes];
                 read_exact_timeout(reader, &mut payload, stop)?;
-                send_packet(&packet_tx, payload, stream_stopped, stop)?;
-                write_json(writer, &json!({"type": "batch_ok", "events": events}))?;
+                if let Err(err) = append_packed_events(info, &payload, &mut events) {
+                    send_protocol_error(writer, "invalid_event_data", err.clone())?;
+                    return Err(err);
+                }
+                write_json(writer, &json!({"type": "batch_ok", "events": batch_events}))?;
             }
             Some(other) => {
-                return send_protocol_error(
+                send_protocol_error(
                     writer,
                     "unexpected_message",
                     format!("expected event_batch or finish_events, got {other}"),
-                );
+                )?;
+                return Err(format!("unexpected Python ingress message {other}"));
             }
             None => {
-                return send_protocol_error(
-                    writer,
-                    "missing_type",
-                    "message is missing a type field",
-                );
+                send_protocol_error(writer, "missing_type", "message is missing a type field")?;
+                return Err("Python ingress message is missing a type field".to_owned());
             }
         }
     }
 
-    Ok(())
+    Ok(events)
 }
 
-fn wait_for_start_reply(
+fn wait_for_gui_reply(
     reply_rx: &mpsc::Receiver<std::result::Result<(), String>>,
     stop: &AtomicBool,
 ) -> std::result::Result<std::result::Result<(), String>, mpsc::RecvTimeoutError> {
@@ -436,29 +410,6 @@ fn wait_for_start_reply(
         }
     }
     Err(mpsc::RecvTimeoutError::Disconnected)
-}
-
-fn send_packet(
-    packet_tx: &Sender<Vec<u8>>,
-    mut payload: Vec<u8>,
-    stream_stopped: &AtomicBool,
-    stop: &AtomicBool,
-) -> std::result::Result<(), String> {
-    loop {
-        if stop.load(Ordering::Relaxed) || stream_stopped.load(Ordering::Relaxed) {
-            return Err("pipeline stopped before receiving the batch".to_owned());
-        }
-
-        match packet_tx.send_timeout(payload, STREAM_READ_TIMEOUT) {
-            Ok(()) => return Ok(()),
-            Err(SendTimeoutError::Timeout(returned_payload)) => {
-                payload = returned_payload;
-            }
-            Err(SendTimeoutError::Disconnected(_)) => {
-                return Err("pipeline stopped before receiving the batch".to_owned());
-            }
-        }
-    }
 }
 
 fn parse_dataset_info(message: &Value) -> std::result::Result<PythonIngressDatasetInfo, String> {
@@ -512,6 +463,48 @@ fn parse_dataset_info(message: &Value) -> std::result::Result<PythonIngressDatas
         timestamp_start_us: required_u64(message, "timestamp_start_us")?,
         timestamp_end_us: required_u64(message, "timestamp_end_us")?,
     })
+}
+
+fn append_packed_events(
+    info: &PythonIngressDatasetInfo,
+    payload: &[u8],
+    out: &mut Vec<CdEvent>,
+) -> std::result::Result<(), String> {
+    let remaining_events = info
+        .event_count
+        .saturating_sub(u64::try_from(out.len()).unwrap_or(u64::MAX));
+    let payload_events = payload.len() / PACKED_XYPT_RECORD_BYTES;
+    if u64::try_from(payload_events).unwrap_or(u64::MAX) > remaining_events {
+        return Err(format!(
+            "received more events than start_events declared: {} + {payload_events} > {}",
+            out.len(),
+            info.event_count
+        ));
+    }
+
+    out.reserve(payload_events);
+    for chunk in payload.chunks_exact(PACKED_XYPT_RECORD_BYTES) {
+        let event = decode_packed_xypt_event(chunk);
+        if event.x >= info.width || event.y >= info.height {
+            return Err(format!(
+                "event coordinate ({}, {}) exceeds published geometry {}x{}",
+                event.x, event.y, info.width, info.height
+            ));
+        }
+        out.push(event);
+    }
+    Ok(())
+}
+
+fn decode_packed_xypt_event(bytes: &[u8]) -> CdEvent {
+    CdEvent {
+        x: u16::from_le_bytes([bytes[0], bytes[1]]),
+        y: u16::from_le_bytes([bytes[2], bytes[3]]),
+        polarity: bytes[4] != 0,
+        timestamp: u64::from_le_bytes([
+            bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+        ]),
+    }
 }
 
 fn read_json_line(
@@ -641,33 +634,54 @@ mod tests {
         serde_json::from_str(&line).expect("test JSON decodes")
     }
 
+    fn packed_event(
+        x: u16,
+        y: u16,
+        polarity: u8,
+        timestamp: u64,
+    ) -> [u8; PACKED_XYPT_RECORD_BYTES] {
+        let mut out = [0_u8; PACKED_XYPT_RECORD_BYTES];
+        out[..2].copy_from_slice(&x.to_le_bytes());
+        out[2..4].copy_from_slice(&y.to_le_bytes());
+        out[4] = polarity;
+        out[6..14].copy_from_slice(&timestamp.to_le_bytes());
+        out
+    }
+
     #[test]
-    fn camera_reads_batches_in_buffer_sized_chunks() {
-        let (tx, rx) = bounded(1);
+    fn append_packed_events_decodes_xypt_records() {
         let info = PythonIngressDatasetInfo {
             name: Some("unit".into()),
-            width: 2,
-            height: 2,
+            width: 8,
+            height: 6,
             event_count: 2,
-            timestamp_start_us: 1,
-            timestamp_end_us: 2,
+            timestamp_start_us: 10,
+            timestamp_end_us: 20,
         };
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut camera = PythonIngressCamera::new(rx, stop, info);
-        tx.send((0_u8..28).collect()).expect("send test payload");
-        drop(tx);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&packed_event(1, 2, 0, 10));
+        payload.extend_from_slice(&packed_event(7, 5, 1, 20));
+        let mut events = Vec::new();
 
-        let mut first = [0_u8; 10];
-        let mut second = [0_u8; 32];
+        append_packed_events(&info, &payload, &mut events).expect("payload decodes");
 
-        assert_eq!(camera.read_packet(&mut first).expect("first read"), 10);
-        assert_eq!(&first, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(camera.read_packet(&mut second).expect("second read"), 18);
-        assert_eq!(&second[..18], &(10_u8..28).collect::<Vec<_>>());
-        assert!(matches!(
-            camera.read_packet(&mut second),
-            Err(CameraError::Eof)
-        ));
+        assert_eq!(
+            events,
+            vec![
+                CdEvent {
+                    x: 1,
+                    y: 2,
+                    timestamp: 10,
+                    polarity: false,
+                },
+                CdEvent {
+                    x: 7,
+                    y: 5,
+                    timestamp: 20,
+                    polarity: true,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -748,7 +762,7 @@ mod tests {
         let request = {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                if let Some(request) = server.try_recv_request() {
+                if let Some(request) = server.try_recv_start_request() {
                     break request;
                 }
                 assert!(
@@ -758,17 +772,15 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
         };
-        let PythonIngressStartRequest {
-            info,
-            mut camera,
-            reply_tx,
-        } = request;
+        let PythonIngressStartRequest { info, reply_tx } = request;
         assert_eq!(info.name.as_deref(), Some("unit-test"));
         assert_eq!((info.width, info.height), (8, 6));
         reply_tx.send(Ok(())).expect("ack start");
         assert_eq!(read_json_test(&mut reader)["type"], "start_ok");
 
-        let payload: Vec<u8> = (0_u8..28).collect();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&packed_event(1, 2, 0, 10));
+        payload.extend_from_slice(&packed_event(7, 5, 1, 20));
         write_json_test(
             &mut stream,
             json!({"type": "event_batch", "events": 2, "bytes": payload.len()}),
@@ -778,14 +790,44 @@ mod tests {
         assert_eq!(batch_ok["type"], "batch_ok");
         assert_eq!(batch_ok["events"], 2);
 
-        let mut buf = [0_u8; 28];
-        assert_eq!(
-            camera.read_packet(&mut buf).expect("camera receives batch"),
-            28
-        );
-        assert_eq!(&buf[..], payload.as_slice());
-
         write_json_test(&mut stream, json!({"type": "finish_events"}));
+        let dataset = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(request) = server.try_recv_dataset_request() {
+                    break request;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "server did not publish dataset request"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let PythonIngressDatasetRequest {
+            info,
+            events,
+            reply_tx,
+        } = dataset;
+        assert_eq!(info.name.as_deref(), Some("unit-test"));
+        assert_eq!(
+            events,
+            vec![
+                CdEvent {
+                    x: 1,
+                    y: 2,
+                    timestamp: 10,
+                    polarity: false,
+                },
+                CdEvent {
+                    x: 7,
+                    y: 5,
+                    timestamp: 20,
+                    polarity: true,
+                },
+            ]
+        );
+        reply_tx.send(Ok(())).expect("ack dataset");
         assert_eq!(read_json_test(&mut reader)["type"], "finish_ok");
         server.stop();
     }

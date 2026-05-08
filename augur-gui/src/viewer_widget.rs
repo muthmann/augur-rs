@@ -539,7 +539,7 @@ fn draw_display_strip(
     state: &mut ViewerState,
     input: &ViewerInput<'_>,
     output: &mut ViewerOutput,
-    max_height: f32,
+    _max_height: f32,
 ) {
     ui.push_id((input.viewer_id, "display_strip"), |ui| {
         draw_section_toggle(ui, &mut state.display_strip_open, "Display");
@@ -547,15 +547,15 @@ fn draw_display_strip(
             return;
         }
 
-        egui::ScrollArea::vertical()
-            .max_height(max_height)
-            .auto_shrink([true, true])
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                constrain_section_width(ui);
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
+                    // Group 1 — preview mode
+                    ui.label(egui::RichText::new("Mode").size(11.0).strong());
                     let previous_preview_mode = state.preview_mode;
-                    ui.label("Mode");
                     egui::ComboBox::from_id_source((input.viewer_id, "preview_mode"))
+                        .width(140.0)
                         .selected_text(match state.preview_mode {
                             PreviewMode::Intensity(colormap) => {
                                 format!("Intensity / {}", colormap.label())
@@ -593,12 +593,16 @@ fn draw_display_strip(
                         reset_preview_render_cache();
                     }
 
+                    crate::theme::toolbar_separator(ui);
+
+                    // Group 2 — scale bar
                     ui.checkbox(&mut state.scale_bar_settings.show, "Scale bar");
                     if state.scale_bar_settings.show {
                         egui::ComboBox::from_id_source((
                             input.viewer_id,
                             "scale_bar_position",
                         ))
+                        .width(100.0)
                         .selected_text(match state.scale_bar_settings.position {
                             ScaleBarPosition::TopLeft => "Top left",
                             ScaleBarPosition::TopRight => "Top right",
@@ -628,89 +632,32 @@ fn draw_display_strip(
                             );
                         });
                     }
-                });
 
-                if matches!(state.preview_mode, PreviewMode::TimeSurface) {
-                    ui.horizontal(|ui| {
+                    // Time-surface decay (only when in time-surface mode)
+                    if matches!(state.preview_mode, PreviewMode::TimeSurface) {
+                        crate::theme::toolbar_separator(ui);
                         let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
+                        ui.label(egui::RichText::new("Decay \u{03C4} [ms]").size(11.0).strong());
                         let response = ui.add(
                             egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
-                                .text("Decay \u{03C4} [ms]")
-                                .logarithmic(true),
+                                .logarithmic(true)
+                                .show_value(true),
                         );
                         if response.changed() {
                             state.time_surface_tau_us =
                                 (tau_ms * 1_000.0).round().max(1.0) as u64;
                             output.time_surface_tau_changed = true;
                         }
-                    });
-                    if input
-                        .frame
-                        .is_some_and(|frame| !frame.raw_events_available())
-                    {
-                        ui.small(
-                            "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
-                        );
+                        if input
+                            .frame
+                            .is_some_and(|frame| !frame.raw_events_available())
+                        {
+                            ui.small(
+                                "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
+                            );
+                        }
                     }
-                }
-
-                if !state.annotation_manager.annotations().is_empty() {
-                    egui::CollapsingHeader::new("Annotations")
-                        .id_source((input.viewer_id, "annotations"))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            constrain_section_width(ui);
-                            let mut clicked_annotation = None;
-                            for (index, annotation) in
-                                state.annotation_manager.annotations().iter().enumerate()
-                            {
-                                let selected =
-                                    state.annotation_manager.selected_id() == Some(annotation.id);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("\u{25A0}").color(annotation.color),
-                                    );
-                                    let response = ui.selectable_label(
-                                        selected,
-                                        format!("ROI {}", index + 1),
-                                    );
-                                    if response.clicked() {
-                                        clicked_annotation = Some(annotation.id);
-                                    }
-                                });
-                            }
-                            if let Some(annotation_id) = clicked_annotation {
-                                state.annotation_manager.select(annotation_id);
-                                activate_pointer_tool(state);
-                            }
-                            if ui
-                                .add_enabled(
-                                    state.annotation_manager.selected_id().is_some(),
-                                    egui::Button::new("Delete selected"),
-                                )
-                                .clicked()
-                            {
-                                delete_selected_annotation(state);
-                            }
-                        });
-                }
-
-                if let Some(stats) = input
-                    .frame
-                    .and_then(|frame| state.annotation_manager.statistics_for_selected(frame))
-                {
-                    ui.small(format!(
-                        "{} | {} px | ON {:.2}\u{00B1}{:.2} | OFF {:.2}\u{00B1}{:.2} | Total {:.2}\u{00B1}{:.2}",
-                        stats.label,
-                        stats.pixel_count,
-                        stats.on.mean,
-                        stats.on.stddev,
-                        stats.off.mean,
-                        stats.off.stddev,
-                        stats.combined.mean,
-                        stats.combined.stddev,
-                    ));
-                }
+                });
             });
     });
 }
@@ -1035,36 +982,6 @@ fn format_thousands(n: u64) -> String {
 
 /// (Legacy) Render the design-system "metric pill" row. Kept as a
 /// reusable helper for surfaces other than the unified diagnostics row.
-#[allow(dead_code)]
-fn draw_status_metric_row(
-    ui: &mut egui::Ui,
-    stats: Option<&augur_core::pipeline::PipelineStatsSnapshot>,
-) {
-    use crate::theme::{metric_pill, Tone};
-    let Some(stats) = stats else {
-        ui.horizontal(|ui| ui.weak("No live pipeline."));
-        return;
-    };
-    let elapsed = stats.elapsed_s as u64;
-    let elapsed_str = format!(
-        "{:02}:{:02}:{:02}",
-        elapsed / 3600,
-        (elapsed % 3600) / 60,
-        elapsed % 60
-    );
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 12.0;
-        metric_pill(
-            ui,
-            &format!("{:.2}", stats.mev_per_s),
-            "Mev/s",
-            Tone::Neutral,
-        );
-        metric_pill(ui, &format!("{:.2}", stats.mb_per_s), "MB/s", Tone::Neutral);
-        metric_pill(ui, &elapsed_str, "elapsed", Tone::Neutral);
-    });
-}
-
 /// ON / OFF percentage split with the polarity colour tints. Mirrors the
 /// design's coloured `ON 54.3%` / `OFF 45.7%` chips.
 struct PolaritySplit {
@@ -1084,27 +1001,6 @@ fn preview_polarity_split(frame: Option<&PreviewFrame>) -> Option<PolaritySplit>
         off_pct: frame.off_count as f64 * 100.0 / total as f64,
         total,
     })
-}
-
-#[allow(dead_code)]
-fn draw_polarity_split_row(ui: &mut egui::Ui, split: PolaritySplit) {
-    use crate::theme::{metric_pill, Tone};
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 12.0;
-        metric_pill(ui, &format!("{:.1}%", split.on_pct), "ON", Tone::PolarityOn);
-        metric_pill(
-            ui,
-            &format!("{:.1}%", split.off_pct),
-            "OFF",
-            Tone::PolarityOff,
-        );
-        ui.label(
-            egui::RichText::new(format!("{} ev/frame", split.total))
-                .monospace()
-                .size(10.0)
-                .weak(),
-        );
-    });
 }
 
 fn preview_frame_status_summary(frame: Option<&PreviewFrame>) -> Option<String> {
@@ -1165,13 +1061,14 @@ fn draw_preview_toolbar(
         .max_height(toolbar_height)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .add(egui::SelectableLabel::new(
-                        workspace.tool == PreviewTool::None,
-                        toolbar_icon(phosphor::CURSOR),
-                    ))
-                    .on_hover_text("Pointer")
-                    .clicked()
+                // Group 1 — selection & annotation tools
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    workspace.tool == PreviewTool::None,
+                    phosphor::CURSOR,
+                    "Pointer",
+                )
+                .clicked()
                 {
                     workspace.clear_selection();
                     line_profile_tool.clear();
@@ -1179,21 +1076,23 @@ fn draw_preview_toolbar(
                     state.annotation_manager.cancel_drawing();
                 }
 
-                let mut select_roi_button = ui.add_enabled(
-                    !input.settings_locked,
-                    egui::SelectableLabel::new(
-                        workspace.tool == PreviewTool::SelectRoi,
-                        toolbar_icon(phosphor::SELECTION),
-                    ),
-                );
-                if input.settings_locked {
-                    select_roi_button = select_roi_button.on_hover_text(
-                        "Hardware ROI editing is disabled during replay. Use the rectangle annotation tool instead.",
-                    );
+                let roi_tooltip = if input.settings_locked {
+                    "Hardware ROI editing is disabled during replay. Use the rectangle annotation tool instead."
                 } else {
-                    select_roi_button = select_roi_button.on_hover_text("Select hardware ROI");
-                }
-                if select_roi_button.clicked() {
+                    "Select hardware ROI"
+                };
+                let roi_response = crate::theme::icon_toggle_button(
+                    ui,
+                    workspace.tool == PreviewTool::SelectRoi,
+                    phosphor::SELECTION,
+                    roi_tooltip,
+                );
+                let roi_response = if input.settings_locked {
+                    roi_response.on_hover_text(roi_tooltip)
+                } else {
+                    roi_response
+                };
+                if roi_response.clicked() {
                     if workspace.tool == PreviewTool::SelectRoi {
                         workspace.clear_selection();
                     } else {
@@ -1237,90 +1136,81 @@ fn draw_preview_toolbar(
                     "Ellipse annotation",
                 );
 
-                ui.separator();
-                if ui
-                    .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_MINUS))
-                    .on_hover_text("Zoom out")
-                    .clicked()
+                crate::theme::toolbar_separator(ui);
+
+                // Group 2 — zoom & crop
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    false,
+                    phosphor::MAGNIFYING_GLASS_MINUS,
+                    "Zoom out",
+                )
+                .clicked()
                 {
                     workspace.zoom = (workspace.zoom / 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
                     if (workspace.zoom - PREVIEW_ZOOM_MIN).abs() < f32::EPSILON {
                         workspace.pan = egui::Vec2::ZERO;
                     }
                 }
-                if ui
-                    .small_button(toolbar_icon(phosphor::MAGNIFYING_GLASS_PLUS))
-                    .on_hover_text("Zoom in")
-                    .clicked()
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    false,
+                    phosphor::MAGNIFYING_GLASS_PLUS,
+                    "Zoom in",
+                )
+                .clicked()
                 {
                     workspace.zoom = (workspace.zoom * 1.25).clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
                 }
-                if ui
-                    .small_button(toolbar_icon(phosphor::FRAME_CORNERS))
-                    .on_hover_text("Fit to window")
-                    .clicked()
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    false,
+                    phosphor::FRAME_CORNERS,
+                    "Fit to window",
+                )
+                .clicked()
                 {
                     workspace.reset_zoom();
                 }
-
-                if ui
-                    .add(egui::SelectableLabel::new(
-                        workspace.crop_active(),
-                        toolbar_icon(phosphor::CROP),
-                    ))
-                    .on_hover_text("Crop to ROI")
-                    .clicked()
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    workspace.crop_active(),
+                    phosphor::CROP,
+                    "Crop to ROI",
+                )
+                .clicked()
                 {
                     workspace.toggle_crop_target(selected_annotation);
                 }
 
-                ui.separator();
-                if ui
-                    .add(egui::SelectableLabel::new(
-                        *histogram_open,
-                        toolbar_icon(phosphor::CHART_BAR),
-                    ))
-                    .on_hover_text("Histogram & Brightness/Contrast")
-                    .clicked()
+                crate::theme::toolbar_separator(ui);
+
+                // Group 3 — histogram & popout
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    *histogram_open,
+                    phosphor::CHART_BAR,
+                    "Histogram & Brightness/Contrast",
+                )
+                .clicked()
                 {
                     *histogram_open = !*histogram_open;
                     output.histogram_visibility_changed = true;
                 }
-
-                if ui
-                    .add(egui::SelectableLabel::new(
-                        popup_active,
-                        toolbar_icon(phosphor::ARROW_SQUARE_OUT),
-                    ))
-                    .on_hover_text(input.popup_button_tooltip)
-                    .clicked()
+                if crate::theme::icon_toggle_button(
+                    ui,
+                    popup_active,
+                    phosphor::ARROW_SQUARE_OUT,
+                    input.popup_button_tooltip,
+                )
+                .clicked()
                 {
                     output.popup_toggled = true;
                 }
-
             });
         });
 
     output
-}
-
-fn activate_pointer_tool(state: &mut ViewerState) {
-    state.workspace.clear_selection();
-    state.line_profile_tool.clear();
-    state.ruler_tool.clear();
-    state.annotation_manager.cancel_drawing();
-}
-
-fn delete_selected_annotation(state: &mut ViewerState) -> bool {
-    let deleted = state.annotation_manager.delete_selected();
-    if let Some(annotation_id) = deleted {
-        state
-            .workspace
-            .clear_crop_target_if_annotation(annotation_id);
-        true
-    } else {
-        false
-    }
 }
 
 fn preview_tool_button(
@@ -1330,14 +1220,7 @@ fn preview_tool_button(
     icon: &str,
     tooltip: &str,
 ) -> bool {
-    if ui
-        .add(egui::SelectableLabel::new(
-            workspace.tool == tool,
-            toolbar_icon(icon),
-        ))
-        .on_hover_text(tooltip)
-        .clicked()
-    {
+    if crate::theme::icon_toggle_button(ui, workspace.tool == tool, icon, tooltip).clicked() {
         if workspace.tool == tool {
             workspace.tool = PreviewTool::None;
             return true;
@@ -1413,7 +1296,7 @@ fn draw_preview_canvas(
     let display_size = viewport.display_size(canvas_rect.size());
     let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(display_size, canvas_rect);
     ui.painter()
-        .rect_filled(canvas_rect, 4.0, ui.visuals().faint_bg_color);
+        .rect_filled(canvas_rect, 4.0, crate::theme::CANVAS_BG);
     texture.paint_at(ui, image_rect, viewport.uv_rect(frame));
 
     workspace.hover_sensor = response
@@ -1751,7 +1634,7 @@ fn draw_preview_canvas(
         let font = egui::FontId::monospace(11.0);
         let galley = ui.fonts(|f| {
             f.layout_no_wrap(
-                text.clone(),
+                text,
                 font.clone(),
                 egui::Color32::from_rgb(0xe9, 0xeb, 0xef),
             )
@@ -1764,9 +1647,9 @@ fn draw_preview_canvas(
             ),
             box_size,
         );
-        ui.painter()
-            .rect_filled(box_rect, 4.0, egui::Color32::from_black_alpha(180));
-        ui.painter().galley(
+        let painter = ui.painter_at(image_rect.intersect(ui.clip_rect()));
+        painter.rect_filled(box_rect, 4.0, egui::Color32::from_black_alpha(180));
+        painter.galley(
             egui::pos2(box_rect.left() + pad.x, box_rect.top() + pad.y),
             galley,
             egui::Color32::from_rgb(0xe9, 0xeb, 0xef),
@@ -1789,40 +1672,34 @@ fn pick_overlay_candidate(
     let mut best_keyed: Option<(OverlayPickCandidate, f32)> = None;
     let mut best_unkeyed: Option<(OverlayPickCandidate, f32)> = None;
 
-    let mut consider =
-        |sensor_position: egui::Pos2, max_distance: f32, item_key: Option<StableRowKey>| {
-            let distance = sensor_position.distance(sensor);
-            if distance > max_distance {
-                return;
+    let update_best = |best: &mut Option<(OverlayPickCandidate, f32)>,
+                       sensor_position: egui::Pos2,
+                       distance: f32,
+                       item_key: Option<StableRowKey>| {
+        match best {
+            Some((_, best_distance)) if distance >= *best_distance => {}
+            _ => {
+                *best = Some((
+                    OverlayPickCandidate {
+                        sensor_position,
+                        item_key,
+                    },
+                    distance,
+                ));
             }
-            let best = if item_key.is_some() {
-                &mut best_keyed
-            } else {
-                &mut best_unkeyed
-            };
-            match best {
-                Some((_, best_distance)) if distance >= *best_distance => {}
-                _ => {
-                    *best = Some((
-                        OverlayPickCandidate {
-                            sensor_position,
-                            item_key,
-                        },
-                        distance,
-                    ));
-                }
-            }
-        };
+        }
+    };
 
     for overlay in overlays {
         match overlay {
             Overlay::HighlightPixels { pixels, .. } => {
                 for pixel in pixels {
-                    consider(
-                        egui::pos2(f32::from(pixel.x) + 0.5, f32::from(pixel.y) + 0.5),
-                        1.1,
-                        None,
-                    );
+                    let sensor_position =
+                        egui::pos2(f32::from(pixel.x) + 0.5, f32::from(pixel.y) + 0.5);
+                    let distance = sensor_position.distance(sensor);
+                    if distance <= 1.1 {
+                        update_best(&mut best_unkeyed, sensor_position, distance, None);
+                    }
                 }
             }
             Overlay::CrosshairMarkers {
@@ -1830,7 +1707,11 @@ fn pick_overlay_candidate(
             } => {
                 let max_distance = f32::from((*arm_len).max(6)) + 2.0;
                 for marker in markers {
-                    consider(egui::pos2(marker.x, marker.y), max_distance, None);
+                    let sensor_position = egui::pos2(marker.x, marker.y);
+                    let distance = sensor_position.distance(sensor);
+                    if distance <= max_distance {
+                        update_best(&mut best_unkeyed, sensor_position, distance, None);
+                    }
                 }
             }
             Overlay::MarkerOverlay {
@@ -1839,22 +1720,44 @@ fn pick_overlay_candidate(
                 ..
             } => {
                 for marker in markers {
-                    let item_key = marker
-                        .source_row
-                        .as_ref()
-                        .map(|(dataset, row)| StableRowKey::new(dataset.clone(), row.clone()))
-                        .or_else(|| {
-                            marker.stable_id.as_ref().and_then(|stable_id| {
-                                dataset_id.as_ref().map(|dataset_id| {
-                                    StableRowKey::new(dataset_id.clone(), stable_id.clone())
+                    let sensor_position = egui::pos2(marker.x, marker.y);
+                    let max_distance = marker.size.max(5.0);
+                    let distance = sensor_position.distance(sensor);
+                    if distance > max_distance {
+                        continue;
+                    }
+                    let has_key = marker.source_row.is_some()
+                        || (marker.stable_id.is_some() && dataset_id.is_some());
+                    let best = if has_key {
+                        &mut best_keyed
+                    } else {
+                        &mut best_unkeyed
+                    };
+                    match best {
+                        Some((_, best_distance)) if distance >= *best_distance => {}
+                        _ => {
+                            let item_key = marker
+                                .source_row
+                                .as_ref()
+                                .map(|(dataset, row)| {
+                                    StableRowKey::new(dataset.clone(), row.clone())
                                 })
-                            })
-                        });
-                    consider(
-                        egui::pos2(marker.x, marker.y),
-                        marker.size.max(5.0),
-                        item_key,
-                    );
+                                .or_else(|| {
+                                    marker.stable_id.as_ref().and_then(|stable_id| {
+                                        dataset_id.as_ref().map(|dataset_id| {
+                                            StableRowKey::new(dataset_id.clone(), stable_id.clone())
+                                        })
+                                    })
+                                });
+                            *best = Some((
+                                OverlayPickCandidate {
+                                    sensor_position,
+                                    item_key,
+                                },
+                                distance,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -2013,16 +1916,14 @@ fn paint_marker_shape(
         }
         MarkerShape::Ellipse => {
             let radii = egui::vec2(size * 1.2, size);
-            let points: Vec<egui::Pos2> = (0..=24)
-                .map(|step| {
-                    let angle = std::f32::consts::TAU * step as f32 / 24.0;
-                    egui::pos2(
-                        center.x + radii.x * angle.cos(),
-                        center.y + radii.y * angle.sin(),
-                    )
-                })
-                .collect();
-            painter.add(egui::Shape::convex_polygon(points.clone(), fill, stroke));
+            let points: [egui::Pos2; 25] = std::array::from_fn(|step| {
+                let angle = std::f32::consts::TAU * step as f32 / 24.0;
+                egui::pos2(
+                    center.x + radii.x * angle.cos(),
+                    center.y + radii.y * angle.sin(),
+                )
+            });
+            painter.add(egui::Shape::convex_polygon(Vec::from(points), fill, stroke));
         }
         MarkerShape::Diamond => {
             let points = vec![
@@ -2656,11 +2557,13 @@ pub(crate) fn draw_replay_transport(
             output.replay_stop = true;
         }
 
-        ui.separator();
+        crate::theme::toolbar_separator(ui);
+
+        crate::theme::toolbar_separator(ui);
 
         let selected_label = replay_speed_label(replay.speed);
         egui::ComboBox::from_id_source((viewer_id, "replay_speed_combo"))
-            .selected_text(format!("Speed: {selected_label}"))
+            .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 for (speed, label) in REPLAY_SPEED_OPTIONS {
                     if ui
@@ -2672,7 +2575,7 @@ pub(crate) fn draw_replay_transport(
                 }
             });
 
-        ui.separator();
+        crate::theme::toolbar_separator(ui);
 
         let time_width =
             ui.fonts(|f| {

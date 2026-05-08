@@ -1,4 +1,4 @@
-# ADR 021: Python Event Ingress Through Packed Preview Pipeline
+# ADR 021: Python Event Ingress Through In-Memory Replay Pipeline
 
 ## Status
 
@@ -16,10 +16,11 @@ borrow shared-memory or memory-mapped Python data directly. That is not the
 lowest-risk first step because it introduces cross-process lifetime,
 synchronization, and columnar-versus-packed layout decisions.
 
-Augur already has a decoded replay path built around `PacketStreamCamera`,
-`PackedEventPreviewDecoder`, and `LiveEventSource`. Feeding Python-published
-events through that path lets the first feature reuse the proven accumulation,
-preview-frame, viewer-tool, 3D, and plugin behavior.
+Augur already has a decoded replay path built around `DecodedEventFileCamera`,
+`PackedEventPreviewDecoder`, replay controls, and `LiveEventSource`. Opening
+Python-published events through that path lets the feature reuse the proven
+accumulation, preview-frame, viewer-tool, 3D, plugin, pause/resume, step, and
+seek behavior.
 
 ## Decision
 
@@ -28,19 +29,22 @@ Add a GUI-owned Python ingress listener in `augur-gui`.
 - The listener binds to `127.0.0.1:57295` by default.
 - The protocol is versioned JSON control messages plus binary
   `packed_xypt_v1` event batches.
-- Python sends bounded chunks; Augur acknowledges each batch after it is queued.
-- Augur adapts the incoming packed chunks to `PacketStreamCamera`.
-- The GUI starts `spawn_pipeline` with `PackedEventPreviewDecoder`.
-- Published data is treated as a finite external preview stream in this first
-  cut, not as a seekable replay file.
+- Python sends bounded chunks; Augur acknowledges each batch after decoding it
+  into a `Vec<CdEvent>`.
+- After `finish_events`, Augur opens the completed dataset as an in-memory
+  decoded replay with `DecodedEventFileCamera`.
+- The GUI starts `spawn_pipeline` with `PackedEventPreviewDecoder` in replay
+  mode, decodes the first frame, and pauses for inspection.
+- Published data is treated as a finite, seekable in-memory replay.
 
 ## Consequences
 
 ### Positive
 
 - Users can send NumPy event arrays into Augur with one Python call.
-- The first implementation has predictable memory behavior: one chunk-sized
-  packed allocation at a time plus a bounded queue.
+- Researchers get the same replay controls for Python data as file replay:
+  play, pause, seek, step, restart, 2D inspection, 3D inspection, and plugin
+  analysis.
 - Existing Augur viewer, 3D, and plugin code paths remain unchanged.
 - The protocol is independent of evt3's internal Python container
   implementation.
@@ -49,16 +53,17 @@ Add a GUI-owned Python ingress listener in `augur-gui`.
 ### Negative
 
 - This is not cross-process zero-copy.
-- Python-published streams are not seekable replays in this stage.
 - Columnar NumPy arrays are packed before Augur decodes them again into its
-  internal frame/event source.
-- Starting a new Python stream while another live camera/replay/recording
-  session is active is rejected.
+  internal replay timeline.
+- Augur holds the completed Python dataset in memory so replay controls can
+  seek and step without asking Python to resend data.
+- Starting a new Python stream while a live camera preview, recording, or
+  non-Python replay is active is rejected.
 
 ### Neutral
 
-- The later external `EventSource` design can replace the packed transport
-  under the same Python-facing API.
+- The later external `EventSource` design can replace the in-memory decoded
+  timeline under the same Python-facing API.
 - The protocol validates transport metadata, while evt3 remains responsible
   for NumPy dtype, shape, timestamp ordering, and geometry validation before
   publication.
@@ -82,4 +87,3 @@ Augur control protocol.
 
 Already supported, but it forces users to write intermediate files and breaks
 the interactive Python analysis loop this feature is meant to improve.
-

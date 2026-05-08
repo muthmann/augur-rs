@@ -172,6 +172,8 @@ impl EventSource for RawReplayEventSource {
                     ));
                 }
             }
+            cd_events.clear();
+            trigger_events.clear();
         }
         decoder.finish_stream_lenient();
 

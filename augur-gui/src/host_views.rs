@@ -19,8 +19,8 @@ use image::{ImageFormat, RgbaImage};
 use crate::{
     colormap::Colormap,
     investigation::{
-        row_key_for_row, InvestigationSortDirection, InvestigationTableViewState, StableRowKey,
-        TablePageSize,
+        row_index_for_key, row_key_for_row, InvestigationSortDirection,
+        InvestigationTableViewState, StableRowKey, TablePageSize,
     },
 };
 
@@ -705,7 +705,6 @@ fn format_timestamp_micros(value_us: Option<u64>, replay_origin_us: Option<u64>)
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SummaryCardOptions<'a> {
-    pub dataset_id: &'a str,
     pub generation: u64,
     pub selected_row: Option<&'a StableRowKey>,
     pub format: TableCellFormatOptions,
@@ -752,17 +751,9 @@ pub fn render_summary_card(
         return output;
     };
 
-    let selected_row_index = options.selected_row.and_then(|key| {
-        (0..dataset.row_count()).find(|row| {
-            row_key_for_row(
-                options.dataset_id,
-                options.generation,
-                schema,
-                dataset,
-                *row,
-            ) == *key
-        })
-    });
+    let selected_row_index = options
+        .selected_row
+        .and_then(|key| row_index_for_key(dataset, schema, options.generation, key));
 
     ui.separator();
     match selected_row_index {
@@ -782,9 +773,21 @@ fn render_summary_detail(
     row: usize,
     format_options: TableCellFormatOptions,
 ) {
-    if let Some(column) = schema.columns.iter().find(|c| is_headline(schema, &c.id)) {
+    let display_map: std::collections::HashMap<&str, &TableColumnDisplayMetadata> = schema
+        .column_display
+        .iter()
+        .map(|e| (e.column_id.as_str(), &e.display))
+        .collect();
+    let is_headline = |column_id: &str| {
+        display_map
+            .get(column_id)
+            .map(|d| d.headline)
+            .unwrap_or(false)
+    };
+
+    if let Some(column) = schema.columns.iter().find(|c| is_headline(&c.id)) {
         if let Some(values) = dataset.column(&column.id) {
-            let display = schema.column_display(&column.id);
+            let display = display_map.get(column.id.as_str()).copied();
             let formatted = format_cell_value(&values.values, row, display, format_options);
             ui.heading(formatted);
         }
@@ -795,11 +798,11 @@ fn render_summary_detail(
         .spacing([16.0, 4.0])
         .show(ui, |ui| {
             for column in &schema.columns {
-                let display = schema.column_display(&column.id);
+                let display = display_map.get(column.id.as_str()).copied();
                 if display.map(|d| d.hide_in_compact).unwrap_or(false) {
                     continue;
                 }
-                if is_headline(schema, &column.id) {
+                if is_headline(&column.id) {
                     continue;
                 }
                 let Some(column_data) = dataset.column(&column.id) else {
@@ -814,13 +817,6 @@ fn render_summary_detail(
                 ui.end_row();
             }
         });
-}
-
-fn is_headline(schema: &TableSchema, column_id: &str) -> bool {
-    schema
-        .column_display(column_id)
-        .map(|d| d.headline)
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -923,6 +919,15 @@ pub fn render_linked_table_view(
     }
 
     let page_rows: Vec<usize> = options.rows[page_start..page_end].to_vec();
+    let page_keys: Vec<StableRowKey> = page_rows
+        .iter()
+        .map(|&row| row_key_for_row(options.dataset_id, options.generation, schema, dataset, row))
+        .collect();
+    let display_map: std::collections::HashMap<&str, &TableColumnDisplayMetadata> = schema
+        .column_display
+        .iter()
+        .map(|e| (e.column_id.as_str(), &e.display))
+        .collect();
     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
 
     let mut builder = TableBuilder::new(ui)
@@ -930,8 +935,8 @@ pub fn render_linked_table_view(
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
     for column in &schema.columns {
-        let width_priority = schema
-            .column_display(&column.id)
+        let width_priority = display_map
+            .get(column.id.as_str())
             .and_then(|d| d.width_priority);
         let initial = match width_priority {
             Some(augur_plugin_api::TableColumnWidthPriority::High) => 160.0,
@@ -955,8 +960,8 @@ pub fn render_linked_table_view(
                         } else {
                             ""
                         };
-                    let label = schema
-                        .column_display(&column.id)
+                    let label = display_map
+                        .get(column.id.as_str())
                         .and_then(|d| d.label.as_deref())
                         .unwrap_or(&column.title);
                     if ui
@@ -974,10 +979,9 @@ pub fn render_linked_table_view(
                 let Some(row) = page_rows.get(row_index_in_page).copied() else {
                     return;
                 };
-                let key =
-                    row_key_for_row(options.dataset_id, options.generation, schema, dataset, row);
-                let is_selected = options.selected_row == Some(&key);
-                let is_hovered = options.hovered_row == Some(&key);
+                let key = &page_keys[row_index_in_page];
+                let is_selected = options.selected_row == Some(key);
+                let is_hovered = options.hovered_row == Some(key);
                 for column in &schema.columns {
                     row_ui.col(|ui| {
                         if is_selected {
@@ -997,7 +1001,7 @@ pub fn render_linked_table_view(
                             ui.label("-");
                             return;
                         };
-                        let display = schema.column_display(&column.id);
+                        let display = display_map.get(column.id.as_str()).copied();
                         let value =
                             format_cell_value(&column_data.values, row, display, options.format);
                         let raw = column_data
@@ -1306,9 +1310,9 @@ pub fn render_line_series_view(
 pub struct TableWindowViewportData {
     pub dataset_id: String,
     pub generation: u64,
-    pub schema: TableSchema,
+    pub schema: Arc<TableSchema>,
     pub dataset: Option<Arc<TableDatasetV1>>,
-    pub filtered_rows: Vec<usize>,
+    pub filtered_rows: Arc<Vec<usize>>,
     pub table_state: InvestigationTableViewState,
     pub selected_row: Option<StableRowKey>,
     pub hovered_row: Option<StableRowKey>,
@@ -1393,9 +1397,9 @@ pub fn render_table_window_viewport(
         (
             data.dataset_id.clone(),
             data.generation,
-            data.schema.clone(),
+            Arc::clone(&data.schema),
             data.dataset.clone(),
-            data.filtered_rows.clone(),
+            Arc::clone(&data.filtered_rows),
             data.table_state.clone(),
             data.selected_row.clone(),
             data.hovered_row.clone(),

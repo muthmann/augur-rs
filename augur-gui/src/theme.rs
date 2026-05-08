@@ -410,31 +410,6 @@ pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) {
     ui.painter().galley(text_pos, text_galley, fg);
 }
 
-/// Render a "metric pill" — small monospace value plus a unit caption.
-/// Used by the viewer status footer to show throughput / data rate /
-/// elapsed / event split. Tone tints the value text colour only; the
-/// background stays panel-coloured.
-pub fn metric_pill(ui: &mut egui::Ui, value: &str, unit: &str, tone: Tone) {
-    let p = palette_for_visuals(ui.visuals());
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.label(
-            egui::RichText::new(value)
-                .monospace()
-                .color(tone.fg(&p))
-                .strong(),
-        );
-        if !unit.is_empty() {
-            ui.label(
-                egui::RichText::new(unit)
-                    .monospace()
-                    .size(10.0)
-                    .color(p.fg_3),
-            );
-        }
-    });
-}
-
 /// Style a button as the primary action — ink-coloured background, light
 /// text, no shadow. Use sparingly: design says one primary per surface.
 pub fn primary_button(text: &str) -> egui::Button<'_> {
@@ -533,31 +508,6 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Respo
     } else {
         response
     }
-}
-
-/// `aug-kbd` keyboard badge — mono pill with a faux double-bottom border.
-#[allow(dead_code)]
-pub fn kbd_badge(ui: &mut egui::Ui, key: &str) {
-    let p = palette_for_visuals(ui.visuals());
-    let font = egui::FontId::monospace(10.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(key.to_owned(), font, p.fg_1));
-    let pad_x = 5.0;
-    let pad_y = 1.0;
-    let size = egui::vec2(galley.size().x + pad_x * 2.0, galley.size().y + pad_y * 2.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, radius::R_2, p.bg_1);
-    painter.rect_stroke(rect, radius::R_2, Stroke::new(1.0, p.line_strong));
-    // Double-bottom border evokes a physical key cap.
-    painter.line_segment(
-        [
-            egui::pos2(rect.left() + 1.0, rect.bottom()),
-            egui::pos2(rect.right() - 1.0, rect.bottom()),
-        ],
-        Stroke::new(1.0, p.line_strong),
-    );
-    let text_pos = egui::pos2(rect.left() + pad_x, rect.top() + pad_y);
-    painter.galley(text_pos, galley, p.fg_1);
 }
 
 /// Two-column inspector row used in the right Workspace panel: a left
@@ -832,6 +782,69 @@ pub fn field_label(ui: &mut egui::Ui, label: &str, unit: Option<&str>) {
             );
         }
     });
+}
+
+/// Fixed dark background for the data viewport canvas. Independent of theme.
+pub const CANVAS_BG: Color32 = Color32::from_rgb(0x0a, 0x0d, 0x12);
+
+/// 22×22 icon-only toggle button used in the viewer toolbar. Mirrors the
+/// design's `.icon-btn` — transparent at rest, `bg-2` on hover,
+/// `accent-weak` fill + `accent-press` fg when active.
+pub fn icon_toggle_button(
+    ui: &mut egui::Ui,
+    active: bool,
+    glyph: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let p = palette_for_visuals(ui.visuals());
+    let size = egui::vec2(22.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    let bg = if active {
+        p.accent_weak
+    } else if response.is_pointer_button_down_on() {
+        p.bg_3
+    } else if response.hovered() {
+        p.bg_2
+    } else {
+        Color32::TRANSPARENT
+    };
+    let fg = if active {
+        p.accent_press
+    } else if response.hovered() {
+        p.fg_0
+    } else {
+        p.fg_1
+    };
+
+    let painter = ui.painter();
+    if bg != Color32::TRANSPARENT {
+        painter.rect_filled(rect, radius::R_2, bg);
+    }
+    let font = egui::FontId::proportional(14.0);
+    let galley = ui.fonts(|f| f.layout_no_wrap(glyph.to_owned(), font.clone(), fg));
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(pos, galley, fg);
+
+    let response = if !tooltip.is_empty() {
+        response.on_hover_text(tooltip)
+    } else {
+        response
+    };
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Vertical toolbar separator — 1px wide, 18px tall, `line` colour,
+/// with 6px horizontal margins on each side.
+pub fn toolbar_separator(ui: &mut egui::Ui) {
+    let p = palette_for_visuals(ui.visuals());
+    let size = egui::vec2(1.0 + 6.0 * 2.0, 18.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let line_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(1.0, 18.0));
+    ui.painter().rect_filled(line_rect, 0.0, p.line);
 }
 
 /// Apply the standard AugurRS spacing/typography baselines on top of an

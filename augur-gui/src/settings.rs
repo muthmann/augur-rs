@@ -13,42 +13,53 @@ pub fn draw_settings(
 ) -> bool {
     let mut changed = false;
 
-    let bias_count = "5 / 5";
+    const BIAS_SLIDER_COUNT: usize = 5;
+    let bias_count = format!("{BIAS_SLIDER_COUNT} / {BIAS_SLIDER_COUNT}");
     crate::theme::collapse(
         ui,
         "settings_biases",
         "Biases",
         false,
-        Some(bias_count),
+        Some(&bias_count),
         |ui| {
             ui.weak("Analog pixel tuning. Values are relative offsets from factory defaults.");
 
+            crate::theme::field_label(ui, "diff_on", None);
             changed |= ui
-            .add(egui::Slider::new(&mut cfg.biases.diff_on, -85..=140).text("diff_on"))
-            .on_hover_text("ON contrast threshold. Lower = more sensitive to brightness increases (more ON events, more noise). Higher = requires larger brightness change.")
-            .changed();
+                .add(egui::Slider::new(&mut cfg.biases.diff_on, -85..=140))
+                .on_hover_text("ON contrast threshold. Lower = more sensitive to brightness increases (more ON events, more noise). Higher = requires larger brightness change.")
+                .changed();
+
+            crate::theme::field_label(ui, "diff_off", None);
             changed |= ui
-            .add(egui::Slider::new(&mut cfg.biases.diff_off, -35..=190).text("diff_off"))
-            .on_hover_text("OFF contrast threshold. Lower = more sensitive to brightness decreases (more OFF events, more noise). Higher = requires larger dimming change.")
-            .changed();
+                .add(egui::Slider::new(&mut cfg.biases.diff_off, -35..=190))
+                .on_hover_text("OFF contrast threshold. Lower = more sensitive to brightness decreases (more OFF events, more noise). Higher = requires larger dimming change.")
+                .changed();
+
+            crate::theme::field_label(ui, "fo", None);
             changed |= ui
-            .add(egui::Slider::new(&mut cfg.biases.fo, -35..=55).text("fo"))
-            .on_hover_text("Pixel low-pass filter cutoff. Lower = filters more high-frequency flicker (e.g. fluorescent lights) but increases latency. Higher = faster response but admits more flicker noise.")
-            .changed();
+                .add(egui::Slider::new(&mut cfg.biases.fo, -35..=55))
+                .on_hover_text("Pixel low-pass filter cutoff. Lower = filters more high-frequency flicker (e.g. fluorescent lights) but increases latency. Higher = faster response but admits more flicker noise.")
+                .changed();
+
+            crate::theme::field_label(ui, "hpf", None);
             changed |= ui
-            .add(egui::Slider::new(&mut cfg.biases.hpf, 0..=120).text("hpf"))
-            .on_hover_text("Pixel high-pass filter cutoff. Lower = responds to slower illumination changes. Higher = only responds to fast transients, filtering out slow changes.")
-            .changed();
+                .add(egui::Slider::new(&mut cfg.biases.hpf, 0..=120))
+                .on_hover_text("Pixel high-pass filter cutoff. Lower = responds to slower illumination changes. Higher = only responds to fast transients, filtering out slow changes.")
+                .changed();
+
+            crate::theme::field_label(ui, "refr", None);
             changed |= ui
-            .add(egui::Slider::new(&mut cfg.biases.refr, -20..=235).text("refr"))
-            .on_hover_text("Refractory period. Higher = shorter dead time, allowing faster event rates. Lower = longer dead time, suppresses hot pixel noise but may miss rapid changes.")
-            .changed();
+                .add(egui::Slider::new(&mut cfg.biases.refr, -20..=235))
+                .on_hover_text("Refractory period. Higher = shorter dead time, allowing faster event rates. Lower = longer dead time, suppresses hot pixel noise but may miss rapid changes.")
+                .changed();
         },
     );
 
     ui.separator();
     crate::theme::collapse(ui, "settings_roi", "ROI", false, None, |ui| {
         ui.weak("Hardware Region of Interest. Only pixels inside this rectangle are active. Inactive pixels consume no power and produce no events.");
+        crate::theme::field_label(ui, "Rect", Some("px"));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
             changed |= ui
@@ -188,32 +199,32 @@ pub fn draw_settings(
         |ui| {
             ui.weak("Hardware noise filters on the sensor's digital pipeline. STC and Trail are mutually exclusive — they share the same on-chip processing block.");
             if ui
-            .checkbox(&mut cfg.digital_filter.stc_enabled, "STC enabled")
-            .on_hover_text("Spatio-Temporal Contrast filter. Suppresses isolated noise events by requiring a confirming second event within the threshold window. Keeps the second event of a burst.")
-            .changed()
-        {
-            changed = true;
-            if cfg.digital_filter.stc_enabled {
-                cfg.digital_filter.trail_enabled = false;
+                .checkbox(&mut cfg.digital_filter.stc_enabled, "STC enabled")
+                .on_hover_text("Spatio-Temporal Contrast filter. Suppresses isolated noise events by requiring a confirming second event within the threshold window. Keeps the second event of a burst.")
+                .changed()
+            {
+                changed = true;
+                if cfg.digital_filter.stc_enabled {
+                    cfg.digital_filter.trail_enabled = false;
+                }
             }
-        }
             changed |= ui
-            .add(
-                egui::Slider::new(&mut cfg.digital_filter.stc_threshold_us, 1_000..=100_000)
-                    .text("STC threshold [us]"),
-            )
-            .on_hover_text("Maximum time window (in microseconds) within which successive same-polarity events are considered part of a burst. Lower = stricter filtering.")
-            .changed();
+                .add(
+                    egui::Slider::new(&mut cfg.digital_filter.stc_threshold_us, 1_000..=100_000)
+                        .text("STC threshold [us]"),
+                )
+                .on_hover_text("Maximum time window (in microseconds) within which successive same-polarity events are considered part of a burst. Lower = stricter filtering.")
+                .changed();
             if ui
-            .checkbox(&mut cfg.digital_filter.trail_enabled, "Trail enabled")
-            .on_hover_text("Trail filter. Keeps only the first event after a polarity transition and suppresses redundant trailing events of the same polarity within the threshold window.")
-            .changed()
-        {
-            changed = true;
-            if cfg.digital_filter.trail_enabled {
-                cfg.digital_filter.stc_enabled = false;
+                .checkbox(&mut cfg.digital_filter.trail_enabled, "Trail enabled")
+                .on_hover_text("Trail filter. Keeps only the first event after a polarity transition and suppresses redundant trailing events of the same polarity within the threshold window.")
+                .changed()
+            {
+                changed = true;
+                if cfg.digital_filter.trail_enabled {
+                    cfg.digital_filter.stc_enabled = false;
+                }
             }
-        }
         },
     );
 

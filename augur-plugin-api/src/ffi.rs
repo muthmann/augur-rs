@@ -137,12 +137,14 @@ pub struct FfiSubpixelMarker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FfiMarkerShape {
-    Point = 0,
-    Cross = 1,
-    Box = 2,
-    Ellipse = 3,
-    Diamond = 4,
-    FilledCircle = 5,
+    Circle = 0,
+    Square = 1,
+    Point = 2,
+    Cross = 3,
+    Box = 4,
+    Ellipse = 5,
+    Diamond = 6,
+    FilledCircle = 7,
 }
 
 #[repr(C)]
@@ -267,7 +269,7 @@ pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 
-pub const PLUGIN_ABI_VERSION: u64 = 1;
+pub const PLUGIN_ABI_VERSION: u64 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

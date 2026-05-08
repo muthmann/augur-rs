@@ -545,8 +545,7 @@ impl EventRing {
             if !valid || slice.is_empty() {
                 return;
             }
-            let start = slice.as_ptr() as usize - self.events.as_ptr() as usize;
-            let start = start / std::mem::size_of::<CompactEvent>();
+            let start = unsafe { slice.as_ptr().offset_from(self.events.as_ptr()) } as usize;
             let physical = start..start + slice.len();
 
             match (&mut first, &mut second) {
@@ -653,6 +652,10 @@ impl EventSource for EventRing {
             events.extend_from_slice(&frame[start..end]);
         }
 
+        // Note: an empty result can mean either "no events in the queried
+        // range" or "the range lies outside the resident timeline". Callers
+        // that need to distinguish these cases should check the ring bounds
+        // before calling `fetch_range`.
         if events.is_empty() {
             Err(FetchError::OutOfTimeline)
         } else {

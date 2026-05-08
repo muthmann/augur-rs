@@ -17,6 +17,7 @@ mod python_ingress;
 mod render_backend;
 mod settings;
 mod theme;
+mod toast;
 mod viewer_tools;
 mod viewer_widget;
 

@@ -615,6 +615,7 @@ impl PipelineStatsInner {
             .saturating_add(duration.as_micros() as u64);
     }
 
+    #[cfg(test)]
     fn record_preview_raw_event_copy_time(&mut self, duration: Duration) {
         self.preview_raw_event_copy_us = self
             .preview_raw_event_copy_us
@@ -780,11 +781,10 @@ fn emit_preview_frame(
                 s.record_preview_frame_send_time(frame_send_started.elapsed());
             }
         }
-        Err(err) => {
+        Err(_err) => {
             if let Ok(mut s) = stats_preview.lock() {
                 s.record_preview_frame_drop();
             }
-            drop(err);
         }
     }
     *on_count = 0;
@@ -1293,8 +1293,8 @@ where
                     }
                     let accumulate_started = Instant::now();
                     let capture_raw_events = raw_events_preview.load(Ordering::Relaxed);
-                    let mut raw_event_copy_elapsed = Duration::ZERO;
                     for ev in &events {
+                        frame_events.push(*ev);
                         if ev.x >= width || ev.y >= height {
                             continue;
                         }
@@ -1324,9 +1324,6 @@ where
                             new_on.abs_diff(new_off),
                         );
                         frame_start_ts.get_or_insert(ev.timestamp);
-                        let raw_event_copy_started = Instant::now();
-                        frame_events.push(*ev);
-                        raw_event_copy_elapsed += raw_event_copy_started.elapsed();
 
                         if frame_start_ts.is_some_and(|t0| {
                             ev.timestamp.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed)
@@ -1360,9 +1357,6 @@ where
                     let accumulate_elapsed = accumulate_started.elapsed();
                     if let Ok(mut s) = stats_preview.lock() {
                         s.record_preview_accumulate_time(accumulate_elapsed);
-                        if raw_event_copy_elapsed > Duration::ZERO {
-                            s.record_preview_raw_event_copy_time(raw_event_copy_elapsed);
-                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
