@@ -13,9 +13,11 @@ uses the new accumulation window, and now auto-derives the replay display cadenc
 ## User-Facing Changes
 
 - The top bar now includes `Settings` between `Camera` and `View`.
-- `Acq time [ms]` moved out of `Camera` into `Settings`.
+- High-level entries such as `Acquisition time…`, `Pixel scale (nm/px)…`, `Sensor geometry…`, and
+  `EventStore budget…` open compact inline submenus instead of crowding the top-level menu with
+  sliders.
 - The EventStore memory budget moved out of the left settings panel into `Settings`.
-- `Settings` also owns pixel scale, sensor geometry, preview cadence, point-cloud cadence, and the
+- `Settings -> Advanced` owns preview cadence, point-cloud cadence, renderer diagnostics, and the
   recording disk-writer buffer size.
 - Sensor geometry and disk-writer buffer are idle-only controls because they shape a pipeline at
   start time. Pixel scale, replay/runtime history budget, preview cadences, and acquisition time

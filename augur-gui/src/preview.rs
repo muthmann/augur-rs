@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use augur_core::pipeline::{CdEvent, PreviewFrame, PREVIEW_HISTOGRAM_BINS};
 use egui::{Color32, ColorImage};
 
-use crate::colormap::Colormap;
+use crate::{colormap::Colormap, theme};
 
 thread_local! {
     static PREVIEW_SCRATCH: RefCell<PreviewRenderScratch> = RefCell::new(PreviewRenderScratch::default());
@@ -181,10 +181,10 @@ impl CpuPreviewImageCache {
                             let brightness = self.brightness_lut[total as usize];
                             match on.cmp(&off) {
                                 std::cmp::Ordering::Greater => {
-                                    polarity_color(brightness, crate::theme::POLARITY_ON_RGB)
+                                    polarity_color(brightness, theme::POLARITY_ON_RGB)
                                 }
                                 std::cmp::Ordering::Less => {
-                                    polarity_color(brightness, crate::theme::POLARITY_OFF_RGB)
+                                    polarity_color(brightness, theme::POLARITY_OFF_RGB)
                                 }
                                 std::cmp::Ordering::Equal => polarity_balanced_color(brightness),
                             }
@@ -257,8 +257,8 @@ fn polarity_color(brightness: u8, tint: [u8; 3]) -> Color32 {
 /// Pixel where the ON / OFF counts are exactly equal — average the two
 /// polarity tints so the colour is unmistakably between the two endpoints.
 fn polarity_balanced_color(brightness: u8) -> Color32 {
-    let on = crate::theme::POLARITY_ON_RGB;
-    let off = crate::theme::POLARITY_OFF_RGB;
+    let on = theme::POLARITY_ON_RGB;
+    let off = theme::POLARITY_OFF_RGB;
     let tint = [
         ((on[0] as u16 + off[0] as u16) / 2) as u8,
         ((on[1] as u16 + off[1] as u16) / 2) as u8,

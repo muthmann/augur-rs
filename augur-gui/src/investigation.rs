@@ -8,9 +8,10 @@ use augur_plugin_api::{
 const DEFAULT_LAYER_COLOR: [u8; 4] = [244, 244, 244, 255];
 const DEFAULT_LAYER_SIZE: f32 = 3.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InvestigationLayout {
     Preview2dOnly,
+    #[default]
     Split2d3d,
     Inspection3dOnly,
 }
@@ -31,12 +32,6 @@ impl InvestigationLayout {
 
     pub fn shows_3d(self) -> bool {
         matches!(self, Self::Split2d3d | Self::Inspection3dOnly)
-    }
-}
-
-impl Default for InvestigationLayout {
-    fn default() -> Self {
-        Self::Split2d3d
     }
 }
 
@@ -93,18 +88,13 @@ impl InvestigationSortDirection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TablePageSize {
     Rows25,
+    #[default]
     Rows100,
     Rows500,
     All,
-}
-
-impl Default for TablePageSize {
-    fn default() -> Self {
-        Self::Rows100
-    }
 }
 
 impl TablePageSize {
@@ -365,11 +355,16 @@ pub fn stable_row_id_value(values: &TableColumnValues, index: usize) -> Option<S
 /// Reverse lookup: find the row index that corresponds to a `StableRowKey`.
 /// This avoids the O(n) linear search with repeated `row_key_for_row` calls.
 pub fn row_index_for_key(
+    dataset_id: &str,
     dataset: &TableDatasetV1,
     schema: &TableSchema,
     generation: u64,
     key: &StableRowKey,
 ) -> Option<usize> {
+    if key.dataset_id != dataset_id {
+        return None;
+    }
+
     if let Some(column_id) = schema.row_id_column.as_deref() {
         if let Some(column) = dataset.column(column_id) {
             return match &column.values {
@@ -598,6 +593,20 @@ mod tests {
         let key = row_key_for_row("table.points", 7, &schema(), &dataset(), 1);
         assert_eq!(key.dataset_id, "table.points");
         assert_eq!(key.row_id, "b");
+    }
+
+    #[test]
+    fn row_index_for_key_rejects_matching_row_id_from_other_dataset() {
+        let key = row_key_for_row("table.a", 7, &schema(), &dataset(), 0);
+
+        assert_eq!(
+            row_index_for_key("table.b", &dataset(), &schema(), 7, &key),
+            None
+        );
+        assert_eq!(
+            row_index_for_key("table.a", &dataset(), &schema(), 7, &key),
+            Some(0)
+        );
     }
 
     #[test]

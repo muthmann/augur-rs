@@ -1001,7 +1001,7 @@ mod tests {
         );
         let mut header = raw_header.into_bytes();
         let preamble_len = NPY_MAGIC.len() + 2 + 2;
-        while (preamble_len + header.len() + 1) % 16 != 0 {
+        while !(preamble_len + header.len() + 1).is_multiple_of(16) {
             header.push(b' ');
         }
         header.push(b'\n');

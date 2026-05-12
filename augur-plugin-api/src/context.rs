@@ -170,22 +170,18 @@ impl HostDatasetKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HostViewPlacement {
+    #[default]
     AnalysisPanel,
     Window,
 }
 
-impl Default for HostViewPlacement {
-    fn default() -> Self {
-        Self::AnalysisPanel
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostViewKind {
+    #[default]
     CompactTable,
     TableWindow,
     Density2dFromTable {
@@ -203,12 +199,6 @@ pub enum HostViewKind {
     },
     ImageWindow,
     LineSeriesWindow,
-}
-
-impl Default for HostViewKind {
-    fn default() -> Self {
-        Self::CompactTable
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -369,20 +359,15 @@ pub struct TableColumn {
     pub value_type: TableValueType,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TableValueType {
     U64,
     I64,
+    #[default]
     F64,
     String,
     Bool,
-}
-
-impl Default for TableValueType {
-    fn default() -> Self {
-        Self::F64
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -495,9 +480,10 @@ impl<'de> Deserialize<'de> for TableCoordinateSpace3d {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HostMarkerShape {
+    #[default]
     Circle,
     Square,
     Diamond,
@@ -506,12 +492,6 @@ pub enum HostMarkerShape {
     Box,
     Ellipse,
     FilledCircle,
-}
-
-impl Default for HostMarkerShape {
-    fn default() -> Self {
-        Self::Circle
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

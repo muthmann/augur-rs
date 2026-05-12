@@ -208,11 +208,12 @@ pub fn draw_settings(
                     cfg.digital_filter.trail_enabled = false;
                 }
             }
+            crate::theme::field_label(ui, "STC threshold", Some("µs"));
             changed |= ui
-                .add(
-                    egui::Slider::new(&mut cfg.digital_filter.stc_threshold_us, 1_000..=100_000)
-                        .text("STC threshold [us]"),
-                )
+                .add(egui::Slider::new(
+                    &mut cfg.digital_filter.stc_threshold_us,
+                    1_000..=100_000,
+                ))
                 .on_hover_text("Maximum time window (in microseconds) within which successive same-polarity events are considered part of a burst. Lower = stricter filtering.")
                 .changed();
             if ui

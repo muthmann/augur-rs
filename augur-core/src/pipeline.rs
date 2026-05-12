@@ -1294,10 +1294,10 @@ where
                     let accumulate_started = Instant::now();
                     let capture_raw_events = raw_events_preview.load(Ordering::Relaxed);
                     for ev in &events {
-                        frame_events.push(*ev);
                         if ev.x >= width || ev.y >= height {
                             continue;
                         }
+                        frame_events.push(*ev);
                         let idx = ev.y as usize * width as usize + ev.x as usize;
                         let old_total = frame_buffers.pixels[idx];
                         let new_total = old_total.saturating_add(1);
@@ -1969,6 +1969,48 @@ mod tests {
         assert!(frame.events.is_none());
         assert_eq!(frame.event_range, Some(0..2));
         assert_eq!(frame.events_snapshot(), Some(events));
+
+        controller.shutdown().expect("shutdown must succeed");
+    }
+
+    #[test]
+    fn preview_pipeline_excludes_out_of_bounds_events_from_retained_history() {
+        let mut config = CameraConfig::default();
+        config.roi.width = 4;
+        config.roi.height = 4;
+        config.global.acq_time_ms = 1;
+        let valid_events = vec![test_event(1_000, 1), test_event(2_000, 2)];
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![vec![1]],
+                next_packet: 0,
+                release_after_first: None,
+            },
+            TaggedEventDecoder::new(vec![(
+                1,
+                vec![
+                    CdEvent {
+                        x: 99,
+                        y: 0,
+                        timestamp: 0,
+                        polarity: true,
+                    },
+                    valid_events[0],
+                    valid_events[1],
+                ],
+            )]),
+            config,
+            PipelineOptions::preview_only(4, 4),
+        )
+        .expect("pipeline must start");
+
+        let frame = recv_preview_frame(&controller);
+
+        assert_eq!(frame.window_start_us, 1_000);
+        assert_eq!(frame.window_end_us, 2_000);
+        assert_eq!(frame.on_count + frame.off_count, 2);
+        assert_eq!(frame.events_snapshot(), Some(valid_events));
 
         controller.shutdown().expect("shutdown must succeed");
     }

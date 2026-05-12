@@ -617,7 +617,11 @@ pub fn pill_cluster(
         );
         painter.galley(text_pos, galley, fg);
         let response = ui
-            .interact(seg_rect, egui::Id::new((label, i)), egui::Sense::click())
+            .interact(
+                seg_rect,
+                ui.id().with(("pill_cluster_segment", label, i)),
+                egui::Sense::click(),
+            )
             .on_hover_cursor(if is_enabled {
                 egui::CursorIcon::PointingHand
             } else {
@@ -696,18 +700,26 @@ pub fn collapse<R>(
     }
 }
 
+/// Result from [`layer_row`].
+pub struct LayerRowResponse {
+    pub row: egui::Response,
+    pub visible_changed: Option<bool>,
+}
+
 /// Compact layer row matching `.layer-row` from the design: eye toggle +
 /// 10×10 swatch + name (mono, fg_1) + count (mono, fg_3). Returns the
-/// new `visible` value when the eye is clicked, otherwise `None`.
+/// full row response plus the new `visible` value when the eye is clicked.
 pub fn layer_row(
     ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
     visible: bool,
     color: [u8; 4],
     name: &str,
     count: &str,
-) -> Option<bool> {
+) -> LayerRowResponse {
     let p = palette_for_visuals(ui.visuals());
-    let mut new_visible: Option<bool> = None;
+    let row_id = ui.id().with(id_source);
+    let mut visible_changed: Option<bool> = None;
     let row_height = 22.0;
     // Allocate the full row width up front so the trailing right-aligned
     // count anchors to the right edge without forcing the parent panel to
@@ -715,55 +727,69 @@ pub fn layer_row(
     // measuring its desired width from content, which expands the right
     // SidePanel when many layers exist.
     let row_width = ui.available_width();
-    ui.allocate_ui_with_layout(
-        egui::vec2(row_width, row_height),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = sp::SP_2;
-            let glyph = if visible {
-                egui_phosphor::regular::EYE
-            } else {
-                egui_phosphor::regular::EYE_SLASH
-            };
-            if ui
-                .add(
-                    egui::Label::new(egui::RichText::new(glyph).size(13.0).color(p.fg_2))
-                        .sense(egui::Sense::click()),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                new_visible = Some(!visible);
-            }
-            // 10×10 swatch with hairline border.
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().rect_filled(
-                rect,
-                radius::R_1,
-                Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]),
-            );
-            ui.painter().rect_stroke(
-                rect,
-                radius::R_1,
-                Stroke::new(1.0, Color32::from_black_alpha(40)),
-            );
-            ui.label(
-                egui::RichText::new(name)
-                    .monospace()
-                    .size(11.0)
-                    .color(p.fg_1),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(count)
-                        .monospace()
-                        .size(11.0)
-                        .color(p.fg_3),
+    let row_rect = ui
+        .allocate_ui_with_layout(
+            egui::vec2(row_width, row_height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.style_mut().wrap = Some(false);
+                ui.spacing_mut().item_spacing.x = sp::SP_2;
+                let glyph = if visible {
+                    egui_phosphor::regular::EYE
+                } else {
+                    egui_phosphor::regular::EYE_SLASH
+                };
+                ui.push_id(row_id.with("visibility"), |ui| {
+                    if ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(glyph).size(13.0).color(p.fg_2))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        visible_changed = Some(!visible);
+                    }
+                });
+                // 10×10 swatch with hairline border.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    radius::R_1,
+                    Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]),
                 );
-            });
-        },
-    );
-    new_visible
+                ui.painter().rect_stroke(
+                    rect,
+                    radius::R_1,
+                    Stroke::new(1.0, Color32::from_black_alpha(40)),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .monospace()
+                            .size(11.0)
+                            .color(p.fg_1),
+                    )
+                    .truncate(true),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(count)
+                            .monospace()
+                            .size(11.0)
+                            .color(p.fg_3),
+                    );
+                });
+            },
+        )
+        .response
+        .rect;
+    let row_response = ui.interact(row_rect, row_id, egui::Sense::click());
+    LayerRowResponse {
+        row: row_response,
+        visible_changed,
+    }
 }
 
 /// Helper for the design's `.field` block — label with optional bracketed

@@ -63,37 +63,46 @@ impl BuiltInHotpixelDetection {
             );
 
             *changed |= ui
-                .add(
-                    egui::Slider::new(&mut this.history_depth, 4..=64)
-                        .text("Smoothing depth")
-                        .clamp_to_range(true),
-                )
-                .on_hover_text(
-                    "Higher values react more slowly but suppress frame-to-frame flicker.",
-                )
-                .changed();
+                .push_id("hotpixel_history_depth", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut this.history_depth, 4..=64)
+                            .text("Smoothing depth")
+                            .clamp_to_range(true),
+                    )
+                    .on_hover_text(
+                        "Higher values react more slowly but suppress frame-to-frame flicker.",
+                    )
+                    .changed()
+                })
+                .inner;
 
             *changed |= ui
-                .add(
-                    egui::Slider::new(&mut this.threshold_factor, 2.0..=50.0)
-                        .text("Threshold factor")
-                        .clamp_to_range(true),
-                )
-                .on_hover_text(
-                    "A pixel is flagged when its activity exceeds this multiple of the global mean.",
-                )
-                .changed();
+                .push_id("hotpixel_threshold_factor", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut this.threshold_factor, 2.0..=50.0)
+                            .text("Threshold factor")
+                            .clamp_to_range(true),
+                    )
+                    .on_hover_text(
+                        "A pixel is flagged when its activity exceeds this multiple of the global mean.",
+                    )
+                    .changed()
+                })
+                .inner;
 
             *changed |= ui
-                .add(
-                    egui::Slider::new(&mut this.min_absolute_count, 1..=100)
-                        .text("Min absolute count")
-                        .clamp_to_range(true),
-                )
-                .on_hover_text(
-                    "Minimum per-frame event count required before a pixel can be treated as hot.",
-                )
-                .changed();
+                .push_id("hotpixel_min_absolute_count", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut this.min_absolute_count, 1..=100)
+                            .text("Min absolute count")
+                            .clamp_to_range(true),
+                    )
+                    .on_hover_text(
+                        "Minimum per-frame event count required before a pixel can be treated as hot.",
+                    )
+                    .changed()
+                })
+                .inner;
 
             ui.separator();
             ui.label(format!(

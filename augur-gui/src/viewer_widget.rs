@@ -31,6 +31,7 @@ pub(crate) const REPLAY_SPEED_OPTIONS: [(f32, &str); 6] = [
 ];
 const PREVIEW_ZOOM_MIN: f32 = 1.0;
 pub(crate) const PREVIEW_ZOOM_MAX: f32 = 16.0;
+const PREVIEW_CANVAS_MIN_HEIGHT: f32 = 180.0;
 pub(crate) const DEFAULT_TIME_SURFACE_TAU_US: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +228,6 @@ pub(crate) struct ViewerState {
     pub(crate) investigation: InvestigationState,
     pub(crate) investigation_3d: Investigation3dState,
     pub(crate) workspace: PreviewWorkspaceState,
-    pub(crate) display_strip_open: bool,
     pub(crate) preview_mode: PreviewMode,
     pub(crate) time_surface_tau_us: u64,
     pub(crate) contrast_settings: ContrastSettings,
@@ -245,7 +245,6 @@ impl Default for ViewerState {
             investigation: InvestigationState::default(),
             investigation_3d: Investigation3dState::default(),
             workspace: PreviewWorkspaceState::default(),
-            display_strip_open: true,
             preview_mode: PreviewMode::default(),
             time_surface_tau_us: DEFAULT_TIME_SURFACE_TAU_US,
             contrast_settings: ContrastSettings::default(),
@@ -399,14 +398,27 @@ pub(crate) fn draw_viewer(
     input: ViewerInput<'_>,
 ) -> ViewerOutput {
     let mut output = ViewerOutput::default();
+    output.merge(draw_viewer_top_chrome(ctx, ui, state, &input));
 
+    let max_image_height = (ui.available_height()
+        - viewer_bottom_chrome_reserve(state, input.replay))
+    .max(PREVIEW_CANVAS_MIN_HEIGHT);
+    output.merge(draw_viewer_canvas(ui, state, &input, max_image_height));
+    output.merge(draw_viewer_bottom_chrome(ui, state, &input));
+
+    output
+}
+
+pub(crate) fn draw_viewer_top_chrome(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    state: &mut ViewerState,
+    input: &ViewerInput<'_>,
+) -> ViewerOutput {
+    let mut output = ViewerOutput::default();
     if input.mode == AppMode::Replaying {
         handle_replay_shortcuts(ctx, input.replay, &mut output);
     }
-
-    // Capture total available height before any dynamic content is laid out.
-    // This prevents the canvas from resizing when hover info or toolbar state changes.
-    let total_available_height = ui.available_size().y.min(ui.clip_rect().height());
 
     // Viewer head row: compact title + bus / resolution / firmware meta,
     // matching the design's `.viewer-head` strip
@@ -424,6 +436,13 @@ pub(crate) fn draw_viewer(
                     .strong()
                     .color(palette.ink),
             );
+            if input.mode == AppMode::Replaying {
+                ui.label(
+                    egui::RichText::new("\u{2014}")
+                        .size(11.0)
+                        .color(palette.fg_3),
+                );
+            }
             if let Some(info) = input.camera_info {
                 let bus = info.compatible.as_deref().unwrap_or(&info.model);
                 let firmware = info.firmware.as_deref().unwrap_or("\u{2014}");
@@ -440,72 +459,79 @@ pub(crate) fn draw_viewer(
                     .color(palette.fg_2),
                 );
             }
-            // Right-aligned hint row: matches the design's
-            // `Hover preview for pixel values · Esc clears tool` caption.
+            // Right-aligned hint row: keep the primary layout shortcuts visible
+            // in the viewer chrome where the prototype teaches them.
             // Use a nested right-to-left layout filling the remaining width
             // so the hint truly anchors to the right edge regardless of the
             // header's measured size.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new(
-                        "Hover preview for pixel values  \u{00B7}  Esc clears tool",
-                    )
-                    .size(11.0)
-                    .color(palette.fg_3),
+                    egui::RichText::new("1 2D   2 Split   3 3D")
+                        .size(11.0)
+                        .color(palette.fg_3),
                 );
             });
         },
     );
     ui.separator();
+    output.merge(draw_preview_toolbar(ui, state, input.popup_active, input));
 
-    let display_strip_reserve = 88.0;
-    let status_footer_reserve = 96.0;
-    // Fixed overhead: heading (~24px) + separator (~8px) + camera info (~20px) + toolbar (~28px)
-    let header_overhead = 80.0;
-    let max_image_height =
-        (total_available_height - display_strip_reserve - status_footer_reserve - header_overhead)
-            .max(180.0);
+    output
+}
 
+pub(crate) fn viewer_bottom_chrome_reserve(_state: &ViewerState, replay: ViewerReplayState) -> f32 {
+    56.0 + 42.0 + replay_transport_reserve(replay)
+}
+
+pub(crate) fn draw_viewer_canvas(
+    ui: &mut egui::Ui,
+    state: &mut ViewerState,
+    input: &ViewerInput<'_>,
+    max_image_height: f32,
+) -> ViewerOutput {
+    let mut output = ViewerOutput::default();
     if input.external_streaming {
-        output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
-        draw_display_strip(ui, state, &input, &mut output, display_strip_reserve);
-        ui.separator();
         draw_text_placeholder(ui, max_image_height, input.external_streaming_label);
         ui.add_space(8.0);
         if ui.button("Return to augur").clicked() {
             output.return_from_external = true;
         }
+    } else if let (Some(texture), Some(frame)) = (input.texture, input.frame) {
+        let scale_bar_settings = state.scale_bar_settings.clone();
+        output.merge(draw_preview_canvas(
+            ui,
+            texture,
+            frame,
+            input.overlays,
+            input.config,
+            state,
+            PreviewCanvasOptions {
+                scale_bar_settings,
+                nm_per_pixel: input.nm_per_pixel,
+                settings_locked: input.settings_locked,
+                auto_focus_roi: input.mode == AppMode::Replaying || input.settings_locked,
+                investigation_points: input.investigation_points_2d,
+                selected_row: input.selected_row,
+                max_height: max_image_height,
+            },
+        ));
     } else {
-        output.merge(draw_preview_toolbar(ui, state, input.popup_active, &input));
-        draw_display_strip(ui, state, &input, &mut output, display_strip_reserve);
-        ui.separator();
-        if let (Some(texture), Some(frame)) = (input.texture, input.frame) {
-            let scale_bar_settings = state.scale_bar_settings.clone();
-            output.merge(draw_preview_canvas(
-                ui,
-                texture,
-                frame,
-                input.overlays,
-                input.config,
-                state,
-                PreviewCanvasOptions {
-                    scale_bar_settings,
-                    nm_per_pixel: input.nm_per_pixel,
-                    settings_locked: input.settings_locked,
-                    investigation_points: input.investigation_points_2d,
-                    selected_row: input.selected_row,
-                    max_height: max_image_height,
-                },
-            ));
-        } else {
-            state.workspace.hover_sensor = None;
-            draw_empty_preview_placeholder(ui, max_image_height, input.mode);
-        }
+        state.workspace.hover_sensor = None;
+        draw_empty_preview_placeholder(ui, max_image_height, input.mode);
     }
+    output
+}
 
+pub(crate) fn draw_viewer_bottom_chrome(
+    ui: &mut egui::Ui,
+    state: &mut ViewerState,
+    input: &ViewerInput<'_>,
+) -> ViewerOutput {
+    let mut output = ViewerOutput::default();
+    draw_display_strip(ui, state, input, &mut output, 0.0);
+    draw_replay_transport(ui, state, input.replay, input.viewer_id, &mut output);
     ui.add_space(2.0);
-    draw_status_footer(ui, state, &input, &mut output, status_footer_reserve);
-
+    draw_status_footer(ui, state, input, &mut output, 56.0);
     output
 }
 
@@ -534,6 +560,14 @@ pub(crate) fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, me
     );
 }
 
+fn replay_transport_reserve(replay: ViewerReplayState) -> f32 {
+    if replay.active {
+        34.0
+    } else {
+        0.0
+    }
+}
+
 fn draw_display_strip(
     ui: &mut egui::Ui,
     state: &mut ViewerState,
@@ -542,15 +576,16 @@ fn draw_display_strip(
     _max_height: f32,
 ) {
     ui.push_id((input.viewer_id, "display_strip"), |ui| {
-        draw_section_toggle(ui, &mut state.display_strip_open, "Display");
-        if !state.display_strip_open {
-            return;
-        }
-
-        egui::ScrollArea::horizontal()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+        let palette = crate::theme::palette_for_visuals(ui.visuals());
+        let frame = egui::Frame::none()
+            .fill(palette.bg_1)
+            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+            .stroke(egui::Stroke::new(1.0, palette.line));
+        frame.show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
                     // Group 1 — preview mode
                     ui.label(egui::RichText::new("Mode").size(11.0).strong());
                     let previous_preview_mode = state.preview_mode;
@@ -633,32 +668,48 @@ fn draw_display_strip(
                         });
                     }
 
-                    // Time-surface decay (only when in time-surface mode)
-                    if matches!(state.preview_mode, PreviewMode::TimeSurface) {
-                        crate::theme::toolbar_separator(ui);
-                        let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
-                        ui.label(egui::RichText::new("Decay \u{03C4} [ms]").size(11.0).strong());
-                        let response = ui.add(
-                            egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
-                                .logarithmic(true)
-                                .show_value(true),
-                        );
-                        if response.changed() {
-                            state.time_surface_tau_us =
-                                (tau_ms * 1_000.0).round().max(1.0) as u64;
-                            output.time_surface_tau_changed = true;
-                        }
-                        if input
-                            .frame
-                            .is_some_and(|frame| !frame.raw_events_available())
-                        {
-                            ui.small(
-                                "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
+                            crate::theme::toolbar_separator(ui);
+                            let mut tau_ms = state.time_surface_tau_us as f64 / 1_000.0;
+                            ui.label(
+                                egui::RichText::new("Decay \u{03C4} [ms]")
+                                    .size(11.0)
+                                    .strong(),
                             );
-                        }
-                    }
+                            let response = ui.add(
+                                egui::Slider::new(&mut tau_ms, 1.0..=1_000.0)
+                                    .logarithmic(true)
+                                    .show_value(true),
+                            );
+                            if response.changed() {
+                                state.time_surface_tau_us =
+                                    (tau_ms * 1_000.0).round().max(1.0) as u64;
+                                output.time_surface_tau_changed = true;
+                            }
+                            if matches!(state.preview_mode, PreviewMode::TimeSurface)
+                                && input
+                                    .frame
+                                    .is_some_and(|frame| !frame.raw_events_available())
+                            {
+                                ui.small(
+                                    "Time Surface needs raw preview events. Augur will fall back to grayscale intensity until a raw-event frame is available.",
+                                );
+                            }
+
+                            crate::theme::toolbar_separator(ui);
+                            let ann_count = state.annotation_manager.annotations().len();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Annotations: {} shape{}",
+                                    ann_count,
+                                    if ann_count == 1 { "" } else { "s" }
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .color(palette.fg_2),
+                            );
+                    });
                 });
-            });
+        });
     });
 }
 
@@ -741,10 +792,9 @@ fn draw_status_footer(
                                 stats.disk_write_us as f64 / 1_000.0,
                             ));
                             ui.small(format!(
-                                "Preview thread avg [ms]: decode {:.3}  |  accumulate {:.3}  |  raw-copy {:.3}  |  frame send {:.3}",
+                                "Preview thread avg [ms]: decode {:.3}  |  accumulate {:.3}  |  frame send {:.3}",
                                 stats.preview_decode_avg_ms(),
                                 stats.preview_accumulate_avg_ms(),
-                                stats.preview_raw_event_copy_avg_ms(),
                                 stats.preview_frame_send_avg_ms(),
                             ));
                         }
@@ -822,43 +872,6 @@ fn draw_status_footer(
     });
 }
 
-fn draw_section_toggle(ui: &mut egui::Ui, open: &mut bool, label: &str) {
-    let chevron = if *open {
-        phosphor::CARET_DOWN
-    } else {
-        phosphor::CARET_RIGHT
-    };
-    let response = ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        let chevron_response = ui
-            .add(
-                egui::Label::new(egui::RichText::new(chevron).size(10.0))
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let icon_response = ui
-            .add(
-                egui::Label::new(
-                    egui::RichText::new(phosphor::SLIDERS_HORIZONTAL)
-                        .size(14.0)
-                        .weak(),
-                )
-                .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let label_response = ui
-            .add(
-                egui::Label::new(egui::RichText::new(label).size(12.0).strong())
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        chevron_response.union(icon_response).union(label_response)
-    });
-    if response.inner.clicked() {
-        *open = !*open;
-    }
-}
-
 fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
     let width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
     ui.set_min_width(width);
@@ -896,21 +909,21 @@ fn draw_unified_diagnostics_row(
                 elapsed % 60
             );
             ui.label(
-                egui::RichText::new(format!("{:.2} Mev/s", stats.mev_per_s))
+                egui::RichText::new(format!("\u{25A1} {:.2} Mev/s", stats.mev_per_s))
                     .monospace()
                     .size(11.0)
                     .color(palette.fg_1),
             );
             ui.label(bullet());
             ui.label(
-                egui::RichText::new(format!("{:.2} MB/s", stats.mb_per_s))
+                egui::RichText::new(format!("\u{2191} {:.2} MB/s", stats.mb_per_s))
                     .monospace()
                     .size(11.0)
                     .color(palette.fg_1),
             );
             ui.label(bullet());
             ui.label(
-                egui::RichText::new(format!("{elapsed_str} elapsed"))
+                egui::RichText::new(format!("\u{25EF} {elapsed_str} elapsed"))
                     .monospace()
                     .size(11.0)
                     .color(palette.fg_1),
@@ -972,7 +985,7 @@ fn format_thousands(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
@@ -1054,13 +1067,19 @@ fn draw_preview_toolbar(
     let histogram_open = &mut state.histogram_window.open;
 
     let mut output = ViewerOutput::default();
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
     let toolbar_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 8.0;
-    egui::ScrollArea::horizontal()
-        .id_source((input.viewer_id, "preview_toolbar_scroll"))
-        .auto_shrink([false, false])
-        .max_height(toolbar_height)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
+    let (toolbar_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), toolbar_height),
+        egui::Sense::hover(),
+    );
+    ui.allocate_ui_at_rect(toolbar_rect, |ui| {
+        egui::ScrollArea::horizontal()
+            .id_source((input.viewer_id, "preview_toolbar_scroll"))
+            .auto_shrink([false, false])
+            .max_height(toolbar_height)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
                 // Group 1 — selection & annotation tools
                 if crate::theme::icon_toggle_button(
                     ui,
@@ -1207,8 +1226,17 @@ fn draw_preview_toolbar(
                 {
                     output.popup_toggled = true;
                 }
+
+                });
             });
-        });
+    });
+    ui.painter_at(toolbar_rect).text(
+        toolbar_rect.right_center() - egui::vec2(crate::theme::sp::SP_3, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        "Hover for pixel values  \u{00B7}  Esc clears tool",
+        egui::FontId::proportional(10.0),
+        palette.fg_3,
+    );
 
     output
 }
@@ -1257,6 +1285,7 @@ struct PreviewCanvasOptions<'a> {
     scale_bar_settings: ScaleBarSettings,
     nm_per_pixel: f64,
     settings_locked: bool,
+    auto_focus_roi: bool,
     investigation_points: &'a [Investigation2dPoint],
     selected_row: Option<&'a StableRowKey>,
     max_height: f32,
@@ -1279,22 +1308,33 @@ fn draw_preview_canvas(
         scale_bar_settings,
         nm_per_pixel,
         settings_locked,
+        auto_focus_roi,
         investigation_points,
         selected_row,
         max_height,
     } = options;
 
-    let viewport = build_preview_viewport(frame, config, annotation_manager, workspace);
+    let viewport = build_preview_viewport_with_options(
+        frame,
+        config,
+        annotation_manager,
+        workspace,
+        auto_focus_roi,
+    );
+    let available_height = ui.available_height().min(ui.clip_rect().height());
+    let canvas_w = ui.available_width().min(ui.clip_rect().width()).max(1.0);
+    let canvas_h = max_height
+        .min(available_height.max(PREVIEW_CANVAS_MIN_HEIGHT))
+        .max(1.0);
+    // Size the canvas to the image's natural aspect ratio — no black letterbox bars.
+    let display_size = viewport.display_size(egui::vec2(canvas_w, canvas_h));
     let canvas_size = egui::vec2(
-        ui.available_width().min(ui.clip_rect().width()).max(1.0),
-        max_height
-            .min(ui.available_height().min(ui.clip_rect().height()).max(1.0))
-            .max(1.0),
+        display_size.x.max(1.0),
+        display_size.y.max(PREVIEW_CANVAS_MIN_HEIGHT),
     );
     let (canvas_rect, response) =
         ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
-    let display_size = viewport.display_size(canvas_rect.size());
-    let image_rect = egui::Align2::CENTER_CENTER.align_size_within_rect(display_size, canvas_rect);
+    let image_rect = canvas_rect;
     ui.painter()
         .rect_filled(canvas_rect, 4.0, crate::theme::CANVAS_BG);
     texture.paint_at(ui, image_rect, viewport.uv_rect(frame));
@@ -2007,11 +2047,22 @@ impl PreviewViewport {
     }
 }
 
+#[cfg(test)]
 fn build_preview_viewport(
     frame: &PreviewFrame,
     config: &CameraConfig,
     annotation_manager: &AnnotationManager,
     workspace: &mut PreviewWorkspaceState,
+) -> PreviewViewport {
+    build_preview_viewport_with_options(frame, config, annotation_manager, workspace, false)
+}
+
+fn build_preview_viewport_with_options(
+    frame: &PreviewFrame,
+    config: &CameraConfig,
+    annotation_manager: &AnnotationManager,
+    workspace: &mut PreviewWorkspaceState,
+    auto_focus_roi: bool,
 ) -> PreviewViewport {
     workspace.zoom = workspace.zoom.clamp(PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_MAX);
 
@@ -2021,6 +2072,21 @@ fn build_preview_viewport(
     );
     let roi_rect = roi_sensor_rect(config, frame);
     let base_sensor_rect = crop_target_sensor_rect(config, frame, annotation_manager, workspace)
+        .or_else(|| {
+            auto_focus_roi.then_some(roi_rect).flatten().filter(|roi| {
+                roi.width() < full_sensor_rect.width() * 0.95
+                    || roi.height() < full_sensor_rect.height() * 0.95
+            })
+        })
+        .or_else(|| {
+            auto_focus_roi
+                .then(|| active_frame_sensor_rect(frame))
+                .flatten()
+                .filter(|rect| {
+                    rect.width() < full_sensor_rect.width() * 0.92
+                        || rect.height() < full_sensor_rect.height() * 0.92
+                })
+        })
         .unwrap_or(full_sensor_rect);
 
     let visible_size = egui::vec2(
@@ -2090,6 +2156,58 @@ fn roi_sensor_rect(config: &CameraConfig, frame: &PreviewFrame) -> Option<egui::
     Some(egui::Rect::from_min_max(
         egui::pos2(min_x, min_y),
         egui::pos2(max_x, max_y),
+    ))
+}
+
+fn active_frame_sensor_rect(frame: &PreviewFrame) -> Option<egui::Rect> {
+    const MIN_ACTIVE_PIXELS_FOR_AUTOFIT: usize = 64;
+    const ACTIVE_BOUNDS_PADDING_FRACTION: f32 = 0.08;
+    const ACTIVE_BOUNDS_MIN_PADDING: f32 = 12.0;
+
+    let width = usize::from(frame.width);
+    let height = usize::from(frame.height);
+    let pixel_count = width.checked_mul(height)?;
+    if width == 0 || height == 0 || frame.pixels.len() < pixel_count {
+        return None;
+    }
+
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut active = 0usize;
+
+    for (idx, &value) in frame.pixels.iter().take(pixel_count).enumerate() {
+        if value == 0 {
+            continue;
+        }
+        let x = idx % width;
+        let y = idx / width;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+        active += 1;
+    }
+
+    if active < MIN_ACTIVE_PIXELS_FOR_AUTOFIT {
+        return None;
+    }
+
+    let raw_width = (max_x.saturating_sub(min_x) + 1) as f32;
+    let raw_height = (max_y.saturating_sub(min_y) + 1) as f32;
+    let pad_x = (raw_width * ACTIVE_BOUNDS_PADDING_FRACTION).max(ACTIVE_BOUNDS_MIN_PADDING);
+    let pad_y = (raw_height * ACTIVE_BOUNDS_PADDING_FRACTION).max(ACTIVE_BOUNDS_MIN_PADDING);
+
+    Some(egui::Rect::from_min_max(
+        egui::pos2(
+            (min_x as f32 - pad_x).max(0.0),
+            (min_y as f32 - pad_y).max(0.0),
+        ),
+        egui::pos2(
+            ((max_x + 1) as f32 + pad_x).min(frame.width as f32),
+            ((max_y + 1) as f32 + pad_y).min(frame.height as f32),
+        ),
     ))
 }
 
@@ -2479,15 +2597,20 @@ pub(crate) fn draw_replay_transport(
     viewer_id: &str,
     output: &mut ViewerOutput,
 ) {
-    if !replay.active || replay.duration_us == 0 {
+    if !replay.active {
         return;
     }
 
-    let time_text = format!(
-        "{} / {}",
-        format_replay_time(replay.time_us),
-        format_replay_time(replay.duration_us)
-    );
+    let has_duration = replay.duration_us > 0;
+    let time_text = if has_duration {
+        format!(
+            "{} / {}",
+            format_replay_time(replay.time_us),
+            format_replay_time(replay.duration_us)
+        )
+    } else {
+        String::new()
+    };
 
     let mut new_speed: Option<f32> = None;
 
@@ -2501,7 +2624,7 @@ pub(crate) fn draw_replay_transport(
         };
         if ui
             .add(
-                egui::Button::new(toolbar_icon(phosphor::SKIP_BACK))
+                egui::Button::new(toolbar_icon(phosphor::ARROW_CLOCKWISE))
                     .min_size(transport_button_size),
             )
             .on_hover_text("Restart replay")
@@ -2559,8 +2682,6 @@ pub(crate) fn draw_replay_transport(
 
         crate::theme::toolbar_separator(ui);
 
-        crate::theme::toolbar_separator(ui);
-
         let selected_label = replay_speed_label(replay.speed);
         egui::ComboBox::from_id_source((viewer_id, "replay_speed_combo"))
             .selected_text(selected_label)
@@ -2575,71 +2696,87 @@ pub(crate) fn draw_replay_transport(
                 }
             });
 
-        crate::theme::toolbar_separator(ui);
-
-        let time_width =
-            ui.fonts(|f| {
-                f.layout_no_wrap(
-                    time_text.clone(),
-                    egui::FontId::default(),
-                    ui.visuals().text_color(),
-                )
-            })
-            .size()
-            .x + ui.spacing().item_spacing.x * 2.0;
-
-        let mut timeline_fraction = state.replay_seek_drag.unwrap_or(replay.fraction);
-        let slider_width = (ui.available_width() - time_width).max(80.0);
-        let track_height: f32 = 14.0;
-        let (track_rect, response) = ui.allocate_exact_size(
-            egui::vec2(slider_width, track_height),
-            egui::Sense::click_and_drag(),
-        );
-        if let Some(pos) = response.interact_pointer_pos() {
-            if response.dragged() || response.clicked() {
-                let f = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
-                timeline_fraction = f;
-                state.replay_seek_drag = Some(f);
-            }
-        }
-        if response.drag_stopped() || response.clicked() {
-            state.replay_seek_drag = None;
-            output.replay_seek_to = Some(timeline_fraction);
-        }
-        // Custom track: 4 px ink-filled bar with circular thumb on top.
-        let palette = crate::theme::palette_for_visuals(ui.visuals());
-        let bar_height = 4.0;
-        let bar_y = track_rect.center().y - bar_height * 0.5;
-        let bar_rect = egui::Rect::from_min_size(
-            egui::pos2(track_rect.left(), bar_y),
-            egui::vec2(track_rect.width(), bar_height),
-        );
-        ui.painter().rect_filled(bar_rect, 2.0, palette.bg_3);
-        let fill_rect = egui::Rect::from_min_size(
-            bar_rect.min,
-            egui::vec2(bar_rect.width() * timeline_fraction, bar_height),
-        );
-        ui.painter().rect_filled(fill_rect, 2.0, palette.ink);
-        let thumb_x = bar_rect.left() + bar_rect.width() * timeline_fraction;
-        let thumb_radius = 6.0;
-        ui.painter().circle_filled(
-            egui::pos2(thumb_x, track_rect.center().y),
-            thumb_radius,
-            palette.bg_1,
-        );
-        ui.painter().circle_stroke(
-            egui::pos2(thumb_x, track_rect.center().y),
-            thumb_radius,
-            egui::Stroke::new(2.0, palette.ink),
-        );
-
-        ui.label(&time_text);
-        ui.separator();
-        ui.small(format!(
+        // Pre-compute so we can reserve its width in the scrubber calculation below.
+        let mb_text = format!(
             "{:.1} / {:.1} MB",
             replay.bytes_read as f64 / (1024.0 * 1024.0),
             replay.data_len as f64 / (1024.0 * 1024.0)
-        ));
+        );
+
+        if has_duration {
+            crate::theme::toolbar_separator(ui);
+
+            let time_width =
+                ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        time_text.clone(),
+                        egui::FontId::default(),
+                        ui.visuals().text_color(),
+                    )
+                })
+                .size()
+                .x + ui.spacing().item_spacing.x * 2.0;
+
+            let mb_width = {
+                let small_font = egui::TextStyle::Small.resolve(ui.style());
+                ui.fonts(|f| {
+                    f.layout_no_wrap(mb_text.clone(), small_font, egui::Color32::WHITE)
+                })
+                .size()
+                .x
+            } + ui.spacing().item_spacing.x * 3.0
+                + 1.0; // separator gap + padding
+
+            let mut timeline_fraction = state.replay_seek_drag.unwrap_or(replay.fraction);
+            let slider_width = (ui.available_width() - time_width - mb_width).max(80.0);
+            let track_height: f32 = 14.0;
+            let (track_rect, response) = ui.allocate_exact_size(
+                egui::vec2(slider_width, track_height),
+                egui::Sense::click_and_drag(),
+            );
+            if let Some(pos) = response.interact_pointer_pos() {
+                if response.dragged() || response.clicked() {
+                    let f = ((pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
+                    timeline_fraction = f;
+                    state.replay_seek_drag = Some(f);
+                }
+            }
+            if response.drag_stopped() || response.clicked() {
+                state.replay_seek_drag = None;
+                output.replay_seek_to = Some(timeline_fraction);
+            }
+            // Custom track: 4 px ink-filled bar with circular thumb on top.
+            let palette = crate::theme::palette_for_visuals(ui.visuals());
+            let bar_height = 4.0;
+            let bar_y = track_rect.center().y - bar_height * 0.5;
+            let bar_rect = egui::Rect::from_min_size(
+                egui::pos2(track_rect.left(), bar_y),
+                egui::vec2(track_rect.width(), bar_height),
+            );
+            ui.painter().rect_filled(bar_rect, 2.0, palette.bg_3);
+            let fill_rect = egui::Rect::from_min_size(
+                bar_rect.min,
+                egui::vec2(bar_rect.width() * timeline_fraction, bar_height),
+            );
+            ui.painter().rect_filled(fill_rect, 2.0, palette.ink);
+            let thumb_x = bar_rect.left() + bar_rect.width() * timeline_fraction;
+            let thumb_radius = 6.0;
+            ui.painter().circle_filled(
+                egui::pos2(thumb_x, track_rect.center().y),
+                thumb_radius,
+                palette.bg_1,
+            );
+            ui.painter().circle_stroke(
+                egui::pos2(thumb_x, track_rect.center().y),
+                thumb_radius,
+                egui::Stroke::new(2.0, palette.ink),
+            );
+
+            ui.label(&time_text);
+        }
+
+        ui.separator();
+        ui.small(&mb_text);
     });
 
     if let Some(speed) = new_speed {
@@ -2652,7 +2789,7 @@ fn handle_replay_shortcuts(
     replay: ViewerReplayState,
     output: &mut ViewerOutput,
 ) {
-    if !replay.active || replay.duration_us == 0 || ctx.wants_keyboard_input() {
+    if !replay.active || ctx.wants_keyboard_input() {
         return;
     }
 
@@ -2705,11 +2842,12 @@ fn format_replay_time(duration_us: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_preview_viewport, pick_overlay_candidate, sensor_rect_to_roi_config,
-        PreviewCropTarget, PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
+        build_preview_viewport, build_preview_viewport_with_options, pick_overlay_candidate,
+        sensor_rect_to_roi_config, PreviewCropTarget, PreviewWorkspaceState, ViewerState,
+        PREVIEW_ZOOM_MAX,
     };
-    use crate::investigation::StableRowKey;
     use crate::viewer_tools::{AnnotationManager, AnnotationShapeKind};
+    use crate::{inspection_3d::Investigation3dState, investigation::StableRowKey};
     use augur_core::{
         analysis::{MarkerOverlayItem, MarkerShape, Overlay, Pixel},
         config::CameraConfig,
@@ -2769,6 +2907,39 @@ mod tests {
 
         assert_eq!(viewport.base_sensor_rect.min, egui::pos2(120.0, 90.0));
         assert_eq!(viewport.base_sensor_rect.size(), egui::vec2(320.0, 180.0));
+    }
+
+    #[test]
+    fn preview_viewport_auto_focuses_active_pixels_when_replay_roi_is_missing() {
+        let mut frame = test_frame();
+        frame.width = 200;
+        frame.height = 120;
+        frame.pixels = vec![0; 200 * 120];
+        frame.pixels_on = vec![0; 200 * 120];
+        frame.pixels_off = vec![0; 200 * 120];
+        for y in 40..80 {
+            for x in 70..130 {
+                frame.pixels[y * 200 + x] = 1;
+            }
+        }
+        let config = CameraConfig::default();
+        let annotations = AnnotationManager::default();
+        let mut workspace = PreviewWorkspaceState::default();
+
+        let viewport = build_preview_viewport_with_options(
+            &frame,
+            &config,
+            &annotations,
+            &mut workspace,
+            true,
+        );
+
+        assert!(viewport.base_sensor_rect.min.x > 0.0);
+        assert!(viewport.base_sensor_rect.min.y > 0.0);
+        assert!(viewport.base_sensor_rect.max.x < frame.width as f32);
+        assert!(viewport.base_sensor_rect.max.y < frame.height as f32);
+        assert!(viewport.base_sensor_rect.width() > 60.0);
+        assert!(viewport.base_sensor_rect.height() > 40.0);
     }
 
     #[test]

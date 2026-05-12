@@ -7,42 +7,46 @@ pub fn render_plugin_settings(
     ui: &mut egui::Ui,
     plugin: &mut DynPlugin,
     show_header: bool,
+    id_source: impl std::hash::Hash,
 ) -> Result<bool, String> {
     let mut changed = false;
-    let mut setting_error = None;
 
     if show_header {
-        ui.heading(plugin.name());
+        crate::theme::section_subhead(ui, plugin.name());
         if !plugin.description().is_empty() {
             ui.weak(plugin.description());
         }
     }
 
     for section in plugin.settings_schema().sections.clone() {
-        egui::CollapsingHeader::new(section.label)
-            .default_open(section.default_open)
-            .show(ui, |ui| {
+        let result = crate::theme::collapse(
+            ui,
+            (&id_source, &section.label),
+            &section.label,
+            section.default_open,
+            None,
+            |ui| {
                 if let Some(description) = &section.description {
                     ui.weak(description);
                 }
-
+                let mut section_changed = false;
                 for item in &section.items {
-                    match render_setting_item(ui, plugin, item) {
+                    match render_setting_item(ui, plugin, item, &id_source) {
                         Ok(item_changed) => {
                             if item_changed {
-                                changed = true;
+                                section_changed = true;
                             }
                         }
-                        Err(err) => {
-                            setting_error = Some(err);
-                            break;
-                        }
+                        Err(err) => return Err(err),
                     }
                 }
-            });
-
-        if let Some(err) = setting_error.take() {
-            return Err(err);
+                Ok(section_changed)
+            },
+        );
+        match result {
+            Some(Err(err)) => return Err(err),
+            Some(Ok(true)) => changed = true,
+            _ => {}
         }
     }
 
@@ -61,14 +65,18 @@ fn render_setting_item(
     ui: &mut egui::Ui,
     plugin: &mut DynPlugin,
     item: &SettingItem,
+    id_source: &impl std::hash::Hash,
 ) -> Result<bool, String> {
+    let widget_id = (id_source, item.key.as_str());
     match &item.kind {
         SettingKind::Bool { default } => {
             let mut value = plugin
                 .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_bool())
                 .unwrap_or(*default);
-            let response = ui.checkbox(&mut value, &item.label);
+            let response = ui
+                .push_id(widget_id, |ui| ui.checkbox(&mut value, &item.label))
+                .inner;
             maybe_add_tooltip(&response, item.tooltip.as_deref());
             if response.changed() {
                 return plugin.set_setting_value(&item.key, &json!(value));
@@ -84,11 +92,12 @@ fn render_setting_item(
                 .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_f64())
                 .unwrap_or(*default);
-            let mut slider = egui::Slider::new(&mut value, *min..=*max).text(&item.label);
-            if let Some(suffix) = suffix {
-                slider = slider.suffix(suffix);
+            crate::theme::field_label(ui, &item.label, suffix.as_deref());
+            let mut slider = egui::Slider::new(&mut value, *min..=*max);
+            if let Some(sfx) = suffix {
+                slider = slider.suffix(sfx.as_str());
             }
-            let response = ui.add(slider);
+            let response = ui.push_id(widget_id, |ui| ui.add(slider)).inner;
             maybe_add_tooltip(&response, item.tooltip.as_deref());
             if response.changed() {
                 return plugin.set_setting_value(&item.key, &json!(value));
@@ -104,11 +113,12 @@ fn render_setting_item(
                 .get_setting_value_cached(&item.key)?
                 .and_then(|value| value.as_i64())
                 .unwrap_or(*default);
-            let mut slider = egui::Slider::new(&mut value, *min..=*max).text(&item.label);
-            if let Some(suffix) = suffix {
-                slider = slider.suffix(suffix);
+            crate::theme::field_label(ui, &item.label, suffix.as_deref());
+            let mut slider = egui::Slider::new(&mut value, *min..=*max);
+            if let Some(sfx) = suffix {
+                slider = slider.suffix(sfx.as_str());
             }
-            let response = ui.add(slider);
+            let response = ui.push_id(widget_id, |ui| ui.add(slider)).inner;
             maybe_add_tooltip(&response, item.tooltip.as_deref());
             if response.changed() {
                 return plugin.set_setting_value(&item.key, &json!(value));
@@ -125,15 +135,20 @@ fn render_setting_item(
                 .and_then(|value| value.as_f64())
                 .unwrap_or(*default);
             let old_value = value;
-            let response = ui.horizontal(|ui| {
-                crate::theme::field_label(ui, &item.label, None);
-                ui.add(
-                    egui::DragValue::new(&mut value)
-                        .clamp_range(*min..=*max)
-                        .speed(*speed),
-                )
-            });
-            maybe_add_tooltip(&response.response, item.tooltip.as_deref());
+            let response = ui
+                .push_id(widget_id, |ui| {
+                    ui.horizontal(|ui| {
+                        crate::theme::field_label(ui, &item.label, None);
+                        ui.add(
+                            egui::DragValue::new(&mut value)
+                                .clamp_range(*min..=*max)
+                                .speed(*speed),
+                        )
+                    })
+                    .response
+                })
+                .inner;
+            maybe_add_tooltip(&response, item.tooltip.as_deref());
             if value != old_value {
                 return plugin.set_setting_value(&item.key, &json!(value));
             }
@@ -144,11 +159,16 @@ fn render_setting_item(
                 .and_then(|value| value.as_i64())
                 .unwrap_or(*default);
             let old_value = value;
-            let response = ui.horizontal(|ui| {
-                crate::theme::field_label(ui, &item.label, None);
-                ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max))
-            });
-            maybe_add_tooltip(&response.response, item.tooltip.as_deref());
+            let response = ui
+                .push_id(widget_id, |ui| {
+                    ui.horizontal(|ui| {
+                        crate::theme::field_label(ui, &item.label, None);
+                        ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max))
+                    })
+                    .response
+                })
+                .inner;
+            maybe_add_tooltip(&response, item.tooltip.as_deref());
             if value != old_value {
                 return plugin.set_setting_value(&item.key, &json!(value));
             }
@@ -160,13 +180,18 @@ fn render_setting_item(
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(*default);
             let old_value = value;
-            let response = ui.horizontal_wrapped(|ui| {
-                ui.label(&item.label);
-                for (index, variant) in variants.iter().enumerate() {
-                    ui.radio_value(&mut value, index, variant);
-                }
-            });
-            maybe_add_tooltip(&response.response, item.tooltip.as_deref());
+            crate::theme::field_label(ui, &item.label, None);
+            let response = ui
+                .push_id(widget_id, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, variant) in variants.iter().enumerate() {
+                            ui.radio_value(&mut value, index, variant);
+                        }
+                    })
+                    .response
+                })
+                .inner;
+            maybe_add_tooltip(&response, item.tooltip.as_deref());
             if value != old_value {
                 return plugin.set_setting_value(&item.key, &json!(value));
             }

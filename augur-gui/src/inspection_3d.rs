@@ -173,7 +173,6 @@ pub struct Investigation3dState {
     pub pitch: f32,
     pub distance: f32,
     pub target: [f32; 3],
-    pub display_strip_open: bool,
     pub clip_enabled: bool,
     pub clip_half_extent: f32,
     pub point_scale: f32,
@@ -189,7 +188,6 @@ impl Default for Investigation3dState {
             pitch: 0.52,
             distance: 12.0,
             target: [0.0, 0.0, 0.0],
-            display_strip_open: true,
             clip_enabled: false,
             clip_half_extent: 240.0,
             point_scale: DEFAULT_POINT_SCALE,
@@ -333,6 +331,15 @@ pub struct Investigation3dOutput {
     pub focus_target: Option<[f32; 3]>,
 }
 
+pub struct Investigation3dViewInput<'a> {
+    pub viewer_id: &'a str,
+    pub scene: &'a Investigation3dScene,
+    pub selected: Option<&'a StableRowKey>,
+    pub raw_history: Option<&'a mut PointCloudState>,
+    pub raw_history_anchor_end_us: Option<u64>,
+    pub max_height: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PreparedPoint<'a> {
     raw: PointInstanceRaw,
@@ -353,8 +360,11 @@ struct RawHistoryFooterStatus {
 }
 
 impl RawHistoryFooterStatus {
-    fn from_state(raw_history: &PointCloudState) -> Self {
-        let summary = raw_history.visible_summary();
+    fn from_state(raw_history: &PointCloudState, anchor_end_us: Option<u64>) -> Self {
+        let summary = anchor_end_us.map_or_else(
+            || raw_history.visible_summary(),
+            |anchor_end_us| raw_history.visible_summary_at(anchor_end_us),
+        );
         Self {
             requested_ms: raw_history.time_window_ms,
             retained_ms: summary.retained_time_span_ms,
@@ -364,15 +374,11 @@ impl RawHistoryFooterStatus {
     }
 }
 
+#[derive(Default)]
 pub(crate) enum Investigation3dRenderer {
+    #[default]
     Disabled,
     Wgpu(Box<WgpuInvestigation3dRenderer>),
-}
-
-impl Default for Investigation3dRenderer {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl Investigation3dRenderer {
@@ -779,96 +785,94 @@ fn prepare_scene_points<'a>(
     prepared
 }
 
+/// Height reserved for the status footer drawn below the 3D canvas.
+/// Callers that control the outer layout (e.g. the replay transport) must
+/// subtract this from their own height budget before passing `max_height`.
+pub const INVESTIGATION_3D_FOOTER_HEIGHT: f32 = 96.0;
+
 pub fn draw_investigation_3d(
     ui: &mut egui::Ui,
     renderer: &mut Investigation3dRenderer,
     state: &mut Investigation3dState,
-    scene: &Investigation3dScene,
-    selected: Option<&StableRowKey>,
-    raw_history: Option<&mut PointCloudState>,
-    max_height: f32,
+    input: Investigation3dViewInput<'_>,
 ) -> Investigation3dOutput {
+    let Investigation3dViewInput {
+        viewer_id,
+        scene,
+        selected,
+        mut raw_history,
+        raw_history_anchor_end_us,
+        max_height,
+    } = input;
+    let footer_height = INVESTIGATION_3D_FOOTER_HEIGHT;
+    // `max_height` is the cap for the canvas alone (caller subtracts footer + transport).
+    let canvas_height = (ui.available_height().min(ui.clip_rect().height()) - footer_height)
+        .max(100.0)
+        .min(max_height);
+    let output = draw_investigation_3d_canvas(
+        ui,
+        renderer,
+        state,
+        Investigation3dViewInput {
+            viewer_id,
+            scene,
+            selected,
+            raw_history: raw_history.as_deref_mut(),
+            raw_history_anchor_end_us,
+            max_height: canvas_height,
+        },
+    );
+
+    let raw_history_status = raw_history
+        .as_deref()
+        .map(|history| RawHistoryFooterStatus::from_state(history, raw_history_anchor_end_us));
+
+    ui.add_space(2.0);
+    draw_3d_status_footer(
+        ui,
+        output.response_id,
+        scene,
+        raw_history_status,
+        footer_height,
+    );
+
+    output.output
+}
+
+pub(crate) struct Investigation3dCanvasOutput {
+    pub(crate) output: Investigation3dOutput,
+    response_id: egui::Id,
+}
+
+pub(crate) fn draw_investigation_3d_canvas(
+    ui: &mut egui::Ui,
+    renderer: &mut Investigation3dRenderer,
+    state: &mut Investigation3dState,
+    input: Investigation3dViewInput<'_>,
+) -> Investigation3dCanvasOutput {
+    let Investigation3dViewInput {
+        viewer_id: _,
+        scene,
+        selected,
+        raw_history,
+        raw_history_anchor_end_us,
+        max_height,
+    } = input;
+    let mut raw_history = raw_history;
+    if let Some(history) = raw_history.as_deref_mut() {
+        history.sanitize_controls();
+    }
     let mut output = Investigation3dOutput::default();
     let scene_empty = scene.is_empty();
     let selected_focus_target = selected.and_then(|key| scene_focus_target(scene, key));
-    let total_available_height = ui.available_height().min(ui.clip_rect().height());
-
-    let toolbar_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 8.0;
-    let display_strip_reserve = 88.0;
-    let footer_height = 96.0;
-    egui::ScrollArea::horizontal()
-        .id_source("investigation_3d_toolbar_scroll")
-        .auto_shrink([false, false])
-        .max_height(toolbar_height)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Reset view")
-                    .on_hover_text(
-                        "Restore the default orbit camera, point scale, and depth-slice settings.",
-                    )
-                    .clicked()
-                {
-                    state.reset_camera();
-                }
-                if ui
-                    .add_enabled(!scene_empty, egui::Button::new("Fit view"))
-                    .on_hover_text(
-                        "Frame all visible data. Double-clicking inside the viewport does the same.",
-                    )
-                    .clicked()
-                {
-                    state.fit_to_scene(scene);
-                }
-                if ui
-                    .add_enabled(
-                        selected_focus_target.is_some(),
-                        egui::Button::new("Focus selected"),
-                    )
-                    .on_hover_text("Center the camera target on the currently selected point.")
-                    .clicked()
-                {
-                    output.focus_target = selected_focus_target;
-                }
-                ui.separator();
-                // Connected orientation pill cluster — matches the design's
-                // `.preview-3d-tb` strip (ISO / XY / XZ / YZ) instead of the
-                // older loose selectable-labels.
-                let presets = [
-                    AxisPreset::Isometric,
-                    AxisPreset::Xy,
-                    AxisPreset::Xz,
-                    AxisPreset::Yz,
-                ];
-                let labels = ["ISO", "XY", "XZ", "YZ"];
-                let selected = presets
-                    .iter()
-                    .position(|p| *p == state.preset)
-                    .unwrap_or(0);
-                if let Some(i) =
-                    crate::theme::pill_cluster(ui, &labels, selected, &[true, true, true, true])
-                {
-                    state.set_axis_preset(presets[i]);
-                }
-            });
-        });
-
-    let raw_history_status = draw_3d_display_strip(ui, state, raw_history, display_strip_reserve);
-    ui.separator();
-
     let available_w = ui.available_width().min(ui.clip_rect().width()).max(1.0);
-    let layout_overhead = toolbar_height + 20.0;
-    let viewport_h =
-        (total_available_height - display_strip_reserve - footer_height - layout_overhead)
-            .max(100.0)
-            .min(max_height);
-    let desired = egui::vec2(available_w, viewport_h);
+    let desired = egui::vec2(available_w, max_height.max(100.0));
     let (rect, response) = ui.allocate_exact_size(
         desired,
         egui::Sense::click_and_drag().union(egui::Sense::hover()),
     );
     let response_id = response.id;
-    let response = response.on_hover_text(
+    response.clone().on_hover_text(
         "Drag to orbit. Shift-drag or right-drag to pan. Scroll to zoom. Double-click to fit the visible cloud.",
     );
 
@@ -920,12 +924,8 @@ pub fn draw_investigation_3d(
                 .and_then(|pos| pick_point(rect, pos, state, prepared.as_slice()));
             output.hovered = hovered.and_then(|point| point.item_key.cloned());
             if let Some(point) = hovered {
-                let label_rect = egui::Rect::from_min_size(
-                    rect.left_top() + egui::vec2(10.0, 10.0),
-                    egui::vec2((rect.width() - 20.0).max(80.0), 22.0),
-                );
                 ui.painter_at(paint_rect).text(
-                    label_rect.left_top(),
+                    paint_rect.left_bottom() + egui::vec2(10.0, -32.0),
                     egui::Align2::LEFT_TOP,
                     point.label,
                     egui::FontId::proportional(13.0),
@@ -964,94 +964,247 @@ pub fn draw_investigation_3d(
         }
     }
 
-    ui.add_space(2.0);
-    draw_3d_status_footer(ui, response_id, scene, raw_history_status, footer_height);
+    draw_3d_canvas_overlay(
+        ui,
+        rect,
+        state,
+        scene,
+        scene_empty,
+        selected_focus_target,
+        raw_history.as_deref_mut(),
+        raw_history_anchor_end_us,
+        &mut output,
+    );
 
-    output
-}
-
-fn draw_3d_display_strip(
-    ui: &mut egui::Ui,
-    state: &mut Investigation3dState,
-    mut raw_history: Option<&mut PointCloudState>,
-    _max_height: f32,
-) -> Option<RawHistoryFooterStatus> {
-    let mut raw_history_status = raw_history
-        .as_deref()
-        .map(RawHistoryFooterStatus::from_state);
-    if let Some(ref mut history) = raw_history {
+    if let Some(history) = raw_history {
         history.sanitize_controls();
     }
 
-    ui.push_id(ui.id().with("display_strip"), |ui| {
-        draw_section_toggle(ui, &mut state.display_strip_open, "Display");
-        if !state.display_strip_open {
-            return;
-        }
+    Investigation3dCanvasOutput {
+        output,
+        response_id,
+    }
+}
 
-        let strip_row_height =
-            ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 4.0;
-        egui::ScrollArea::horizontal()
-            .id_source("3d_display_strip_scroll_a")
+fn draw_3d_canvas_overlay(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    state: &mut Investigation3dState,
+    scene: &Investigation3dScene,
+    scene_empty: bool,
+    selected_focus_target: Option<[f32; 3]>,
+    raw_history: Option<&mut PointCloudState>,
+    raw_history_anchor_end_us: Option<u64>,
+    output: &mut Investigation3dOutput,
+) {
+    let paint_rect = rect.intersect(ui.clip_rect());
+
+    // Centre the controls tray and size it to content.  The width of the content is unknown on
+    // the first frame so we read the measurement saved last frame; the first render falls back
+    // to full-canvas width (old behaviour) and subsequent frames are correctly centred.
+    let tray_width_id = ui.id().with("overlay_tray_w");
+    let prev_tray_w: f32 =
+        ui.memory(|mem| mem.data.get_temp::<f32>(tray_width_id)).unwrap_or(0.0);
+    let max_tray_w = (paint_rect.width() - 16.0).max(0.0);
+    let tray_w = if prev_tray_w > 0.0 {
+        prev_tray_w.min(max_tray_w)
+    } else {
+        max_tray_w
+    };
+    let tray_left = paint_rect.left() + ((paint_rect.width() - tray_w) * 0.5).max(0.0);
+    let tray_rect = egui::Rect::from_min_size(
+        egui::pos2(tray_left, paint_rect.top() + 8.0),
+        egui::vec2(tray_w, 38.0),
+    );
+    let painter = ui.painter_at(paint_rect);
+    painter.rect_filled(
+        tray_rect,
+        5.0,
+        egui::Color32::from_rgba_premultiplied(10, 14, 18, 205),
+    );
+    painter.rect_stroke(
+        tray_rect,
+        5.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(50)),
+    );
+
+    let content_rect = tray_rect.shrink2(egui::vec2(6.0, 4.0));
+    ui.allocate_ui_at_rect(content_rect, |ui| {
+        // Capture the natural content width from inside the scroll area's inner UI.
+        // The inner UI is unbounded, so min_rect reflects the true content extent.
+        let content_w = egui::ScrollArea::horizontal()
+            .id_source("investigation_3d_canvas_overlay")
             .auto_shrink([false, false])
-            .max_height(strip_row_height)
+            .max_height(30.0)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut state.clip_enabled, "Depth slice")
-                        .on_hover_text(
-                            "Hide points outside a camera-aligned slab so dense clouds are easier to inspect.",
-                        );
-                    ui.add_enabled(
-                        state.clip_enabled,
-                        egui::Slider::new(&mut state.clip_half_extent, 10.0..=4_000.0)
-                            .text("Slice depth")
-                            .logarithmic(true),
-                    )
-                    .on_hover_text(
-                        "Thickness of the depth slice. Larger values reveal more of the cloud.",
-                    );
-                    ui.separator();
-                    ui.add(
-                        egui::Slider::new(&mut state.point_scale, 2.0..=24.0)
-                            .text("Point scale")
-                            .logarithmic(true),
-                    )
-                    .on_hover_text(
-                        "Change the rendered point size without changing the underlying data.",
-                    );
-                });
-            });
-
-        if let Some(history) = raw_history {
-            egui::ScrollArea::horizontal()
-                .id_source("3d_display_strip_scroll_b")
-                .auto_shrink([false, false])
-                .max_height(strip_row_height)
-                .show(ui, |ui| {
+                ui.scope(|ui| {
+                    ui.style_mut().wrap = Some(false);
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
+                    ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+                    ui.visuals_mut().widgets.active.fg_stroke.color = egui::Color32::WHITE;
+                    // Make slider tracks and checkbox borders legible on the dark overlay.
+                    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_white_alpha(40);
+                    ui.visuals_mut().widgets.inactive.bg_stroke =
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(80));
+                    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_white_alpha(65);
+                    ui.visuals_mut().widgets.hovered.bg_stroke =
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(120));
+                    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_white_alpha(90);
+                    ui.visuals_mut().widgets.active.bg_stroke =
+                        egui::Stroke::new(1.0, egui::Color32::WHITE);
+                    ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+                    ui.spacing_mut().slider_width = 56.0;
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::Slider::new(&mut history.time_window_ms, 5.0..=5_000.0)
-                                .text("History [ms]")
-                                .logarithmic(true),
+                        let presets = [
+                            AxisPreset::Isometric,
+                            AxisPreset::Xy,
+                            AxisPreset::Xz,
+                            AxisPreset::Yz,
+                        ];
+                        let labels = ["ISO", "XY", "XT", "YT"];
+                        let selected = presets.iter().position(|p| *p == state.preset).unwrap_or(0);
+                        for (i, label) in labels.iter().enumerate() {
+                            let is_selected = i == selected;
+                            let fill = if is_selected {
+                                egui::Color32::from_white_alpha(42)
+                            } else {
+                                egui::Color32::from_white_alpha(12)
+                            };
+                            let stroke = egui::Stroke::new(
+                                1.0,
+                                if is_selected {
+                                    egui::Color32::from_white_alpha(120)
+                                } else {
+                                    egui::Color32::from_white_alpha(45)
+                                },
+                            );
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(*label)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(fill)
+                                    .stroke(stroke)
+                                    .min_size(egui::vec2(27.0, 22.0)),
+                                )
+                                .clicked()
+                            {
+                                state.set_axis_preset(presets[i]);
+                            }
+                        }
+                        crate::theme::toolbar_separator(ui);
+                        ui.add(egui::Checkbox::without_text(&mut state.clip_enabled))
+                            .on_hover_text("Enable depth slab clipping.");
+                        ui.label("Depth");
+                        ui.add_enabled_ui(state.clip_enabled, |ui| {
+                            ui.add_sized(
+                                egui::vec2(56.0, 18.0),
+                                egui::Slider::new(&mut state.clip_half_extent, 10.0..=4_000.0)
+                                    .logarithmic(true)
+                                    .show_value(false),
+                            )
+                            .on_hover_text("Thickness of the depth slab.");
+                        });
+                        ui.label("Pt");
+                        ui.add_sized(
+                            egui::vec2(50.0, 18.0),
+                            egui::Slider::new(&mut state.point_scale, 2.0..=24.0)
+                                .logarithmic(true)
+                                .show_value(false),
                         )
-                        .on_hover_text(
-                            "Extend or shrink the raw-event time span shown in 3D. The 2D preview window stays unchanged.",
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut history.point_limit, 1_000..=100_000)
-                                .text("Max points")
-                                .logarithmic(true),
-                        )
-                        .on_hover_text(
-                            "Cap the retained raw-event sample for the 3D view so dense windows stay responsive.",
-                        );
+                        .on_hover_text("Rendered point size.");
+                        if let Some(history) = raw_history {
+                            ui.label("Hist");
+                            ui.add_sized(
+                                egui::vec2(58.0, 18.0),
+                                egui::Slider::new(&mut history.time_window_ms, 5.0..=5_000.0)
+                                    .logarithmic(true)
+                                    .show_value(false),
+                            )
+                            .on_hover_text("Raw-event history span shown in 3D.");
+                            let status = RawHistoryFooterStatus::from_state(
+                                history,
+                                raw_history_anchor_end_us,
+                            );
+                            ui.monospace(format!(
+                                "{:.0} ms",
+                                status.retained_ms.unwrap_or(status.requested_ms)
+                            ));
+                        }
+                        crate::theme::toolbar_separator(ui);
+                        // Use explicit fills so these buttons are legible on the dark
+                        // overlay tray regardless of the host theme.
+                        let btn_fill = egui::Color32::from_white_alpha(22);
+                        let btn_stroke =
+                            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70));
+                        let btn_text = |label: &str| {
+                            egui::RichText::new(label)
+                                .size(11.0)
+                                .color(egui::Color32::WHITE)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(btn_text("Reset"))
+                                    .fill(btn_fill)
+                                    .stroke(btn_stroke)
+                                    .min_size(egui::vec2(0.0, 22.0)),
+                            )
+                            .on_hover_text("Reset orbit camera and view controls.")
+                            .clicked()
+                        {
+                            state.reset_camera();
+                        }
+                        if ui
+                            .add_enabled(
+                                !scene_empty,
+                                egui::Button::new(btn_text("Fit"))
+                                    .fill(btn_fill)
+                                    .stroke(btn_stroke)
+                                    .min_size(egui::vec2(0.0, 22.0)),
+                            )
+                            .on_hover_text("Frame all visible 3D data.")
+                            .clicked()
+                        {
+                            state.fit_to_scene(scene);
+                        }
+                        if ui
+                            .add_enabled(
+                                selected_focus_target.is_some(),
+                                egui::Button::new(btn_text("Focus"))
+                                    .fill(btn_fill)
+                                    .stroke(btn_stroke)
+                                    .min_size(egui::vec2(0.0, 22.0)),
+                            )
+                            .on_hover_text("Center the selected point in 3D.")
+                            .clicked()
+                        {
+                            output.focus_target = selected_focus_target;
+                        }
                     });
                 });
-            raw_history_status = Some(RawHistoryFooterStatus::from_state(history));
-        }
+                ui.min_rect().width() // natural content width, returned to outer scope
+            })
+            .inner;
+        // Save content width so the tray can be centred on the next frame.
+        let measured_w = (content_w + 12.0).min(max_tray_w);
+        ui.memory_mut(|mem| mem.data.insert_temp(tray_width_id, measured_w));
     });
 
-    raw_history_status
+    let help_rect = egui::Rect::from_min_size(
+        rect.left_bottom() + egui::vec2(10.0, -28.0),
+        egui::vec2((rect.width() - 20.0).max(160.0), 20.0),
+    );
+    ui.painter_at(rect).text(
+        help_rect.left_top(),
+        egui::Align2::LEFT_TOP,
+        "orbit \u{00B7} pan \u{00B7} zoom \u{00B7} F focus \u{00B7} double-click reset",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_white_alpha(190),
+    );
 }
 
 fn draw_3d_status_footer(
@@ -1157,43 +1310,6 @@ fn draw_3d_status_footer(
                     });
             });
     });
-}
-
-fn draw_section_toggle(ui: &mut egui::Ui, open: &mut bool, label: &str) {
-    let chevron = if *open {
-        egui_phosphor::regular::CARET_DOWN
-    } else {
-        egui_phosphor::regular::CARET_RIGHT
-    };
-    let response = ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        let chevron_response = ui
-            .add(
-                egui::Label::new(egui::RichText::new(chevron).size(10.0))
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let icon_response = ui
-            .add(
-                egui::Label::new(
-                    egui::RichText::new(egui_phosphor::regular::SLIDERS_HORIZONTAL)
-                        .size(14.0)
-                        .weak(),
-                )
-                .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        let label_response = ui
-            .add(
-                egui::Label::new(egui::RichText::new(label).size(12.0).strong())
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        chevron_response.union(icon_response).union(label_response)
-    });
-    if response.inner.clicked() {
-        *open = !*open;
-    }
 }
 
 fn constrain_section_width(ui: &mut egui::Ui) -> f32 {

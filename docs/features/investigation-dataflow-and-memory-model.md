@@ -115,7 +115,7 @@ bounded preview-frame queue can drop the UI projection.
 `CameraApp::update_preview_texture()` drains the preview-frame queue and keeps:
 
 - **all drained frame ranges** for the GUI raw-history projection
-- **only the newest drained `PreviewFrame`** for 2D rendering, plugin
+- **the newest drained `PreviewFrame` candidate** for 2D rendering, plugin
   execution, histograms, line profile, and replay snapshots
 
 That single choice is one of the most important current design facts:
@@ -123,6 +123,12 @@ That single choice is one of the most important current design facts:
 - the 3D raw-event view can see data from multiple drained frames
 - the 2D preview and plugins only process the newest frame that survived the
   drain
+
+If the GUI throttles processing for display cadence, that newest candidate is
+kept in `pending_preview_frame` instead of being dropped. This keeps the
+intended asymmetry between 3D continuity and 2D current-frame processing
+without allowing the 3D raw-history path to advance while the 2D preview never
+receives a display frame.
 
 ## Allocation And Ownership Map
 
@@ -238,7 +244,10 @@ Owner: `augur-gui`
   instance buffer
 
 These are presentation-side copies/derivations, not authoritative data
-stores.
+stores. A semantic `Investigation3dScene` cache is intentionally not part of
+this model: the scene must be rebuilt from current viewer state, raw-history
+projection metadata, and host-view dataset generations so ROI, layer, selection,
+and history-control edits are visible without waiting for another frame.
 
 ## How The 2D Scene Is Rendered
 
@@ -322,6 +331,10 @@ Path:
 4. each event becomes an `Investigation3dPoint`
 5. `inspection_3d.rs` prepares GPU instance data and uploads it
 
+`build_investigation_scene_3d()` is deliberately a projection builder rather
+than a cache lookup. It may allocate temporary scene vectors, but it must not
+retain a semantic scene snapshot across frames or UI edits.
+
 Coordinate mapping:
 
 - `x` stays sensor `x`
@@ -350,7 +363,7 @@ Important detail:
 
 ### 3. GPU upload path
 
-`inspection_3d.rs` rebuilds CPU-side scene vectors each render:
+`inspection_3d.rs` rebuilds CPU-side render vectors each render:
 
 - `prepare_scene_points(...)` allocates a fresh `Vec<PreparedPoint>`
 - render then allocates a fresh `Vec<PointInstanceRaw>` for GPU upload
@@ -358,7 +371,9 @@ Important detail:
   insufficient
 
 So the 3D renderer is allocation-aware on the GPU-resource side, but it still
-rebuilds per-frame CPU staging vectors.
+rebuilds per-frame CPU staging vectors. Persistent caches are limited to
+presentation resources; they are not allowed to decide which points, layers,
+ROI focus volume, or raw-history window are visible.
 
 ## Do 2D And 3D Share The Exact Same Data?
 
@@ -382,12 +397,16 @@ No, not in the strict sense.
 
 ### What is not even the same temporal slice
 
-- 2D preview + plugin execution operate on the newest drained frame
-- raw 3D history can include multiple drained frames that never became the
-  visible 2D frame
+- 2D preview + current-frame plugin execution operate on the newest processed
+  display frame
+- raw 3D history can include intermediate drained frames that never became the
+  visible 2D frame, but visible raw 3D rendering is anchored to the displayed
+  2D frame's `window_end_us`
 
 That means the raw 3D cloud can be temporally richer than both the 2D preview
-and the plugin retained history.
+and current-frame plugin execution, but it should not run ahead of the 2D
+preview timestamp. If the 2D frame covers `[t-x, t]` and the 3D history control
+is set to `y ms`, the raw 3D cloud is selected from `[t-y, t]`.
 
 ## Replay And Seeking Behavior
 
@@ -509,7 +528,11 @@ its own upstream cursor even when the bounded preview-frame queue drops a GUI
 projection. Visible 2D rendering and current-frame plugin execution still use
 the newest processed preview frame.
 
-This improves 3D continuity but creates multiple truths.
+This improves 3D continuity while keeping the visible 3D raw cloud anchored to
+the same display-frame end timestamp as the 2D preview. The remaining
+"multiple truths" are deliberate projection differences: 2D count planes,
+current-frame plugin input, plugin retained history, and sampled 3D raw history
+can have different storage and retention windows.
 
 ### 3. `FrameOnly` plugins still inherit raw-event marshaling cost
 

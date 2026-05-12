@@ -705,6 +705,7 @@ fn format_timestamp_micros(value_us: Option<u64>, replay_origin_us: Option<u64>)
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SummaryCardOptions<'a> {
+    pub dataset_id: &'a str,
     pub generation: u64,
     pub selected_row: Option<&'a StableRowKey>,
     pub format: TableCellFormatOptions,
@@ -751,9 +752,9 @@ pub fn render_summary_card(
         return output;
     };
 
-    let selected_row_index = options
-        .selected_row
-        .and_then(|key| row_index_for_key(dataset, schema, options.generation, key));
+    let selected_row_index = options.selected_row.and_then(|key| {
+        row_index_for_key(options.dataset_id, dataset, schema, options.generation, key)
+    });
 
     ui.separator();
     match selected_row_index {

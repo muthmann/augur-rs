@@ -88,14 +88,16 @@ impl PointCloudState {
     }
 
     pub fn visible_summary(&self) -> VisiblePointCloudEvents {
-        let mut events = self.visible_event_candidates();
+        let Some(latest) = self.frames.back() else {
+            return self.empty_visible_summary();
+        };
+        self.visible_summary_at(latest.window_end_us)
+    }
+
+    pub fn visible_summary_at(&self, anchor_end_us: u64) -> VisiblePointCloudEvents {
+        let mut events = self.visible_event_candidates_at(anchor_end_us);
         if events.is_empty() {
-            return VisiblePointCloudEvents {
-                events,
-                retained_time_span_ms: None,
-                sampled_count: 0,
-                effective_time_window_ms: self.time_window_ms.max(1.0),
-            };
+            return self.empty_visible_summary();
         }
 
         let retained_time_span_ms = events
@@ -116,6 +118,15 @@ impl PointCloudState {
             effective_time_window_ms: retained_time_span_ms
                 .unwrap_or(self.time_window_ms)
                 .max(1.0),
+        }
+    }
+
+    fn empty_visible_summary(&self) -> VisiblePointCloudEvents {
+        VisiblePointCloudEvents {
+            events: Vec::new(),
+            retained_time_span_ms: None,
+            sampled_count: 0,
+            effective_time_window_ms: self.time_window_ms.max(1.0),
         }
     }
 
@@ -148,11 +159,7 @@ impl PointCloudState {
         self.frames.iter().map(|frame| frame.event_count).sum()
     }
 
-    fn visible_event_candidates(&self) -> Vec<CdEvent> {
-        let Some(latest) = self.frames.back() else {
-            return Vec::new();
-        };
-        let end_ts = latest.window_end_us;
+    fn visible_event_candidates_at(&self, end_ts: u64) -> Vec<CdEvent> {
         let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
         let mut events = Vec::new();
         for frame in &self.frames {
@@ -212,15 +219,8 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_controls_clamps_values() {
-        let mut state = PointCloudState {
-            time_window_ms: 0.0,
-            point_limit: 1,
-            ..PointCloudState::default()
-        };
-
-        state.sanitize_controls();
-
+    fn default_controls_have_sane_values() {
+        let state = PointCloudState::default();
         assert!(state.time_window_ms >= 5.0);
         assert!(state.point_limit >= 1_000);
     }
@@ -274,5 +274,36 @@ mod tests {
         let summary = state.visible_summary();
         assert_eq!(summary.retained_time_span_ms, Some(1.0));
         assert_eq!(summary.effective_time_window_ms, 1.0);
+    }
+
+    #[test]
+    fn visible_summary_can_anchor_to_displayed_frame_end() {
+        let mut state = PointCloudState {
+            time_window_ms: 2.0,
+            point_limit: 16,
+            ..PointCloudState::default()
+        };
+        state.push_frame(&frame(&[event(0, 0, 0), event(1_000, 1, 0)]));
+        state.push_frame(&frame(&[event(2_000, 2, 0), event(3_000, 3, 0)]));
+
+        let anchored = state.visible_summary_at(1_000);
+        let latest = state.visible_summary();
+
+        assert_eq!(
+            anchored
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![0, 1_000]
+        );
+        assert_eq!(
+            latest
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000]
+        );
     }
 }

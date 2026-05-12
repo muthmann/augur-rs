@@ -36,14 +36,19 @@ metadata. Plugin-specific research semantics are still outside this repository.
 
 ## UI Behavior
 
-- The top bar now switches investigation layouts instead of the old 2D/3D mode toggle.
+- The top bar exposes the prototype-style `2D` / `Split` / `3D` segmented layout switch and a
+  consolidated source/status label such as `Live preview · EVK4 / IMX636`, `Replay · file.raw`, or
+  `Idle`.
 - The central viewer can show:
   - the existing 2D preview widget
   - the new 3D inspection surface
   - both side by side with a persistent split ratio
+- Split mode shares the viewer header, 2D tool row, display strip, replay transport, and
+  diagnostics footer across the central column; the divider only separates the 2D and 3D canvas
+  band.
 - Popup viewing reuses the same layout model and linked investigation state.
-- The replay transport strip now stays available in the same top position in the popup/external
-  viewer instead of disappearing outside the main window.
+- In 2D and split layouts, the replay transport is part of the viewer chrome below the canvas and
+  display strip instead of being injected above the viewer from the outer shell.
 - The split layout now uses a visible draggable divider in both the embedded and popup viewers.
 - Narrow split panes now keep both the 2D preview and the 3D inspection surface clipped to their
   actual pane rects instead of letting either pane reserve space under the right inspector or over
@@ -70,26 +75,32 @@ metadata. Plugin-specific research semantics are still outside this repository.
   state, and auto-scroll toward externally selected rows.
 - The investigation inspector shows:
   - a clearer `Workspace` section for ROI linking plus selected and hovered rows
-  - grouped `Layers` controls that separate raw-event ON/OFF point-cloud styling from extra
-    analysis layers
-  - a `Status & warnings` section that lists concrete warning messages instead of only aggregate
-    counts
-  - a reminder that raw-event history controls live in the 3D toolbar
-  - `Analysis Extensions` cards for host hotpixel detection plus enabled runtime plugins
+  - shortcut hints for focusing 3D, clearing selection, and removing the selected annotation
+  - compact `Layers` controls with stable per-row widget identities, truncated single-line labels,
+    and raw-event ON/OFF point-cloud styling next to extra analysis layers
+  - a `Status & warnings` section that lists runtime analysis warnings, host-view registry
+    warnings, notices, and errors instead of only aggregate counts
+  - `Extensions` cards for host hotpixel detection plus runtime plugins, with local eye toggles
+    and a Plugin Manager button in the section header
   - stale host-setting indicators, notices, and errors
 - Keyboard shortcuts:
   - `1` / `2` / `3` switch `2D only` / `split 2D + 3D` / `3D only`
   - `L` toggles 2D↔3D ROI linking
   - `Esc` clears the linked selection
   - `F` focuses the 3D camera on the current selection
-- The 3D toolbar now exposes hover explanations for reset/fit/focus, depth slicing, point scale,
-  and axis presets.
-- The 3D display strip now carries depth slicing, point scale, raw-event history range, and point
-  budget controls so the temporal context can be widened while inspecting the cloud without
-  crowding the navigation toolbar or forcing a trip through the right inspector.
-- The 2D preview now mirrors that structure with its preview-mode, scale-bar, time-surface, and
-  annotation controls in a matching `Display` strip above the viewport, while hover/pipeline
-  status moved into the footer below the canvas.
+- The 3D canvas now carries compact overlay controls for reset/fit/focus, axis presets, depth
+  slab, point scale, and raw-event history span, keeping split-mode tuning close to the scene.
+- Those 3D overlay controls are drawn on a dark contrast tray with bounded slider widths and
+  explicit light text so the controls stay readable over dense point clouds and dark scene
+  backgrounds.
+- The 2D preview now keeps preview-mode, scale-bar, time-surface, and annotation count controls in
+  a matching `Display` strip below the viewport, with hover/pipeline status in the footer.
+- The Analysis panel is resizable within a bounded width range, and both the open panel and
+  collapsed right rail reserve enough inner width to keep controls and reopen arrows visible at the
+  window edge.
+- The open Analysis panel does not force child widgets to the global clip width. Its scroll content
+  uses local inner margins so text, cards, and right-aligned controls stay inside the visible panel
+  instead of overlapping the central viewport during narrow split layouts.
 - Raw-event point clouds now keep the events from every drained preview frame, not only the newest
   frame chosen for 2D rendering. This removes the avoidable time-axis packet gaps caused by the
   lossy preview queue.
