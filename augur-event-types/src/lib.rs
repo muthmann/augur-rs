@@ -148,10 +148,6 @@ impl FrameIndex {
     fn pop_front(&mut self) -> Option<FrameWindowEntry> {
         self.entries.pop_front()
     }
-
-    fn front(&self) -> Option<&FrameWindowEntry> {
-        self.entries.front()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -428,15 +424,30 @@ impl EventRing {
         let physical_range = physical_start..physical_start + len;
         self.check_eviction_allowed(physical_range.clone())?;
 
-        while self
+        // Frames are stored oldest-first, but physical positions are not
+        // monotonic with age: after a wrap, a younger low-address frame can sit
+        // *behind* an older high-address survivor. A wrapped write region can
+        // therefore overlap frames that are not a contiguous prefix of the
+        // deque. Evicting only while the *front* overlaps would leave such a
+        // mid-deque frame in place, letting `copy_from_slice` overwrite its
+        // bytes while it still counts toward the resident total (corruption +
+        // capacity overflow). We must still evict oldest-first to keep the
+        // logical timeline contiguous, so we drop every frame up to and
+        // including the newest one that overlaps the write region.
+        let evict_through = self
             .frame_index
-            .front()
-            .is_some_and(|entry| entry.overlaps_physical(physical_range.clone()))
-        {
-            let Some(evicted) = self.frame_index.pop_front() else {
-                break;
-            };
-            self.advance_best_effort_cursors(evicted.end_event_idx());
+            .entries()
+            .enumerate()
+            .filter(|(_, entry)| entry.overlaps_physical(physical_range.clone()))
+            .map(|(index, _)| index)
+            .max();
+        if let Some(last) = evict_through {
+            for _ in 0..=last {
+                let Some(evicted) = self.frame_index.pop_front() else {
+                    break;
+                };
+                self.advance_best_effort_cursors(evicted.end_event_idx());
+            }
         }
 
         self.events[physical_range.clone()].copy_from_slice(events);
@@ -801,7 +812,61 @@ mod tests {
                 .sum();
             let retained_range = ring.retained_event_range().expect("retained events");
             assert_eq!(retained_count, retained_range.end - retained_range.start);
+
+            // The resident events must never exceed the physical capacity, and
+            // no two retained frames may claim overlapping physical slots —
+            // either would mean eviction left a frame whose bytes were
+            // overwritten by a later append.
+            assert!(
+                retained_count <= ring.capacity() as u64,
+                "resident events {retained_count} exceed capacity {}",
+                ring.capacity()
+            );
+            let frames: Vec<_> = ring.frame_index().entries().collect();
+            for (i, a) in frames.iter().enumerate() {
+                for b in &frames[i + 1..] {
+                    assert!(
+                        !a.overlaps_physical(b.physical_range()),
+                        "retained frames physically overlap: {a:?} vs {b:?}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn wrapped_write_evicts_overlap_behind_older_survivor() {
+        // Regression for an event-ring overflow that crashed the live preview.
+        // Two consecutive wraps leave an older high-address frame at the front
+        // of the deque while a younger low-address frame sits behind it. The
+        // next wrapped write overlaps the younger frame but not the front, so a
+        // front-only eviction left it resident — its bytes overwritten and its
+        // events double-counted, tripping `resident_byte_count <= capacity`.
+        let mut ring = EventRing::with_capacity(3);
+        let mut next = 0u64;
+        for len in [2usize, 1, 2, 2] {
+            let events: Vec<_> = (0..len)
+                .map(|_| {
+                    next += 1;
+                    event(next, next as u16)
+                })
+                .collect();
+            ring.append_frame(&events, next - len as u64 + 1, next)
+                .expect("append within capacity must succeed");
+
+            let resident: u64 = ring
+                .frame_index()
+                .entries()
+                .map(|entry| u64::from(entry.event_count))
+                .sum();
+            assert!(
+                resident <= ring.capacity() as u64,
+                "resident events {resident} exceed capacity {}",
+                ring.capacity()
+            );
+        }
+        // After the final wrap only the newest frame survives.
+        assert_eq!(ring.retained_event_range(), Some(5..7));
     }
 
     #[test]
