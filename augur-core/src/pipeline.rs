@@ -717,19 +717,35 @@ fn emit_preview_frame(
     height: u16,
     pixel_count: usize,
     window_end_us: u64,
-) -> std::result::Result<(), RingAppendError> {
+) {
     let Some(window_start_us) = *frame_start_ts else {
-        return Ok(());
+        return;
     };
 
     let event_range = if frame_events.is_empty() {
         None
     } else {
-        let range = event_source.append_cd_frame(frame_events, window_start_us, window_end_us)?;
-        if let Some(cursor) = recording_cursor {
-            event_source.advance_cursor(cursor, range.end);
+        // Archiving a frame's raw events into the shared ring is best-effort.
+        // A single accumulation window can legitimately exceed the ring
+        // capacity (high event rates, or a long replay window), in which case
+        // `append_cd_frame` returns `FrameTooLarge`. That must NOT tear down the
+        // preview thread: the visual frame is already fully accumulated and can
+        // still be shown. We emit it without a ring-backed event range and count
+        // the archival miss as a frame drop for visibility.
+        match event_source.append_cd_frame(frame_events, window_start_us, window_end_us) {
+            Ok(range) => {
+                if let Some(cursor) = recording_cursor {
+                    event_source.advance_cursor(cursor, range.end);
+                }
+                Some(range)
+            }
+            Err(_err) => {
+                if let Ok(mut s) = stats_preview.lock() {
+                    s.record_preview_frame_drop();
+                }
+                None
+            }
         }
-        Some(range)
     };
 
     if frame_tx.is_full() {
@@ -743,7 +759,7 @@ fn emit_preview_frame(
         if let Ok(mut s) = stats_preview.lock() {
             s.record_preview_frame_drop();
         }
-        return Ok(());
+        return;
     }
 
     let frame_send_started = Instant::now();
@@ -790,7 +806,6 @@ fn emit_preview_frame(
     *on_count = 0;
     *off_count = 0;
     *frame_start_ts = None;
-    Ok(())
 }
 
 fn histogram_index(value: u16) -> usize {
@@ -1328,7 +1343,7 @@ where
                         if frame_start_ts.is_some_and(|t0| {
                             ev.timestamp.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed)
                         }) {
-                            if let Err(err) = emit_preview_frame(
+                            emit_preview_frame(
                                 &frame_tx,
                                 &stats_preview,
                                 &event_source_preview,
@@ -1343,15 +1358,7 @@ where
                                 height,
                                 pixel_count,
                                 ev.timestamp,
-                            ) {
-                                report_pipeline_error(
-                                    &error_preview,
-                                    &stop_preview,
-                                    "preview",
-                                    format!("event ring append failed: {err}"),
-                                );
-                                break;
-                            }
+                            );
                         }
                     }
                     let accumulate_elapsed = accumulate_started.elapsed();
@@ -2101,12 +2108,58 @@ mod tests {
             2,
             4,
             10,
-        )
-        .expect("drop path still succeeds");
+        );
 
         assert_eq!(frame_rx.len(), 1);
         assert_eq!(source.events_for_range(0..1), Some(vec![test_event(10, 1)]));
         assert_eq!(stats.lock().expect("stats").preview_frame_drops, 1);
+    }
+
+    #[test]
+    fn oversized_frame_keeps_preview_alive_without_ring_archival() {
+        // A single accumulation window larger than the ring capacity must not
+        // tear down the preview: the frame is still emitted (with no ring-backed
+        // event range) and the archival miss is counted as a drop.
+        let (frame_tx, frame_rx) = bounded(1);
+        let mut buffers = take_preview_frame_buffers(4);
+        // Ring holds a single event; the frame carries two -> FrameTooLarge.
+        let source = LiveEventSource::with_capacity(1);
+        let mut events = vec![test_event(10, 0), test_event(20, 1)];
+        let mut on_count = 2;
+        let mut off_count = 0;
+        let mut frame_start_ts = Some(10);
+        let stats = Arc::new(Mutex::new(test_stats(Instant::now())));
+
+        emit_preview_frame(
+            &frame_tx,
+            &stats,
+            &source,
+            None,
+            &mut buffers,
+            &mut events,
+            true,
+            &mut on_count,
+            &mut off_count,
+            &mut frame_start_ts,
+            2,
+            2,
+            4,
+            20,
+        );
+
+        let frame = frame_rx.try_recv().expect("preview frame is still emitted");
+        assert_eq!(frame.event_range, None, "oversized frame has no ring range");
+        assert_eq!(
+            frame.events.as_deref(),
+            Some(&[test_event(10, 0), test_event(20, 1)][..]),
+            "captured raw events still travel with the frame",
+        );
+        assert_eq!(source.next_event_idx(), 0, "nothing was stored in the ring");
+        assert_eq!(stats.lock().expect("stats").preview_frame_drops, 1);
+        // Accumulators are reset so the next window starts clean.
+        assert_eq!(frame_start_ts, None);
+        assert_eq!(on_count, 0);
+        assert_eq!(off_count, 0);
     }
 
     #[test]
