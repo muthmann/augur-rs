@@ -9,6 +9,8 @@ mod colormap;
 mod line_profile;
 #[path = "../src/preview.rs"]
 mod preview;
+#[path = "../src/theme.rs"]
+mod theme;
 
 use colormap::Colormap;
 use line_profile::LineProfileTool;

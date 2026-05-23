@@ -177,18 +177,8 @@ pub const POLARITY_ON_RGB: [u8; 3] = [0xe8, 0x3e, 0xb0];
 pub const POLARITY_OFF_RGB: [u8; 3] = [0x00, 0xb8, 0xd4];
 
 /// ROI / annotation accent colours from the design bundle.
-#[allow(dead_code)]
 pub const ROI_AMBER: Color32 = rgb(0xff, 0xc4, 0x40);
-#[allow(dead_code)]
 pub const ROI_CYAN: Color32 = rgb(0x40, 0xdc, 0xff);
-#[allow(dead_code)]
-pub const ROI_GREEN: Color32 = rgb(0x8c, 0xff, 0x8c);
-#[allow(dead_code)]
-pub const ROI_RED: Color32 = rgb(0xff, 0x80, 0x80);
-#[allow(dead_code)]
-pub const ROI_VIOLET: Color32 = rgb(0xdc, 0xa0, 0xff);
-#[allow(dead_code)]
-pub const ROI_YELLOW: Color32 = rgb(0xff, 0xff, 0x8c);
 
 /// Pick the right palette for the active visuals.
 pub fn palette_for_visuals(visuals: &egui::Visuals) -> Palette {
@@ -313,6 +303,17 @@ pub fn card_frame(ui: &egui::Ui) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(sp::SP_3, sp::SP_3))
 }
 
+/// Clamp a sub-area to the available/clip width and enable wrapping, so dense
+/// single-row sections don't overflow their panel. Returns the resolved width.
+pub fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
+    let width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
+    ui.set_min_width(width);
+    ui.set_max_width(width);
+    ui.set_width(width);
+    ui.style_mut().wrap = Some(true);
+    width
+}
+
 /// Render a terse uppercase section subhead — the workbench design uses
 /// these to label sub-areas inside dense panels (`SETTINGS`, `LAYERS`,
 /// `STATUS & WARNINGS`).
@@ -329,7 +330,6 @@ pub fn section_subhead(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Tone for chips, metric pills and inline status badges.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
     Neutral,
@@ -337,10 +337,6 @@ pub enum Tone {
     Info,
     Warn,
     Error,
-    /// Tinted with the polarity-ON colour (hot magenta).
-    PolarityOn,
-    /// Tinted with the polarity-OFF colour (arctic cyan).
-    PolarityOff,
 }
 
 impl Tone {
@@ -351,14 +347,6 @@ impl Tone {
             Self::Info => p.status_info,
             Self::Warn => p.status_warn,
             Self::Error => p.status_error,
-            Self::PolarityOn => {
-                Color32::from_rgb(POLARITY_ON_RGB[0], POLARITY_ON_RGB[1], POLARITY_ON_RGB[2])
-            }
-            Self::PolarityOff => Color32::from_rgb(
-                POLARITY_OFF_RGB[0],
-                POLARITY_OFF_RGB[1],
-                POLARITY_OFF_RGB[2],
-            ),
         }
     }
 
@@ -726,66 +714,70 @@ pub fn layer_row(
     // grow. Without this allocation a nested `right_to_left` block ends up
     // measuring its desired width from content, which expands the right
     // SidePanel when many layers exist.
-    let row_width = ui.available_width();
-    let row_rect = ui
-        .allocate_ui_with_layout(
-            egui::vec2(row_width, row_height),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.style_mut().wrap = Some(false);
-                ui.spacing_mut().item_spacing.x = sp::SP_2;
-                let glyph = if visible {
-                    egui_phosphor::regular::EYE
-                } else {
-                    egui_phosphor::regular::EYE_SLASH
-                };
-                ui.push_id(row_id.with("visibility"), |ui| {
-                    if ui
-                        .add(
-                            egui::Label::new(egui::RichText::new(glyph).size(13.0).color(p.fg_2))
+    let row_response = ui
+        .push_id(row_id, |ui| {
+            let row_width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(row_width, row_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    ui.spacing_mut().item_spacing.x = sp::SP_2;
+                    let glyph = if visible {
+                        egui_phosphor::regular::EYE
+                    } else {
+                        egui_phosphor::regular::EYE_SLASH
+                    };
+                    ui.push_id("visibility", |ui| {
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(glyph).size(13.0).color(p.fg_2),
+                                )
                                 .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        visible_changed = Some(!visible);
-                    }
-                });
-                // 10×10 swatch with hairline border.
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().rect_filled(
-                    rect,
-                    radius::R_1,
-                    Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]),
-                );
-                ui.painter().rect_stroke(
-                    rect,
-                    radius::R_1,
-                    Stroke::new(1.0, Color32::from_black_alpha(40)),
-                );
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(name)
-                            .monospace()
-                            .size(11.0)
-                            .color(p.fg_1),
-                    )
-                    .truncate(true),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(count)
-                            .monospace()
-                            .size(11.0)
-                            .color(p.fg_3),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            visible_changed = Some(!visible);
+                        }
+                    });
+                    // 10×10 swatch with hairline border.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        radius::R_1,
+                        Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]),
                     );
-                });
-            },
-        )
-        .response
-        .rect;
-    let row_response = ui.interact(row_rect, row_id, egui::Sense::click());
+                    ui.painter().rect_stroke(
+                        rect,
+                        radius::R_1,
+                        Stroke::new(1.0, Color32::from_black_alpha(40)),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(name)
+                                .monospace()
+                                .size(11.0)
+                                .color(p.fg_1),
+                        )
+                        .truncate(true),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(count)
+                                .monospace()
+                                .size(11.0)
+                                .color(p.fg_3),
+                        );
+                    });
+                },
+            )
+            .response
+            .interact(egui::Sense::click())
+        })
+        .inner;
     LayerRowResponse {
         row: row_response,
         visible_changed,

@@ -31,13 +31,12 @@ transport, and diagnostics now live below the image so the data viewport gets fi
   analysis warnings, notices, hotpixel masking actions, replay-open progress, and errors.
 - The 3D canvas now overlays compact `ISO` / `XY` / `XT` / `YT`, reset, fit, and focus controls
   directly on the viewport instead of reserving a tall text toolbar above it.
-- In split mode, depth-slab, point-size, and raw-history controls also live in that canvas overlay
+- In split mode, point-size, raw-history, and max-point controls also live in that canvas overlay
   so the user does not scroll a separate right-pane strip just to tune 3D context.
-- The 3D `Display` strip is one compact horizontal strip for:
-  - depth-slice enable + thickness
+- The 3D overlay keeps one compact horizontal control row for:
   - point scale
   - raw-event history range
-  - raw-event point budget
+  - raw-event max-point budget
 - The 3D footer now summarizes visible layers, point count, retained history, and active focus
   volume, with expandable orientation and control guidance below.
 - Both display strips stay open unconditionally; the toggle UI and its associated state field have

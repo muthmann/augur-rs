@@ -12,8 +12,8 @@ This pass adds:
   - `2D only`
   - `split 2D + 3D`
   - `3D only`
-- a WGPU-backed generic 3D inspection view with orbit, pan, zoom, focus, clip slab, and axis
-  presets
+- a WGPU-backed generic 3D inspection view with orbit, pan, zoom, focus,
+  point-size, raw-history, max-point, and axis-preset controls
 - host-owned linked selection between preview markers, linked tables, and 3D points
 - stable row identity through additive dataset metadata in `augur-plugin-api`
 - generic rich marker overlays through `Overlay::MarkerOverlay` plus the plugin-side
@@ -88,8 +88,9 @@ metadata. Plugin-specific research semantics are still outside this repository.
   - `L` toggles 2D↔3D ROI linking
   - `Esc` clears the linked selection
   - `F` focuses the 3D camera on the current selection
-- The 3D canvas now carries compact overlay controls for reset/fit/focus, axis presets, depth
-  slab, point scale, and raw-event history span, keeping split-mode tuning close to the scene.
+- The 3D canvas now carries compact overlay controls for reset/fit/focus, axis presets,
+  point scale, raw-event history span, and max-point budget, keeping split-mode tuning close
+  to the scene.
 - Those 3D overlay controls are drawn on a dark contrast tray with bounded slider widths and
   explicit light text so the controls stay readable over dense point clouds and dark scene
   backgrounds.

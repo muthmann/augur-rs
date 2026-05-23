@@ -731,7 +731,7 @@ fn draw_status_footer(
             .max_height(max_height)
             .auto_shrink([true, true])
             .show(ui, |ui| {
-                constrain_section_width(ui);
+                crate::theme::constrain_section_width(ui);
                 // Single `·`-separated diagnostics line under the transport,
                 // matching the design's
                 // `24.8 Mev/s · 9.1 MB/s · 00:01:23 elapsed · ON 54.3% OFF 45.7% · 1,192,227 ev/frame · Diagnostics ▾`.
@@ -768,7 +768,7 @@ fn draw_status_footer(
                     .id_source((input.viewer_id, "pipeline_details"))
                     .default_open(emphasize_details)
                     .show(ui, |ui| {
-                        constrain_section_width(ui);
+                        crate::theme::constrain_section_width(ui);
                         let mut rendered_anything = false;
 
                         if let Some(stats) = input.pipeline_stats {
@@ -870,15 +870,6 @@ fn draw_status_footer(
                     });
             });
     });
-}
-
-fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
-    let width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
-    ui.set_min_width(width);
-    ui.set_max_width(width);
-    ui.set_width(width);
-    ui.style_mut().wrap = Some(true);
-    width
 }
 
 /// Single-row, `·`-separated diagnostics line that runs beneath the
@@ -993,9 +984,7 @@ fn format_thousands(n: u64) -> String {
     out
 }
 
-/// (Legacy) Render the design-system "metric pill" row. Kept as a
-/// reusable helper for surfaces other than the unified diagnostics row.
-/// ON / OFF percentage split with the polarity colour tints. Mirrors the
+/// ON / OFF event-count percentage split for a preview frame. Mirrors the
 /// design's coloured `ON 54.3%` / `OFF 45.7%` chips.
 struct PolaritySplit {
     on_pct: f64,
@@ -1017,16 +1006,10 @@ fn preview_polarity_split(frame: Option<&PreviewFrame>) -> Option<PolaritySplit>
 }
 
 fn preview_frame_status_summary(frame: Option<&PreviewFrame>) -> Option<String> {
-    let frame = frame?;
-    let total = frame.on_count + frame.off_count;
-    if total == 0 {
-        return None;
-    }
-    let on_pct = frame.on_count as f64 * 100.0 / total as f64;
-    let off_pct = frame.off_count as f64 * 100.0 / total as f64;
+    let split = preview_polarity_split(frame)?;
     Some(format!(
         "ON {:.1}% / OFF {:.1}% ({} ev this frame)",
-        on_pct, off_pct, total
+        split.on_pct, split.off_pct, split.total
     ))
 }
 
@@ -2719,11 +2702,9 @@ pub(crate) fn draw_replay_transport(
 
             let mb_width = {
                 let small_font = egui::TextStyle::Small.resolve(ui.style());
-                ui.fonts(|f| {
-                    f.layout_no_wrap(mb_text.clone(), small_font, egui::Color32::WHITE)
-                })
-                .size()
-                .x
+                ui.fonts(|f| f.layout_no_wrap(mb_text.clone(), small_font, egui::Color32::WHITE))
+                    .size()
+                    .x
             } + ui.spacing().item_spacing.x * 3.0
                 + 1.0; // separator gap + padding
 
@@ -2843,11 +2824,10 @@ fn format_replay_time(duration_us: u64) -> String {
 mod tests {
     use super::{
         build_preview_viewport, build_preview_viewport_with_options, pick_overlay_candidate,
-        sensor_rect_to_roi_config, PreviewCropTarget, PreviewWorkspaceState, ViewerState,
-        PREVIEW_ZOOM_MAX,
+        sensor_rect_to_roi_config, PreviewCropTarget, PreviewWorkspaceState, PREVIEW_ZOOM_MAX,
     };
+    use crate::investigation::StableRowKey;
     use crate::viewer_tools::{AnnotationManager, AnnotationShapeKind};
-    use crate::{inspection_3d::Investigation3dState, investigation::StableRowKey};
     use augur_core::{
         analysis::{MarkerOverlayItem, MarkerShape, Overlay, Pixel},
         config::CameraConfig,

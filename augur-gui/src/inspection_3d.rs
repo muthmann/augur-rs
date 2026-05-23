@@ -173,8 +173,6 @@ pub struct Investigation3dState {
     pub pitch: f32,
     pub distance: f32,
     pub target: [f32; 3],
-    pub clip_enabled: bool,
-    pub clip_half_extent: f32,
     pub point_scale: f32,
     pub preset: AxisPreset,
     /// Set to true after the first auto-fit. Prevents repeated auto-fits.
@@ -188,8 +186,6 @@ impl Default for Investigation3dState {
             pitch: 0.52,
             distance: 12.0,
             target: [0.0, 0.0, 0.0],
-            clip_enabled: false,
-            clip_half_extent: 240.0,
             point_scale: DEFAULT_POINT_SCALE,
             preset: AxisPreset::Isometric,
             auto_fitted: false,
@@ -239,9 +235,9 @@ impl Investigation3dState {
 
         for layer in scene.layers.iter().filter(|l| l.visible) {
             for point in &layer.points {
-                for i in 0..3 {
-                    min[i] = min[i].min(point.position[i]);
-                    max[i] = max[i].max(point.position[i]);
+                for (axis, &value) in point.position.iter().enumerate() {
+                    min[axis] = min[axis].min(value);
+                    max[axis] = max[axis].max(value);
                 }
                 count += 1;
             }
@@ -656,7 +652,7 @@ impl WgpuInvestigation3dRenderer {
     ) -> RenderTextureResult<'a> {
         self.ensure_target(size);
 
-        let prepared = prepare_scene_points(scene, state, selected);
+        let prepared = prepare_scene_points(scene, selected);
         self.ensure_instance_capacity(prepared.len().max(1));
 
         let view_proj = state.view_projection(egui::vec2(size[0] as f32, size[1] as f32));
@@ -738,10 +734,8 @@ impl WgpuInvestigation3dRenderer {
 
 fn prepare_scene_points<'a>(
     scene: &'a Investigation3dScene,
-    state: &Investigation3dState,
     selected: Option<&StableRowKey>,
 ) -> Vec<PreparedPoint<'a>> {
-    let view = state.view_matrix();
     let mut prepared = Vec::new();
 
     for layer in scene.layers.iter().filter(|layer| layer.visible) {
@@ -751,14 +745,6 @@ fn prepare_scene_points<'a>(
         );
         for point in &layer.points {
             let position = Vec3::from_array(point.position);
-            if state.clip_enabled {
-                let camera_space = view * position.extend(1.0);
-                let depth = -camera_space.z;
-                if depth.abs() > state.clip_half_extent {
-                    continue;
-                }
-            }
-
             prepared.push(PreparedPoint {
                 raw: PointInstanceRaw {
                     position: point.position,
@@ -986,6 +972,7 @@ pub(crate) fn draw_investigation_3d_canvas(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_3d_canvas_overlay(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -1003,8 +990,9 @@ fn draw_3d_canvas_overlay(
     // the first frame so we read the measurement saved last frame; the first render falls back
     // to full-canvas width (old behaviour) and subsequent frames are correctly centred.
     let tray_width_id = ui.id().with("overlay_tray_w");
-    let prev_tray_w: f32 =
-        ui.memory(|mem| mem.data.get_temp::<f32>(tray_width_id)).unwrap_or(0.0);
+    let prev_tray_w: f32 = ui
+        .memory(|mem| mem.data.get_temp::<f32>(tray_width_id))
+        .unwrap_or(0.0);
     let max_tray_w = (paint_rect.width() - 16.0).max(0.0);
     let tray_w = if prev_tray_w > 0.0 {
         prev_tray_w.min(max_tray_w)
@@ -1097,18 +1085,6 @@ fn draw_3d_canvas_overlay(
                             }
                         }
                         crate::theme::toolbar_separator(ui);
-                        ui.add(egui::Checkbox::without_text(&mut state.clip_enabled))
-                            .on_hover_text("Enable depth slab clipping.");
-                        ui.label("Depth");
-                        ui.add_enabled_ui(state.clip_enabled, |ui| {
-                            ui.add_sized(
-                                egui::vec2(56.0, 18.0),
-                                egui::Slider::new(&mut state.clip_half_extent, 10.0..=4_000.0)
-                                    .logarithmic(true)
-                                    .show_value(false),
-                            )
-                            .on_hover_text("Thickness of the depth slab.");
-                        });
                         ui.label("Pt");
                         ui.add_sized(
                             egui::vec2(50.0, 18.0),
@@ -1134,6 +1110,26 @@ fn draw_3d_canvas_overlay(
                                 "{:.0} ms",
                                 status.retained_ms.unwrap_or(status.requested_ms)
                             ));
+                            ui.label("Max pts");
+                            ui.scope(|ui| {
+                                ui.visuals_mut().extreme_bg_color =
+                                    egui::Color32::from_rgba_premultiplied(10, 14, 18, 210);
+                                ui.visuals_mut().widgets.inactive.bg_fill =
+                                    egui::Color32::from_white_alpha(18);
+                                ui.visuals_mut().widgets.hovered.bg_fill =
+                                    egui::Color32::from_white_alpha(34);
+                                ui.visuals_mut().widgets.active.bg_fill =
+                                    egui::Color32::from_white_alpha(46);
+                                ui.add_sized(
+                                    egui::vec2(68.0, 18.0),
+                                    egui::DragValue::new(&mut history.point_limit)
+                                        .clamp_range(1_000..=100_000)
+                                        .speed(1_000.0),
+                                )
+                                .on_hover_text(
+                                    "Maximum raw-event points sampled into the 3D view.",
+                                );
+                            });
                         }
                         crate::theme::toolbar_separator(ui);
                         // Use explicit fills so these buttons are legible on the dark
@@ -1230,7 +1226,7 @@ fn draw_3d_status_footer(
             .max_height(max_height)
             .auto_shrink([true, true])
             .show(ui, |ui| {
-                constrain_section_width(ui);
+                crate::theme::constrain_section_width(ui);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let mut first = true;
@@ -1258,7 +1254,7 @@ fn draw_3d_status_footer(
                     .id_source("investigation_3d_view_details")
                     .default_open(false)
                     .show(ui, |ui| {
-                        constrain_section_width(ui);
+                        crate::theme::constrain_section_width(ui);
                         ui.small(format!(
                             "Layers: {}{}",
                             visible_layers.len(),
@@ -1310,15 +1306,6 @@ fn draw_3d_status_footer(
                     });
             });
     });
-}
-
-fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
-    let width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
-    ui.set_min_width(width);
-    ui.set_max_width(width);
-    ui.set_width(width);
-    ui.style_mut().wrap = Some(true);
-    width
 }
 
 fn draw_inline_separator(ui: &mut egui::Ui, first: &mut bool) {

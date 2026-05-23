@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, ops::Range};
+use std::{cell::RefCell, collections::VecDeque, ops::Range};
 
 use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
 
@@ -25,6 +25,25 @@ pub struct PointCloudState {
     frames: VecDeque<RetainedEventFrame>,
     pub time_window_ms: f32,
     pub point_limit: usize,
+    /// Bumped whenever `frames` changes so a stale memoized summary is rejected.
+    generation: u64,
+    /// Memoized result of the last `visible_summary_at` so the per-frame scene
+    /// build and footer status don't each re-scan and re-decode the ring.
+    summary_cache: RefCell<Option<CachedSummary>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SummaryKey {
+    anchor_end_us: u64,
+    time_window_bits: u32,
+    point_limit: usize,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSummary {
+    key: SummaryKey,
+    value: VisiblePointCloudEvents,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,6 +60,8 @@ impl Default for PointCloudState {
             frames: VecDeque::with_capacity(512),
             time_window_ms: DEFAULT_TIME_WINDOW_MS,
             point_limit: DEFAULT_POINT_LIMIT,
+            generation: 0,
+            summary_cache: RefCell::new(None),
         }
     }
 }
@@ -48,6 +69,7 @@ impl Default for PointCloudState {
 impl PointCloudState {
     pub fn clear(&mut self) {
         self.frames.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn push_frame(&mut self, frame: &PreviewFrame) {
@@ -78,6 +100,7 @@ impl PointCloudState {
             event_count,
         });
         self.trim_history();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn sanitize_controls(&mut self) {
@@ -95,6 +118,26 @@ impl PointCloudState {
     }
 
     pub fn visible_summary_at(&self, anchor_end_us: u64) -> VisiblePointCloudEvents {
+        let key = SummaryKey {
+            anchor_end_us,
+            time_window_bits: self.time_window_ms.to_bits(),
+            point_limit: self.point_limit,
+            generation: self.generation,
+        };
+        if let Some(cached) = self.summary_cache.borrow().as_ref() {
+            if cached.key == key {
+                return cached.value.clone();
+            }
+        }
+        let value = self.compute_visible_summary_at(anchor_end_us);
+        *self.summary_cache.borrow_mut() = Some(CachedSummary {
+            key,
+            value: value.clone(),
+        });
+        value
+    }
+
+    fn compute_visible_summary_at(&self, anchor_end_us: u64) -> VisiblePointCloudEvents {
         let mut events = self.visible_event_candidates_at(anchor_end_us);
         if events.is_empty() {
             return self.empty_visible_summary();

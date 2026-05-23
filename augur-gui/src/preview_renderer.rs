@@ -1670,20 +1670,23 @@ impl WgpuPreviewRenderer {
         frame: &augur_core::pipeline::PreviewFrame,
         mode: PreviewMode,
     ) -> Result<(), String> {
-        let events = frame
-            .events_snapshot()
+        let event_count = frame
+            .event_count()
             .ok_or_else(|| "count accumulation requires raw preview events".to_owned())?;
         let key = CountAccumulationKey {
             width: frame.width,
             height: frame.height,
             window_start_us: frame.window_start_us,
             window_end_us: frame.window_end_us,
-            event_count: events.len(),
+            event_count,
         };
         if self.count_accumulation_key == Some(key) {
             return Ok(());
         }
 
+        let events = frame
+            .events_snapshot()
+            .ok_or_else(|| "count accumulation requires raw preview events".to_owned())?;
         let size = [frame.width as usize, frame.height as usize];
         self.ensure_count_buffers(size, events.len())?;
 
@@ -1919,11 +1922,11 @@ impl WgpuPreviewRenderer {
         &mut self,
         frame: &augur_core::pipeline::PreviewFrame,
     ) -> Result<(), String> {
-        let events = frame
-            .events_snapshot()
+        let event_count = frame
+            .event_count()
             .ok_or_else(|| "time-surface accumulation requires raw preview events".to_owned())?;
         let size = [frame.width as usize, frame.height as usize];
-        self.ensure_time_surface_buffers(size, events.len())?;
+        self.ensure_time_surface_buffers(size, event_count)?;
 
         let accumulation_key = TimeSurfaceAccumulationKey {
             width: frame.width,
@@ -1957,6 +1960,9 @@ impl WgpuPreviewRenderer {
             return Ok(());
         }
 
+        let events = frame
+            .events_snapshot()
+            .ok_or_else(|| "time-surface accumulation requires raw preview events".to_owned())?;
         self.time_surface_packed_events.clear();
         self.time_surface_packed_events.reserve(events.len() * 2);
         self.time_surface_packed_events
@@ -2807,6 +2813,33 @@ mod tests {
                 }
             }
             _ => panic!("unexpected payload/mode combination"),
+        }
+    }
+
+    #[test]
+    fn polarity_shader_literals_match_theme_constants() {
+        // The WGSL fragment shaders hardcode the polarity tints as normalized
+        // float literals. They must stay byte-identical to the CPU-path theme
+        // constants, or the GPU and CPU previews would render different colours.
+        fn wgsl_rgb(rgb: [u8; 3]) -> String {
+            format!(
+                "vec3<f32>({:.4}, {:.4}, {:.4})",
+                f32::from(rgb[0]) / 255.0,
+                f32::from(rgb[1]) / 255.0,
+                f32::from(rgb[2]) / 255.0,
+            )
+        }
+        let on = wgsl_rgb(crate::theme::POLARITY_ON_RGB);
+        let off = wgsl_rgb(crate::theme::POLARITY_OFF_RGB);
+        for shader in [super::PREVIEW_SHADER, super::COUNT_RENDER_SHADER] {
+            assert!(
+                shader.contains(&on),
+                "shader missing polarity-on literal {on}"
+            );
+            assert!(
+                shader.contains(&off),
+                "shader missing polarity-off literal {off}"
+            );
         }
     }
 

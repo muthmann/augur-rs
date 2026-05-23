@@ -60,6 +60,17 @@ impl CompactEvent {
     }
 }
 
+/// Returns the sub-slice of an ascending-timestamp event slice whose timestamps
+/// fall within the inclusive window `[start_us, end_us]`.
+///
+/// Both bounds are resolved with `partition_point`, so the input must already be
+/// sorted by `timestamp_us()` (which holds for every frame stored in the ring).
+pub fn inclusive_window(events: &[CompactEvent], start_us: u64, end_us: u64) -> &[CompactEvent] {
+    let start = events.partition_point(|event| event.timestamp_us() < start_us);
+    let end = events.partition_point(|event| event.timestamp_us() <= end_us);
+    &events[start..end]
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CursorId(u64);
@@ -658,9 +669,7 @@ impl EventSource for EventRing {
                 continue;
             }
             let frame = &self.events[entry.physical_range()];
-            let start = frame.partition_point(|event| event.timestamp_us() < start_us);
-            let end = frame.partition_point(|event| event.timestamp_us() <= end_us);
-            events.extend_from_slice(&frame[start..end]);
+            events.extend_from_slice(inclusive_window(frame, start_us, end_us));
         }
 
         // Note: an empty result can mean either "no events in the queried

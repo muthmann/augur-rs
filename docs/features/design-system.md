@@ -623,6 +623,20 @@ cargo test  -p augur-gui --bins
 
 All three pass. 98 tests green.
 
+## Pass 6.3 — plugin host-view interaction repair
+
+Follow-up screenshot review showed that runtime plugin host views were leaking into the wrong
+surfaces:
+
+- `Scatter3dFromTable` descriptors now stay out of the dock, View menu, plugin-card chips, and
+  deferred OS windows. They remain active as main investigation 3D scene layers.
+- Compact `AnalysisPanel` host views now render inside the owning runtime plugin card, with
+  provider/view-scoped egui ids so repeated EVE cards do not collide.
+- Host-view chips use shortened labels plus full-title tooltips, preventing the narrow Analysis
+  panel from wrapping labels into vertical strips.
+- Default dock seeding now chooses only dock-renderable host views, so candidate 3D layer
+  descriptors no longer produce an immediate dock mismatch error.
+
 ## Follow-ups (still open)
 
 - Settings panel collapse counters (`5 / 5`, `0 / 64`) — needs the

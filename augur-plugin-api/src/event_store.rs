@@ -135,13 +135,11 @@ impl EventStore {
 
         for index in start_index..end_index {
             let frame = &self.frames[index];
-            let start = frame
-                .events
-                .partition_point(|event| event.timestamp_us() < start_timestamp_us);
-            let end = frame
-                .events
-                .partition_point(|event| event.timestamp_us() <= end_timestamp_us);
-            out.extend_from_slice(&frame.events[start..end]);
+            out.extend_from_slice(augur_event_types::inclusive_window(
+                &frame.events,
+                start_timestamp_us,
+                end_timestamp_us,
+            ));
         }
     }
 

@@ -20,7 +20,7 @@ pub const MAX_CHUNK_EVENTS: usize = 1_048_576;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STREAM_READ_TIMEOUT: Duration = Duration::from_millis(100);
-const START_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const GUI_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PythonIngressStatus {
@@ -398,7 +398,7 @@ fn wait_for_gui_reply(
     reply_rx: &mpsc::Receiver<std::result::Result<(), String>>,
     stop: &AtomicBool,
 ) -> std::result::Result<std::result::Result<(), String>, mpsc::RecvTimeoutError> {
-    let mut remaining = START_ACK_TIMEOUT;
+    let mut remaining = GUI_REPLY_TIMEOUT;
     while !stop.load(Ordering::Relaxed) {
         let wait = remaining.min(STREAM_READ_TIMEOUT);
         match reply_rx.recv_timeout(wait) {

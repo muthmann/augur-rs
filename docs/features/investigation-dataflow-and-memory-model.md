@@ -130,6 +130,14 @@ intended asymmetry between 3D continuity and 2D current-frame processing
 without allowing the 3D raw-history path to advance while the 2D preview never
 receives a display frame.
 
+Runtime plugins that request retained event history have one extra drain-time
+requirement: `update_preview_texture()` synchronizes the plugin `EventStore`
+from the upstream `plugin-runtime` cursor as soon as preview frames are
+dequeued. Plugin analysis can still run only on the newest processed frame, but
+the lossless upstream cursor advances before display throttling, click-triggered
+recomputes, or replay snapshot application can leave it pinned at an old
+logical event and block ring eviction.
+
 ## Allocation And Ownership Map
 
 ### `PreviewFrame` buffers

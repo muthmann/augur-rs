@@ -18,12 +18,13 @@ use augur_core::{
     config::{CameraConfig, GlobalSettingsConfig},
     metadata::{RecordingAnnotations, RecordingMetadata},
     pipeline::{
-        spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, PipelineController, PipelineOptions,
-        PipelineStatsSnapshot, PreviewFrame,
+        spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, LiveEventSource, PipelineController,
+        PipelineOptions, PipelineStatsSnapshot, PreviewFrame,
     },
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
+use augur_event_types::CursorId;
 use augur_plugin_api::{
     FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
     HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginInput, Series1dV1,
@@ -2384,6 +2385,7 @@ impl CameraApp {
         let default_tabs: Vec<String> = self
             .host_view_registry
             .window_views()
+            .filter(|view| host_view_kind_is_dockable(&view.descriptor.kind))
             .take(3)
             .map(|view| view.descriptor.id.clone())
             .collect();
@@ -2607,16 +2609,6 @@ impl CameraApp {
             ^ u64::from(occurrence).rotate_left(47)
     }
 
-    fn row_index_for_key(
-        dataset_id: &str,
-        generation: u64,
-        schema: &augur_plugin_api::TableSchema,
-        table: &TableDatasetV1,
-        key: &StableRowKey,
-    ) -> Option<usize> {
-        investigation_row_index_for_key(dataset_id, table, schema, generation, key)
-    }
-
     fn resolve_related_event_ids_for_row(
         &mut self,
         row_key: &StableRowKey,
@@ -2642,9 +2634,13 @@ impl CameraApp {
         let Ok(Some(table)) = cached_table(cache_entry) else {
             return;
         };
-        let Some(row_idx) =
-            Self::row_index_for_key(&row_key.dataset_id, generation, schema, table, row_key)
-        else {
+        let Some(row_idx) = investigation_row_index_for_key(
+            &row_key.dataset_id,
+            table,
+            schema,
+            generation,
+            row_key,
+        ) else {
             return;
         };
 
@@ -3647,6 +3643,12 @@ impl CameraApp {
     /// Add a host view to the dock (or focus it if already present).
     /// Drops stale tab IDs whose view no longer exists in the registry.
     fn dock_open_view(&mut self, view_id: &str) {
+        let Some(view) = self.host_view_registry.view(view_id) else {
+            return;
+        };
+        if !host_view_kind_is_dockable(&view.descriptor.kind) {
+            return;
+        }
         if !self.dock_tabs.iter().any(|id| id == view_id) {
             self.dock_tabs.push(view_id.to_owned());
         }
@@ -3682,8 +3684,9 @@ impl CameraApp {
         // Drop stale tabs whose view IDs no longer resolve.
         self.dock_tabs.retain(|id| {
             self.host_view_registry
-                .views()
-                .any(|v| v.descriptor.id == *id)
+                .view(id)
+                .map(|view| host_view_kind_is_dockable(&view.descriptor.kind))
+                .unwrap_or(false)
         });
         if let Some(active) = &self.dock_active {
             if !self.dock_tabs.iter().any(|id| id == active) {
@@ -3946,6 +3949,7 @@ impl CameraApp {
         let chips: Vec<(String, String, augur_plugin_api::HostViewKind)> = self
             .host_view_registry
             .window_views_for_provider(provider)
+            .filter(|view| host_view_kind_is_dockable(&view.descriptor.kind))
             .map(|view| {
                 (
                     view.descriptor.id.clone(),
@@ -3966,7 +3970,8 @@ impl CameraApp {
                 let in_window = *self.host_view_window_open.get(&id).unwrap_or(&false);
                 let active = in_dock || in_window;
                 let icon = host_view_kind_icon(&kind);
-                let label = format!("{icon}  {title}");
+                let label_title = short_host_view_chip_title(&title);
+                let label = format!("{icon}  {label_title}");
                 let response = ui
                     .push_id(&id, |ui| {
                         if active {
@@ -3998,6 +4003,7 @@ impl CameraApp {
                         })
                     })
                     .inner;
+                let response = response.on_hover_text(&title);
                 if response.clicked() {
                     self.dock_open_view(&id);
                 }
@@ -4024,23 +4030,36 @@ impl CameraApp {
             return;
         }
 
-        egui::CollapsingHeader::new("Host Views")
-            .default_open(false)
-            .show(ui, |ui| {
+        let count = views.len().to_string();
+        crate::theme::collapse(
+            ui,
+            ("provider_host_views", provider),
+            "Host Views",
+            false,
+            Some(&count),
+            |ui| {
                 for (index, view) in views.iter().enumerate() {
-                    ui.label(egui::RichText::new(&view.descriptor.title).strong());
-                    self.render_host_view_content(ctx, ui, view);
-                    if index + 1 < views.len() {
-                        ui.separator();
-                    }
+                    ui.push_id((&view.descriptor.id, index), |ui| {
+                        ui.label(egui::RichText::new(&view.descriptor.title).strong());
+                        self.render_host_view_content(ctx, ui, view);
+                        if index + 1 < views.len() {
+                            ui.separator();
+                        }
+                    });
                 }
-            });
+            },
+        );
     }
 
     fn render_host_view_windows(&mut self, ctx: &egui::Context) {
         let views: Vec<ResolvedHostView> =
             self.host_view_registry.window_views().cloned().collect();
         for view in views {
+            if !host_view_kind_is_dockable(&view.descriptor.kind) {
+                self.host_view_window_open
+                    .insert(view.descriptor.id.clone(), false);
+                continue;
+            }
             if !self
                 .host_view_window_open
                 .get(&view.descriptor.id)
@@ -4719,6 +4738,28 @@ impl CameraApp {
         if let Some(controller) = &self.controller {
             self.sync_pipeline_requirements(controller);
         }
+    }
+
+    fn sync_retained_event_history_from_controller(&mut self) -> bool {
+        if !self.plugins_need_retained_event_history() {
+            return false;
+        }
+
+        let Some((source, cursor)) = self.controller.as_ref().map(|controller| {
+            (
+                controller.event_source.clone(),
+                controller.plugin_event_cursor,
+            )
+        }) else {
+            return false;
+        };
+
+        sync_retained_event_history_from_upstream(
+            &mut self.event_store,
+            source,
+            cursor,
+            &mut self.analysis_output.warnings,
+        )
     }
 
     fn enabled_plugin_names(&self) -> Vec<String> {
@@ -5878,19 +5919,12 @@ impl CameraApp {
                         controller.plugin_event_cursor,
                     )
                 }) {
-                    self.event_store.attach_upstream(source, cursor);
-                    match self.event_store.sync_from_upstream() {
-                        Ok(()) => {
-                            synced_upstream = cursor.is_some();
-                        }
-                        Err(err) => {
-                            self.analysis_output.warnings.push(AnalysisWarning {
-                                source: "Plugin history".into(),
-                                severity: AnalysisSeverity::Error,
-                                message: err,
-                            });
-                        }
-                    }
+                    synced_upstream = sync_retained_event_history_from_upstream(
+                        &mut self.event_store,
+                        source,
+                        cursor,
+                        &mut self.analysis_output.warnings,
+                    );
                 }
 
                 if !synced_upstream && append_current_frame_to_event_store {
@@ -6044,6 +6078,7 @@ impl CameraApp {
         };
         if drained_frame {
             self.preview_perf.record_dequeue(dequeue_started.elapsed());
+            self.sync_retained_event_history_from_controller();
         }
 
         let external_streaming = self.external_tool_status().is_streaming();
@@ -6870,7 +6905,11 @@ impl eframe::App for CameraApp {
                     }
                     ui.separator();
                     let window_views: Vec<ResolvedHostView> =
-                        self.host_view_registry.window_views().cloned().collect();
+                        self.host_view_registry
+                            .window_views()
+                            .filter(|view| host_view_kind_is_dockable(&view.descriptor.kind))
+                            .cloned()
+                            .collect();
                     for view in window_views {
                         let open = self
                             .host_view_window_open
@@ -7402,88 +7441,112 @@ impl eframe::App for CameraApp {
                                             .host_view_registry
                                             .panel_views_for_provider(provider)
                                             .count();
-                                        let rendered = {
-                                            let phase_label =
-                                                self.plugin_manager.records()[index].phase_label();
-                                            let record =
-                                                &mut self.plugin_manager.records_mut()[index];
-                                            let Some(plugin) = record.plugin_mut() else {
-                                                continue;
-                                            };
-                                            if !plugin.enabled() {
-                                                // Render a dimmed compact card so users can see
-                                                // disabled plugins exist (and toggle them from
-                                                // the Analysis menu). Opacity ~0.72 mirrors the
-                                                // design's `.is-off` card style.
-                                                let plugin_name = plugin.name().to_owned();
-                                                ui.push_id(("plugin_card_off", index, &plugin_name), |ui| {
+                                        let phase_label =
+                                            self.plugin_manager.records()[index].phase_label();
+                                        let Some(plugin_name) = self.plugin_manager.records()[index]
+                                            .plugin()
+                                            .map(|plugin| plugin.name().to_owned())
+                                        else {
+                                            continue;
+                                        };
+                                        let plugin_enabled = self.plugin_manager.records()[index]
+                                            .plugin()
+                                            .map(|plugin| plugin.enabled())
+                                            .unwrap_or(false);
+
+                                        if !plugin_enabled {
+                                            // Render a dimmed compact card so users can see
+                                            // disabled plugins exist (and toggle them from
+                                            // the Analysis menu). Opacity ~0.72 mirrors the
+                                            // design's `.is-off` card style.
+                                            ui.push_id(
+                                                ("plugin_card_off", index, &plugin_name),
+                                                |ui| {
                                                     ui.scope(|ui| {
                                                         ui.set_opacity(0.72);
-                                                        crate::theme::card_frame(ui).show(ui, |ui| {
-                                                            let row_w = ui.available_width();
-                                                            ui.allocate_ui_with_layout(
-                                                                egui::vec2(row_w, 22.0),
-                                                                egui::Layout::left_to_right(
-                                                                    egui::Align::Center,
-                                                                ),
-                                                                |ui| {
-                                                                    let p = crate::theme::palette_for_visuals(
-                                                                        ui.visuals(),
-                                                                    );
-                                                                    if crate::theme::icon_button(
-                                                                        ui,
-                                                                        egui_phosphor::regular::EYE_SLASH,
-                                                                        "Enable plugin",
-                                                                    )
-                                                                    .clicked()
-                                                                    {
-                                                                        plugin.set_enabled(true);
-                                                                        analysis_toggle_changed = true;
-                                                                    }
-                                                                    ui.add_space(crate::theme::sp::SP_1);
-                                                                    ui.label(
-                                                                        egui::RichText::new(&plugin_name)
-                                                                            .strong()
-                                                                            .size(13.0)
-                                                                            .color(p.fg_2),
-                                                                    );
-                                                                    ui.with_layout(
-                                                                        egui::Layout::right_to_left(
-                                                                            egui::Align::Center,
-                                                                        ),
-                                                                        |ui| {
-                                                                            crate::theme::chip(
-                                                                                ui,
-                                                                                "off",
-                                                                                crate::theme::Tone::Neutral,
-                                                                            );
-                                                                        },
-                                                                    );
-                                                                },
-                                                            );
-                                                            ui.small(
-                                                                "Enable here or from Analysis to configure.",
-                                                            );
-                                                        });
+                                                        crate::theme::card_frame(ui).show(
+                                                            ui,
+                                                            |ui| {
+                                                                let Some(plugin) = self
+                                                                    .plugin_manager
+                                                                    .records_mut()[index]
+                                                                    .plugin_mut()
+                                                                else {
+                                                                    return;
+                                                                };
+                                                                let row_w = ui.available_width();
+                                                                ui.allocate_ui_with_layout(
+                                                                    egui::vec2(row_w, 22.0),
+                                                                    egui::Layout::left_to_right(
+                                                                        egui::Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        let p = crate::theme::palette_for_visuals(
+                                                                            ui.visuals(),
+                                                                        );
+                                                                        if crate::theme::icon_button(
+                                                                            ui,
+                                                                            egui_phosphor::regular::EYE_SLASH,
+                                                                            "Enable plugin",
+                                                                        )
+                                                                        .clicked()
+                                                                        {
+                                                                            plugin.set_enabled(true);
+                                                                            analysis_toggle_changed = true;
+                                                                        }
+                                                                        ui.add_space(crate::theme::sp::SP_1);
+                                                                        ui.label(
+                                                                            egui::RichText::new(&plugin_name)
+                                                                                .strong()
+                                                                                .size(13.0)
+                                                                                .color(p.fg_2),
+                                                                        );
+                                                                        ui.with_layout(
+                                                                            egui::Layout::right_to_left(
+                                                                                egui::Align::Center,
+                                                                            ),
+                                                                            |ui| {
+                                                                                crate::theme::chip(
+                                                                                    ui,
+                                                                                    "off",
+                                                                                    crate::theme::Tone::Neutral,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                    },
+                                                                );
+                                                                ui.small(
+                                                                    "Enable here or from Analysis to configure.",
+                                                                );
+                                                            },
+                                                        );
                                                     });
-                                                });
-                                                continue;
-                                            }
+                                                },
+                                            );
+                                            continue;
+                                        }
 
-                                            let missing_dependencies: Vec<String> = plugin
-                                                .dependencies()
-                                                .iter()
-                                                .filter(|dependency| {
-                                                    !enabled_plugin_names
+                                        let mut stage_changed = false;
+                                        ui.push_id(("plugin_card", index, &plugin_name), |ui| {
+                                            crate::theme::card_frame(ui).show(ui, |ui| {
+                                                {
+                                                    let Some(plugin) = self
+                                                        .plugin_manager
+                                                        .records_mut()[index]
+                                                        .plugin_mut()
+                                                    else {
+                                                        return;
+                                                    };
+                                                    let missing_dependencies: Vec<String> = plugin
+                                                        .dependencies()
                                                         .iter()
-                                                        .any(|name| name == *dependency)
-                                                })
-                                                .cloned()
-                                                .collect();
-                                            let mut stage_changed = false;
-                                            let plugin_name = plugin.name().to_owned();
-                                            ui.push_id(("plugin_card", index, &plugin_name), |ui| {
-                                                crate::theme::card_frame(ui).show(ui, |ui| {
+                                                        .filter(|dependency| {
+                                                            !enabled_plugin_names
+                                                                .iter()
+                                                                .any(|name| name == *dependency)
+                                                        })
+                                                        .cloned()
+                                                        .collect();
                                                     let row_w = ui.available_width();
                                                     let plugin_dirty = plugin.is_dirty();
                                                     ui.allocate_ui_with_layout(
@@ -7573,7 +7636,12 @@ impl eframe::App for CameraApp {
                                                         );
                                                     }
                                                     ui.separator();
-                                                    match render_plugin_settings(ui, plugin, false, plugin_name.clone()) {
+                                                    match render_plugin_settings(
+                                                        ui,
+                                                        plugin,
+                                                        false,
+                                                        plugin_name.clone(),
+                                                    ) {
                                                         Ok(changed) => {
                                                             stage_changed = changed;
                                                         }
@@ -7586,24 +7654,14 @@ impl eframe::App for CameraApp {
                                                             );
                                                         }
                                                     }
-                                                });
-                                            });
-                                            analysis_parameter_changed |= stage_changed;
-                                            true
-                                        };
+                                                }
 
-                                        if rendered {
-                                            self.render_provider_view_chips(
-                                                ui,
-                                                HostViewProviderKey::Runtime(index),
-                                            );
-                                            self.render_provider_host_views(
-                                                ctx,
-                                                ui,
-                                                HostViewProviderKey::Runtime(index),
-                                            );
-                                            ui.separator();
-                                        }
+                                                self.render_provider_view_chips(ui, provider);
+                                                self.render_provider_host_views(ctx, ui, provider);
+                                            });
+                                        });
+                                        analysis_parameter_changed |= stage_changed;
+                                        ui.separator();
                                     }
                                 }
                             });
@@ -7877,10 +7935,10 @@ impl eframe::App for CameraApp {
                         let transport_reserve = if replay_state.active { 34.0 } else { 0.0 };
                         // max_height is the cap for the canvas only; draw_investigation_3d
                         // adds INVESTIGATION_3D_FOOTER_HEIGHT below it, so both must fit.
-                        let max_3d_height =
-                            (ui.available_size().y - transport_reserve - INVESTIGATION_3D_FOOTER_HEIGHT)
-                                .min(800.0 - INVESTIGATION_3D_FOOTER_HEIGHT)
-                                .max(100.0);
+                        let max_3d_height = (ui.available_size().y
+                            - transport_reserve
+                            - INVESTIGATION_3D_FOOTER_HEIGHT)
+                            .clamp(100.0, 800.0 - INVESTIGATION_3D_FOOTER_HEIGHT);
                         main_3d_output = Some(draw_investigation_3d(
                             ui,
                             &mut self.investigation_renderer,
@@ -8523,6 +8581,29 @@ fn host_view_kind_tag(kind: &augur_plugin_api::HostViewKind) -> &'static str {
     }
 }
 
+fn host_view_kind_is_dockable(kind: &augur_plugin_api::HostViewKind) -> bool {
+    use augur_plugin_api::HostViewKind;
+    !matches!(
+        kind,
+        HostViewKind::CompactTable | HostViewKind::Scatter3dFromTable { .. }
+    )
+}
+
+fn short_host_view_chip_title(title: &str) -> String {
+    const MAX_CHARS: usize = 22;
+    let compact = title
+        .trim()
+        .replace(" Candidate Events", " events")
+        .replace(" Table", "")
+        .replace(" 3D", "");
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+    let mut truncated: String = compact.chars().take(MAX_CHARS.saturating_sub(3)).collect();
+    truncated.push_str("...");
+    truncated
+}
+
 /// Load the bundled owl brand mark from `assets/logo.png`. Returns `None`
 /// if the asset is missing or fails to decode — the menubar wordmark
 /// still renders in that case.
@@ -8635,8 +8716,8 @@ fn show_investigation_split_in_rect(
     let (min_ratio, max_ratio) = investigation_split_ratio_bounds(usable_width, min_pane_width);
     // Hard-cap the left pane so it cannot grow past the 2D image's natural display width.
     let max_left = (usable_width - min_pane_width).min(max_left_width.unwrap_or(f32::MAX));
-    let mut left_width = (usable_width * (*split_ratio).clamp(min_ratio, max_ratio))
-        .clamp(min_pane_width, max_left);
+    let mut left_width =
+        (usable_width * (*split_ratio).clamp(min_ratio, max_ratio)).clamp(min_pane_width, max_left);
     let handle_rect = egui::Rect::from_min_size(
         egui::pos2(full_rect.left() + left_width, full_rect.top()),
         egui::vec2(handle_width, full_rect.height()),
@@ -8770,6 +8851,26 @@ fn python_ingress_dataset_label(info: &PythonIngressDatasetInfo) -> String {
         .clone()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "NumPy event stream".into())
+}
+
+fn sync_retained_event_history_from_upstream(
+    event_store: &mut PluginEventHistory,
+    source: LiveEventSource,
+    cursor: Option<CursorId>,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> bool {
+    event_store.attach_upstream(source, cursor);
+    match event_store.sync_from_upstream() {
+        Ok(()) => cursor.is_some(),
+        Err(err) => {
+            warnings.push(AnalysisWarning {
+                source: "Plugin history".into(),
+                severity: AnalysisSeverity::Error,
+                message: err,
+            });
+            false
+        }
+    }
 }
 
 fn python_ingress_replay_info(
@@ -9001,16 +9102,18 @@ fn render_action_modal_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        acq_time_us_from_ms, derived_replay_preview_interval_ms, investigation_split_ratio_bounds,
-        pipeline_stream_active, python_ingress_pipeline_config, python_ingress_replay_info,
-        raw_event_focus_volume, raw_event_point_position, replay_fraction_from_time,
-        replay_history_has_display_override, replay_history_step_target, replay_pipeline_config,
-        replay_seek_target_reached, replay_snapshot_frame, replay_step_target_time_us,
-        replay_step_uses_current_controller, replay_time_from_position_sources,
-        roi_is_effectively_full_frame, sync_acq_time_atomic, sync_popup_investigation_payload,
-        viewport_stream_active, CameraApp, PopupSharedData, RawEventSceneInput,
-        RAW_EVENTS_ON_LAYER_ID,
+        acq_time_us_from_ms, derived_replay_preview_interval_ms, host_view_kind_is_dockable,
+        investigation_split_ratio_bounds, pipeline_stream_active, python_ingress_pipeline_config,
+        python_ingress_replay_info, raw_event_focus_volume, raw_event_point_position,
+        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
+        replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
+        replay_step_target_time_us, replay_step_uses_current_controller,
+        replay_time_from_position_sources, roi_is_effectively_full_frame,
+        short_host_view_chip_title, sync_acq_time_atomic, sync_popup_investigation_payload,
+        sync_retained_event_history_from_upstream, viewport_stream_active, CameraApp,
+        PopupSharedData, RawEventSceneInput, RAW_EVENTS_ON_LAYER_ID,
     };
+    use augur_event_types::{BackpressureBehavior, CursorPolicy};
     use std::{
         collections::HashSet,
         sync::{
@@ -9022,6 +9125,7 @@ mod tests {
     use crate::{
         inspection_3d::{Investigation3dLayer, Investigation3dPoint, Investigation3dScene},
         investigation::{AnalysisRoi, InvestigationLayerStyle, InvestigationState},
+        plugin_loader::PluginEventHistory,
         point_cloud::PointCloudState,
         python_ingress::PythonIngressDatasetInfo,
         viewer_widget::{AppMode, ViewerReplayState},
@@ -9032,7 +9136,7 @@ mod tests {
         replay::ReplayFileInfo,
         PACKED_EVENT_RECORD_BYTES,
     };
-    use augur_plugin_api::HostMarkerShape;
+    use augur_plugin_api::{FfiCdEvent, HostMarkerShape, HostViewKind};
 
     fn raw_layer_style(title: &str, color: [u8; 4], size: f32) -> InvestigationLayerStyle {
         InvestigationLayerStyle {
@@ -9042,6 +9146,41 @@ mod tests {
             marker_shape: HostMarkerShape::Point,
             size,
         }
+    }
+
+    #[test]
+    fn scatter3d_host_views_are_scene_layers_not_dock_tabs() {
+        assert!(!host_view_kind_is_dockable(
+            &HostViewKind::Scatter3dFromTable {
+                x_column: "x".into(),
+                y_column: "y".into(),
+                z_column: "t".into(),
+            },
+        ));
+        assert!(!host_view_kind_is_dockable(&HostViewKind::CompactTable));
+        assert!(host_view_kind_is_dockable(&HostViewKind::TableWindow));
+        assert!(host_view_kind_is_dockable(
+            &HostViewKind::Scatter2dFromTable {
+                x_column: "x".into(),
+                y_column: "y".into(),
+            },
+        ));
+    }
+
+    #[test]
+    fn host_view_chip_titles_are_shortened_for_analysis_panel() {
+        assert_eq!(
+            short_host_view_chip_title("Accepted Candidate Events Table"),
+            "Accepted events"
+        );
+        assert_eq!(
+            short_host_view_chip_title("Rejected Candidate Events 3D"),
+            "Rejected events"
+        );
+        assert_eq!(
+            short_host_view_chip_title("Very Long Host View Name That Will Wrap"),
+            "Very Long Host View..."
+        );
     }
 
     fn point_cloud_frame(events: &[CdEvent]) -> PreviewFrame {
@@ -9196,6 +9335,77 @@ mod tests {
 
         assert!(snapshot.events.is_none());
         assert_eq!(snapshot.events_snapshot(), Some(events));
+    }
+
+    #[test]
+    fn retained_history_sync_advances_plugin_cursor_before_preview_processing() {
+        let source = LiveEventSource::with_capacity(3);
+        let cursor = source.register_cursor(
+            "plugin-runtime",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::FailLoud,
+            },
+        );
+        source
+            .append_cd_frame(
+                &[
+                    CdEvent {
+                        x: 1,
+                        y: 0,
+                        timestamp: 10,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        x: 2,
+                        y: 0,
+                        timestamp: 20,
+                        polarity: false,
+                    },
+                ],
+                10,
+                20,
+            )
+            .expect("first frame fits");
+
+        let mut store = PluginEventHistory::default();
+        let mut warnings = Vec::new();
+        assert!(sync_retained_event_history_from_upstream(
+            &mut store,
+            source.clone(),
+            Some(cursor),
+            &mut warnings,
+        ));
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            source.cursor_next_event_idx(cursor),
+            Some(2),
+            "dequeued-but-throttled frames must still advance the plugin cursor"
+        );
+        assert_eq!(
+            store.materialize_frame(0).as_deref(),
+            Some(&[FfiCdEvent::new(1, 0, 10, 1), FfiCdEvent::new(2, 0, 20, 0),][..])
+        );
+        source
+            .append_cd_frame(
+                &[
+                    CdEvent {
+                        x: 3,
+                        y: 0,
+                        timestamp: 30,
+                        polarity: true,
+                    },
+                    CdEvent {
+                        x: 4,
+                        y: 0,
+                        timestamp: 40,
+                        polarity: true,
+                    },
+                ],
+                30,
+                40,
+            )
+            .expect("advanced plugin cursor permits eviction");
     }
 
     #[test]

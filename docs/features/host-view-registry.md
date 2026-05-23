@@ -28,6 +28,7 @@ Current view kinds:
 - `HostViewKind::TableWindow`
 - `HostViewKind::Density2dFromTable`
 - `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::Scatter3dFromTable`
 - `HostViewKind::ImageWindow`
 - `HostViewKind::LineSeriesWindow`
 
@@ -65,12 +66,16 @@ alive until either the dataset generation changes or the view settings change.
 
 `augur-gui` currently renders:
 
-- compact panel tables with a 10-row preview cap
+- compact panel summaries inside the owning plugin card
 - read-only table windows with CSV export
 - density maps derived from numeric table columns, with zoom/contrast/colormap/image export
 - scatter plots derived from numeric table columns, with CSV export
 - generic 2D image windows with zoom/contrast/colormap/image export
 - generic 1D line-series plots
+
+`Scatter3dFromTable` is intentionally not dockable. The host uses those descriptors as
+investigation 3D scene layers in the main split/3D viewer, so plugin cards and the View menu do not
+offer them as separate host-view windows.
 
 Exports stay generic:
 

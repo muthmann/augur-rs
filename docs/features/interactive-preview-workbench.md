@@ -36,7 +36,7 @@ The 3D mode:
   `x`, `y`, and event age forming the 3D coordinates
 - keeps that retained raw-event history in `augur-gui` instead of changing the capture pipeline design
 - requests raw events from the pipeline only while the 3D view is active or a plugin already needs them
-- exposes controls for time range and max render limit, plus camera reset
+- exposes controls for time range, max render limit, point size, and camera reset
 - now feeds the WGPU investigation renderer in `augur-gui/src/inspection_3d.rs`
   rather than the earlier painter-only 3D prototype
 - can link the active ROI into the 3D scene as a host-owned focus volume and

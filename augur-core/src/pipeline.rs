@@ -190,7 +190,7 @@ impl LiveEventSource {
             }
             newest_drained_idx = Some(range.end);
             batches.push(LiveEventFrameBatch {
-                events: compact_events.clone(),
+                events: std::mem::take(&mut compact_events),
                 event_range: range,
                 window_start_us: entry.window_start_us,
                 window_end_us: entry.window_end_us,

@@ -758,7 +758,15 @@ pub fn render_summary_card(
 
     ui.separator();
     match selected_row_index {
-        Some(row) => render_summary_detail(ui, schema, dataset, row, options.format),
+        Some(row) => render_summary_detail(
+            ui,
+            schema,
+            dataset,
+            row,
+            options.dataset_id,
+            options.generation,
+            options.format,
+        ),
         None => {
             ui.small("Select a row in the full table to see details here.");
         }
@@ -772,6 +780,8 @@ fn render_summary_detail(
     schema: &TableSchema,
     dataset: &TableDatasetV1,
     row: usize,
+    dataset_id: &str,
+    generation: u64,
     format_options: TableCellFormatOptions,
 ) {
     let display_map: std::collections::HashMap<&str, &TableColumnDisplayMetadata> = schema
@@ -794,7 +804,7 @@ fn render_summary_detail(
         }
     }
 
-    egui::Grid::new(("summary_card_grid", row))
+    egui::Grid::new(("summary_card_grid", dataset_id, generation, row))
         .num_columns(2)
         .spacing([16.0, 4.0])
         .show(ui, |ui| {

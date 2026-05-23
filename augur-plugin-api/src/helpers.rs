@@ -187,9 +187,9 @@ impl<'a> EventStoreHandle<'a> {
                 continue;
             };
             let events = unsafe { frame.as_slice() };
-            let start_index = events.partition_point(|event| event.timestamp_us() < start_us);
-            let end_index = events.partition_point(|event| event.timestamp_us() <= end_us);
-            out.extend_from_slice(&events[start_index..end_index]);
+            out.extend_from_slice(augur_event_types::inclusive_window(
+                events, start_us, end_us,
+            ));
         }
     }
 
