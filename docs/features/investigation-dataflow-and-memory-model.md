@@ -90,10 +90,10 @@ For each decoded batch of `CdEvent`s, the preview thread:
    - `pixels_on`
    - `pixels_off`
    - cached histograms
-2. appends the closed frame's raw events into the upstream `LiveEventSource`
-   / `EventRing`
-3. optionally keeps an inline `PreviewFrame.events` copy when
-   `raw_events_needed == true`
+2. when `raw_events_needed == true`, appends the closed frame's raw events into
+   the upstream `LiveEventSource` / `EventRing`
+3. when `raw_events_needed == true`, keeps an inline `PreviewFrame.events` copy
+   for compatibility consumers
 4. emits a `PreviewFrame` once the acquisition window closes
 
 `PreviewFrame` contains:
@@ -108,7 +108,9 @@ For each decoded batch of `CdEvent`s, the preview thread:
 The image/count buffers are pooled and recycled on `Drop`. The raw-event
 `Vec<CdEvent>` is not pooled the same way; it is moved into the frame only when
 raw events were requested. The upstream ring receives the frame before the
-bounded preview-frame queue can drop the UI projection.
+bounded preview-frame queue can drop the UI projection only when a real raw
+consumer is active; pure 2D preview skips both the raw-event vector and ring
+archival.
 
 ### 2. Drain preview frames in `augur-gui`
 
@@ -130,13 +132,16 @@ intended asymmetry between 3D continuity and 2D current-frame processing
 without allowing the 3D raw-history path to advance while the 2D preview never
 receives a display frame.
 
-Runtime plugins that request retained event history have one extra drain-time
-requirement: `update_preview_texture()` synchronizes the plugin `EventStore`
-from the upstream `plugin-runtime` cursor as soon as preview frames are
-dequeued. Plugin analysis can still run only on the newest processed frame, but
-the lossless upstream cursor advances before display throttling, click-triggered
-recomputes, or replay snapshot application can leave it pinned at an old
-logical event and block ring eviction.
+Runtime plugins that request retained event history have one extra live-worker
+requirement: the worker owns a dedicated upstream cursor and drains it before
+processing the newest coalesced frame trigger. Plugin analysis can still publish
+only the newest processed result, but the lossless upstream cursor advances
+independently of GUI display throttling.
+
+Replay seeks and source replacements clear retained plugin history and reset
+runtime plugins before the new upstream source publishes frames. This keeps the
+frame window deque monotonic for timestamp-range lookups and prevents
+pre-seek/post-seek frames from being double counted by accumulating plugins.
 
 ## Allocation And Ownership Map
 
@@ -206,7 +211,7 @@ retained-history projection.
 
 ### Plugin retained history / `EventStoreHandle`
 
-Owner: `augur-gui`, implementation in `augur-gui/src/plugin_loader.rs`
+Owner: `augur-runtime`, implementation in `augur-runtime/src/lib.rs`
 
 - type: `VecDeque<PluginEventFrame>`
 - each stored frame normally keeps a `LiveEventSource` handle plus a logical
@@ -214,8 +219,9 @@ Owner: `augur-gui`, implementation in `augur-gui/src/plugin_loader.rs`
 - fallback inline storage exists only for compatibility frames that do not
   carry an upstream source/range
 - limited by `event_store_budget_bytes`
-- only appended from the newest processed frame when
-  `append_current_frame_to_event_store == true`
+- in live mode, filled by the worker's dedicated upstream cursor
+- in synchronous replay recomputation, appended from the newest processed frame
+  when `append_current_frame_to_event_store == true`
 
 This is the retained-history source for plugins. The ABI-facing
 `EventStoreHandle` remains unchanged: plugins still request frame counts,
@@ -478,7 +484,8 @@ reflect the later controller state.
 
 ## Plugin Interface Boundary
 
-At runtime, the host calls each enabled plugin with four main inputs:
+At runtime, the worker or synchronous replay path calls each enabled plugin
+with four main inputs:
 
 1. `PluginFrame`
    - width / height
@@ -542,13 +549,11 @@ the same display-frame end timestamp as the 2D preview. The remaining
 current-frame plugin input, plugin retained history, and sampled 3D raw history
 can have different storage and retention windows.
 
-### 3. `FrameOnly` plugins still inherit raw-event marshaling cost
+### 3. Raw-event marshaling is demand-gated
 
-`CameraApp::run_analysis()` currently converts `frame.events` into
-`Vec<FfiCdEvent>` whenever any runtime plugin is enabled, even if the enabled
-plugins are all `FrameOnly`.
-
-So the raw-event FFI copy boundary is wider than the logical plugin demand.
+Current-frame `Vec<FfiCdEvent>` materialization happens only when an enabled
+`RawEvents` plugin needs it. Frame-only and derived-data-only plugins do not
+force current-frame raw-event copies.
 
 ### 4. Decoded replay is efficient for seeks, but still has a compatibility cache
 
@@ -581,7 +586,8 @@ evicts old windows.
 | `augur-gui/src/point_cloud.rs` | GUI-owned 3D projection metadata over upstream event ranges |
 | `augur-gui/src/inspection_3d.rs` | WGPU 3D renderer and interaction |
 | `augur-gui/src/host_views.rs` | host dataset/view resolution, decoding, and rendering |
-| `augur-gui/src/plugin_loader.rs` | runtime plugin bridge and GUI-hosted retained-history projection |
+| `augur-runtime/src/lib.rs` | runtime plugin bridge, retained-history projection, and live worker |
+| `augur-gui/src/plugin_loader.rs` | compatibility re-export of runtime plugin types |
 | `augur-plugin-api/src/event_store.rs` | public retained-event helper / compatibility implementation for plugin-side tests |
 | `augur-plugin-api/src/helpers.rs` | safe plugin-side wrappers (`PluginFrame`, `EventStoreHandle`, `HostContext`) |
 | `augur-plugin-api/src/context.rs` | host-view registry and dataset/view/action schema |
@@ -596,5 +602,5 @@ evicts old windows.
   - replay seek / step behavior in `augur-gui/src/app.rs`
   - replay reopen behavior in `augur-core/src/replay.rs` and
     `augur-core/src/decoded_replay.rs`
-  - plugin retained-history callback tests in `augur-gui/src/plugin_loader.rs`
+  - plugin retained-history callback tests in `augur-runtime/src/lib.rs`
   - compatibility `EventStore` retention tests in `augur-plugin-api/src/event_store.rs`

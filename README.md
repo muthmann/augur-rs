@@ -160,6 +160,7 @@ All adjustable live, mid-session:
 # CLI — for scripting and automation
 augur status
 augur record captures/run.raw --duration-s 30
+augur analyze captures/run.raw --out analysis/run
 
 # GUI — for live preview and interactive control
 augur-gui
@@ -171,18 +172,19 @@ The CLI and GUI share the same config types. A TOML file saved from the GUI work
 
 ## Architecture
 
-Six crates with explicit, enforced boundaries:
+Seven crates with explicit, enforced boundaries:
 
 ```
 augur-cli ─────────────┐
                         ├──► augur-core          (generic camera SDK)
 augur-gui ─────────────┼──► augur-prophesee      (EVK4/IMX636 driver)
+                        ├──► augur-runtime       (plugin host, live worker, offline analysis)
                         ├──► augur-plugin-api     (plugin FFI contract)
 runtime plugins ───────┼──► augur-plugin-types    (shared domain types)
                         └──► host-owned analysis UI in augur-gui
 ```
 
-**`augur-core` is a generic camera SDK** with a trait-based abstraction. The Prophesee driver (`augur-prophesee`) is one implementation — additional backends can be added without touching the core or GUI. **`augur-gui`** owns the investigation workspace, built-in analysis tools, and the runtime plugin host.
+**`augur-core` is a generic camera SDK** with a trait-based abstraction. The Prophesee driver (`augur-prophesee`) is one implementation — additional backends can be added without touching the core or GUI. **`augur-runtime`** owns dynamic plugin loading, live worker execution, retained plugin history, and offline analysis. **`augur-gui`** owns the investigation workspace and built-in analysis tools.
 
 ### Streaming Pipeline
 

@@ -40,6 +40,8 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 - `HostOutput`
 - `HostContext`
 - `EventStoreHandle`
+- `PluginDiscontinuity`
+- `PluginStateKind`
 - `PluginCapabilities`
 - `SettingsSchema` / `StatusEntry`
 - `HostViewRegistry`
@@ -133,6 +135,29 @@ This keeps the default preview/record path cheap when no plugin actually needs
 historical event access. If the plugin-history cursor falls behind the resident
 upstream ring, the host surfaces an analysis error instead of continuing with
 missing retained frames.
+
+## Lifecycle And State
+
+The current dynamic plugin ABI is v4. Plugins built against older vtable layouts
+must be rebuilt before the host will load them.
+
+Plugins are accumulating by default. The default `on_discontinuity`
+implementation calls `reset()` for accumulating plugins, which is correct for
+most plugins that derive state from prior frames. Return
+`PluginStateKind::Stateless` only when the plugin has no cross-frame accumulator
+and every output can be recomputed from the current frame plus host context.
+
+The host calls `on_discontinuity` when a timeline or configuration boundary
+would make existing accumulated state unsafe to reuse:
+
+- replay seek
+- source/file replacement
+- plugin or global setting change
+- retained-history eviction after the live worker falls behind ring capacity
+
+Do not cache `EventStoreHandle` frame ranges across `process_frame` calls or
+across discontinuities. Query ranges from the handle inside the frame that needs
+them.
 
 ## Example
 
@@ -234,7 +259,8 @@ If the plugin can degrade gracefully, prefer a runtime warning over a hard depen
 | `augur-plugin-api/src/context.rs` | generic host datasets/views and `GlobalSettings` |
 | `augur-plugin-types/src/` | optional domain-specific companion payloads |
 | `augur-plugin-api/src/macros.rs` | `export_plugin!` |
-| `augur-gui/src/plugin_loader.rs` | manifest parsing, library loading, callback bridges |
+| `augur-runtime/src/lib.rs` | manifest parsing, library loading, callback bridges, retained history, and live worker |
+| `augur-gui/src/plugin_loader.rs` | compatibility re-export for the runtime loader |
 | `augur-gui/src/host_views.rs` | registry resolution, dataset decoding, host-side rendering/export |
 | `augur-gui/src/plugin_settings_ui.rs` | declarative settings and status renderer |
 | `augur-gui/src/hotpixel.rs` | host-owned built-in hotpixel tool (not part of the runtime plugin ABI) |

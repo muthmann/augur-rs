@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 augur-core = { path = "../augur-core" }
+augur-runtime.workspace = true
 augur-prophesee = { path = "../augur-prophesee" }
 clap.workspace = true
 ctrlc.workspace = true

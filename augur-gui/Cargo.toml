@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 augur-event-types.workspace = true
 augur-core = { path = "../augur-core" }
+augur-runtime.workspace = true
 augur-plugin-api = { path = "../augur-plugin-api" }
 augur-prophesee = { path = "../augur-prophesee" }
 bytemuck.workspace = true

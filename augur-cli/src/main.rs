@@ -16,6 +16,7 @@ use augur_core::{
     pipeline::{spawn_pipeline, Evt3CorePreviewDecoder, PipelineOptions},
 };
 use augur_prophesee::evk4::Evk4Camera;
+use augur_runtime::{run_offline_analysis, OfflineAnalysisConfig, OfflineAnalysisOptions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -47,6 +48,15 @@ enum Command {
         operator: Option<String>,
         #[arg(long)]
         notes: Option<String>,
+    },
+    Analyze {
+        input: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        plugins_dir: Option<PathBuf>,
     },
     Config {
         #[command(subcommand)]
@@ -105,6 +115,12 @@ fn main() -> Result<()> {
             }
             .normalized(),
         ),
+        Command::Analyze {
+            input,
+            config,
+            out,
+            plugins_dir,
+        } => analyze(input, config, out, plugins_dir),
         Command::Config { cmd } => config_cmd(cmd),
     }
 }
@@ -201,6 +217,60 @@ fn record(
         anyhow::bail!("pipeline failed: {err}");
     }
     println!("Stopped.");
+    Ok(())
+}
+
+fn analyze(
+    input: PathBuf,
+    config_path: Option<PathBuf>,
+    out: PathBuf,
+    plugins_dir: Option<PathBuf>,
+) -> Result<()> {
+    let config = match config_path {
+        Some(path) => OfflineAnalysisConfig::from_toml_file(&path)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("failed loading analysis config {}", path.display()))?,
+        None => OfflineAnalysisConfig::default(),
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running_flag = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            running_flag.store(false, Ordering::Relaxed);
+        })
+        .context("failed installing Ctrl+C handler")?;
+    }
+
+    println!("Analyzing {} -> {}", input.display(), out.display());
+    let summary = run_offline_analysis(
+        OfflineAnalysisOptions {
+            input_path: input,
+            output_dir: out,
+            plugins_dir,
+            config,
+            stop: Some(Arc::clone(&running)),
+        },
+        |progress| {
+            println!(
+                "  window {}/{} [{}, {}) us",
+                progress.processed_windows,
+                progress.total_windows.max(1),
+                progress.window_start_us,
+                progress.window_end_us
+            );
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    println!(
+        "Done. Processed {} window(s), exported {} file(s).",
+        summary.processed_windows,
+        summary.exported_files.len()
+    );
+    for path in summary.exported_files {
+        println!("  {}", path.display());
+    }
     Ok(())
 }
 

@@ -144,12 +144,12 @@ This is the second hot path after the GUI. Per-iteration cost:
 1. `recv_timeout(2 ms)` from `preview_rx`;
 2. `decoder.decode_bytes(...)` → reusable `Vec<CdEvent>`;
 3. for every event, update `pixels`, `pixels_on`, `pixels_off`, transition the
-   total and signed histograms, optionally push the event into a per-frame
+   total and signed histograms, and optionally push the event into a per-frame
    `Vec<CdEvent>` (only when `raw_events_needed`);
-4. when the acquisition window closes, `emit_preview_frame` appends the
-   closed frame into the live `EventRing` (locking the ring once), advances
-   recording / plugin cursors, and `try_send`s the `PreviewFrame` to
-   `frame_tx`.
+4. when the acquisition window closes, `emit_preview_frame` appends the closed
+   frame into the live `EventRing` only when `raw_events_needed`, advances
+   recording / plugin cursors for that archived range, and `try_send`s the
+   `PreviewFrame` to `frame_tx`.
 
 This loop is the **per-event** code path. Anything that touches per-event
 state during accumulation (extra histogram bins, conditional copies) shows up
@@ -165,26 +165,25 @@ Each repaint, in order (`app.rs:5210`):
 1. `apply_theme_to_ctx`
 2. `poll_replay_open_task`
 3. `poll_tiff_stack_export_task`
-4. **`update_preview_texture(ctx)`** — this is where most steady-state work
+4. **`poll_live_analysis_results()`** — drains epoch-tagged worker results and
+   publishes only current live plugin overlays/host-view snapshots.
+5. **`update_preview_texture(ctx)`** — this is where most steady-state work
    lives:
    - exhaustively drain `frame_rx`. For every drained frame, push its
      upstream source/range projection into `PointCloudState`. Keep only the
      newest frame for further processing (`app.rs:4976–4979`).
-   - for the newest frame, run `run_analysis(&frame, true)` (`app.rs:5025`):
-     - reset `analysis_output`;
-     - run `hotpixel_detection.process_frame` if enabled;
-     - if any runtime plugin is enabled, materialize `Vec<FfiCdEvent>` from
-       `frame.events_snapshot()` (the FFI cost gate from the dataflow doc);
-     - sync `PluginEventHistory` against the upstream cursor;
-     - call every enabled plugin's `process_frame` over the FFI vtable, in
-       three phases (`FrameOnly` → `RawEvents` → `DerivedData`).
-5. `poll_pipeline_state` (drains `error_rx`, refreshes stats / status)
-6. `refresh_host_view_registry_if_dirty` — pulls plugin-published descriptors
-   and decodes plugin dataset bytes
-7. all egui panels: toolbar, settings, viewer widget (which may invoke the
+   - for live preview, recording, and unpaused replay playback, send the newest frame to
+     `LiveAnalysisWorker` instead of executing runtime plugins on this thread;
+   - for paused replay scrubs and explicit recomputation, run the synchronous
+     analysis path.
+6. `poll_pipeline_state` (drains `error_rx`, refreshes stats / status)
+7. `refresh_host_view_registry_if_dirty` — resolves plugin host-view descriptors
+   from worker snapshots in live mode or the GUI plugin mirror otherwise
+8. all egui panels: toolbar, settings, viewer widget (which may invoke the
    2D preview and 3D scene paths), histograms, etc.
 
-Everything in steps 1–7 runs on this single thread. The **2D preview**
+Everything in steps 1–8 except the live worker itself runs on this single
+thread. The **2D preview**
 (`preview_renderer.rs`) and **3D investigation scene** (`inspection_3d.rs`)
 both encode their command buffers here and submit through
 `render_state.queue.submit(...)`.
@@ -244,10 +243,14 @@ Two readback paths *do* synchronously block the GUI thread:
 
 This is the single most important threading fact about plugins today:
 
-> **All runtime plugins execute synchronously on the GUI thread, inside
-> `CameraApp::run_analysis`, called from `update_preview_texture`.**
+> **Live runtime plugins execute on the `augur-runtime` live analysis worker.
+> Replay-time recomputation can still use `CameraApp::run_analysis`
+> synchronously.**
 
-Concretely (`app.rs:4851–4871`):
+Concretely, the worker owns its own `PluginManager`, `PluginEventHistory`, and
+event-source cursor. The GUI keeps a separate plugin manager for settings,
+status, and plugin-manager UI, then mirrors settings to the worker with
+epoch-tagged configuration messages.
 
 ```text
 for phase in [FrameOnly, RawEvents, DerivedData]:
@@ -256,10 +259,10 @@ for phase in [FrameOnly, RawEvents, DerivedData]:
             plugin.process_frame(...)   // FFI call into the plugin .so
 ```
 
-Each `plugin.process_frame` is a `(self.vtable.process_frame)(self.instance,
-…)` indirect call (`plugin_loader.rs:655`) into a `cdylib` loaded with
-`libloading`. The plugin's view of the world is the four FFI inputs from the
-plugin authoring guide:
+Each worker-side `plugin.process_frame` is a
+`(self.vtable.process_frame)(self.instance, …)` indirect call in
+`augur-runtime` into a `cdylib` loaded with `libloading`. The plugin's view of
+the world is the four FFI inputs from the plugin authoring guide:
 
 - `FfiPreviewFrame` — borrows `frame.pixels` and the just-built
   `Vec<FfiCdEvent>`;
@@ -274,18 +277,17 @@ plugin authoring guide:
 
 Implications:
 
-- a slow plugin **directly stalls the egui repaint**. There is no watchdog.
+- a slow live plugin reduces result cadence, but it no longer directly stalls
+  egui repaint;
 - plugins inside one phase run **sequentially**, in registration order, and
   the host does not parallelize them.
 - plugins cannot legitimately spawn their own threads and call host
   callbacks from those threads, because the callback `ctx` pointer is only
   valid for the duration of the current `process_frame` call.
-- the FFI marshaling cost (`Vec<FfiCdEvent>` from the events snapshot) is paid
-  whenever **any** plugin is enabled, regardless of whether that plugin is
-  `FrameOnly` (refactor pressure point #3 in the dataflow doc).
-- host-view dataset publication is **pull-based**, also on the GUI thread:
-  `refresh_host_view_registry_if_dirty` calls
-  `host_view_dataset(dataset_id)` over the FFI to get serialized bytes,
+- current-frame raw-event materialization is paid only for enabled
+  `RawEvents` plugins;
+- live host-view dataset publication is worker-snapshotted and then rendered on
+  the GUI thread.
   copies them, and decodes into `Arc<TableDatasetV1>` etc.
 
 The host's own built-in tools (`HotpixelDetection`) run in the same loop and
@@ -329,19 +331,17 @@ At 100M events/s the loop body is the dominant cost. The `transition_*`
 helpers and the optional event copy are the two places where unnecessary
 work shows up.
 
-### 2. GUI-thread plugin pipeline
+### 2. Live plugin pipeline
 
-`run_analysis` is the single biggest source of non-rendering work on the GUI
-thread:
+The live worker is the main runtime plugin path:
 
-- `Vec<FfiCdEvent>` is built whenever any plugin is enabled, even if all
-  enabled plugins are `FrameOnly`;
-- `PluginEventHistory::sync_from_upstream` may copy multiple frames if the
-  GUI dropped intermediate `PreviewFrame`s;
-- every plugin's `process_frame` runs synchronously on this thread.
+- it coalesces queued frame triggers to the newest frame;
+- retained-history plugins drain all events through a dedicated upstream cursor;
+- results carry an epoch and stale results are dropped by the GUI;
+- live outputs are labeled approximate because result cadence may lag.
 
-Any plugin that takes more than a few milliseconds is visible to the user as
-dropped frames in the preview.
+Replay recomputation can still run synchronously, where determinism and
+single-step behavior matter more than live responsiveness.
 
 ### 3. `LiveEventSource` mutex contention
 
@@ -397,11 +397,12 @@ preview compute pipeline.
 | `augur-core/src/replay.rs` | raw replay; runs on the USB thread, owns the wall-clock throttle and pause atomics |
 | `augur-core/src/decoded_replay.rs` | decoded replay; runs on the USB thread but the heavy decoding happens once on the replay-open helper thread |
 | `augur-gui/src/render_backend.rs` | starts the eframe/egui main loop and configures the WGPU backend |
-| `augur-gui/src/app.rs` | the single GUI thread; owns the queue drain, plugin host loop, replay/export helper threads, and scene assembly |
+| `augur-gui/src/app.rs` | the single GUI thread; owns queue drain, live-worker dispatch/result publish, replay/export helper threads, and scene assembly |
 | `augur-gui/src/preview.rs` | thread-local preview scratch (GUI thread only) |
 | `augur-gui/src/preview_renderer.rs` | WGPU compute + render pipelines for the 2D preview, encoded on the GUI thread |
 | `augur-gui/src/inspection_3d.rs` | WGPU 3D renderer, encoded on the GUI thread, output exposed as a native texture |
-| `augur-gui/src/plugin_loader.rs` | `libloading` plugin host; `process_frame` runs synchronously on the GUI thread |
+| `augur-runtime/src/lib.rs` | `libloading` plugin host, retained history, FFI bridges, and live analysis worker |
+| `augur-gui/src/plugin_loader.rs` | compatibility re-export of `augur-runtime` plugin loader types |
 | `augur-gui/src/external_tools/imagej.rs` | TCP bridge worker thread + GUI-side `try_send` channel |
 
 ## Verification

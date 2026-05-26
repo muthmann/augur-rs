@@ -342,6 +342,84 @@ impl PreviewFrame {
         let source = self.event_source.as_ref()?;
         source.events_for_range(self.event_range.clone()?)
     }
+
+    pub fn compact_events_snapshot(&self) -> Option<Vec<CompactEvent>> {
+        if let Some(events) = &self.events {
+            return Some(events.iter().copied().map(CompactEvent::from).collect());
+        }
+        let source = self.event_source.as_ref()?;
+        source.compact_events_for_range(self.event_range.clone()?)
+    }
+}
+
+pub fn accumulate_compact_frame(
+    events: &[CompactEvent],
+    width: u16,
+    height: u16,
+    window_start_us: u64,
+    window_end_us: u64,
+    include_raw_events: bool,
+) -> PreviewFrame {
+    let pixel_count = width as usize * height as usize;
+    let mut frame_buffers = take_preview_frame_buffers(pixel_count);
+    frame_buffers.pixels.fill(0);
+    frame_buffers.pixels_on.fill(0);
+    frame_buffers.pixels_off.fill(0);
+    reset_histogram_bins(&mut frame_buffers.total_histogram, pixel_count as u64);
+    reset_histogram_bins(&mut frame_buffers.signed_histogram, pixel_count as u64);
+
+    let mut on_count = 0_u64;
+    let mut off_count = 0_u64;
+    let mut raw_events = include_raw_events.then(|| Vec::with_capacity(events.len()));
+
+    for compact in events {
+        let event = CdEvent::from(*compact);
+        if event.x >= width || event.y >= height {
+            continue;
+        }
+        if let Some(raw_events) = &mut raw_events {
+            raw_events.push(event);
+        }
+        let idx = event.y as usize * width as usize + event.x as usize;
+        let old_total = frame_buffers.pixels[idx];
+        let new_total = old_total.saturating_add(1);
+        frame_buffers.pixels[idx] = new_total;
+        transition_histogram_bin(&mut frame_buffers.total_histogram, old_total, new_total);
+
+        let old_on = frame_buffers.pixels_on[idx];
+        let old_off = frame_buffers.pixels_off[idx];
+        if event.polarity {
+            frame_buffers.pixels_on[idx] = old_on.saturating_add(1);
+            on_count += 1;
+        } else {
+            frame_buffers.pixels_off[idx] = old_off.saturating_add(1);
+            off_count += 1;
+        }
+        let new_on = frame_buffers.pixels_on[idx];
+        let new_off = frame_buffers.pixels_off[idx];
+        transition_histogram_bin(
+            &mut frame_buffers.signed_histogram,
+            old_on.abs_diff(old_off),
+            new_on.abs_diff(new_off),
+        );
+    }
+
+    PreviewFrame {
+        width,
+        height,
+        pixels: frame_buffers.pixels,
+        pixels_on: frame_buffers.pixels_on,
+        pixels_off: frame_buffers.pixels_off,
+        cached_total_histogram: frame_buffers.total_histogram,
+        cached_signed_histogram: frame_buffers.signed_histogram,
+        on_count,
+        off_count,
+        events: raw_events,
+        event_range: None,
+        event_source: None,
+        window_start_us,
+        window_end_us,
+    }
 }
 
 impl Drop for PreviewFrame {
@@ -722,7 +800,7 @@ fn emit_preview_frame(
         return;
     };
 
-    let event_range = if frame_events.is_empty() {
+    let event_range = if !capture_raw_events || frame_events.is_empty() {
         None
     } else {
         // Archiving a frame's raw events into the shared ring is best-effort.
@@ -1312,7 +1390,9 @@ where
                         if ev.x >= width || ev.y >= height {
                             continue;
                         }
-                        frame_events.push(*ev);
+                        if capture_raw_events {
+                            frame_events.push(*ev);
+                        }
                         let idx = ev.y as usize * width as usize + ev.x as usize;
                         let old_total = frame_buffers.pixels[idx];
                         let new_total = old_total.saturating_add(1);
@@ -1954,10 +2034,9 @@ mod tests {
     }
 
     #[test]
-    fn preview_frame_can_resolve_events_from_upstream_source_without_inline_copy() {
+    fn preview_frame_skips_upstream_source_when_raw_events_are_not_required() {
         let mut config = CameraConfig::default();
         config.global.acq_time_ms = 1;
-        let events = vec![test_event(0, 1), test_event(1_000, 2)];
 
         let controller = spawn_pipeline(
             ScriptedPacketCamera {
@@ -1965,7 +2044,7 @@ mod tests {
                 next_packet: 0,
                 release_after_first: None,
             },
-            TaggedEventDecoder::new(vec![(1, events.clone())]),
+            TaggedEventDecoder::new(vec![(1, vec![test_event(0, 1), test_event(1_000, 2)])]),
             config,
             PipelineOptions::preview_only(1280, 720),
         )
@@ -1974,19 +2053,21 @@ mod tests {
         let frame = recv_preview_frame(&controller);
 
         assert!(frame.events.is_none());
-        assert_eq!(frame.event_range, Some(0..2));
-        assert_eq!(frame.events_snapshot(), Some(events));
+        assert_eq!(frame.event_range, None);
+        assert_eq!(frame.events_snapshot(), None);
+        assert_eq!(frame.compact_events_snapshot(), None);
+        assert_eq!(controller.event_source.next_event_idx(), 0);
 
         controller.shutdown().expect("shutdown must succeed");
     }
 
     #[test]
-    fn preview_pipeline_excludes_out_of_bounds_events_from_retained_history() {
+    fn preview_pipeline_excludes_out_of_bounds_events_from_counts_without_raw_retention() {
         let mut config = CameraConfig::default();
         config.roi.width = 4;
         config.roi.height = 4;
         config.global.acq_time_ms = 1;
-        let valid_events = vec![test_event(1_000, 1), test_event(2_000, 2)];
+        let valid_events = [test_event(1_000, 1), test_event(2_000, 2)];
 
         let controller = spawn_pipeline(
             ScriptedPacketCamera {
@@ -2017,7 +2098,8 @@ mod tests {
         assert_eq!(frame.window_start_us, 1_000);
         assert_eq!(frame.window_end_us, 2_000);
         assert_eq!(frame.on_count + frame.off_count, 2);
-        assert_eq!(frame.events_snapshot(), Some(valid_events));
+        assert_eq!(frame.events_snapshot(), None);
+        assert_eq!(controller.event_source.next_event_idx(), 0);
 
         controller.shutdown().expect("shutdown must succeed");
     }
@@ -2065,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_frame_drop_keeps_events_in_upstream_source() {
+    fn preview_frame_drop_skips_archival_when_raw_events_are_not_required() {
         let (frame_tx, frame_rx) = bounded(1);
         let mut buffers = take_preview_frame_buffers(4);
         let mut events = vec![test_event(10, 1)];
@@ -2101,6 +2183,57 @@ mod tests {
             &mut buffers,
             &mut events,
             false,
+            &mut on_count,
+            &mut off_count,
+            &mut frame_start_ts,
+            2,
+            2,
+            4,
+            10,
+        );
+
+        assert_eq!(frame_rx.len(), 1);
+        assert_eq!(source.next_event_idx(), 0);
+        assert_eq!(stats.lock().expect("stats").preview_frame_drops, 1);
+    }
+
+    #[test]
+    fn preview_frame_drop_keeps_events_in_upstream_source_when_raw_events_are_required() {
+        let (frame_tx, frame_rx) = bounded(1);
+        let mut buffers = take_preview_frame_buffers(4);
+        let mut events = vec![test_event(10, 1)];
+        let mut on_count = 1;
+        let mut off_count = 0;
+        let mut frame_start_ts = Some(10);
+        let stats = Arc::new(Mutex::new(test_stats(Instant::now())));
+        let source = LiveEventSource::default();
+        frame_tx
+            .send(PreviewFrame {
+                width: 2,
+                height: 2,
+                pixels: Vec::new(),
+                pixels_on: Vec::new(),
+                pixels_off: Vec::new(),
+                cached_total_histogram: Vec::new(),
+                cached_signed_histogram: Vec::new(),
+                on_count: 0,
+                off_count: 0,
+                events: None,
+                event_range: None,
+                event_source: None,
+                window_start_us: 0,
+                window_end_us: 0,
+            })
+            .expect("queue seed succeeds");
+
+        emit_preview_frame(
+            &frame_tx,
+            &stats,
+            &source,
+            None,
+            &mut buffers,
+            &mut events,
+            true,
             &mut on_count,
             &mut off_count,
             &mut frame_start_ts,

@@ -106,6 +106,25 @@ pub enum PluginInput {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginStateKind {
+    #[default]
+    Accumulating = 0,
+    Stateless = 1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginDiscontinuity {
+    Seek = 0,
+    SourceChanged = 1,
+    HistoryEvicted = 2,
+    SettingsChanged = 3,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCapabilities {
     pub retained_event_history: bool,
 }
@@ -268,8 +287,10 @@ pub type EventStoreOldestTsFn = unsafe extern "C" fn(*const c_void) -> u64;
 pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
+pub type PluginStateKindFn = unsafe extern "C" fn(*const c_void) -> PluginStateKind;
+pub type PluginDiscontinuityFn = unsafe extern "C" fn(*mut c_void, PluginDiscontinuity);
 
-pub const PLUGIN_ABI_VERSION: u64 = 3;
+pub const PLUGIN_ABI_VERSION: u64 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -310,8 +331,10 @@ pub struct PluginVTable {
     pub enabled: unsafe extern "C" fn(*const c_void) -> bool,
     pub set_enabled: unsafe extern "C" fn(*mut c_void, bool),
     pub reset: unsafe extern "C" fn(*mut c_void),
+    pub on_discontinuity: PluginDiscontinuityFn,
     pub input_kind: unsafe extern "C" fn(*const c_void) -> PluginInput,
     pub capabilities: PluginCapabilitiesFn,
+    pub plugin_state_kind: PluginStateKindFn,
     pub num_dependencies: unsafe extern "C" fn(*const c_void) -> usize,
     pub dependency: unsafe extern "C" fn(*const c_void, usize) -> FfiString,
     pub process_frame: unsafe extern "C" fn(

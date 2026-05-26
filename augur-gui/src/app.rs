@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -27,11 +27,16 @@ use augur_core::{
 use augur_event_types::CursorId;
 use augur_plugin_api::{
     FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
-    HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginInput, Series1dV1,
-    SettingsSchema, TableColumnValues, TableDatasetV1, CTX_GLOBAL_SETTINGS,
-    CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
+    HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginDiscontinuity,
+    PluginInput, PluginStateKind, Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1,
+    CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
+use augur_runtime::{
+    run_offline_analysis, LiveAnalysisJob, LiveAnalysisResult, LiveAnalysisWorker,
+    LiveHostDatasetSnapshot, LivePluginHostSnapshot, LivePluginState, LivePluginStateSnapshot,
+    OfflineAnalysisConfig, OfflineAnalysisOptions, OfflineAnalysisSummary, OfflineProgress,
+};
 
 use crate::{
     export::{export_tiff_stack, ExportEventSource, TiffStackExportParams},
@@ -188,6 +193,35 @@ fn viewport_stream_active(mode: AppMode, replay: ViewerReplayState) -> bool {
         || (mode == AppMode::Replaying
             && replay.active
             && ((!replay.paused && !replay.finished) || replay.stepping))
+}
+
+fn live_worker_active_for_state(
+    mode: AppMode,
+    replay_paused: bool,
+    replay_finished: bool,
+    replay_pause_after_seek_frame: bool,
+) -> bool {
+    matches!(mode, AppMode::Previewing | AppMode::Recording)
+        || (mode == AppMode::Replaying
+            && !replay_paused
+            && !replay_finished
+            && !replay_pause_after_seek_frame)
+}
+
+fn should_dispatch_live_analysis_for_state(
+    mode: AppMode,
+    replay_paused: bool,
+    replay_finished: bool,
+    replay_pause_after_seek_frame: bool,
+    runtime_plugins_enabled: bool,
+) -> bool {
+    runtime_plugins_enabled
+        && live_worker_active_for_state(
+            mode,
+            replay_paused,
+            replay_finished,
+            replay_pause_after_seek_frame,
+        )
 }
 
 fn child_viewport_repaint_after(
@@ -545,6 +579,14 @@ struct TiffStackExportTask {
     rx: mpsc::Receiver<Result<usize, String>>,
 }
 
+struct OfflineAnalysisTask {
+    output_dir: PathBuf,
+    rx: mpsc::Receiver<Result<OfflineAnalysisSummary, String>>,
+    progress_rx: mpsc::Receiver<OfflineProgress>,
+    stop: Arc<AtomicBool>,
+    latest_progress: Option<OfflineProgress>,
+}
+
 struct PopupSharedData {
     viewer: ViewerState,
     investigation_renderer: Investigation3dRenderer,
@@ -646,6 +688,12 @@ impl Default for ImageJDialogState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSnapshotSource {
+    Worker,
+    Offline,
+}
+
 fn format_timestamp_now() -> String {
     let dur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -721,6 +769,13 @@ pub struct CameraApp {
     plugin_context_data: HashMap<String, Vec<u8>>,
     persistent_context_data: HashMap<String, Vec<u8>>,
     event_store: PluginEventHistory,
+    analysis_epoch: Arc<AtomicU64>,
+    live_analysis_worker: LiveAnalysisWorker,
+    live_analysis_rx: mpsc::Receiver<LiveAnalysisResult>,
+    live_host_snapshots: Vec<LivePluginHostSnapshot>,
+    runtime_snapshot_source: Option<RuntimeSnapshotSource>,
+    cached_global_settings: Option<GlobalSettings>,
+    cached_global_settings_json: Vec<u8>,
     nm_per_pixel: f64,
     sensor_width: u16,
     sensor_height: u16,
@@ -749,6 +804,7 @@ pub struct CameraApp {
     imagej_dialog: ImageJDialogState,
     export_dialog: ExportDialog,
     export_task: Option<TiffStackExportTask>,
+    offline_analysis_task: Option<OfflineAnalysisTask>,
     external_tool: Option<Box<dyn ExternalTool>>,
     python_ingress: Option<PythonIngressServer>,
     python_stream_name: Option<String>,
@@ -819,6 +875,10 @@ impl CameraApp {
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
         let global_defaults = GlobalSettingsConfig::default();
+        let (live_analysis_worker, live_analysis_rx) = LiveAnalysisWorker::spawn(
+            plugin_manager.plugins_dir().to_path_buf(),
+            mib_to_bytes(global_defaults.event_store_budget_mib),
+        );
         let renderer_info = ActiveRendererInfo::from_creation_context(cc);
         let (preview_renderer, preview_renderer_notice) = PreviewRenderer::new(cc);
         let investigation_renderer = Investigation3dRenderer::new(cc);
@@ -866,6 +926,13 @@ impl CameraApp {
             plugin_context_data: HashMap::new(),
             persistent_context_data: HashMap::new(),
             event_store: PluginEventHistory::default(),
+            analysis_epoch: Arc::new(AtomicU64::new(1)),
+            live_analysis_worker,
+            live_analysis_rx,
+            live_host_snapshots: Vec::new(),
+            runtime_snapshot_source: None,
+            cached_global_settings: None,
+            cached_global_settings_json: Vec::new(),
             nm_per_pixel: global_defaults.nm_per_pixel,
             sensor_width: global_defaults.sensor_width,
             sensor_height: global_defaults.sensor_height,
@@ -894,6 +961,7 @@ impl CameraApp {
             imagej_dialog: ImageJDialogState::default(),
             export_dialog: ExportDialog::default(),
             export_task: None,
+            offline_analysis_task: None,
             external_tool: None,
             python_ingress: None,
             python_stream_name: None,
@@ -919,6 +987,7 @@ impl CameraApp {
             app.viewer.investigation.layout = InvestigationLayout::Preview2dOnly;
         }
         app.sync_config_global_from_runtime();
+        app.sync_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
         app.refresh_host_view_registry();
         app
     }
@@ -962,6 +1031,25 @@ impl CameraApp {
         } else {
             self.acq_time_ms
         }
+    }
+
+    fn current_global_settings(&self) -> GlobalSettings {
+        GlobalSettings {
+            nm_per_pixel: self.nm_per_pixel,
+            sensor_width: self.sensor_width,
+            sensor_height: self.sensor_height,
+            acq_time_ms: self.published_acq_time_ms(),
+            event_store_budget_bytes: self.event_store.memory_budget_bytes(),
+        }
+    }
+
+    fn cached_global_settings_json(&mut self) -> Option<Vec<u8>> {
+        let global_settings = self.current_global_settings();
+        if self.cached_global_settings.as_ref() != Some(&global_settings) {
+            self.cached_global_settings_json = serde_json::to_vec(&global_settings).ok()?;
+            self.cached_global_settings = Some(global_settings);
+        }
+        Some(self.cached_global_settings_json.clone())
     }
 
     fn effective_preview_interval_ms(&self) -> u64 {
@@ -2013,6 +2101,7 @@ impl CameraApp {
 
         if let Some(controller) = self.controller.take() {
             self.event_store.detach_upstream();
+            self.reset_plugin_analysis_after_discontinuity(PluginDiscontinuity::SourceChanged);
             if let Err(err) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {err}"));
             }
@@ -2299,11 +2388,7 @@ impl CameraApp {
 
     fn reset_analysis(&mut self) {
         self.hotpixel_detection.reset();
-        for record in self.plugin_manager.records_mut() {
-            if let Some(plugin) = record.plugin_mut() {
-                plugin.reset();
-            }
-        }
+        self.reset_runtime_plugins();
         self.plugin_context_data.clear();
         self.persistent_context_data.clear();
         self.event_store.clear();
@@ -2311,6 +2396,135 @@ impl CameraApp {
         self.analysis_notice = None;
         self.clear_host_view_dataset_cache();
         self.refresh_host_view_registry();
+    }
+
+    fn current_analysis_epoch(&self) -> u64 {
+        self.analysis_epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_analysis_epoch(&self) -> u64 {
+        self.analysis_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn live_worker_outputs_active(&self) -> bool {
+        self.runtime_snapshot_source.is_some() && !self.live_host_snapshots.is_empty()
+    }
+
+    fn clear_runtime_snapshots(&mut self) {
+        self.live_host_snapshots.clear();
+        self.runtime_snapshot_source = None;
+    }
+
+    fn collect_live_plugin_state_snapshot(&self) -> LivePluginStateSnapshot {
+        let plugins = self
+            .plugin_manager
+            .records()
+            .iter()
+            .filter_map(|record| {
+                let plugin = record.plugin()?;
+                let settings = plugin
+                    .settings_schema()
+                    .sections
+                    .iter()
+                    .flat_map(|section| section.items.iter())
+                    .filter_map(|item| {
+                        plugin
+                            .get_setting_value(&item.key)
+                            .ok()
+                            .flatten()
+                            .map(|value| (item.key.clone(), value))
+                    })
+                    .collect();
+                Some(LivePluginState {
+                    name: plugin.name().to_owned(),
+                    enabled: plugin.enabled(),
+                    settings,
+                })
+            })
+            .collect();
+        LivePluginStateSnapshot { plugins }
+    }
+
+    fn sync_live_plugin_configuration(&mut self, reason: PluginDiscontinuity) {
+        let epoch = self.bump_analysis_epoch();
+        let snapshot = self.collect_live_plugin_state_snapshot();
+        self.live_analysis_worker.configure(epoch, snapshot, reason);
+        self.clear_runtime_snapshots();
+        self.host_view_registry_dirty = true;
+        self.clear_host_view_dataset_cache();
+    }
+
+    fn reload_live_plugin_configuration(&mut self, reason: PluginDiscontinuity) {
+        let epoch = self.bump_analysis_epoch();
+        let snapshot = self.collect_live_plugin_state_snapshot();
+        self.live_analysis_worker
+            .reload_plugins(epoch, snapshot, reason);
+        self.clear_runtime_snapshots();
+        self.host_view_registry_dirty = true;
+        self.clear_host_view_dataset_cache();
+    }
+
+    fn notify_live_discontinuity(&mut self, reason: PluginDiscontinuity) {
+        let epoch = self.bump_analysis_epoch();
+        self.live_analysis_worker.discontinuity(epoch, reason);
+        self.clear_runtime_snapshots();
+        self.host_view_registry_dirty = true;
+        self.clear_host_view_dataset_cache();
+    }
+
+    fn poll_live_analysis_results(&mut self) {
+        let current_epoch = self.current_analysis_epoch();
+        let mut latest = None;
+        while let Ok(result) = self.live_analysis_rx.try_recv() {
+            if result.epoch < current_epoch {
+                continue;
+            }
+            latest = Some(result);
+        }
+
+        let Some(result) = latest else {
+            return;
+        };
+        let mut output = result.output;
+        if self.hotpixel_detection.enabled() {
+            if let Some(frame) = &self.latest_frame {
+                self.hotpixel_detection.process_frame(frame, &mut output);
+            }
+        }
+        self.analysis_output = output;
+        self.plugin_context_data = result.context_data;
+        self.persistent_context_data = result.persistent_data;
+        self.live_host_snapshots = result.host_snapshots;
+        self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Worker);
+        self.host_view_registry_dirty = true;
+        self.mark_host_view_datasets_stale();
+        self.refresh_host_view_registry_if_dirty();
+    }
+
+    fn reset_runtime_plugins(&mut self) {
+        for record in self.plugin_manager.records_mut() {
+            if let Some(plugin) = record.plugin_mut() {
+                plugin.reset();
+            }
+        }
+    }
+
+    fn reset_plugin_analysis_after_discontinuity(&mut self, reason: PluginDiscontinuity) {
+        self.event_store.clear();
+        self.notify_live_discontinuity(reason);
+        for record in self.plugin_manager.records_mut() {
+            let Some(plugin) = record.plugin_mut() else {
+                continue;
+            };
+            if plugin.plugin_state_kind() == PluginStateKind::Accumulating {
+                plugin.on_discontinuity(reason);
+            }
+        }
+        self.plugin_context_data.clear();
+        self.analysis_output = AnalysisOutput::default();
+        self.host_view_registry_dirty = true;
+        self.mark_host_view_datasets_stale();
+        self.clear_host_view_dataset_cache();
     }
 
     fn mark_host_view_datasets_stale(&mut self) {
@@ -2336,24 +2550,39 @@ impl CameraApp {
         let mut contributions = Vec::new();
         let mut warnings = Vec::new();
 
-        for (index, record) in self.plugin_manager.records().iter().enumerate() {
-            let Some(plugin) = record.plugin() else {
-                continue;
-            };
-            if !plugin.enabled() {
-                continue;
+        if self.live_worker_outputs_active() {
+            for snapshot in &self.live_host_snapshots {
+                if let Some(registry) = snapshot.registry.clone() {
+                    contributions.push(HostRegistryContribution {
+                        provider: HostViewProviderKey::Runtime(snapshot.index),
+                        provider_name: snapshot.name.clone(),
+                        registry,
+                    });
+                }
+                if let Some(warning) = &snapshot.warning {
+                    warnings.push(warning.clone());
+                }
             }
+        } else {
+            for (index, record) in self.plugin_manager.records().iter().enumerate() {
+                let Some(plugin) = record.plugin() else {
+                    continue;
+                };
+                if !plugin.enabled() {
+                    continue;
+                }
 
-            match plugin.host_views() {
-                Ok(registry) => contributions.push(HostRegistryContribution {
-                    provider: HostViewProviderKey::Runtime(index),
-                    provider_name: plugin.name().to_owned(),
-                    registry,
-                }),
-                Err(err) => warnings.push(format!(
-                    "Failed to read host views from {}: {err}",
-                    plugin.name()
-                )),
+                match plugin.host_views() {
+                    Ok(registry) => contributions.push(HostRegistryContribution {
+                        provider: HostViewProviderKey::Runtime(index),
+                        provider_name: plugin.name().to_owned(),
+                        registry,
+                    }),
+                    Err(err) => warnings.push(format!(
+                        "Failed to read host views from {}: {err}",
+                        plugin.name()
+                    )),
+                }
             }
         }
 
@@ -2404,6 +2633,19 @@ impl CameraApp {
 
         let bytes = match dataset.provider {
             HostViewProviderKey::Runtime(index) => {
+                if self.live_worker_outputs_active() {
+                    let Some(snapshot) = self.live_host_dataset_snapshot(index, dataset_id) else {
+                        return Err(format!(
+                            "live runtime provider index {index} has no dataset {dataset_id}"
+                        ));
+                    };
+                    return match &snapshot.bytes {
+                        Some(bytes) => {
+                            decode_dataset_snapshot(&dataset.descriptor, bytes).map(Some)
+                        }
+                        None => Ok(None),
+                    };
+                }
                 let Some(record) = self.plugin_manager.records().get(index) else {
                     return Err(format!(
                         "runtime provider index {index} is out of range for dataset {dataset_id}"
@@ -2425,6 +2667,22 @@ impl CameraApp {
         }
     }
 
+    fn live_host_dataset_snapshot(
+        &self,
+        provider_index: usize,
+        dataset_id: &str,
+    ) -> Option<&LiveHostDatasetSnapshot> {
+        self.live_host_snapshots
+            .iter()
+            .find(|snapshot| snapshot.index == provider_index)
+            .and_then(|snapshot| {
+                snapshot
+                    .datasets
+                    .iter()
+                    .find(|dataset| dataset.id == dataset_id)
+            })
+    }
+
     fn current_host_view_dataset_generation(&self, dataset_id: &str) -> Result<u64, String> {
         let Some(dataset) = self.host_view_registry.dataset(dataset_id) else {
             return Err(format!("unknown host dataset {dataset_id}"));
@@ -2432,6 +2690,16 @@ impl CameraApp {
 
         Ok(match dataset.provider {
             HostViewProviderKey::Runtime(index) => {
+                if self.live_worker_outputs_active() {
+                    return self
+                        .live_host_dataset_snapshot(index, dataset_id)
+                        .map(|snapshot| snapshot.generation)
+                        .ok_or_else(|| {
+                            format!(
+                                "live runtime provider index {index} has no dataset {dataset_id}"
+                            )
+                        });
+                }
                 let Some(record) = self.plugin_manager.records().get(index) else {
                     return Err(format!(
                         "runtime provider index {index} is out of range for dataset {dataset_id}"
@@ -3932,12 +4200,20 @@ impl CameraApp {
 
     fn provider_plugin_tag(&self, provider: HostViewProviderKey) -> Option<String> {
         match provider {
-            HostViewProviderKey::Runtime(idx) => self
-                .plugin_manager
-                .records()
-                .get(idx)
-                .and_then(|r| r.plugin())
-                .map(|p| p.name().to_owned()),
+            HostViewProviderKey::Runtime(idx) => {
+                if self.live_worker_outputs_active() {
+                    return self
+                        .live_host_snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.index == idx)
+                        .map(|snapshot| snapshot.name.clone());
+                }
+                self.plugin_manager
+                    .records()
+                    .get(idx)
+                    .and_then(|r| r.plugin())
+                    .map(|p| p.name().to_owned())
+            }
         }
     }
 
@@ -4718,6 +4994,23 @@ impl CameraApp {
         })
     }
 
+    fn runtime_plugins_enabled(&self) -> bool {
+        self.plugin_manager
+            .records()
+            .iter()
+            .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()))
+    }
+
+    fn should_dispatch_live_analysis(&self) -> bool {
+        should_dispatch_live_analysis_for_state(
+            self.mode,
+            self.replay_paused,
+            self.replay_finished,
+            self.replay_pause_after_seek_frame,
+            self.runtime_plugins_enabled(),
+        )
+    }
+
     fn raw_events_required(&self) -> bool {
         let preview_mode = self.with_active_viewer(|viewer| viewer.preview_mode);
         let layout = self.active_investigation_layout();
@@ -5177,6 +5470,114 @@ impl CameraApp {
         }
     }
 
+    fn start_offline_analysis_for_file(&mut self, input_path: PathBuf) {
+        if self.offline_analysis_task.is_some() {
+            return;
+        }
+        let Some(parent_dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let stem = input_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("analysis");
+        let output_dir = parent_dir.join(format!("{stem}_analysis_{}", format_timestamp_now()));
+        let (tx, rx) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let config = OfflineAnalysisConfig {
+            acq_time_ms: Some(self.acq_time_ms),
+            ..OfflineAnalysisConfig::default()
+        };
+        let worker_output_dir = output_dir.clone();
+
+        thread::spawn(move || {
+            let result = run_offline_analysis(
+                OfflineAnalysisOptions {
+                    input_path,
+                    output_dir: worker_output_dir,
+                    plugins_dir: None,
+                    config,
+                    stop: Some(worker_stop),
+                },
+                |progress| {
+                    let _ = progress_tx.send(progress);
+                },
+            );
+            let _ = tx.send(result);
+        });
+
+        self.offline_analysis_task = Some(OfflineAnalysisTask {
+            output_dir,
+            rx,
+            progress_rx,
+            stop,
+            latest_progress: None,
+        });
+        self.analysis_notice = Some("Offline analysis started.".into());
+    }
+
+    fn open_offline_analysis_file_dialog(&mut self) {
+        if self.offline_analysis_task.is_some() {
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Replay Files", &["raw", "csv", "bin", "npy", "h5", "hdf5"])
+            .pick_file()
+        {
+            self.start_offline_analysis_for_file(path);
+        }
+    }
+
+    fn poll_offline_analysis_task(&mut self) {
+        let Some(mut task) = self.offline_analysis_task.take() else {
+            return;
+        };
+        while let Ok(progress) = task.progress_rx.try_recv() {
+            task.latest_progress = Some(progress);
+        }
+        if let Some(progress) = task.latest_progress {
+            self.analysis_notice = Some(format!(
+                "Offline analysis: {}/{} window(s).",
+                progress.processed_windows,
+                progress.total_windows.max(1)
+            ));
+        }
+
+        match task.rx.try_recv() {
+            Ok(Ok(summary)) => {
+                self.live_host_snapshots = summary.host_snapshots;
+                self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Offline);
+                self.host_view_registry_dirty = true;
+                self.clear_host_view_dataset_cache();
+                self.refresh_host_view_registry_if_dirty();
+                self.analysis_notice = Some(format!(
+                    "Offline analysis exported {} file(s) to {}.",
+                    summary.exported_files.len(),
+                    task.output_dir.display()
+                ));
+                self.toast_queue.push(
+                    format!("Offline analysis complete: {}", task.output_dir.display()),
+                    crate::toast::ToastTone::Success,
+                );
+            }
+            Ok(Err(err)) => {
+                self.last_error = Some(err.clone());
+                self.analysis_notice = Some(format!("Offline analysis failed: {err}"));
+                self.toast_queue.push(err, crate::toast::ToastTone::Error);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.offline_analysis_task = Some(task);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "Offline analysis task ended unexpectedly".to_owned();
+                self.last_error = Some(message.clone());
+                self.analysis_notice = Some(message);
+            }
+        }
+    }
+
     fn load_replay_display_settings(
         &self,
         raw_path: &Path,
@@ -5295,6 +5696,8 @@ impl CameraApp {
         self.replay_paused = paused;
         if !paused {
             self.replay_pause_after_seek_frame = false;
+        } else {
+            self.notify_live_discontinuity(PluginDiscontinuity::Seek);
         }
     }
 
@@ -5589,6 +5992,7 @@ impl CameraApp {
 
         if let Some(controller) = self.controller.take() {
             self.event_store.detach_upstream();
+            self.reset_plugin_analysis_after_discontinuity(PluginDiscontinuity::Seek);
             if let Err(err) = controller.shutdown() {
                 self.last_error = Some(format!("pipeline shutdown failed: {err}"));
             }
@@ -5883,34 +6287,26 @@ impl CameraApp {
     }
 
     fn run_analysis(&mut self, frame: &PreviewFrame, append_current_frame_to_event_store: bool) {
+        self.clear_runtime_snapshots();
         self.analysis_output = AnalysisOutput::default();
         self.plugin_context_data.clear();
         if self.hotpixel_detection.enabled() {
             self.hotpixel_detection
                 .process_frame(frame, &mut self.analysis_output);
         }
-        let global_settings = GlobalSettings {
-            nm_per_pixel: self.nm_per_pixel,
-            sensor_width: self.sensor_width,
-            sensor_height: self.sensor_height,
-            acq_time_ms: self.published_acq_time_ms(),
-            event_store_budget_bytes: self.event_store.memory_budget_bytes(),
-        };
-        if let Ok(json) = serde_json::to_vec(&global_settings) {
+        if let Some(json) = self.cached_global_settings_json() {
             self.plugin_context_data
                 .insert(CTX_GLOBAL_SETTINGS.to_owned(), json);
         }
         self.publish_pending_action_requests();
         let retained_history_needed = self.plugins_need_retained_event_history();
+        let current_frame_raw_events_needed = self.plugins_need_raw_events();
         let runtime_plugins_enabled = self
             .plugin_manager
             .records()
             .iter()
             .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()));
-        let ffi_events = if runtime_plugins_enabled {
-            let raw_events = frame.events_snapshot().unwrap_or_default();
-            let ffi_events: Vec<FfiCdEvent> =
-                raw_events.iter().copied().map(FfiCdEvent::from).collect();
+        let ffi_events: Vec<FfiCdEvent> = if runtime_plugins_enabled {
             if retained_history_needed {
                 let mut synced_upstream = false;
                 if let Some((source, cursor)) = self.controller.as_ref().map(|controller| {
@@ -5934,7 +6330,11 @@ impl CameraApp {
                 self.event_store.detach_upstream();
                 self.event_store.clear();
             }
-            ffi_events
+            if current_frame_raw_events_needed {
+                frame.compact_events_snapshot().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
         } else {
             self.event_store.detach_upstream();
             self.event_store.clear();
@@ -5962,6 +6362,21 @@ impl CameraApp {
                 }
             }
         }
+    }
+
+    fn dispatch_live_analysis(&mut self, frame: &PreviewFrame) {
+        self.publish_pending_action_requests();
+        self.analysis_notice =
+            Some("Live analysis is approximate — run Analyze Whole File for exact outputs.".into());
+        let epoch = self.current_analysis_epoch();
+        let global_settings_json = self.cached_global_settings_json();
+        let persistent_data = self.persistent_context_data.clone();
+        self.live_analysis_worker.analyze(LiveAnalysisJob {
+            epoch,
+            frame: frame.clone(),
+            global_settings_json,
+            persistent_data,
+        });
     }
 
     fn rerun_current_analysis_frame(&mut self, ctx: &egui::Context, reason: &str) -> bool {
@@ -6076,9 +6491,12 @@ impl CameraApp {
         let Some(frame) = newest_frame else {
             return;
         };
+        let dispatch_live_analysis = self.should_dispatch_live_analysis();
         if drained_frame {
             self.preview_perf.record_dequeue(dequeue_started.elapsed());
-            self.sync_retained_event_history_from_controller();
+            if !dispatch_live_analysis {
+                self.sync_retained_event_history_from_controller();
+            }
         }
 
         let external_streaming = self.external_tool_status().is_streaming();
@@ -6125,7 +6543,11 @@ impl CameraApp {
 
         let frame_total_started = Instant::now();
         let analysis_started = Instant::now();
-        self.run_analysis(&frame, true);
+        if dispatch_live_analysis {
+            self.dispatch_live_analysis(&frame);
+        } else {
+            self.run_analysis(&frame, true);
+        }
         self.host_view_registry_dirty = true;
         self.mark_host_view_datasets_stale();
         self.preview_perf
@@ -6324,6 +6746,8 @@ impl eframe::App for CameraApp {
         self.poll_replay_open_task();
         self.poll_python_ingress_requests();
         self.poll_tiff_stack_export_task();
+        self.poll_offline_analysis_task();
+        self.poll_live_analysis_results();
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
         self.refresh_host_view_registry_if_dirty();
@@ -6378,6 +6802,18 @@ impl eframe::App for CameraApp {
                             self.open_tiff_stack_export_dialog();
                             ui.close_menu();
                         }
+                        if ui
+                            .add_enabled(
+                                self.replay_path.is_some() && self.offline_analysis_task.is_none(),
+                                egui::Button::new("Analyze Whole File…"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(path) = self.replay_path.as_ref().map(PathBuf::from) {
+                                self.start_offline_analysis_for_file(path);
+                            }
+                            ui.close_menu();
+                        }
                         ui.separator();
                         if ui.button("Close Replay").clicked() {
                             self.stop_pipeline();
@@ -6429,6 +6865,35 @@ impl eframe::App for CameraApp {
                             ui.close_menu();
                         }
                         ui.separator();
+                        if ui
+                            .add_enabled(
+                                mode != AppMode::Recording && self.offline_analysis_task.is_none(),
+                                egui::Button::new("Analyze Whole File…"),
+                            )
+                            .clicked()
+                        {
+                            self.open_offline_analysis_file_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                    }
+                    if let Some(task) = &self.offline_analysis_task {
+                        ui.separator();
+                        let label = task
+                            .latest_progress
+                            .map(|progress| {
+                                format!(
+                                    "Analyzing: {}/{}",
+                                    progress.processed_windows,
+                                    progress.total_windows.max(1)
+                                )
+                            })
+                            .unwrap_or_else(|| "Analyzing…".to_owned());
+                        ui.add_enabled(false, egui::Label::new(label));
+                        if ui.button("Cancel Analysis").clicked() {
+                            task.stop.store(true, Ordering::Relaxed);
+                            ui.close_menu();
+                        }
                     }
                     if ui
                         .add_enabled(
@@ -6677,8 +7142,9 @@ impl eframe::App for CameraApp {
                             .add(egui::Slider::new(&mut event_store_budget_mb, 1..=1024))
                             .on_hover_text(EVENT_HISTORY_TOOLTIP);
                         if event_store_response.changed() {
-                            self.event_store
-                                .set_memory_budget(mib_to_bytes(event_store_budget_mb));
+                            let budget_bytes = mib_to_bytes(event_store_budget_mb);
+                            self.event_store.set_memory_budget(budget_bytes);
+                            self.live_analysis_worker.set_memory_budget(budget_bytes);
                             global_settings_changed = true;
                         }
                         ui.small(format!(
@@ -6852,6 +7318,7 @@ impl eframe::App for CameraApp {
 
                     if global_settings_changed {
                         self.sync_config_global_from_runtime();
+                        self.sync_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
                     }
                 });
 
@@ -7121,6 +7588,7 @@ impl eframe::App for CameraApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.reset_analysis();
+                    self.reload_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
                     analysis_toggle_changed = true;
                     let count = self.plugin_manager.records().len();
                     self.toast_queue.push(
@@ -7788,6 +8256,7 @@ impl eframe::App for CameraApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.reset_analysis();
+                    self.reload_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
                     analysis_toggle_changed = true;
                 }
                 Err(err) => self.last_error = Some(err),
@@ -7799,6 +8268,7 @@ impl eframe::App for CameraApp {
                 Ok(()) => {
                     self.last_error = None;
                     self.reset_analysis();
+                    self.reload_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
                     analysis_toggle_changed = true;
                 }
                 Err(err) => self.last_error = Some(err),
@@ -7812,10 +8282,12 @@ impl eframe::App for CameraApp {
         }
 
         if analysis_toggle_changed {
+            self.sync_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
             self.analysis_output = AnalysisOutput::default();
             self.note_analysis_change(ctx, "analysis stage enablement");
         }
         if analysis_parameter_changed {
+            self.sync_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
             self.note_analysis_change(ctx, "analysis parameters");
         }
 
@@ -9109,9 +9581,10 @@ mod tests {
         replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
         replay_step_target_time_us, replay_step_uses_current_controller,
         replay_time_from_position_sources, roi_is_effectively_full_frame,
-        short_host_view_chip_title, sync_acq_time_atomic, sync_popup_investigation_payload,
-        sync_retained_event_history_from_upstream, viewport_stream_active, CameraApp,
-        PopupSharedData, RawEventSceneInput, RAW_EVENTS_ON_LAYER_ID,
+        short_host_view_chip_title, should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
+        sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
+        viewport_stream_active, CameraApp, PopupSharedData, RawEventSceneInput,
+        RAW_EVENTS_ON_LAYER_ID,
     };
     use augur_event_types::{BackpressureBehavior, CursorPolicy};
     use std::{
@@ -9181,6 +9654,60 @@ mod tests {
             short_host_view_chip_title("Very Long Host View Name That Will Wrap"),
             "Very Long Host View..."
         );
+    }
+
+    #[test]
+    fn live_analysis_dispatches_for_live_and_unpaused_replay_only_when_plugins_are_enabled() {
+        assert!(should_dispatch_live_analysis_for_state(
+            AppMode::Previewing,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(should_dispatch_live_analysis_for_state(
+            AppMode::Recording,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(should_dispatch_live_analysis_for_state(
+            AppMode::Replaying,
+            false,
+            false,
+            false,
+            true
+        ));
+
+        assert!(!should_dispatch_live_analysis_for_state(
+            AppMode::Previewing,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!should_dispatch_live_analysis_for_state(
+            AppMode::Replaying,
+            true,
+            false,
+            false,
+            true
+        ));
+        assert!(!should_dispatch_live_analysis_for_state(
+            AppMode::Replaying,
+            false,
+            true,
+            false,
+            true
+        ));
+        assert!(!should_dispatch_live_analysis_for_state(
+            AppMode::Replaying,
+            false,
+            false,
+            true,
+            true
+        ));
     }
 
     fn point_cloud_frame(events: &[CdEvent]) -> PreviewFrame {

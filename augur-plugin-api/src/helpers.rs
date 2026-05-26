@@ -4,7 +4,8 @@ use crate::{
     ffi::{
         AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
         FfiMarkerOverlayItem, FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame,
-        FfiSlice, FfiString, FfiSubpixelMarker, PluginCapabilities, PluginInput,
+        FfiSlice, FfiString, FfiSubpixelMarker, PluginCapabilities, PluginDiscontinuity,
+        PluginInput, PluginStateKind,
     },
     settings::{SettingsSchema, StatusEntry},
     HostViewRegistry,
@@ -300,8 +301,18 @@ pub trait Plugin: Default {
 
     fn reset(&mut self);
 
+    fn on_discontinuity(&mut self, _reason: PluginDiscontinuity) {
+        if self.plugin_state_kind() == PluginStateKind::Accumulating {
+            self.reset();
+        }
+    }
+
     fn input_kind(&self) -> PluginInput {
         PluginInput::FrameOnly
+    }
+
+    fn plugin_state_kind(&self) -> PluginStateKind {
+        PluginStateKind::Accumulating
     }
 
     fn capabilities(&self) -> PluginCapabilities {

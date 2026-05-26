@@ -586,6 +586,7 @@ dependencies = [
  "anyhow",
  "augur-core",
  "augur-prophesee",
+ "augur-runtime",
  "clap",
  "ctrlc",
  "toml",
@@ -622,6 +623,7 @@ dependencies = [
  "augur-event-types",
  "augur-plugin-api",
  "augur-prophesee",
+ "augur-runtime",
  "bytemuck",
  "criterion",
  "crossbeam-channel",
@@ -665,6 +667,20 @@ version = "1.0.0"
 dependencies = [
  "augur-core",
  "rusb",
+]
+
+[[package]]
+name = "augur-runtime"
+version = "1.0.0"
+dependencies = [
+ "augur-core",
+ "augur-event-types",
+ "augur-plugin-api",
+ "image",
+ "libloading 0.8.9",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

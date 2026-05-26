@@ -109,6 +109,17 @@ macro_rules! export_plugin {
                 }));
             }
 
+            unsafe extern "C" fn __on_discontinuity(
+                instance: *mut ::std::ffi::c_void,
+                reason: $crate::PluginDiscontinuity,
+            ) {
+                let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    if let Some(plugin) = __instance_mut(instance) {
+                        plugin.plugin.on_discontinuity(reason);
+                    }
+                }));
+            }
+
             unsafe extern "C" fn __input_kind(
                 instance: *const ::std::ffi::c_void,
             ) -> $crate::PluginInput {
@@ -118,6 +129,17 @@ macro_rules! export_plugin {
                         .unwrap_or($crate::PluginInput::FrameOnly)
                 })
                 .unwrap_or($crate::PluginInput::FrameOnly)
+            }
+
+            unsafe extern "C" fn __plugin_state_kind(
+                instance: *const ::std::ffi::c_void,
+            ) -> $crate::PluginStateKind {
+                ::std::panic::catch_unwind(|| {
+                    __instance_ref(instance)
+                        .map(|plugin| plugin.plugin.plugin_state_kind())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
             }
 
             unsafe extern "C" fn __capabilities(
@@ -394,8 +416,10 @@ macro_rules! export_plugin {
                 enabled: __enabled,
                 set_enabled: __set_enabled,
                 reset: __reset,
+                on_discontinuity: __on_discontinuity,
                 input_kind: __input_kind,
                 capabilities: __capabilities,
+                plugin_state_kind: __plugin_state_kind,
                 num_dependencies: __num_dependencies,
                 dependency: __dependency,
                 process_frame: __process_frame,

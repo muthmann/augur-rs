@@ -66,6 +66,10 @@ The loader validates both the exported `PluginVTable` size and the explicit ABI 
 calls any plugin function pointers. A stale plugin now shows up as a normal load error in the
 Plugin Manager instead of crashing AugurRS during startup.
 
+The loader and FFI callback bridges live in `augur-runtime`. `augur-gui` keeps a
+GUI-side plugin manager for settings and status, while live analysis uses a
+worker-owned plugin manager loaded from the same plugin directory.
+
 ## Runtime Plugin Sources
 
 The companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository hosts the plugin template, authoring docs, and community plugin implementations. Build a plugin there (or start from the template), then copy its `plugin.toml` plus release library into `~/.augur/plugins/<plugin-name>/`.
@@ -96,6 +100,9 @@ The library was built against a different version of the plugin API. Rebuild it 
 The plugin was compiled against an older `augur-plugin-api` layout whose vtable size may still look
 compatible by coincidence. Rebuild the plugin against the current host release, then replace the
 old library in `~/.augur/plugins/<plugin-name>/`.
+
+The current host expects ABI v4, which includes `PluginDiscontinuity` and
+`PluginStateKind` hooks for seek/source/settings/history boundaries.
 
 ## Why C FFI + `libloading`
 
