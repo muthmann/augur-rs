@@ -1,6 +1,7 @@
 use std::{cell::RefCell, collections::VecDeque, ops::Range};
 
 use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
+use augur_event_types::FrameWindowEntry;
 
 const DEFAULT_TIME_WINDOW_MS: f32 = 120.0;
 const MIN_TIME_WINDOW_MS: f32 = 5.0;
@@ -99,6 +100,48 @@ impl PointCloudState {
             window_end_us: frame.window_end_us,
             event_count,
         });
+        self.trim_history();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Whether the retained history fully spans `[start_us, end_us]`, so an
+    /// anchored summary inside that window can be served without refilling.
+    pub fn covers_window(&self, start_us: u64, end_us: u64) -> bool {
+        let (Some(front), Some(back)) = (self.frames.front(), self.frames.back()) else {
+            return false;
+        };
+        front.window_start_us <= start_us && back.window_end_us >= end_us
+    }
+
+    /// Replaces the retained history with the frame windows currently
+    /// resident in the upstream ring. Used after a replay seek: the seek
+    /// sprint archives every decoded frame into the ring even when the
+    /// bounded preview channel drops the frame object, so rebuilding from the
+    /// ring gives the 3D view a gap-free look-back window.
+    pub fn rebuild_from_source_frames(
+        &mut self,
+        source: &LiveEventSource,
+        entries: &[FrameWindowEntry],
+    ) {
+        self.frames.clear();
+        for entry in entries {
+            let event_count = entry.event_count as usize;
+            if event_count == 0 {
+                continue;
+            }
+            if event_count >= MAX_HISTORY_POINTS {
+                self.frames.clear();
+            } else {
+                self.trim_to_point_budget(MAX_HISTORY_POINTS.saturating_sub(event_count));
+            }
+            self.frames.push_back(RetainedEventFrame {
+                source: source.clone(),
+                event_range: entry.first_event_idx..entry.end_event_idx(),
+                window_start_us: entry.window_start_us,
+                window_end_us: entry.window_end_us,
+                event_count,
+            });
+        }
         self.trim_history();
         self.generation = self.generation.wrapping_add(1);
     }
@@ -317,6 +360,57 @@ mod tests {
         let summary = state.visible_summary();
         assert_eq!(summary.retained_time_span_ms, Some(1.0));
         assert_eq!(summary.effective_time_window_ms, 1.0);
+    }
+
+    #[test]
+    fn covers_window_reflects_retained_span() {
+        let mut state = PointCloudState::default();
+        assert!(!state.covers_window(0, 10));
+
+        state.push_frame(&frame(&[event(1_000, 0, 0), event(2_000, 1, 0)]));
+        state.push_frame(&frame(&[event(3_000, 2, 0), event(4_000, 3, 0)]));
+
+        assert!(state.covers_window(1_000, 4_000));
+        assert!(state.covers_window(2_000, 3_000));
+        assert!(!state.covers_window(500, 3_000), "starts before history");
+        assert!(!state.covers_window(2_000, 5_000), "ends after history");
+    }
+
+    #[test]
+    fn rebuild_from_source_frames_replaces_history_from_ring_entries() {
+        use augur_core::pipeline::LiveEventSource;
+
+        let mut state = PointCloudState {
+            time_window_ms: 100.0,
+            ..PointCloudState::default()
+        };
+        // Stale history that must be replaced.
+        state.push_frame(&frame(&[event(99_000, 9, 9)]));
+
+        let source = LiveEventSource::with_capacity(16);
+        source
+            .append_cd_frame(&[event(1_000, 0, 0), event(2_000, 1, 0)], 1_000, 2_000)
+            .expect("first ring frame appends");
+        source
+            .append_cd_frame(&[event(3_000, 2, 0)], 2_000, 3_000)
+            .expect("second ring frame appends");
+        let entries = source.retained_frame_entries();
+        assert_eq!(entries.len(), 2);
+
+        state.rebuild_from_source_frames(&source, &entries);
+
+        let summary = state.visible_summary_at(3_000);
+        assert_eq!(
+            summary
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000],
+            "rebuilt history must reflect exactly the ring frames",
+        );
+        assert!(state.covers_window(1_000, 3_000));
+        assert!(!state.covers_window(99_000, 99_000));
     }
 
     #[test]

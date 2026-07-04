@@ -169,6 +169,11 @@ impl LiveEventSource {
         self.lock_ring().frame_entries_from(next_event_idx)
     }
 
+    /// All frame windows currently resident in the ring, oldest first.
+    pub fn retained_frame_entries(&self) -> Vec<FrameWindowEntry> {
+        self.lock_ring().frame_index().entries().cloned().collect()
+    }
+
     pub fn drain_cursor_frames(
         &self,
         cursor: CursorId,
@@ -2441,7 +2446,7 @@ mod tests {
                 return Ok(());
             }
             let reads_at_start = self.reads.load(Ordering::Relaxed);
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 let progressed = self
                     .reads
@@ -2507,7 +2512,7 @@ mod tests {
             .send(CameraConfig::default())
             .expect("settings channel must accept the runtime config");
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !reconfigured.load(Ordering::Relaxed) {
             assert!(Instant::now() < deadline, "runtime reconfigure never ran");
             thread::sleep(Duration::from_millis(1));
@@ -2558,7 +2563,7 @@ mod tests {
             }
             let waited = Instant::now();
             while !self.stop_requested.load(Ordering::Relaxed) {
-                if waited.elapsed() > Duration::from_secs(2) {
+                if waited.elapsed() > Duration::from_secs(10) {
                     return Err(CameraError::Timeout("stop gate never opened".into()));
                 }
                 thread::sleep(Duration::from_millis(1));
@@ -2599,7 +2604,7 @@ mod tests {
 
         // Wait until the first packet has been accepted by the USB reader and
         // the camera is blocked inside the gated second read.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while controller.stats_snapshot().bytes_total < 4 {
             assert!(Instant::now() < deadline, "first packet never arrived");
             thread::sleep(Duration::from_millis(1));

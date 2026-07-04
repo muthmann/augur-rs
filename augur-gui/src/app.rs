@@ -757,6 +757,7 @@ pub struct CameraApp {
     replay_finished: bool,
     replay_pause_after_seek_frame: bool,
     replay_pause_after_seek_target_timestamp_us: Option<u64>,
+    replay_acq_reopen_pending: bool,
     replay_pending_fraction: Option<f32>,
     replay_frame_history: VecDeque<ReplayFrameSnapshot>,
     replay_history_cursor: Option<usize>,
@@ -915,6 +916,7 @@ impl CameraApp {
             replay_finished: false,
             replay_pause_after_seek_frame: false,
             replay_pause_after_seek_target_timestamp_us: None,
+            replay_acq_reopen_pending: false,
             replay_pending_fraction: None,
             replay_frame_history: VecDeque::with_capacity(REPLAY_FRAME_HISTORY_CAPACITY),
             replay_history_cursor: None,
@@ -1772,8 +1774,19 @@ impl CameraApp {
             if viewer.needs_line_profile_refresh() {
                 viewer.line_profile_tool.recompute(&snapshot.frame);
             }
-            viewer.workspace.point_cloud.clear();
-            viewer.workspace.point_cloud.push_frame(&snapshot.frame);
+            // Keep the retained 3D history when it still spans the snapshot's
+            // window: the 3D summary is anchored to the displayed frame's end
+            // timestamp, so stepping back shows the full look-back window
+            // instead of collapsing to a single acquisition frame. Only fall
+            // back to the lone snapshot frame when history no longer covers it.
+            if !viewer
+                .workspace
+                .point_cloud
+                .covers_window(snapshot.frame.window_start_us, snapshot.frame.window_end_us)
+            {
+                viewer.workspace.point_cloud.clear();
+                viewer.workspace.point_cloud.push_frame(&snapshot.frame);
+            }
         });
 
         if !self.external_tool_status().is_streaming()
@@ -5695,9 +5708,15 @@ impl CameraApp {
             return;
         };
         self.set_replay_paused_internal(controls, paused);
+        if !paused {
+            // Resuming can interrupt a seek sprint; make sure playback runs at
+            // the user's speed, not the sprint's unthrottled speed.
+            self.set_replay_speed_internal(controls, self.replay_speed);
+        }
         self.replay_paused = paused;
         if !paused {
             self.replay_pause_after_seek_frame = false;
+            self.replay_pause_after_seek_target_timestamp_us = None;
         } else {
             self.notify_live_discontinuity(PluginDiscontinuity::Seek);
         }
@@ -5928,6 +5947,9 @@ impl CameraApp {
         };
 
         self.set_replay_paused_internal(&controls, false);
+        // Sprint to the step target unthrottled; the user's speed is restored
+        // when the target frame is displayed.
+        self.set_replay_speed_internal(&controls, f32::INFINITY);
         self.replay_paused = true;
         self.replay_finished = false;
         self.replay_pause_after_seek_frame = true;
@@ -6002,9 +6024,23 @@ impl CameraApp {
 
         let data_len = info.data_len();
         let fraction = fraction.clamp(0.0, 1.0);
-        let target_rel = ((data_len as f64 * fraction as f64) as u64).min(data_len);
         let target_time_us = replay_time_from_fraction(fraction, info.total_duration_us);
         let target_timestamp_us = info.first_timestamp_us.saturating_add(target_time_us);
+        // When a paused scrub lands at T with the 3D view open, start decoding
+        // one 3D time window earlier so the point cloud can show [T - window,
+        // T] instead of a single acquisition frame. The reopened pipeline
+        // sprints to T unthrottled and only the first frame reaching T is
+        // displayed.
+        let lookback_us = if desired_paused && self.active_investigation_layout().shows_3d() {
+            self.with_active_viewer(|viewer| {
+                (f64::from(viewer.workspace.point_cloud.time_window_ms) * 1_000.0).round() as u64
+            })
+        } else {
+            0
+        };
+        let decode_time_us = target_time_us.saturating_sub(lookback_us);
+        let decode_fraction = replay_fraction_from_time(decode_time_us, info.total_duration_us);
+        let target_rel = ((data_len as f64 * decode_fraction as f64) as u64).min(data_len);
         let reopen_result = if let Some(decoded_events) = decoded_events {
             let target_byte = target_rel - (target_rel % PACKED_EVENT_RECORD_BYTES as u64);
             match DecodedEventFileCamera::open_at(decoded_events, &info, target_byte) {
@@ -6058,7 +6094,14 @@ impl CameraApp {
 
         let pause_after_first_frame = desired_paused;
         self.set_replay_paused_internal(&controls, false);
-        self.set_replay_speed_internal(&controls, self.replay_speed);
+        // Paused seeks sprint to the target unthrottled; the user's speed is
+        // restored when the target frame is displayed.
+        let seek_speed = if pause_after_first_frame {
+            f32::INFINITY
+        } else {
+            self.replay_speed
+        };
+        self.set_replay_speed_internal(&controls, seek_speed);
         self.sync_pipeline_requirements(&controller);
         self.controller = Some(controller);
         if let Some(controller) = &self.controller {
@@ -6541,12 +6584,32 @@ impl CameraApp {
         };
 
         let dequeue_started = Instant::now();
+        let seek_target_us = (self.mode == AppMode::Replaying
+            && self.replay_pause_after_seek_frame)
+            .then_some(self.replay_pause_after_seek_target_timestamp_us)
+            .flatten();
         let mut newest_frame = self.pending_preview_frame.take();
+        let mut seek_target_frame: Option<PreviewFrame> = None;
         let mut drained_frame = false;
         while let Ok(frame) = frame_rx.try_recv() {
             drained_frame = true;
             self.with_active_viewer_mut(|viewer| viewer.workspace.point_cloud.push_frame(&frame));
+            // During a seek sprint, display the first frame that reaches the
+            // target. Later frames still feed the 3D history above, but must
+            // not overshoot the paused 2D view past the seek target.
+            if let Some(target_us) = seek_target_us {
+                if seek_target_frame.is_some() {
+                    continue;
+                }
+                if frame.window_end_us >= target_us {
+                    seek_target_frame = Some(frame);
+                    continue;
+                }
+            }
             newest_frame = Some(frame);
+        }
+        if seek_target_frame.is_some() {
+            newest_frame = seek_target_frame;
         }
 
         let Some(frame) = newest_frame else {
@@ -6558,6 +6621,18 @@ impl CameraApp {
             if !dispatch_live_analysis {
                 self.sync_retained_event_history_from_controller();
             }
+        }
+
+        // Frames arriving while replay is already paused are seek-sprint
+        // leftovers or packets that were in flight before the pause. They are
+        // part of the 3D history above, but must not advance the paused 2D
+        // display.
+        if self.mode == AppMode::Replaying
+            && self.replay_paused
+            && !self.replay_pause_after_seek_frame
+            && self.latest_frame.is_some()
+        {
+            return;
         }
 
         let external_streaming = self.external_tool_status().is_streaming();
@@ -6593,10 +6668,31 @@ impl CameraApp {
         if self.mode == AppMode::Replaying && self.replay_pause_after_seek_frame {
             if let Some(controls) = &self.replay_controls {
                 self.set_replay_paused_internal(controls, true);
+                // The seek sprint ran unthrottled; restore the user's speed.
+                self.set_replay_speed_internal(controls, self.replay_speed);
             }
             self.replay_pause_after_seek_frame = false;
             self.replay_pause_after_seek_target_timestamp_us = None;
             self.replay_paused = true;
+            // The sprint archived every decoded frame into the event ring,
+            // even where the bounded preview channel dropped frame objects.
+            // Rebuild the 3D history from the ring so the look-back window
+            // behind the seek target is gap-free.
+            if let Some(source) = self
+                .controller
+                .as_ref()
+                .map(|ctrl| ctrl.event_source.clone())
+            {
+                let entries = source.retained_frame_entries();
+                if !entries.is_empty() {
+                    self.with_active_viewer_mut(|viewer| {
+                        viewer
+                            .workspace
+                            .point_cloud
+                            .rebuild_from_source_frames(&source, &entries);
+                    });
+                }
+            }
         }
         if self.mode == AppMode::Replaying && self.replay_pending_fraction.is_some() {
             self.replay_pending_fraction = None;
@@ -7147,8 +7243,34 @@ impl eframe::App for CameraApp {
                             )
                             .on_hover_text(ACQ_TIME_TOOLTIP);
                         if response.changed() {
-                            self.acq_dirty = true;
                             global_settings_changed = true;
+                            // The acquisition window is a host-side preview
+                            // parameter, not a sensor setting: apply it to the
+                            // running pipeline immediately instead of waiting
+                            // for Apply Settings, which replay mode locks out.
+                            if let Some(ctrl) = &self.controller {
+                                sync_acq_time_atomic(&ctrl.acq_time_us, self.acq_time_ms);
+                                self.acq_dirty = false;
+                            } else {
+                                self.acq_dirty = true;
+                            }
+                            if self.mode == AppMode::Replaying && self.replay_paused {
+                                self.replay_acq_reopen_pending = true;
+                            }
+                        }
+                        // A paused replay frame was built with the old window;
+                        // rebuild it at the same position once the slider
+                        // interaction ends.
+                        if self.replay_acq_reopen_pending
+                            && (response.drag_stopped() || response.lost_focus())
+                        {
+                            self.replay_acq_reopen_pending = false;
+                            if self.mode == AppMode::Replaying && self.replay_paused {
+                                self.reopen_replay_at_fraction(
+                                    self.current_replay_fraction(),
+                                    true,
+                                );
+                            }
                         }
                     });
 
