@@ -1,5 +1,5 @@
 use augur_core::{
-    camera::{DeviceInfo, EventCamera, PacketStreamCamera},
+    camera::{DeviceInfo, EventCamera, PacketStreamCamera, PacketStreamReader},
     config::CameraConfig,
     CameraError, Result,
 };
@@ -161,9 +161,28 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
     }
 }
 
+/// Stream-endpoint reader sharing the camera's USB handle. Bulk reads on the
+/// stream endpoint are safe to run concurrently with control transfers on the
+/// control endpoints, which is what lets reconfiguration avoid stalling reads.
+pub struct Evk4StreamReader {
+    transport: Transport,
+}
+
+impl PacketStreamReader for Evk4StreamReader {
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.transport.read_stream(buf)
+    }
+}
+
 impl<S: PseeSensor> PacketStreamCamera for Evk4Camera<S> {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.transport.read_stream(buf)
+    }
+
+    fn split_stream_reader(&mut self) -> Option<Box<dyn PacketStreamReader>> {
+        Some(Box::new(Evk4StreamReader {
+            transport: self.transport.clone(),
+        }))
     }
 }
 

@@ -828,6 +828,7 @@ pub struct CameraApp {
     pending_action_requests: Vec<HostActionRequest>,
     next_action_request_id: u64,
     action_modal: Option<ActionModalState>,
+    apply_settings_confirm_open: bool,
     toast_queue: crate::toast::ToastQueue,
 }
 
@@ -979,6 +980,7 @@ impl CameraApp {
             pending_action_requests: Vec::new(),
             next_action_request_id: 1,
             action_modal: None,
+            apply_settings_confirm_open: false,
             toast_queue: crate::toast::ToastQueue::default(),
         };
         app.event_store
@@ -6221,6 +6223,65 @@ impl CameraApp {
     }
 
     fn apply_runtime_changes(&mut self) {
+        // Reconfiguring the sensor mid-recording is visible in the recorded
+        // data (bias/ROI/filter changes take effect immediately), so ask for
+        // an explicit confirmation instead of applying silently.
+        if self.mode == AppMode::Recording && self.config_dirty && self.controller.is_some() {
+            self.apply_settings_confirm_open = true;
+            return;
+        }
+        self.apply_runtime_changes_now();
+    }
+
+    fn render_apply_settings_confirm(&mut self, ctx: &egui::Context) {
+        if !self.apply_settings_confirm_open {
+            return;
+        }
+        if self.mode != AppMode::Recording {
+            // The recording ended while the dialog was open; nothing to guard.
+            self.apply_settings_confirm_open = false;
+            self.apply_runtime_changes_now();
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Apply settings while recording?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    "A recording is running. Applying settings reconfigures the \
+                     sensor immediately, so the change (and a brief sensor \
+                     disturbance around it) becomes part of the recorded data.",
+                );
+                ui.small(
+                    "Recording stays gap-free: the stream keeps being read and \
+                     written while the new settings are applied.",
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(crate::theme::primary_button("Apply to recording"))
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if apply {
+            self.apply_settings_confirm_open = false;
+            self.apply_runtime_changes_now();
+        } else if cancel || !open {
+            self.apply_settings_confirm_open = false;
+        }
+    }
+
+    fn apply_runtime_changes_now(&mut self) {
         self.sync_config_global_from_runtime();
 
         let Some(ctrl) = &self.controller else {
@@ -8993,6 +9054,7 @@ impl eframe::App for CameraApp {
 
         self.render_host_view_windows(ctx);
         self.render_action_modal(ctx);
+        self.render_apply_settings_confirm(ctx);
 
         self.sync_active_pipeline_requirements();
 

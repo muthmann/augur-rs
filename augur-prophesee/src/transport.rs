@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use augur_core::{CameraError, Result};
 use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
@@ -23,9 +23,22 @@ pub struct BoardInfo {
     pub usb_serial: Option<String>,
 }
 
-pub struct Transport {
+struct TransportShared {
     _ctx: Context,
     handle: DeviceHandle<Context>,
+}
+
+/// USB transport for a Treuzell board.
+///
+/// The device handle is shared, so a `Transport` can be cloned to move stream
+/// reads onto a dedicated thread while control transfers continue elsewhere.
+/// libusb supports concurrent synchronous transfers on different endpoints
+/// from different threads; callers must keep control-command sequencing
+/// (write + read pairs) on a single thread, which `Treuzell`'s `&mut`
+/// borrow of one clone enforces.
+#[derive(Clone)]
+pub struct Transport {
+    shared: Arc<TransportShared>,
     interface: u8,
     ep_ctrl_in: u8,
     ep_ctrl_out: u8,
@@ -84,8 +97,7 @@ impl Transport {
             };
 
             return Ok(Self {
-                _ctx: ctx,
-                handle,
+                shared: Arc::new(TransportShared { _ctx: ctx, handle }),
                 interface: iface,
                 ep_ctrl_in,
                 ep_ctrl_out,
@@ -110,19 +122,22 @@ impl Transport {
     }
 
     pub fn write_control(&mut self, data: &[u8]) -> Result<usize> {
-        self.handle
+        self.shared
+            .handle
             .write_bulk(self.ep_ctrl_out, data, self.control_timeout)
             .map_err(|e| CameraError::Transport(e.to_string()))
     }
 
     pub fn read_control(&mut self, out: &mut [u8]) -> Result<usize> {
-        self.handle
+        self.shared
+            .handle
             .read_bulk(self.ep_ctrl_in, out, self.control_timeout)
             .map_err(|e| CameraError::Transport(e.to_string()))
     }
 
     pub fn read_stream(&mut self, out: &mut [u8]) -> Result<usize> {
-        self.handle
+        self.shared
+            .handle
             .read_bulk(self.ep_stream_in, out, self.stream_timeout)
             .map_err(|e| match e {
                 rusb::Error::Timeout => CameraError::Timeout("USB stream read timed out".into()),

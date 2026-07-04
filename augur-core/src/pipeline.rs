@@ -22,7 +22,7 @@ use crossbeam_channel::{
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
-    camera::PacketStreamCamera,
+    camera::{PacketStreamCamera, PacketStreamReader},
     config::CameraConfig,
     evt3_timestamps::Evt3TimestampUnwrapper,
     metadata::{RecordingMetadata, RecordingSidecar},
@@ -940,6 +940,204 @@ struct PreviewChunk {
     len: usize,
 }
 
+/// The stream thread's packet source. Inline mode owns the camera and pumps
+/// runtime reconfiguration between reads; split mode reads from a detached
+/// stream reader while a dedicated control thread owns the camera, so
+/// reconfiguration never pauses stream reads.
+trait StreamWorker: Send {
+    fn start(&mut self) -> std::result::Result<(), String>;
+    fn poll_control(&mut self, error_tx: &Sender<String>);
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize>;
+    fn finish(&mut self) -> std::result::Result<(), String>;
+}
+
+struct InlineCameraWorker<C: PacketStreamCamera> {
+    camera: C,
+    initial_config: CameraConfig,
+    settings_rx: Receiver<CameraConfig>,
+}
+
+impl<C: PacketStreamCamera> StreamWorker for InlineCameraWorker<C> {
+    fn start(&mut self) -> std::result::Result<(), String> {
+        self.camera
+            .configure(&self.initial_config)
+            .map_err(|e| format!("initial camera configure failed: {e}"))?;
+        self.camera
+            .start_streaming()
+            .map_err(|e| format!("camera start_streaming failed: {e}"))
+    }
+
+    fn poll_control(&mut self, error_tx: &Sender<String>) {
+        while let Ok(cfg) = self.settings_rx.try_recv() {
+            if let Err(e) = self.camera.configure(&cfg) {
+                let _ = error_tx.try_send(format!("usb: runtime reconfigure failed: {e}"));
+            }
+        }
+    }
+
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.camera.read_packet(buf)
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), String> {
+        self.camera
+            .stop_streaming()
+            .map_err(|e| format!("camera stop_streaming failed: {e}"))
+    }
+}
+
+struct SplitStreamWorker {
+    reader: Box<dyn PacketStreamReader>,
+}
+
+impl StreamWorker for SplitStreamWorker {
+    fn start(&mut self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    fn poll_control(&mut self, _error_tx: &Sender<String>) {}
+
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.reader.read_packet(buf)
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_stream_loop(
+    worker: &mut dyn StreamWorker,
+    stop: &AtomicBool,
+    stats: &Mutex<PipelineStatsInner>,
+    error_tx: &Sender<String>,
+    pool_rx: &Receiver<UsbBuffer>,
+    pool_return_tx: &Sender<UsbBuffer>,
+    preview_pool_rx: &Receiver<UsbBuffer>,
+    preview_pool_return_tx: &Sender<UsbBuffer>,
+    preview_tx: &Sender<PreviewChunk>,
+    disk_tx: Option<&Sender<DiskChunk>>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        worker.poll_control(error_tx);
+
+        let mut buf = match pool_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(b) => b,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        let len = match worker.read_packet(&mut buf[..]) {
+            Ok(n) => n,
+            Err(CameraError::Timeout(_)) => {
+                let _ = pool_return_tx.send(buf);
+                continue;
+            }
+            Err(CameraError::Eof) => {
+                let _ = pool_return_tx.send(buf);
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            Err(e) => {
+                report_pipeline_error(error_tx, stop, "usb", format!("stream read failed: {e}"));
+                let _ = pool_return_tx.send(buf);
+                break;
+            }
+        };
+
+        if len == 0 {
+            let _ = pool_return_tx.send(buf);
+            continue;
+        }
+
+        if let Ok(mut s) = stats.lock() {
+            let now = Instant::now();
+            s.record_packet(now, len as u64, 0);
+        }
+        // PacketStreamCamera does not currently expose upstream overflow counters.
+        // Surface them here once the transport API makes them available.
+
+        if !preview_tx.is_full() {
+            match preview_pool_rx.try_recv() {
+                Ok(mut preview_buf) => {
+                    preview_buf[..len].copy_from_slice(&buf[..len]);
+                    match preview_tx.try_send(PreviewChunk {
+                        buf: preview_buf,
+                        len,
+                    }) {
+                        Ok(()) => {
+                            if let Ok(mut s) = stats.lock() {
+                                s.record_preview_packet_queue_depth(preview_tx.len());
+                            }
+                        }
+                        Err(TrySendError::Full(chunk)) | Err(TrySendError::Disconnected(chunk)) => {
+                            if let Ok(mut s) = stats.lock() {
+                                s.record_preview_packet_drop();
+                            }
+                            let _ = preview_pool_return_tx.try_send(chunk.buf);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                    if let Ok(mut s) = stats.lock() {
+                        s.record_preview_packet_drop();
+                    }
+                }
+            }
+        } else if let Ok(mut s) = stats.lock() {
+            s.record_preview_packet_drop();
+        }
+
+        if let Some(disk_tx) = disk_tx {
+            let disk_send_started = Instant::now();
+            match disk_tx.send_timeout(DiskChunk { buf, len }, Duration::from_millis(50)) {
+                Ok(_) => {
+                    if let Ok(mut s) = stats.lock() {
+                        s.record_disk_send_wait(disk_send_started.elapsed());
+                        s.record_disk_queue_depth(disk_tx.len());
+                    }
+                }
+                Err(SendTimeoutError::Timeout(chunk)) => match disk_tx.send(chunk) {
+                    Ok(_) => {
+                        if let Ok(mut s) = stats.lock() {
+                            s.record_disk_send_wait(disk_send_started.elapsed());
+                            s.record_disk_queue_depth(disk_tx.len());
+                        }
+                    }
+                    Err(e) => {
+                        if let Ok(mut s) = stats.lock() {
+                            s.record_disk_send_wait(disk_send_started.elapsed());
+                        }
+                        report_pipeline_error(
+                            error_tx,
+                            stop,
+                            "usb",
+                            format!("disk channel send failed: {e}"),
+                        );
+                        break;
+                    }
+                },
+                Err(SendTimeoutError::Disconnected(chunk)) => {
+                    if let Ok(mut s) = stats.lock() {
+                        s.record_disk_send_wait(disk_send_started.elapsed());
+                    }
+                    let _ = pool_return_tx.send(chunk.buf);
+                    report_pipeline_error(
+                        error_tx,
+                        stop,
+                        "usb",
+                        "disk channel disconnected".to_string(),
+                    );
+                    break;
+                }
+            }
+        } else {
+            let _ = pool_return_tx.send(buf);
+        }
+    }
+}
+
 pub struct PipelineController {
     pub frame_rx: Receiver<PreviewFrame>,
     pub settings_tx: Sender<CameraConfig>,
@@ -1124,175 +1322,96 @@ where
     let preview_pool_tx_usb = preview_pool_tx.clone();
     let stats_preview = Arc::clone(&stats);
 
-    let usb_thread = thread::spawn(move || {
-        let mut camera = camera;
+    let mut threads = Vec::new();
 
-        if let Err(e) = camera.configure(&initial_config) {
-            report_pipeline_error(
-                &error_usb,
-                &stop_usb,
-                "usb",
-                format!("initial camera configure failed: {e}"),
-            );
-            return;
-        }
-
-        if let Err(e) = camera.start_streaming() {
-            report_pipeline_error(
-                &error_usb,
-                &stop_usb,
-                "usb",
-                format!("camera start_streaming failed: {e}"),
-            );
-            return;
-        }
-
-        while !stop_usb.load(Ordering::Relaxed) {
-            loop {
-                match settings_rx.try_recv() {
-                    Ok(cfg) => {
-                        if let Err(e) = camera.configure(&cfg) {
-                            let _ =
-                                error_usb.try_send(format!("usb: runtime reconfigure failed: {e}"));
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
-                }
-            }
-
-            let mut buf = match pool_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(b) => b,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
-
-            let len = match camera.read_packet(&mut buf[..]) {
-                Ok(n) => n,
-                Err(CameraError::Timeout(_)) => {
-                    let _ = usb_pool_tx.send(buf);
-                    continue;
-                }
-                Err(CameraError::Eof) => {
-                    let _ = usb_pool_tx.send(buf);
-                    stop_usb.store(true, Ordering::Relaxed);
-                    break;
-                }
-                Err(e) => {
+    let mut camera = camera;
+    let mut worker: Box<dyn StreamWorker> = match camera.split_stream_reader() {
+        Some(reader) => {
+            // Camera control (initial configure, start/stop streaming, and
+            // runtime reconfiguration) runs on a dedicated thread: control
+            // transfers can take tens of milliseconds, and a paused stream
+            // reader overflows the camera FIFO and leaves gaps in the
+            // recording.
+            let stop_control = Arc::clone(&stop);
+            let error_control = error_tx.clone();
+            let control_thread = thread::spawn(move || {
+                if let Err(e) = camera.configure(&initial_config) {
                     report_pipeline_error(
-                        &error_usb,
-                        &stop_usb,
-                        "usb",
-                        format!("stream read failed: {e}"),
+                        &error_control,
+                        &stop_control,
+                        "control",
+                        format!("initial camera configure failed: {e}"),
                     );
-                    let _ = usb_pool_tx.send(buf);
-                    break;
+                    return;
                 }
-            };
-
-            if len == 0 {
-                let _ = usb_pool_tx.send(buf);
-                continue;
-            }
-
-            if let Ok(mut s) = stats_usb.lock() {
-                let now = Instant::now();
-                s.record_packet(now, len as u64, 0);
-            }
-            // PacketStreamCamera does not currently expose upstream overflow counters.
-            // Surface them here once the transport API makes them available.
-
-            if !preview_tx.is_full() {
-                match preview_pool_rx.try_recv() {
-                    Ok(mut preview_buf) => {
-                        preview_buf[..len].copy_from_slice(&buf[..len]);
-                        match preview_tx.try_send(PreviewChunk {
-                            buf: preview_buf,
-                            len,
-                        }) {
-                            Ok(()) => {
-                                if let Ok(mut s) = stats_usb.lock() {
-                                    s.record_preview_packet_queue_depth(preview_tx.len());
-                                }
-                            }
-                            Err(TrySendError::Full(chunk))
-                            | Err(TrySendError::Disconnected(chunk)) => {
-                                if let Ok(mut s) = stats_usb.lock() {
-                                    s.record_preview_packet_drop();
-                                }
-                                let _ = preview_pool_tx_usb.try_send(chunk.buf);
+                if let Err(e) = camera.start_streaming() {
+                    report_pipeline_error(
+                        &error_control,
+                        &stop_control,
+                        "control",
+                        format!("camera start_streaming failed: {e}"),
+                    );
+                    return;
+                }
+                loop {
+                    match settings_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(cfg) => {
+                            if let Err(e) = camera.configure(&cfg) {
+                                let _ = error_control
+                                    .try_send(format!("control: runtime reconfigure failed: {e}"));
                             }
                         }
-                    }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
-                        if let Ok(mut s) = stats_usb.lock() {
-                            s.record_preview_packet_drop();
+                        Err(RecvTimeoutError::Timeout) => {
+                            if stop_control.load(Ordering::Relaxed) {
+                                break;
+                            }
                         }
+                        Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
-            } else if let Ok(mut s) = stats_usb.lock() {
-                s.record_preview_packet_drop();
-            }
-
-            if let Some(ref disk_tx) = disk_tx {
-                let disk_send_started = Instant::now();
-                match disk_tx.send_timeout(DiskChunk { buf, len }, Duration::from_millis(50)) {
-                    Ok(_) => {
-                        if let Ok(mut s) = stats_usb.lock() {
-                            s.record_disk_send_wait(disk_send_started.elapsed());
-                            s.record_disk_queue_depth(disk_tx.len());
-                        }
-                    }
-                    Err(SendTimeoutError::Timeout(chunk)) => match disk_tx.send(chunk) {
-                        Ok(_) => {
-                            if let Ok(mut s) = stats_usb.lock() {
-                                s.record_disk_send_wait(disk_send_started.elapsed());
-                                s.record_disk_queue_depth(disk_tx.len());
-                            }
-                        }
-                        Err(e) => {
-                            if let Ok(mut s) = stats_usb.lock() {
-                                s.record_disk_send_wait(disk_send_started.elapsed());
-                            }
-                            report_pipeline_error(
-                                &error_usb,
-                                &stop_usb,
-                                "usb",
-                                format!("disk channel send failed: {e}"),
-                            );
-                            break;
-                        }
-                    },
-                    Err(SendTimeoutError::Disconnected(chunk)) => {
-                        if let Ok(mut s) = stats_usb.lock() {
-                            s.record_disk_send_wait(disk_send_started.elapsed());
-                        }
-                        let _ = usb_pool_tx.send(chunk.buf);
-                        report_pipeline_error(
-                            &error_usb,
-                            &stop_usb,
-                            "usb",
-                            "disk channel disconnected".to_string(),
-                        );
-                        break;
-                    }
+                if let Err(e) = camera.stop_streaming() {
+                    report_pipeline_error(
+                        &error_control,
+                        &stop_control,
+                        "control",
+                        format!("camera stop_streaming failed: {e}"),
+                    );
                 }
-            } else {
-                let _ = usb_pool_tx.send(buf);
-            }
+            });
+            threads.push(control_thread);
+            Box::new(SplitStreamWorker { reader })
+        }
+        None => Box::new(InlineCameraWorker {
+            camera,
+            initial_config,
+            settings_rx,
+        }),
+    };
+
+    let usb_thread = thread::spawn(move || {
+        if let Err(message) = worker.start() {
+            report_pipeline_error(&error_usb, &stop_usb, "usb", message);
+            return;
         }
 
-        if let Err(e) = camera.stop_streaming() {
-            report_pipeline_error(
-                &error_usb,
-                &stop_usb,
-                "usb",
-                format!("camera stop_streaming failed: {e}"),
-            );
+        run_stream_loop(
+            worker.as_mut(),
+            &stop_usb,
+            &stats_usb,
+            &error_usb,
+            &pool_rx,
+            &usb_pool_tx,
+            &preview_pool_rx,
+            &preview_pool_tx_usb,
+            &preview_tx,
+            disk_tx.as_ref(),
+        );
+
+        if let Err(message) = worker.finish() {
+            report_pipeline_error(&error_usb, &stop_usb, "usb", message);
         }
     });
-
-    let mut threads = vec![usb_thread];
+    threads.push(usb_thread);
 
     if let (Some(disk_rx), Some(mut writer)) = (disk_rx, disk_writer) {
         let stop_disk = Arc::clone(&stop);
@@ -2292,6 +2411,113 @@ mod tests {
         assert_eq!(frame_start_ts, None);
         assert_eq!(on_count, 0);
         assert_eq!(off_count, 0);
+    }
+
+    struct CountingStreamReader {
+        reads: Arc<AtomicU64>,
+    }
+
+    impl crate::camera::PacketStreamReader for CountingStreamReader {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(1));
+            Err(CameraError::Timeout("idle counting reader".into()))
+        }
+    }
+
+    /// Split-capable camera whose runtime reconfigure waits until the stream
+    /// reader has made progress, proving reads continue during configure.
+    struct SplitControlCamera {
+        reads: Arc<AtomicU64>,
+        configure_calls: u32,
+        reads_progressed_during_reconfigure: Arc<AtomicU64>,
+        reconfigured: Arc<AtomicBool>,
+    }
+
+    impl EventCamera for SplitControlCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            self.configure_calls += 1;
+            if self.configure_calls == 1 {
+                return Ok(());
+            }
+            let reads_at_start = self.reads.load(Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let progressed = self
+                    .reads
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(reads_at_start);
+                if progressed >= 3 {
+                    self.reads_progressed_during_reconfigure
+                        .store(progressed, Ordering::Relaxed);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.reconfigured.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+    }
+
+    impl PacketStreamCamera for SplitControlCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("split camera reads via reader".into()))
+        }
+
+        fn split_stream_reader(&mut self) -> Option<Box<dyn crate::camera::PacketStreamReader>> {
+            Some(Box::new(CountingStreamReader {
+                reads: Arc::clone(&self.reads),
+            }))
+        }
+    }
+
+    #[test]
+    fn split_camera_keeps_reading_during_runtime_reconfigure() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let progressed = Arc::new(AtomicU64::new(0));
+        let reconfigured = Arc::new(AtomicBool::new(false));
+
+        let controller = spawn_pipeline(
+            SplitControlCamera {
+                reads: Arc::clone(&reads),
+                configure_calls: 0,
+                reads_progressed_during_reconfigure: Arc::clone(&progressed),
+                reconfigured: Arc::clone(&reconfigured),
+            },
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        controller
+            .settings_tx
+            .send(CameraConfig::default())
+            .expect("settings channel must accept the runtime config");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !reconfigured.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "runtime reconfigure never ran");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            progressed.load(Ordering::Relaxed) >= 3,
+            "stream reads must continue while the control thread reconfigures",
+        );
+
+        controller.shutdown().expect("pipeline must shut down");
     }
 
     /// Camera whose second packet only completes after the test requests
