@@ -35,9 +35,29 @@ drops stale results before publishing them to the investigation workspace.
 The worker coalesces pending frame triggers by keeping the newest queued frame,
 but retained-history plugins drain all available frames from their own
 `LiveEventSource` cursor before processing. Coalescing therefore drops result
-cadence, not upstream events. If retained history falls behind the ring capacity,
-the worker emits a warning, clears plugin history, and sends an explicit
-`HistoryEvicted` discontinuity to accumulating plugins.
+cadence, not upstream events; host-authored persistent-bus updates from
+superseded jobs are merged into the surviving job. If retained history falls
+behind the ring capacity, the worker emits a warning, clears plugin history,
+and sends an explicit `HistoryEvicted` discontinuity.
+
+The controller-owned lossless `plugin-runtime` cursor is drained by the GUI on
+every dequeued frame batch — including while the worker executes plugins. A
+registered lossless cursor that never advances blocks ring eviction and stalls
+raw-event archival once the ring wraps. The GUI registers that cursor on
+demand when a retained-history plugin is enabled mid-session and releases it
+when no plugin needs history; the worker's own history never unregisters a
+cursor it did not register.
+
+## Persistent Context Bus Ownership
+
+The worker's persistent map is authoritative between jobs, so
+plugin-published persistent values are never rolled back by a stale GUI echo.
+Jobs carry either a full bus snapshot (`persistent_seed` — sent at startup,
+after an epoch bump, and after the synchronous GUI executor may have written
+plugin values) or an incremental set of host-authored upserts/removals
+(`persistent_updates`). `reset_analysis` clears both sides through an
+epoch-tagged `ClearPersistent` command so pre-reset (possibly cross-source)
+values cannot resurrect through in-flight results.
 
 Unpaused replay playback uses the live worker for dynamic plugins. Paused replay
 scrubs and explicit single-frame recomputes use the synchronous path so the
@@ -92,7 +112,15 @@ mode = "fast"
 - `Plugin::plugin_state_kind`
 
 Accumulating plugins default to resetting on discontinuity. Stateless plugins can
-return `PluginStateKind::Stateless` and skip accumulator resets.
+return `PluginStateKind::Stateless` and skip accumulator resets. The host
+delivers `on_discontinuity` to every loaded plugin; the default trait
+implementation performs the state-kind filtering, so stateless plugins that
+override the hook still observe timeline boundaries.
+
+Raw-event visibility is identical across live, paused-scrub, and offline
+paths: only `RawEvents`-phase plugins receive the current frame's raw events.
+A plugin's own input-kind declaration — never another plugin's needs —
+decides what it sees, so live results agree with whole-file runs.
 
 Discontinuities are emitted for seek, source change, settings change, and
 retained-history eviction. Replay seeks and source replacements clear

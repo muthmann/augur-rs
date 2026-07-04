@@ -79,6 +79,9 @@ pub struct LiveAnalysisResult {
     pub context_data: HashMap<String, Vec<u8>>,
     pub persistent_data: HashMap<String, Vec<u8>>,
     pub host_snapshots: Vec<LivePluginHostSnapshot>,
+    /// Highest host action request id that was visible on the persistent bus
+    /// while this job ran. The GUI retires delivered requests up to this id.
+    pub action_request_watermark: u64,
 }
 
 #[derive(Debug)]
@@ -146,6 +149,12 @@ impl LiveAnalysisWorker {
             .send(LiveAnalysisCommand::Discontinuity { epoch, reason });
     }
 
+    /// Drops every persistent context value held by the worker. Paired with
+    /// an epoch bump so results computed against the old bus are discarded.
+    pub fn clear_persistent(&self, epoch: u64) {
+        let _ = self.tx.send(LiveAnalysisCommand::ClearPersistent { epoch });
+    }
+
     pub fn set_memory_budget(&self, memory_budget_bytes: usize) {
         let _ = self
             .tx
@@ -168,7 +177,61 @@ pub struct LiveAnalysisJob {
     pub epoch: u64,
     pub frame: PreviewFrame,
     pub global_settings_json: Option<Vec<u8>>,
-    pub persistent_data: HashMap<String, Vec<u8>>,
+    /// Full replacement snapshot of the persistent context bus. The GUI sends
+    /// one when it owned the bus since the last live job (startup and
+    /// paused-scrub → live transitions); otherwise the worker's own map stays
+    /// authoritative so plugin-published values are never rolled back by a
+    /// stale echo.
+    pub persistent_seed: Option<HashMap<String, Vec<u8>>>,
+    /// Host-authored upserts (`Some`) and removals (`None`) since the last
+    /// dispatched job, applied on top of the worker's persistent map.
+    pub persistent_updates: HashMap<String, Option<Vec<u8>>>,
+    /// Highest host action request id published into this job's bus view.
+    /// Echoed back through [`LiveAnalysisResult::action_request_watermark`].
+    pub action_request_watermark: u64,
+}
+
+impl LiveAnalysisJob {
+    /// Folds `next` into `self` when the worker coalesces queued jobs, so
+    /// host-authored persistent updates from superseded jobs are not lost.
+    fn coalesce_with(&mut self, next: LiveAnalysisJob) {
+        let LiveAnalysisJob {
+            epoch,
+            frame,
+            global_settings_json,
+            persistent_seed,
+            persistent_updates,
+            action_request_watermark,
+        } = next;
+        self.epoch = epoch;
+        self.frame = frame;
+        self.global_settings_json = global_settings_json;
+        if persistent_seed.is_some() {
+            // A newer full snapshot already contains every older update.
+            self.persistent_seed = persistent_seed;
+            self.persistent_updates = persistent_updates;
+        } else {
+            self.persistent_updates.extend(persistent_updates);
+        }
+        self.action_request_watermark = self.action_request_watermark.max(action_request_watermark);
+    }
+
+    /// Applies this job's persistent-bus seed/updates to the worker map.
+    fn apply_persistent_changes(&mut self, persistent_data: &mut HashMap<String, Vec<u8>>) {
+        if let Some(seed) = self.persistent_seed.take() {
+            *persistent_data = seed;
+        }
+        for (key, value) in self.persistent_updates.drain() {
+            match value {
+                Some(value) => {
+                    persistent_data.insert(key, value);
+                }
+                None => {
+                    persistent_data.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -186,6 +249,9 @@ enum LiveAnalysisCommand {
     Discontinuity {
         epoch: u64,
         reason: PluginDiscontinuity,
+    },
+    ClearPersistent {
+        epoch: u64,
     },
     Analyze(Box<LiveAnalysisJob>),
     SetMemoryBudget(usize),
@@ -216,6 +282,10 @@ pub struct PluginEventHistory {
     memory_usage_bytes: usize,
     upstream: Option<LiveEventSource>,
     upstream_cursor: Option<CursorId>,
+    /// True when this history registered `upstream_cursor` itself. Borrowed
+    /// cursors (e.g. the pipeline controller's) stay registered on detach so
+    /// their owner can re-attach without a stale id.
+    owns_upstream_cursor: bool,
 }
 
 impl Default for PluginEventHistory {
@@ -226,6 +296,7 @@ impl Default for PluginEventHistory {
             memory_usage_bytes: 0,
             upstream: None,
             upstream_cursor: None,
+            owns_upstream_cursor: false,
         }
     }
 }
@@ -238,23 +309,37 @@ impl PluginEventHistory {
             .is_some_and(|existing| existing.ptr_eq(&source))
         {
             if self.upstream_cursor.is_none() {
-                self.upstream_cursor = cursor.or_else(|| Some(register_plugin_cursor(&source)));
+                match cursor {
+                    Some(cursor) => {
+                        self.upstream_cursor = Some(cursor);
+                        self.owns_upstream_cursor = false;
+                    }
+                    None => {
+                        self.upstream_cursor = Some(register_plugin_cursor(&source));
+                        self.owns_upstream_cursor = true;
+                    }
+                }
             }
             return;
         }
 
         self.detach_upstream();
+        let owns_cursor = cursor.is_none();
         let cursor = cursor.unwrap_or_else(|| register_plugin_cursor(&source));
         self.upstream = Some(source);
         self.upstream_cursor = Some(cursor);
+        self.owns_upstream_cursor = owns_cursor;
     }
 
     pub fn detach_upstream(&mut self) {
         if let (Some(source), Some(cursor)) = (&self.upstream, self.upstream_cursor) {
-            source.unregister_cursor(cursor);
+            if self.owns_upstream_cursor {
+                source.unregister_cursor(cursor);
+            }
         }
         self.upstream = None;
         self.upstream_cursor = None;
+        self.owns_upstream_cursor = false;
     }
 
     pub fn sync_from_upstream(&mut self) -> Result<(), String> {
@@ -1093,7 +1178,7 @@ fn run_live_analysis_worker(
             } => {
                 active_epoch = active_epoch.max(epoch);
                 apply_live_plugin_snapshot(&mut manager, &snapshot);
-                reset_accumulating_plugins(&mut manager, reason);
+                notify_plugins_of_discontinuity(&mut manager, reason);
                 event_store.clear();
             }
             LiveAnalysisCommand::Reload {
@@ -1104,13 +1189,17 @@ fn run_live_analysis_worker(
                 active_epoch = active_epoch.max(epoch);
                 load_warning = manager.scan_and_load().err();
                 apply_live_plugin_snapshot(&mut manager, &snapshot);
-                reset_accumulating_plugins(&mut manager, reason);
+                notify_plugins_of_discontinuity(&mut manager, reason);
                 event_store.clear();
             }
             LiveAnalysisCommand::Discontinuity { epoch, reason } => {
                 active_epoch = active_epoch.max(epoch);
                 event_store.clear();
-                reset_accumulating_plugins(&mut manager, reason);
+                notify_plugins_of_discontinuity(&mut manager, reason);
+            }
+            LiveAnalysisCommand::ClearPersistent { epoch } => {
+                active_epoch = active_epoch.max(epoch);
+                persistent_data.clear();
             }
             LiveAnalysisCommand::Analyze(mut job) => {
                 while let Ok(next) = rx.try_recv() {
@@ -1126,7 +1215,7 @@ fn run_live_analysis_worker(
                         } => {
                             active_epoch = active_epoch.max(epoch);
                             apply_live_plugin_snapshot(&mut manager, &snapshot);
-                            reset_accumulating_plugins(&mut manager, reason);
+                            notify_plugins_of_discontinuity(&mut manager, reason);
                             event_store.clear();
                         }
                         LiveAnalysisCommand::Reload {
@@ -1137,16 +1226,24 @@ fn run_live_analysis_worker(
                             active_epoch = active_epoch.max(epoch);
                             load_warning = manager.scan_and_load().err();
                             apply_live_plugin_snapshot(&mut manager, &snapshot);
-                            reset_accumulating_plugins(&mut manager, reason);
+                            notify_plugins_of_discontinuity(&mut manager, reason);
                             event_store.clear();
                         }
                         LiveAnalysisCommand::Discontinuity { epoch, reason } => {
                             active_epoch = active_epoch.max(epoch);
                             event_store.clear();
-                            reset_accumulating_plugins(&mut manager, reason);
+                            notify_plugins_of_discontinuity(&mut manager, reason);
+                        }
+                        LiveAnalysisCommand::ClearPersistent { epoch } => {
+                            active_epoch = active_epoch.max(epoch);
+                            persistent_data.clear();
+                            // The pending job's merged seed/updates predate
+                            // the clear and must not resurrect old values.
+                            job.persistent_seed = None;
+                            job.persistent_updates.clear();
                         }
                         LiveAnalysisCommand::Analyze(next_job) => {
-                            job = next_job;
+                            job.coalesce_with(*next_job);
                         }
                     }
                 }
@@ -1155,7 +1252,7 @@ fn run_live_analysis_worker(
                     continue;
                 }
                 active_epoch = active_epoch.max(job.epoch);
-                persistent_data.extend(job.persistent_data.clone());
+                job.apply_persistent_changes(&mut persistent_data);
                 let mut result = process_live_analysis_job(
                     &mut manager,
                     &mut event_store,
@@ -1212,7 +1309,7 @@ fn process_live_analysis_job(
                 message: err,
             });
             event_store.clear();
-            reset_accumulating_plugins(manager, PluginDiscontinuity::HistoryEvicted);
+            notify_plugins_of_discontinuity(manager, PluginDiscontinuity::HistoryEvicted);
         }
     } else {
         event_store.detach_upstream();
@@ -1235,9 +1332,16 @@ fn process_live_analysis_job(
                 continue;
             };
             if plugin.enabled() && plugin.input_kind() == phase {
+                // Only RawEvents-phase plugins receive the current frame's raw
+                // events — matching the offline pipeline, so declaring an
+                // input kind (not another plugin's needs) decides visibility.
                 plugin.process_frame(
                     &job.frame,
-                    &raw_events,
+                    if phase == PluginInput::RawEvents {
+                        &raw_events
+                    } else {
+                        &[]
+                    },
                     event_store,
                     &mut output,
                     &mut context_data,
@@ -1253,6 +1357,7 @@ fn process_live_analysis_job(
         context_data,
         persistent_data: persistent_data.clone(),
         host_snapshots: collect_live_host_snapshots(manager),
+        action_request_watermark: job.action_request_watermark,
     }
 }
 
@@ -1273,14 +1378,15 @@ fn apply_live_plugin_snapshot(manager: &mut PluginManager, snapshot: &LivePlugin
     }
 }
 
-fn reset_accumulating_plugins(manager: &mut PluginManager, reason: PluginDiscontinuity) {
+/// Delivers a discontinuity to every loaded plugin. The default trait
+/// implementation resets only `Accumulating` plugins; `Stateless` plugins
+/// that override `on_discontinuity` still get to observe the boundary.
+fn notify_plugins_of_discontinuity(manager: &mut PluginManager, reason: PluginDiscontinuity) {
     for record in manager.records_mut() {
         let Some(plugin) = record.plugin_mut() else {
             continue;
         };
-        if plugin.plugin_state_kind() == PluginStateKind::Accumulating {
-            plugin.on_discontinuity(reason);
-        }
+        plugin.on_discontinuity(reason);
     }
 }
 
@@ -2125,7 +2231,9 @@ mod tests {
             epoch: 1,
             frame: empty_preview_frame(),
             global_settings_json: None,
-            persistent_data: HashMap::new(),
+            persistent_seed: None,
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
         });
         assert!(
             rx.recv_timeout(Duration::from_millis(50)).is_err(),
@@ -2136,7 +2244,9 @@ mod tests {
             epoch: 2,
             frame: empty_preview_frame(),
             global_settings_json: None,
-            persistent_data: HashMap::new(),
+            persistent_seed: None,
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
         });
         let result = rx
             .recv_timeout(Duration::from_secs(1))
@@ -2145,6 +2255,145 @@ mod tests {
 
         drop(worker);
         let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn clear_persistent_drops_worker_state_and_stale_echoes() {
+        let plugins_dir = unique_temp_dir("worker-clear-persistent");
+        let (worker, rx) = LiveAnalysisWorker::spawn(plugins_dir.clone(), 1024 * 1024);
+        worker.configure(
+            1,
+            LivePluginStateSnapshot::default(),
+            PluginDiscontinuity::SettingsChanged,
+        );
+
+        let mut seed = HashMap::new();
+        seed.insert("plugin.state".to_owned(), b"old-source".to_vec());
+        worker.analyze(LiveAnalysisJob {
+            epoch: 1,
+            frame: empty_preview_frame(),
+            global_settings_json: None,
+            persistent_seed: Some(seed),
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
+        });
+        let seeded = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("seeded job publishes");
+        assert_eq!(
+            seeded.persistent_data.get("plugin.state"),
+            Some(&b"old-source".to_vec())
+        );
+
+        worker.clear_persistent(2);
+        worker.analyze(LiveAnalysisJob {
+            epoch: 2,
+            frame: empty_preview_frame(),
+            global_settings_json: None,
+            persistent_seed: None,
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
+        });
+        let cleared = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("post-clear job publishes");
+        assert!(
+            cleared.persistent_data.is_empty(),
+            "cleared persistent bus must not resurrect old-source values"
+        );
+
+        drop(worker);
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn coalesced_jobs_keep_superseded_persistent_updates() {
+        let mut job = LiveAnalysisJob {
+            epoch: 1,
+            frame: empty_preview_frame(),
+            global_settings_json: None,
+            persistent_seed: None,
+            persistent_updates: HashMap::from([("host.queue".to_owned(), Some(b"first".to_vec()))]),
+            action_request_watermark: 3,
+        };
+        job.coalesce_with(LiveAnalysisJob {
+            epoch: 2,
+            frame: empty_preview_frame(),
+            global_settings_json: None,
+            persistent_seed: None,
+            persistent_updates: HashMap::from([("host.other".to_owned(), None)]),
+            action_request_watermark: 2,
+        });
+
+        assert_eq!(job.epoch, 2);
+        assert_eq!(job.action_request_watermark, 3);
+        assert_eq!(
+            job.persistent_updates.get("host.queue"),
+            Some(&Some(b"first".to_vec())),
+            "updates from superseded jobs must survive coalescing"
+        );
+        assert_eq!(job.persistent_updates.get("host.other"), Some(&None));
+
+        let mut persistent = HashMap::new();
+        job.apply_persistent_changes(&mut persistent);
+        assert_eq!(persistent.get("host.queue"), Some(&b"first".to_vec()));
+        assert!(!persistent.contains_key("host.other"));
+    }
+
+    #[test]
+    fn seeded_coalesce_replaces_older_seed_and_updates() {
+        let mut job = LiveAnalysisJob {
+            epoch: 1,
+            frame: empty_preview_frame(),
+            global_settings_json: None,
+            persistent_seed: Some(HashMap::from([("stale".to_owned(), b"a".to_vec())])),
+            persistent_updates: HashMap::from([("stale.update".to_owned(), Some(b"b".to_vec()))]),
+            action_request_watermark: 0,
+        };
+        job.coalesce_with(LiveAnalysisJob {
+            epoch: 2,
+            frame: empty_preview_frame(),
+            global_settings_json: None,
+            persistent_seed: Some(HashMap::from([("fresh".to_owned(), b"c".to_vec())])),
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
+        });
+
+        let mut persistent = HashMap::from([("pre".to_owned(), b"x".to_vec())]);
+        job.apply_persistent_changes(&mut persistent);
+        assert_eq!(
+            persistent,
+            HashMap::from([("fresh".to_owned(), b"c".to_vec())]),
+            "a newer full seed supersedes older seeds, updates, and worker state"
+        );
+    }
+
+    #[test]
+    fn detach_keeps_borrowed_cursors_registered() {
+        let source = LiveEventSource::default();
+        let controller_cursor = source.register_cursor(
+            "plugin-runtime",
+            CursorPolicy::Lossless {
+                backpressure: BackpressureBehavior::FailLoud,
+            },
+        );
+
+        let mut store = PluginEventHistory::default();
+        store.attach_upstream(source.clone(), Some(controller_cursor));
+        store.detach_upstream();
+
+        assert!(
+            source.drain_cursor_frames(controller_cursor).is_ok(),
+            "borrowed controller cursor must survive detach so it can be re-attached"
+        );
+
+        store.attach_upstream(source.clone(), None);
+        let owned_cursor = store.upstream_cursor.expect("owned cursor registered");
+        store.detach_upstream();
+        assert!(
+            source.drain_cursor_frames(owned_cursor).is_err(),
+            "self-registered cursors are unregistered on detach"
+        );
     }
 
     unsafe extern "C" fn stub_create() -> *mut c_void {

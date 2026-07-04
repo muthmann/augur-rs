@@ -68,7 +68,12 @@ The host resolves duplicate ids in plugin execution order:
 - views whose dataset ids do not resolve are ignored and logged
 - views whose kinds do not match the dataset kind are ignored and logged
 - dataset payloads are fetched lazily and cached by dataset id
-- cached snapshots reload only when the provider reports a higher generation
+- cached snapshots reload only when the provider reports a changed, nonzero
+  generation
+- providers that leave `host_view_dataset_generation` at the default `0` are
+  treated as generation-less: the host reloads their datasets once per
+  analysis pass instead of caching them forever — implement real generation
+  counters to avoid that per-pass reload cost
 
 Current generic dataset kinds:
 
@@ -147,8 +152,9 @@ most plugins that derive state from prior frames. Return
 `PluginStateKind::Stateless` only when the plugin has no cross-frame accumulator
 and every output can be recomputed from the current frame plus host context.
 
-The host calls `on_discontinuity` when a timeline or configuration boundary
-would make existing accumulated state unsafe to reuse:
+The host calls `on_discontinuity` on every loaded plugin — including
+stateless ones, whose default implementation ignores it — when a timeline or
+configuration boundary would make existing accumulated state unsafe to reuse:
 
 - replay seek
 - source/file replacement

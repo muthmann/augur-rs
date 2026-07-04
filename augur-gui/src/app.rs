@@ -24,11 +24,11 @@ use augur_core::{
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
-use augur_event_types::CursorId;
+use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
 use augur_plugin_api::{
     FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
     HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginDiscontinuity,
-    PluginInput, PluginStateKind, Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1,
+    PluginInput, Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1,
     CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
@@ -456,7 +456,14 @@ fn pipeline_stream_active(
 
 #[derive(Debug, Clone)]
 struct HostDatasetCacheEntry {
-    generation: u64,
+    /// Generation reported by the providing plugin; 0 means the provider
+    /// does not maintain generation counters.
+    provider_generation: u64,
+    /// Host-side cache/render key: the provider generation when nonzero,
+    /// otherwise the refresh sequence of the analysis pass that produced the
+    /// snapshot — so gen-less providers still refresh on new data instead of
+    /// freezing on their first snapshot.
+    effective_generation: u64,
     snapshot: CachedHostDataset,
 }
 
@@ -769,6 +776,17 @@ pub struct CameraApp {
     plugin_manager: PluginManager,
     plugin_context_data: HashMap<String, Vec<u8>>,
     persistent_context_data: HashMap<String, Vec<u8>>,
+    /// Host-authored persistent-bus upserts/removals not yet shipped to the
+    /// live worker. Drained into the next `LiveAnalysisJob`.
+    pending_persistent_updates: HashMap<String, Option<Vec<u8>>>,
+    /// When true, the next live job carries a full persistent-bus snapshot
+    /// (startup, reset, and after the synchronous GUI executor may have
+    /// written plugin values while paused).
+    live_persistent_reseed: bool,
+    /// Bumped whenever new analysis data may have arrived (worker result,
+    /// synchronous recompute, offline summary). Drives refetching of host
+    /// datasets whose providers do not maintain generation counters.
+    host_dataset_refresh_seq: u64,
     event_store: PluginEventHistory,
     analysis_epoch: Arc<AtomicU64>,
     live_analysis_worker: LiveAnalysisWorker,
@@ -828,6 +846,9 @@ pub struct CameraApp {
     brand_logo: Option<egui::TextureHandle>,
     pending_action_requests: Vec<HostActionRequest>,
     next_action_request_id: u64,
+    /// Set when `pending_action_requests` changed since the last publish, so
+    /// the queue is only re-serialized onto the bus when it actually moved.
+    action_queue_dirty: bool,
     action_modal: Option<ActionModalState>,
     apply_settings_confirm_open: bool,
     toast_queue: crate::toast::ToastQueue,
@@ -928,6 +949,9 @@ impl CameraApp {
             plugin_manager,
             plugin_context_data: HashMap::new(),
             persistent_context_data: HashMap::new(),
+            pending_persistent_updates: HashMap::new(),
+            live_persistent_reseed: true,
+            host_dataset_refresh_seq: 1,
             event_store: PluginEventHistory::default(),
             analysis_epoch: Arc::new(AtomicU64::new(1)),
             live_analysis_worker,
@@ -981,6 +1005,7 @@ impl CameraApp {
             brand_logo: logo_texture,
             pending_action_requests: Vec::new(),
             next_action_request_id: 1,
+            action_queue_dirty: false,
             action_modal: None,
             apply_settings_confirm_open: false,
             toast_queue: crate::toast::ToastQueue::default(),
@@ -2406,6 +2431,15 @@ impl CameraApp {
         self.reset_runtime_plugins();
         self.plugin_context_data.clear();
         self.persistent_context_data.clear();
+        self.pending_persistent_updates.clear();
+        self.pending_action_requests.clear();
+        self.action_queue_dirty = false;
+        self.live_persistent_reseed = true;
+        // The worker's persistent map must be wiped too, and in-flight
+        // results computed against the old bus must be dropped — otherwise
+        // the next result resurrects pre-reset (possibly cross-source) data.
+        let epoch = self.bump_analysis_epoch();
+        self.live_analysis_worker.clear_persistent(epoch);
         self.event_store.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
@@ -2464,9 +2498,7 @@ impl CameraApp {
         let epoch = self.bump_analysis_epoch();
         let snapshot = self.collect_live_plugin_state_snapshot();
         self.live_analysis_worker.configure(epoch, snapshot, reason);
-        self.clear_runtime_snapshots();
-        self.host_view_registry_dirty = true;
-        self.clear_host_view_dataset_cache();
+        self.after_live_epoch_bump();
     }
 
     fn reload_live_plugin_configuration(&mut self, reason: PluginDiscontinuity) {
@@ -2474,17 +2506,23 @@ impl CameraApp {
         let snapshot = self.collect_live_plugin_state_snapshot();
         self.live_analysis_worker
             .reload_plugins(epoch, snapshot, reason);
-        self.clear_runtime_snapshots();
-        self.host_view_registry_dirty = true;
-        self.clear_host_view_dataset_cache();
+        self.after_live_epoch_bump();
     }
 
     fn notify_live_discontinuity(&mut self, reason: PluginDiscontinuity) {
         let epoch = self.bump_analysis_epoch();
         self.live_analysis_worker.discontinuity(epoch, reason);
+        self.after_live_epoch_bump();
+    }
+
+    fn after_live_epoch_bump(&mut self) {
         self.clear_runtime_snapshots();
         self.host_view_registry_dirty = true;
         self.clear_host_view_dataset_cache();
+        // In-flight jobs may be dropped as stale together with their
+        // persistent-bus updates; the next job re-seeds the full bus so
+        // host-authored keys (e.g. the action queue) are re-delivered.
+        self.live_persistent_reseed = true;
     }
 
     fn poll_live_analysis_results(&mut self) {
@@ -2509,10 +2547,24 @@ impl CameraApp {
         self.analysis_output = output;
         self.plugin_context_data = result.context_data;
         self.persistent_context_data = result.persistent_data;
+        // Keep host-authored updates that are still in flight visible in the
+        // GUI's local view of the bus.
+        for (key, value) in &self.pending_persistent_updates {
+            match value {
+                Some(value) => {
+                    self.persistent_context_data
+                        .insert(key.clone(), value.clone());
+                }
+                None => {
+                    self.persistent_context_data.remove(key);
+                }
+            }
+        }
+        self.retire_action_requests_up_to(result.action_request_watermark);
         self.live_host_snapshots = result.host_snapshots;
         self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Worker);
         self.host_view_registry_dirty = true;
-        self.mark_host_view_datasets_stale();
+        self.host_dataset_refresh_seq = self.host_dataset_refresh_seq.wrapping_add(1);
         self.refresh_host_view_registry_if_dirty();
     }
 
@@ -2531,14 +2583,14 @@ impl CameraApp {
             let Some(plugin) = record.plugin_mut() else {
                 continue;
             };
-            if plugin.plugin_state_kind() == PluginStateKind::Accumulating {
-                plugin.on_discontinuity(reason);
-            }
+            // Deliver to every plugin: the trait's default implementation
+            // resets only accumulating plugins, while stateless plugins that
+            // override `on_discontinuity` still observe the boundary.
+            plugin.on_discontinuity(reason);
         }
         self.plugin_context_data.clear();
         self.analysis_output = AnalysisOutput::default();
         self.host_view_registry_dirty = true;
-        self.mark_host_view_datasets_stale();
         self.clear_host_view_dataset_cache();
     }
 
@@ -2732,13 +2784,15 @@ impl CameraApp {
     }
 
     fn ensure_host_view_dataset_cached(&mut self, dataset_id: &str) {
-        let generation = match self.current_host_view_dataset_generation(dataset_id) {
+        let refresh_seq = self.host_dataset_refresh_seq;
+        let provider_generation = match self.current_host_view_dataset_generation(dataset_id) {
             Ok(generation) => generation,
             Err(err) => {
                 self.host_view_dataset_cache.insert(
                     dataset_id.to_owned(),
                     HostDatasetCacheEntry {
-                        generation: 0,
+                        provider_generation: 0,
+                        effective_generation: refresh_seq,
                         snapshot: Err(err),
                     },
                 );
@@ -2746,17 +2800,29 @@ impl CameraApp {
             }
         };
 
-        if self
+        let fresh = self
             .host_view_dataset_cache
             .get(dataset_id)
-            .is_some_and(|entry| entry.generation == generation)
-        {
+            .is_some_and(|entry| {
+                if provider_generation != 0 {
+                    entry.provider_generation == provider_generation
+                } else {
+                    // No provider counter: reload once per analysis pass.
+                    entry.effective_generation == refresh_seq
+                }
+            });
+        if fresh {
             return;
         }
         self.host_view_dataset_cache.insert(
             dataset_id.to_owned(),
             HostDatasetCacheEntry {
-                generation,
+                provider_generation,
+                effective_generation: if provider_generation != 0 {
+                    provider_generation
+                } else {
+                    refresh_seq
+                },
                 snapshot: self.load_host_view_dataset_snapshot(dataset_id),
             },
         );
@@ -2849,7 +2915,9 @@ impl CameraApp {
 
             self.ensure_host_view_dataset_cached(&dataset.descriptor.id);
             let cache_entry = self.host_view_dataset_cache.get(&dataset.descriptor.id);
-            let generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+            let generation = cache_entry
+                .map(|entry| entry.effective_generation)
+                .unwrap_or(0);
             let Ok(Some(table)) = cached_table(cache_entry) else {
                 continue;
             };
@@ -2913,7 +2981,9 @@ impl CameraApp {
             return;
         };
         let cache_entry = self.host_view_dataset_cache.get(&row_key.dataset_id);
-        let generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+        let generation = cache_entry
+            .map(|entry| entry.effective_generation)
+            .unwrap_or(0);
         let Ok(Some(table)) = cached_table(cache_entry) else {
             return;
         };
@@ -2965,7 +3035,9 @@ impl CameraApp {
                 continue;
             };
             let target_cache = self.host_view_dataset_cache.get(&target_dataset_id);
-            let target_generation = target_cache.map(|entry| entry.generation).unwrap_or(0);
+            let target_generation = target_cache
+                .map(|entry| entry.effective_generation)
+                .unwrap_or(0);
             let Ok(Some(target_table)) = cached_table(target_cache) else {
                 continue;
             };
@@ -3083,7 +3155,9 @@ impl CameraApp {
             let cache_entry = self
                 .host_view_dataset_cache
                 .get(&view.descriptor.dataset_id);
-            let generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+            let generation = cache_entry
+                .map(|entry| entry.effective_generation)
+                .unwrap_or(0);
             let Ok(Some(table)) = cached_table(cache_entry) else {
                 continue;
             };
@@ -3682,7 +3756,9 @@ impl CameraApp {
         let cache_entry = self
             .host_view_dataset_cache
             .get(&view.descriptor.dataset_id);
-        let dataset_generation = cache_entry.map(|entry| entry.generation).unwrap_or(0);
+        let dataset_generation = cache_entry
+            .map(|entry| entry.effective_generation)
+            .unwrap_or(0);
 
         match (&view.descriptor.kind, &dataset.descriptor.kind) {
             (HostViewKind::CompactTable, HostDatasetKind::TableV1(schema)) => {
@@ -4398,12 +4474,14 @@ impl CameraApp {
                     let (table_arc, error_message, generation) = match &cache_entry {
                         Some(HostDatasetCacheEntry {
                             snapshot: Ok(Some(HostDatasetSnapshot::Table(table))),
-                            generation,
-                        }) => (Some(Arc::clone(table)), None, *generation),
+                            effective_generation,
+                            ..
+                        }) => (Some(Arc::clone(table)), None, *effective_generation),
                         Some(HostDatasetCacheEntry {
                             snapshot: Err(err),
-                            generation,
-                        }) => (None, Some(err.clone()), *generation),
+                            effective_generation,
+                            ..
+                        }) => (None, Some(err.clone()), *effective_generation),
                         _ => (None, None, 0),
                     };
                     let (filtered_rows, table_state, selected_row, hovered_row) = self
@@ -4562,7 +4640,7 @@ impl CameraApp {
                             .density_state();
                         let dataset_generation = cache_entry
                             .as_ref()
-                            .map(|entry| entry.generation)
+                            .map(|entry| entry.effective_generation)
                             .unwrap_or(0);
 
                         let table_result = cached_table(cache_entry.as_ref());
@@ -4806,7 +4884,7 @@ impl CameraApp {
                             .image_state();
                         let dataset_generation = cache_entry
                             .as_ref()
-                            .map(|entry| entry.generation)
+                            .map(|entry| entry.effective_generation)
                             .unwrap_or(0);
                         let image_result = cached_image(cache_entry.as_ref());
                         let render_result = match image_result {
@@ -5062,24 +5140,50 @@ impl CameraApp {
         }
     }
 
+    /// Keeps the controller-owned lossless `plugin-runtime` cursor in
+    /// lockstep with plugin needs and drains it into the GUI event store.
+    ///
+    /// This must run for every drained frame batch — including while the
+    /// live worker executes plugins — because a registered lossless cursor
+    /// that never advances blocks ring eviction and silently stalls
+    /// raw-event archival once the ring wraps.
     fn sync_retained_event_history_from_controller(&mut self) -> bool {
-        if !self.plugins_need_retained_event_history() {
-            return false;
-        }
-
-        let Some((source, cursor)) = self.controller.as_ref().map(|controller| {
-            (
-                controller.event_source.clone(),
-                controller.plugin_event_cursor,
-            )
-        }) else {
+        let needed = self.plugins_need_retained_event_history();
+        let Some(controller) = self.controller.as_mut() else {
+            if !needed {
+                self.event_store.detach_upstream();
+                self.event_store.clear();
+            }
             return false;
         };
 
+        if !needed {
+            self.event_store.detach_upstream();
+            self.event_store.clear();
+            // Release the controller cursor: an idle lossless cursor would
+            // pin ring eviction, and a stale unregistered id must not be
+            // reused on the next attach.
+            if let Some(cursor) = controller.plugin_event_cursor.take() {
+                controller.event_source.unregister_cursor(cursor);
+            }
+            return false;
+        }
+
+        // Register on demand so enabling a retained-history plugin
+        // mid-session gets lossless coverage from this point forward.
+        let cursor = *controller.plugin_event_cursor.get_or_insert_with(|| {
+            controller.event_source.register_cursor(
+                "plugin-runtime",
+                CursorPolicy::Lossless {
+                    backpressure: BackpressureBehavior::FailLoud,
+                },
+            )
+        });
+        let source = controller.event_source.clone();
         sync_retained_event_history_from_upstream(
             &mut self.event_store,
             source,
-            cursor,
+            Some(cursor),
             &mut self.analysis_output.warnings,
         )
     }
@@ -6002,7 +6106,7 @@ impl CameraApp {
         self.ensure_host_view_dataset_cached(&row_key.dataset_id);
         let fraction = (|| -> Option<f32> {
             let entry = self.host_view_dataset_cache.get(&row_key.dataset_id);
-            let generation = entry.map(|entry| entry.generation).unwrap_or(0);
+            let generation = entry.map(|entry| entry.effective_generation).unwrap_or(0);
             let table = cached_table(entry).ok().flatten()?;
             let row = (0..table.row_count()).find(|row| {
                 row_key_for_row(&row_key.dataset_id, generation, &schema, table, *row) == *row_key
@@ -6372,9 +6476,15 @@ impl CameraApp {
     }
 
     fn publish_pending_action_requests(&mut self) {
+        if !self.action_queue_dirty {
+            return;
+        }
+        self.action_queue_dirty = false;
         if self.pending_action_requests.is_empty() {
             self.persistent_context_data
                 .remove(CTX_INVESTIGATION_ACTION_REQUESTS);
+            self.pending_persistent_updates
+                .insert(CTX_INVESTIGATION_ACTION_REQUESTS.to_owned(), None);
             return;
         }
         let queue = HostActionRequestQueue {
@@ -6382,7 +6492,24 @@ impl CameraApp {
         };
         if let Ok(bytes) = serde_json::to_vec(&queue) {
             self.persistent_context_data
-                .insert(CTX_INVESTIGATION_ACTION_REQUESTS.to_owned(), bytes);
+                .insert(CTX_INVESTIGATION_ACTION_REQUESTS.to_owned(), bytes.clone());
+            self.pending_persistent_updates
+                .insert(CTX_INVESTIGATION_ACTION_REQUESTS.to_owned(), Some(bytes));
+        }
+    }
+
+    /// Drops requests the active executor has consumed. Requests are
+    /// delivered at-least-once to the executor active at apply time; they do
+    /// not replay onto rebuilt plugin instances or across executor switches.
+    fn retire_action_requests_up_to(&mut self, watermark: u64) {
+        if watermark == 0 {
+            return;
+        }
+        let before = self.pending_action_requests.len();
+        self.pending_action_requests
+            .retain(|request| request.request_id > watermark);
+        if self.pending_action_requests.len() != before {
+            self.action_queue_dirty = true;
         }
     }
 
@@ -6401,6 +6528,7 @@ impl CameraApp {
             scope_payload,
             params,
         });
+        self.action_queue_dirty = true;
         self.publish_pending_action_requests();
     }
 
@@ -6424,29 +6552,10 @@ impl CameraApp {
             .records()
             .iter()
             .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()));
+        let synced_upstream = self.sync_retained_event_history_from_controller();
         let ffi_events: Vec<FfiCdEvent> = if runtime_plugins_enabled {
-            if retained_history_needed {
-                let mut synced_upstream = false;
-                if let Some((source, cursor)) = self.controller.as_ref().map(|controller| {
-                    (
-                        controller.event_source.clone(),
-                        controller.plugin_event_cursor,
-                    )
-                }) {
-                    synced_upstream = sync_retained_event_history_from_upstream(
-                        &mut self.event_store,
-                        source,
-                        cursor,
-                        &mut self.analysis_output.warnings,
-                    );
-                }
-
-                if !synced_upstream && append_current_frame_to_event_store {
-                    self.event_store.push_frame(frame);
-                }
-            } else {
-                self.event_store.detach_upstream();
-                self.event_store.clear();
+            if retained_history_needed && !synced_upstream && append_current_frame_to_event_store {
+                self.event_store.push_frame(frame);
             }
             if current_frame_raw_events_needed {
                 frame.compact_events_snapshot().unwrap_or_default()
@@ -6454,8 +6563,6 @@ impl CameraApp {
                 Vec::new()
             }
         } else {
-            self.event_store.detach_upstream();
-            self.event_store.clear();
             Vec::new()
         };
 
@@ -6469,9 +6576,16 @@ impl CameraApp {
                     continue;
                 };
                 if plugin.enabled() && plugin.input_kind() == phase {
+                    // Match the offline pipeline: only RawEvents-phase
+                    // plugins see the current frame's raw events, so live
+                    // and whole-file results agree.
                     plugin.process_frame(
                         frame,
-                        &ffi_events,
+                        if phase == PluginInput::RawEvents {
+                            &ffi_events
+                        } else {
+                            &[]
+                        },
                         &self.event_store,
                         &mut self.analysis_output,
                         &mut self.plugin_context_data,
@@ -6480,6 +6594,20 @@ impl CameraApp {
                 }
             }
         }
+
+        if runtime_plugins_enabled {
+            // The synchronous executor consumed the published queue and may
+            // have written persistent values: retire delivered requests and
+            // reseed the worker bus on the next live dispatch.
+            let watermark = self
+                .pending_action_requests
+                .last()
+                .map(|request| request.request_id)
+                .unwrap_or(0);
+            self.retire_action_requests_up_to(watermark);
+            self.live_persistent_reseed = true;
+        }
+        self.host_dataset_refresh_seq = self.host_dataset_refresh_seq.wrapping_add(1);
     }
 
     fn dispatch_live_analysis(&mut self, frame: &PreviewFrame) {
@@ -6488,12 +6616,28 @@ impl CameraApp {
             Some("Live analysis is approximate — run Analyze Whole File for exact outputs.".into());
         let epoch = self.current_analysis_epoch();
         let global_settings_json = self.cached_global_settings_json();
-        let persistent_data = self.persistent_context_data.clone();
+        // The worker's persistent map stays authoritative between jobs so
+        // plugin-published values are never rolled back by a stale echo.
+        // A full snapshot is sent only when the GUI owned the bus.
+        let (persistent_seed, persistent_updates) = if self.live_persistent_reseed {
+            self.live_persistent_reseed = false;
+            self.pending_persistent_updates.clear();
+            (Some(self.persistent_context_data.clone()), HashMap::new())
+        } else {
+            (None, std::mem::take(&mut self.pending_persistent_updates))
+        };
+        let action_request_watermark = self
+            .pending_action_requests
+            .last()
+            .map(|request| request.request_id)
+            .unwrap_or(0);
         self.live_analysis_worker.analyze(LiveAnalysisJob {
             epoch,
             frame: frame.clone(),
             global_settings_json,
-            persistent_data,
+            persistent_seed,
+            persistent_updates,
+            action_request_watermark,
         });
     }
 
@@ -6508,7 +6652,6 @@ impl CameraApp {
         self.host_view_registry_dirty = true;
         self.refresh_host_view_registry_if_dirty();
         self.run_analysis(&frame, false);
-        self.mark_host_view_datasets_stale();
         self.analysis_notice = Some(format!(
             "Recomputed the current replay frame after {reason}."
         ));
@@ -6632,9 +6775,11 @@ impl CameraApp {
         let dispatch_live_analysis = self.should_dispatch_live_analysis();
         if drained_frame {
             self.preview_perf.record_dequeue(dequeue_started.elapsed());
-            if !dispatch_live_analysis {
-                self.sync_retained_event_history_from_controller();
-            }
+            // Drain unconditionally: even while the worker executes plugins
+            // (it owns its own cursor), the controller cursor must keep
+            // advancing or it blocks ring eviction after ~ring-capacity
+            // events and raw-event archival silently stops.
+            self.sync_retained_event_history_from_controller();
         }
 
         // Frames arriving while replay is already paused are seek-sprint
@@ -6720,7 +6865,10 @@ impl CameraApp {
             self.run_analysis(&frame, true);
         }
         self.host_view_registry_dirty = true;
-        self.mark_host_view_datasets_stale();
+        // Dataset and render caches invalidate via provider generations (or
+        // the refresh sequence for generation-less providers) — no blanket
+        // per-frame staleness, so unchanged density/image views keep their
+        // textures (ADR 008).
         self.preview_perf
             .record_analysis(analysis_started.elapsed());
 

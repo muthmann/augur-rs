@@ -36,3 +36,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 021: Python Event Ingress Through Packed Preview Pipeline](./021-python-event-ingress.md)
 - [ADR 022: Analysis Runtime, Live Worker, And Offline Pipeline](./022-analysis-runtime-live-worker-and-offline-pipeline.md)
 - [ADR 023: Split Control And Stream Transport Threads](./023-split-control-and-stream-transport.md)
+- [ADR 024: Host/Worker Plugin State Ownership](./024-host-worker-plugin-state-ownership.md)

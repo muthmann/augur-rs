@@ -64,8 +64,25 @@ have handled.
   assigns a `request_id`, snapshots the selected cluster rows when
   applicable, appends to the queue, and publishes to
   `persistent_context_data`. Cancel drops the modal.
-- The queue is re-published at the start of every `run_analysis` tick so
-  plugins always see pending requests.
+- The serialized queue is re-published onto the bus only when it changed
+  (append or retirement); the worker's persistent map keeps it visible to
+  plugins between publishes.
+
+## Delivery And Retirement
+
+Requests are delivered at-least-once to the executor active at apply time,
+then retired so the queue stays bounded:
+
+- Live: each job carries the highest published `request_id` as a watermark;
+  when the worker's result echoes that watermark back, the host retires every
+  request up to it.
+- Paused scrub: the synchronous executor consumed the published queue during
+  its pass, so the host retires the queue right after `run_analysis`.
+- `reset_analysis` (source change, plugin reload) drops pending requests —
+  requests never replay onto rebuilt plugin instances or a different source.
+
+Plugins still dedupe by `request_id` for the at-least-once window between
+delivery and retirement.
 
 ## Byte-Identical Pipeline On Discard
 
