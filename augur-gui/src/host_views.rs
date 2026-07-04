@@ -331,36 +331,7 @@ pub fn resolve_host_view_registry(
     resolved
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum HostDatasetSnapshot {
-    Table(Arc<TableDatasetV1>),
-    Image2d(Arc<Image2dV1>),
-    Series1d(Arc<Series1dV1>),
-}
-
-pub fn decode_dataset_snapshot(
-    descriptor: &HostDatasetDescriptor,
-    bytes: &[u8],
-) -> Result<HostDatasetSnapshot, String> {
-    match &descriptor.kind {
-        HostDatasetKind::TableV1(schema) => {
-            let dataset: TableDatasetV1 = serde_json::from_slice(bytes)
-                .map_err(|err| format!("table dataset JSON is invalid: {err}"))?;
-            dataset.validate_against_schema(schema)?;
-            Ok(HostDatasetSnapshot::Table(Arc::new(dataset)))
-        }
-        HostDatasetKind::Image2dV1 => {
-            let dataset: Image2dV1 = serde_json::from_slice(bytes)
-                .map_err(|err| format!("image dataset JSON is invalid: {err}"))?;
-            Ok(HostDatasetSnapshot::Image2d(Arc::new(dataset)))
-        }
-        HostDatasetKind::Series1dV1 => {
-            let dataset: Series1dV1 = serde_json::from_slice(bytes)
-                .map_err(|err| format!("series dataset JSON is invalid: {err}"))?;
-            Ok(HostDatasetSnapshot::Series1d(Arc::new(dataset)))
-        }
-    }
-}
+pub use augur_runtime::{decode_dataset_snapshot, HostDatasetSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostViewImageFormat {
@@ -1778,13 +1749,26 @@ fn write_table_csv(
             }
             let value = dataset
                 .column(&column.id)
-                .and_then(|column| column.values.display_value(row))
+                .and_then(|column| raw_cell_value(&column.values, row))
                 .unwrap_or_default();
             write!(writer, "\"{}\"", value.replace('"', "\"\""))?;
         }
         writeln!(writer)?;
     }
     writer.flush()
+}
+
+/// Full-precision raw cell values for exports. UI display formatting (e.g.
+/// four-digit float rounding in `display_value`) must never leak into CSV
+/// output.
+fn raw_cell_value(values: &TableColumnValues, row: usize) -> Option<String> {
+    match values {
+        TableColumnValues::U64(values) => values.get(row).map(ToString::to_string),
+        TableColumnValues::I64(values) => values.get(row).map(ToString::to_string),
+        TableColumnValues::F64(values) => values.get(row).map(ToString::to_string),
+        TableColumnValues::String(values) => values.get(row).cloned(),
+        TableColumnValues::Bool(values) => values.get(row).map(ToString::to_string),
+    }
 }
 
 struct RenderedDensityImage {

@@ -23,7 +23,8 @@ use image::{ImageFormat, RgbaImage};
 use serde::Deserialize;
 
 use crate::{
-    collect_live_host_snapshots, LivePluginHostSnapshot, PluginEventHistory, PluginManager,
+    collect_live_host_snapshots, AnalysisPassContext, EventHistoryMaterializationCache,
+    HostSnapshotCache, LivePluginHostSnapshot, PluginEventHistory, PluginManager,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +334,11 @@ pub fn run_offline_analysis(
         )?;
 
         let mut analysis_output = augur_core::analysis::AnalysisOutput::default();
+        let history_cache = EventHistoryMaterializationCache::default();
+        let pass = AnalysisPassContext {
+            event_store: &event_store,
+            history_cache: &history_cache,
+        };
         for phase in [
             PluginInput::FrameOnly,
             PluginInput::RawEvents,
@@ -350,7 +356,7 @@ pub fn run_offline_analysis(
                         } else {
                             &[]
                         },
-                        &event_store,
+                        &pass,
                         &mut analysis_output,
                         &mut context_data,
                         &mut persistent_context_data,
@@ -368,7 +374,8 @@ pub fn run_offline_analysis(
         });
     }
 
-    let host_snapshots = collect_live_host_snapshots(&plugin_manager);
+    let host_snapshots =
+        collect_live_host_snapshots(&plugin_manager, &mut HostSnapshotCache::default());
     export_outputs(
         &mut plugin_manager,
         &options.output_dir,

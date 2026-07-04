@@ -33,9 +33,10 @@ use augur_plugin_api::{
 };
 use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
-    run_offline_analysis, LiveAnalysisJob, LiveAnalysisResult, LiveAnalysisWorker,
-    LiveHostDatasetSnapshot, LivePluginHostSnapshot, LivePluginState, LivePluginStateSnapshot,
-    OfflineAnalysisConfig, OfflineAnalysisOptions, OfflineAnalysisSummary, OfflineProgress,
+    run_offline_analysis, AnalysisPassContext, EventHistoryMaterializationCache, LiveAnalysisJob,
+    LiveAnalysisResult, LiveAnalysisWorker, LiveHostDatasetSnapshot, LivePluginHostSnapshot,
+    LivePluginState, LivePluginStateSnapshot, OfflineAnalysisConfig, OfflineAnalysisOptions,
+    OfflineAnalysisSummary, OfflineProgress,
 };
 
 use crate::{
@@ -2561,9 +2562,16 @@ impl CameraApp {
             }
         }
         self.retire_action_requests_up_to(result.action_request_watermark);
+        // Re-resolving the host-view registry clones every descriptor set;
+        // only do it when the worker's registries actually changed.
+        let registries_changed = self.runtime_snapshot_source
+            != Some(RuntimeSnapshotSource::Worker)
+            || !live_snapshot_registries_equal(&self.live_host_snapshots, &result.host_snapshots);
         self.live_host_snapshots = result.host_snapshots;
         self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Worker);
-        self.host_view_registry_dirty = true;
+        if registries_changed {
+            self.host_view_registry_dirty = true;
+        }
         self.host_dataset_refresh_seq = self.host_dataset_refresh_seq.wrapping_add(1);
         self.refresh_host_view_registry_if_dirty();
     }
@@ -2706,10 +2714,11 @@ impl CameraApp {
                             "live runtime provider index {index} has no dataset {dataset_id}"
                         ));
                     };
-                    return match &snapshot.bytes {
-                        Some(bytes) => {
-                            decode_dataset_snapshot(&dataset.descriptor, bytes).map(Some)
-                        }
+                    // Live datasets arrive pre-decoded on the worker thread;
+                    // consuming them here is an Arc clone, not a JSON parse.
+                    return match &snapshot.payload {
+                        Some(Ok(payload)) => Ok(Some(payload.clone())),
+                        Some(Err(err)) => Err(err.clone()),
                         None => Ok(None),
                     };
                 }
@@ -6566,6 +6575,11 @@ impl CameraApp {
             Vec::new()
         };
 
+        let history_cache = EventHistoryMaterializationCache::default();
+        let pass = AnalysisPassContext {
+            event_store: &self.event_store,
+            history_cache: &history_cache,
+        };
         for phase in [
             PluginInput::FrameOnly,
             PluginInput::RawEvents,
@@ -6586,7 +6600,7 @@ impl CameraApp {
                         } else {
                             &[]
                         },
-                        &self.event_store,
+                        &pass,
                         &mut self.analysis_output,
                         &mut self.plugin_context_data,
                         &mut self.persistent_context_data,
@@ -6862,9 +6876,12 @@ impl CameraApp {
         if dispatch_live_analysis {
             self.dispatch_live_analysis(&frame);
         } else {
+            // Only the synchronous executor mutates GUI-side plugin state
+            // here; worker results mark the registry dirty on arrival when
+            // their registries actually changed.
             self.run_analysis(&frame, true);
+            self.host_view_registry_dirty = true;
         }
-        self.host_view_registry_dirty = true;
         // Dataset and render caches invalidate via provider generations (or
         // the refresh sequence for generation-less providers) — no blanket
         // per-frame staleness, so unchanged density/image views keep their
@@ -9669,6 +9686,22 @@ fn python_ingress_dataset_label(info: &PythonIngressDatasetInfo) -> String {
         .clone()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "NumPy event stream".into())
+}
+
+/// True when two worker snapshot sets describe the same host-view
+/// registries (providers, descriptors, warnings) — dataset payloads are
+/// deliberately ignored, they invalidate through generations instead.
+fn live_snapshot_registries_equal(
+    previous: &[LivePluginHostSnapshot],
+    next: &[LivePluginHostSnapshot],
+) -> bool {
+    previous.len() == next.len()
+        && previous.iter().zip(next.iter()).all(|(left, right)| {
+            left.index == right.index
+                && left.name == right.name
+                && left.registry == right.registry
+                && left.warning == right.warning
+        })
 }
 
 fn sync_retained_event_history_from_upstream(

@@ -32,9 +32,10 @@ use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
 use augur_plugin_api::{
     AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
     FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostViewRegistry, PluginCapabilities,
-    PluginDiscontinuity, PluginEntry, PluginInput, PluginStateKind, PluginVTable, SettingsSchema,
-    StatusEntry, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostDatasetDescriptor,
+    HostDatasetKind, HostViewRegistry, Image2dV1, PluginCapabilities, PluginDiscontinuity,
+    PluginEntry, PluginInput, PluginStateKind, PluginVTable, Series1dV1, SettingsSchema,
+    StatusEntry, TableDatasetV1, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -56,11 +57,99 @@ pub struct LivePluginStateSnapshot {
     pub plugins: Vec<LivePluginState>,
 }
 
+/// A host-view dataset decoded once on the worker thread. Payloads are
+/// `Arc`-shared so re-publishing an unchanged dataset with each result is a
+/// refcount bump instead of a serialize/clone/parse round-trip on the GUI
+/// thread.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostDatasetSnapshot {
+    Table(Arc<TableDatasetV1>),
+    Image2d(Arc<Image2dV1>),
+    Series1d(Arc<Series1dV1>),
+}
+
+/// Decodes and validates a plugin-provided dataset payload against its
+/// descriptor.
+pub fn decode_dataset_snapshot(
+    descriptor: &HostDatasetDescriptor,
+    bytes: &[u8],
+) -> Result<HostDatasetSnapshot, String> {
+    match &descriptor.kind {
+        HostDatasetKind::TableV1(schema) => {
+            let dataset: TableDatasetV1 = serde_json::from_slice(bytes)
+                .map_err(|err| format!("table dataset JSON is invalid: {err}"))?;
+            dataset.validate_against_schema(schema)?;
+            Ok(HostDatasetSnapshot::Table(Arc::new(dataset)))
+        }
+        HostDatasetKind::Image2dV1 => {
+            let dataset: Image2dV1 = serde_json::from_slice(bytes)
+                .map_err(|err| format!("image dataset JSON is invalid: {err}"))?;
+            Ok(HostDatasetSnapshot::Image2d(Arc::new(dataset)))
+        }
+        HostDatasetKind::Series1dV1 => {
+            let dataset: Series1dV1 = serde_json::from_slice(bytes)
+                .map_err(|err| format!("series dataset JSON is invalid: {err}"))?;
+            Ok(HostDatasetSnapshot::Series1d(Arc::new(dataset)))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveHostDatasetSnapshot {
     pub id: String,
     pub generation: u64,
-    pub bytes: Option<Vec<u8>>,
+    /// Decoded dataset (`None` when the plugin returned no data); decode and
+    /// schema-validation failures carry the error message.
+    pub payload: Option<Result<HostDatasetSnapshot, String>>,
+}
+
+/// Worker-side cache that skips fetching, decoding, and re-shipping dataset
+/// payloads whose provider generation is unchanged. Generation `0` means
+/// "no counter" and is refreshed on every collection pass.
+#[derive(Debug, Default)]
+pub struct HostSnapshotCache {
+    entries: HashMap<(usize, String), CachedHostSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedHostSnapshot {
+    generation: u64,
+    payload: Option<Result<HostDatasetSnapshot, String>>,
+}
+
+impl HostSnapshotCache {
+    /// Drops all cached payloads. Must be called whenever plugin instances
+    /// are reconfigured, reloaded, or reset — a fresh instance may reuse
+    /// generation numbers for different data.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Returns the payload for `key`, calling `fetch` only when the provider
+    /// generation changed (generation `0` always refetches).
+    fn resolve(
+        &mut self,
+        key: (usize, String),
+        generation: u64,
+        fetch: impl FnOnce() -> Option<Result<HostDatasetSnapshot, String>>,
+    ) -> Option<Result<HostDatasetSnapshot, String>> {
+        let reuse = generation != 0
+            && self
+                .entries
+                .get(&key)
+                .is_some_and(|cached| cached.generation == generation);
+        if !reuse {
+            let payload = fetch();
+            self.entries.insert(
+                key.clone(),
+                CachedHostSnapshot {
+                    generation,
+                    payload,
+                },
+            );
+        }
+        self.entries[&key].payload.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -872,11 +961,13 @@ impl DynPlugin {
         &mut self,
         frame: &PreviewFrame,
         raw_events: &[FfiCdEvent],
-        event_store: &PluginEventHistory,
+        pass: &AnalysisPassContext<'_>,
         analysis_output: &mut AnalysisOutput,
         context_data: &mut HashMap<String, Vec<u8>>,
         persistent_data: &mut HashMap<String, Vec<u8>>,
     ) {
+        let event_store = pass.event_store;
+        let history_cache = pass.history_cache;
         let ffi_frame = FfiPreviewFrame {
             width: frame.width,
             height: frame.height,
@@ -895,7 +986,7 @@ impl DynPlugin {
         };
         let store_bridge = EventStoreBridge {
             store: event_store,
-            materialized_frames: UnsafeCell::new(HashMap::new()),
+            materialized_frames: &history_cache.frames,
         };
         let mut callbacks = FfiOutputCallbacks {
             ctx: (&mut output_bridge as *mut OutputBridge).cast(),
@@ -1160,6 +1251,7 @@ fn run_live_analysis_worker(
     let mut event_store = PluginEventHistory::default();
     event_store.set_memory_budget(memory_budget_bytes);
     let mut persistent_data = HashMap::new();
+    let mut host_snapshot_cache = HostSnapshotCache::default();
     let mut active_epoch = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
@@ -1179,6 +1271,7 @@ fn run_live_analysis_worker(
                 active_epoch = active_epoch.max(epoch);
                 apply_live_plugin_snapshot(&mut manager, &snapshot);
                 notify_plugins_of_discontinuity(&mut manager, reason);
+                host_snapshot_cache.clear();
                 event_store.clear();
             }
             LiveAnalysisCommand::Reload {
@@ -1190,12 +1283,14 @@ fn run_live_analysis_worker(
                 load_warning = manager.scan_and_load().err();
                 apply_live_plugin_snapshot(&mut manager, &snapshot);
                 notify_plugins_of_discontinuity(&mut manager, reason);
+                host_snapshot_cache.clear();
                 event_store.clear();
             }
             LiveAnalysisCommand::Discontinuity { epoch, reason } => {
                 active_epoch = active_epoch.max(epoch);
                 event_store.clear();
                 notify_plugins_of_discontinuity(&mut manager, reason);
+                host_snapshot_cache.clear();
             }
             LiveAnalysisCommand::ClearPersistent { epoch } => {
                 active_epoch = active_epoch.max(epoch);
@@ -1216,6 +1311,7 @@ fn run_live_analysis_worker(
                             active_epoch = active_epoch.max(epoch);
                             apply_live_plugin_snapshot(&mut manager, &snapshot);
                             notify_plugins_of_discontinuity(&mut manager, reason);
+                            host_snapshot_cache.clear();
                             event_store.clear();
                         }
                         LiveAnalysisCommand::Reload {
@@ -1227,12 +1323,14 @@ fn run_live_analysis_worker(
                             load_warning = manager.scan_and_load().err();
                             apply_live_plugin_snapshot(&mut manager, &snapshot);
                             notify_plugins_of_discontinuity(&mut manager, reason);
+                            host_snapshot_cache.clear();
                             event_store.clear();
                         }
                         LiveAnalysisCommand::Discontinuity { epoch, reason } => {
                             active_epoch = active_epoch.max(epoch);
                             event_store.clear();
                             notify_plugins_of_discontinuity(&mut manager, reason);
+                            host_snapshot_cache.clear();
                         }
                         LiveAnalysisCommand::ClearPersistent { epoch } => {
                             active_epoch = active_epoch.max(epoch);
@@ -1257,6 +1355,7 @@ fn run_live_analysis_worker(
                     &mut manager,
                     &mut event_store,
                     &mut persistent_data,
+                    &mut host_snapshot_cache,
                     &job,
                 );
                 if let Some(warning) = load_warning.take() {
@@ -1279,6 +1378,7 @@ fn process_live_analysis_job(
     manager: &mut PluginManager,
     event_store: &mut PluginEventHistory,
     persistent_data: &mut HashMap<String, Vec<u8>>,
+    host_snapshot_cache: &mut HostSnapshotCache,
     job: &LiveAnalysisJob,
 ) -> LiveAnalysisResult {
     let mut output = AnalysisOutput::default();
@@ -1310,6 +1410,7 @@ fn process_live_analysis_job(
             });
             event_store.clear();
             notify_plugins_of_discontinuity(manager, PluginDiscontinuity::HistoryEvicted);
+            host_snapshot_cache.clear();
         }
     } else {
         event_store.detach_upstream();
@@ -1322,6 +1423,11 @@ fn process_live_analysis_job(
         Vec::new()
     };
 
+    let history_cache = EventHistoryMaterializationCache::default();
+    let pass = AnalysisPassContext {
+        event_store,
+        history_cache: &history_cache,
+    };
     for phase in [
         PluginInput::FrameOnly,
         PluginInput::RawEvents,
@@ -1342,7 +1448,7 @@ fn process_live_analysis_job(
                     } else {
                         &[]
                     },
-                    event_store,
+                    &pass,
                     &mut output,
                     &mut context_data,
                     persistent_data,
@@ -1356,7 +1462,7 @@ fn process_live_analysis_job(
         output,
         context_data,
         persistent_data: persistent_data.clone(),
-        host_snapshots: collect_live_host_snapshots(manager),
+        host_snapshots: collect_live_host_snapshots(manager, host_snapshot_cache),
         action_request_watermark: job.action_request_watermark,
     }
 }
@@ -1390,7 +1496,10 @@ fn notify_plugins_of_discontinuity(manager: &mut PluginManager, reason: PluginDi
     }
 }
 
-fn collect_live_host_snapshots(manager: &PluginManager) -> Vec<LivePluginHostSnapshot> {
+fn collect_live_host_snapshots(
+    manager: &PluginManager,
+    cache: &mut HostSnapshotCache,
+) -> Vec<LivePluginHostSnapshot> {
     manager
         .records()
         .iter()
@@ -1406,10 +1515,23 @@ fn collect_live_host_snapshots(manager: &PluginManager) -> Vec<LivePluginHostSna
                     let datasets = registry
                         .datasets
                         .iter()
-                        .map(|descriptor| LiveHostDatasetSnapshot {
-                            id: descriptor.id.clone(),
-                            generation: plugin.host_view_dataset_generation(&descriptor.id),
-                            bytes: plugin.host_view_dataset(&descriptor.id).ok().flatten(),
+                        .map(|descriptor| {
+                            let generation = plugin.host_view_dataset_generation(&descriptor.id);
+                            let payload =
+                                cache.resolve((index, descriptor.id.clone()), generation, || {
+                                    match plugin.host_view_dataset(&descriptor.id) {
+                                        Ok(Some(bytes)) => {
+                                            Some(decode_dataset_snapshot(descriptor, &bytes))
+                                        }
+                                        Ok(None) => None,
+                                        Err(err) => Some(Err(err)),
+                                    }
+                                });
+                            LiveHostDatasetSnapshot {
+                                id: descriptor.id.clone(),
+                                generation,
+                                payload,
+                            }
                         })
                         .collect();
                     Some(LivePluginHostSnapshot {
@@ -1441,13 +1563,29 @@ struct ContextBridge<'a> {
     persistent_data: &'a mut HashMap<String, Vec<u8>>,
 }
 
+/// Caches ring-backed history frames materialized for plugin FFI reads,
+/// shared by every plugin call of one analysis pass so N retained-history
+/// plugins decode each frame once instead of N times.
+///
+/// # Safety
+/// `!Sync` by construction (`UnsafeCell`); only accessed from
+/// `frame_at_callback`, which runs synchronously and non-reentrantly during
+/// `process_frame`. Callers must use a fresh cache per analysis pass —
+/// frame indexes shift when the history evicts between passes.
+#[derive(Default)]
+pub struct EventHistoryMaterializationCache {
+    frames: UnsafeCell<HashMap<usize, Box<[FfiCdEvent]>>>,
+}
+
+/// Retained-history inputs shared by every plugin call of one analysis pass.
+pub struct AnalysisPassContext<'a> {
+    pub event_store: &'a PluginEventHistory,
+    pub history_cache: &'a EventHistoryMaterializationCache,
+}
+
 struct EventStoreBridge<'a> {
     store: &'a PluginEventHistory,
-    /// # Safety
-    /// This is only accessed from `frame_at_callback`, which is invoked
-    /// synchronously during `process_frame`. The host guarantees that
-    /// `process_frame` is not re-entrant.
-    materialized_frames: UnsafeCell<HashMap<usize, Box<[FfiCdEvent]>>>,
+    materialized_frames: &'a UnsafeCell<HashMap<usize, Box<[FfiCdEvent]>>>,
 }
 
 unsafe extern "C" fn add_highlight_pixels(
@@ -2022,9 +2160,10 @@ mod tests {
         let mut store = PluginEventHistory::default();
         store.push_frame(&retained_frame(&[event(10, 1), event(20, 2)], 10, 20));
         store.push_frame(&retained_frame(&[event(30, 3)], 30, 30));
+        let cache = EventHistoryMaterializationCache::default();
         let bridge = EventStoreBridge {
             store: &store,
-            materialized_frames: UnsafeCell::new(HashMap::new()),
+            materialized_frames: &cache.frames,
         };
         let mut out = FfiEventFrame::empty();
 
@@ -2036,7 +2175,7 @@ mod tests {
         let slice = unsafe { out.as_slice() };
         assert_eq!(slice, &[event(10, 1), event(20, 2)]);
         assert_eq!(
-            unsafe { (*bridge.materialized_frames.get()).len() },
+            unsafe { (*cache.frames.get()).len() },
             1,
             "repeated frame_at calls for one index reuse the materialized cache"
         );
@@ -2055,9 +2194,10 @@ mod tests {
         let mut store = PluginEventHistory::default();
         store.push_frame(&retained_frame(&[event(10, 1), event(20, 2)], 10, 20));
         store.push_frame(&retained_frame(&[event(30, 3), event(40, 4)], 30, 40));
+        let cache = EventHistoryMaterializationCache::default();
         let bridge = EventStoreBridge {
             store: &store,
-            materialized_frames: UnsafeCell::new(HashMap::new()),
+            materialized_frames: &cache.frames,
         };
         let mut out_start = usize::MAX;
         let mut out_end = usize::MAX;
@@ -2366,6 +2506,85 @@ mod tests {
             HashMap::from([("fresh".to_owned(), b"c".to_vec())]),
             "a newer full seed supersedes older seeds, updates, and worker state"
         );
+    }
+
+    #[test]
+    fn snapshot_cache_skips_refetch_for_unchanged_nonzero_generations() {
+        let mut cache = HostSnapshotCache::default();
+        let key = (0usize, "table.demo".to_owned());
+        let payload = || {
+            Some(Ok(HostDatasetSnapshot::Series1d(Arc::new(
+                augur_plugin_api::Series1dV1::default(),
+            ))))
+        };
+
+        let mut fetches = 0;
+        cache.resolve(key.clone(), 7, || {
+            fetches += 1;
+            payload()
+        });
+        cache.resolve(key.clone(), 7, || {
+            fetches += 1;
+            payload()
+        });
+        assert_eq!(fetches, 1, "unchanged generation must reuse the payload");
+
+        cache.resolve(key.clone(), 8, || {
+            fetches += 1;
+            payload()
+        });
+        assert_eq!(fetches, 2, "a changed generation must refetch");
+
+        let mut zero_fetches = 0;
+        let zero_key = (0usize, "table.genless".to_owned());
+        cache.resolve(zero_key.clone(), 0, || {
+            zero_fetches += 1;
+            payload()
+        });
+        cache.resolve(zero_key, 0, || {
+            zero_fetches += 1;
+            payload()
+        });
+        assert_eq!(
+            zero_fetches, 2,
+            "generation 0 means no counter and refetches every pass"
+        );
+    }
+
+    #[test]
+    fn decode_dataset_snapshot_validates_tables_against_schema() {
+        let descriptor = HostDatasetDescriptor {
+            id: "table.demo".into(),
+            title: "Demo".into(),
+            kind: HostDatasetKind::TableV1(augur_plugin_api::TableSchema {
+                columns: vec![augur_plugin_api::TableColumn {
+                    id: "x".into(),
+                    title: "X".into(),
+                    value_type: augur_plugin_api::TableValueType::F64,
+                }],
+                ..Default::default()
+            }),
+            empty_message: String::new(),
+            display: None,
+            relations: Vec::new(),
+        };
+
+        let valid = serde_json::json!({
+            "columns": [{ "column_id": "x", "values": { "value_type": "f64", "values": [1.5] } }]
+        });
+        let decoded = decode_dataset_snapshot(&descriptor, &serde_json::to_vec(&valid).unwrap())
+            .expect("valid table decodes");
+        let HostDatasetSnapshot::Table(table) = decoded else {
+            panic!("expected table payload");
+        };
+        assert_eq!(table.row_count(), 1);
+
+        let wrong_type = serde_json::json!({
+            "columns": [{ "column_id": "x", "values": { "value_type": "u64", "values": [1] } }]
+        });
+        let err = decode_dataset_snapshot(&descriptor, &serde_json::to_vec(&wrong_type).unwrap())
+            .expect_err("schema mismatch must fail");
+        assert!(err.contains("has type"));
     }
 
     #[test]

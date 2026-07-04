@@ -37,10 +37,17 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
   `FfiCdEvent` materialization. Only enabled `RawEvents` plugins receive the
   raw slice for the current frame.
 - Dynamic-plugin settings/status reads are cached for 250 ms and invalidated on runtime mutations instead of being re-polled every update.
-- Plugin `EventStoreHandle::frame_at` calls reuse a per-plugin-call
-  materialization cache, and global settings context JSON is cached until the
-  effective settings change.
-- Host-view dataset snapshots are now cached by dataset generation instead of being cleared unconditionally on every processed frame.
+- Plugin `EventStoreHandle::frame_at` calls share one materialization cache
+  per analysis pass (all plugins of a frame reuse it), and global settings
+  context JSON is cached until the effective settings change.
+- Host-view dataset snapshots are cached by dataset generation instead of being cleared unconditionally on every processed frame. Providers that report generation 0 (no counter) refresh once per analysis pass instead of freezing.
+- The live worker decodes host-view dataset JSON on its own thread and skips
+  fetching datasets whose generation is unchanged; results carry `Arc`-shared
+  decoded payloads, so the GUI thread no longer parses dataset JSON or pays a
+  per-frame re-serialization for unchanged tables/images/series.
+- Worker results only trigger a host-view registry re-resolution when the
+  registries actually changed, and density/image view textures re-render only
+  on a real generation change — not on every frame.
 - The 3D investigation scene is only built when a 3D pane can actually be shown (3D/split layout or popup); 2D-only layouts skip selection resolution, dataset scans, and raw-event layer construction entirely.
 - The memoized 3D point-cloud summary hands out its event list behind an `Arc` instead of cloning up to `point_limit` events on every UI read (the scene build, overlay status, and footer status all read it each frame).
 - Raw-event 3D layers share one label allocation per layer instead of cloning a `String` per point, and per-event id hashing plus the occurrence map only run when a selection actually needs to be matched.

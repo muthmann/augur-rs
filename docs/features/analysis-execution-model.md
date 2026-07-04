@@ -138,8 +138,15 @@ the active `PipelineController`. That signal includes:
 
 Enabled `FrameOnly` and `DerivedData` plugins no longer force current-frame raw
 event materialization. Ring-backed frames materialize `FfiCdEvent` directly from
-`CompactEvent` storage, and repeated `EventStoreHandle::frame_at` requests reuse
-a per-call cache.
+`CompactEvent` storage, and `EventStoreHandle::frame_at` requests share one
+materialization cache per analysis pass — N retained-history plugins decode
+each history frame once, not N times.
+
+Host-view dataset payloads are fetched and JSON-decoded on the worker thread,
+gated by provider generation: unchanged datasets ship as `Arc` clones of the
+previous decode instead of a serialize/parse round-trip per frame. The GUI
+consumes decoded payloads directly and only re-resolves the host-view
+registry when a result's registries actually changed.
 
 Global settings JSON is cached until the effective settings change.
 
