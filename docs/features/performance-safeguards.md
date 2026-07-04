@@ -8,7 +8,10 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
 
 - The output file and EVT3 header are prepared before the camera starts streaming. If file creation or header writing fails, the pipeline now fails fast instead of starting capture and erroring asynchronously later.
 - Once the USB reader has accepted a packet, shutdown now keeps trying to enqueue that packet to the disk writer instead of discarding it when stop and backpressure overlap.
+- The disk writer thread drains its queue until the USB reader hangs up the channel, never on the stop flag. Exiting on the stop flag raced the USB reader's final packet (a bulk read can complete just after stop is requested) and silently dropped the tail of the recording. A regression test (`disk_writer_persists_packet_accepted_after_stop_request`) pins this.
+- The in-flight budget between the USB reader and the disk writer (`RAW_BUFFER_POOL_CAPACITY` / `DISK_QUEUE_CAPACITY`) is 256 × 64 KiB = 16 MiB. This budget is what rides out disk-write hiccups: once the pool is empty the USB reader stops reading and the camera-side FIFO overflows, which shows up as a hard multi-millisecond gap in the recording. The previous 8-buffer (512 KiB) budget only covered ~2.5 ms at EVK4 peak ingress — less than a single 4 MiB `BufWriter` flush on a slow disk. The path stays bounded and explicit; only the bound grew.
 - The USB reader does not scan every packet to estimate event counts. Ingress bytes remain authoritative on the capture path, while decoded-event stats are measured on the lossy preview side.
+- Residual risk: applying camera settings during an active recording runs the sensor reconfiguration (USB control transfers) on the reader thread, so stream reads pause for the duration of the reconfigure and the device FIFO can overflow. Settings are only sent on an explicit user apply, never continuously. Removing this stall requires splitting control and stream transport ownership across threads.
 
 ## Preview / GUI Changes
 

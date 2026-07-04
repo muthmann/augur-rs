@@ -30,8 +30,13 @@ use crate::{
 };
 
 pub const BUF_SIZE: usize = 65_536;
-pub const RAW_BUFFER_POOL_CAPACITY: usize = 8;
-pub const DISK_QUEUE_CAPACITY: usize = 8;
+// The pool + disk queue bound the bytes that can sit between the USB reader
+// and the disk writer. This budget is what rides out disk-write hiccups: once
+// the pool is empty the USB thread stops reading and the camera FIFO
+// overflows, which shows up as a hard gap in the recording. 256 x 64 KiB
+// = 16 MiB, roughly 80 ms of headroom at EVK4 peak ingress (~200 MB/s).
+pub const RAW_BUFFER_POOL_CAPACITY: usize = 256;
+pub const DISK_QUEUE_CAPACITY: usize = RAW_BUFFER_POOL_CAPACITY;
 pub const PREVIEW_PACKET_POOL_CAPACITY: usize = 4;
 pub const PREVIEW_PACKET_QUEUE_CAPACITY: usize = 4;
 pub const PREVIEW_FRAME_QUEUE_CAPACITY: usize = 4;
@@ -1296,32 +1301,26 @@ where
         let stats_disk = Arc::clone(&stats);
 
         let disk_thread = thread::spawn(move || {
-            loop {
-                match disk_rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok(chunk) => {
-                        let write_started = Instant::now();
-                        let write_result = writer.write_all(&chunk.buf[..chunk.len]);
-                        if let Ok(mut s) = stats_disk.lock() {
-                            s.record_disk_write_time(write_started.elapsed());
-                        }
-                        if let Err(e) = write_result {
-                            report_pipeline_error(
-                                &error_disk,
-                                &stop_disk,
-                                "disk",
-                                format!("failed writing raw data: {e}"),
-                            );
-                            break;
-                        }
-                        let _ = disk_pool_tx.send(chunk.buf);
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        if stop_disk.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Disconnected) => break,
+            // Recording is lossless: drain until the USB thread drops its
+            // sender. Exiting on the stop flag instead would race the USB
+            // thread's final send (it may still be blocked in read_packet
+            // when stop is set) and silently drop the tail of the recording.
+            while let Ok(chunk) = disk_rx.recv() {
+                let write_started = Instant::now();
+                let write_result = writer.write_all(&chunk.buf[..chunk.len]);
+                if let Ok(mut s) = stats_disk.lock() {
+                    s.record_disk_write_time(write_started.elapsed());
                 }
+                if let Err(e) = write_result {
+                    report_pipeline_error(
+                        &error_disk,
+                        &stop_disk,
+                        "disk",
+                        format!("failed writing raw data: {e}"),
+                    );
+                    break;
+                }
+                let _ = disk_pool_tx.send(chunk.buf);
             }
 
             let flush_started = Instant::now();
@@ -2293,6 +2292,105 @@ mod tests {
         assert_eq!(frame_start_ts, None);
         assert_eq!(on_count, 0);
         assert_eq!(off_count, 0);
+    }
+
+    /// Camera whose second packet only completes after the test requests
+    /// stop, like a USB bulk transfer that lands just as shutdown begins.
+    struct StopGatedTailCamera {
+        sent_first: bool,
+        tail_sent: bool,
+        stop_requested: Arc<AtomicBool>,
+    }
+
+    impl EventCamera for StopGatedTailCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+    }
+
+    impl PacketStreamCamera for StopGatedTailCamera {
+        fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if !self.sent_first {
+                self.sent_first = true;
+                buf[..4].copy_from_slice(&[1, 2, 3, 4]);
+                return Ok(4);
+            }
+            if self.tail_sent {
+                return Err(CameraError::Eof);
+            }
+            let waited = Instant::now();
+            while !self.stop_requested.load(Ordering::Relaxed) {
+                if waited.elapsed() > Duration::from_secs(2) {
+                    return Err(CameraError::Timeout("stop gate never opened".into()));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            // Stop is now requested while this read is still in flight. Give
+            // the disk thread ample time to observe the stop flag before the
+            // packet is handed over, so any stop-flag-based disk exit would
+            // lose this tail packet.
+            thread::sleep(Duration::from_millis(80));
+            self.tail_sent = true;
+            buf[..4].copy_from_slice(&[5, 6, 7, 8]);
+            Ok(4)
+        }
+    }
+
+    #[test]
+    fn disk_writer_persists_packet_accepted_after_stop_request() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock must be sane")
+            .as_nanos();
+        let output_path = std::env::temp_dir().join(format!("augur-tail-loss-{nanos}.raw"));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+
+        let mut options = PipelineOptions::new(&output_path);
+        options.write_evt3_header = false;
+        let controller = spawn_pipeline(
+            StopGatedTailCamera {
+                sent_first: false,
+                tail_sent: false,
+                stop_requested: Arc::clone(&stop_requested),
+            },
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            options,
+        )
+        .expect("pipeline must start");
+
+        // Wait until the first packet has been accepted by the USB reader and
+        // the camera is blocked inside the gated second read.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.stats_snapshot().bytes_total < 4 {
+            assert!(Instant::now() < deadline, "first packet never arrived");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        controller.request_stop();
+        stop_requested.store(true, Ordering::Relaxed);
+        controller.shutdown().expect("pipeline must shut down");
+
+        let written = std::fs::read(&output_path).expect("recording file must exist");
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(output_path.with_extension("toml"));
+        assert_eq!(
+            written,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "every packet accepted by the USB reader must reach the recording",
+        );
     }
 
     #[test]
