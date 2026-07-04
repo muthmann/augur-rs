@@ -41,6 +41,12 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
   materialization cache, and global settings context JSON is cached until the
   effective settings change.
 - Host-view dataset snapshots are now cached by dataset generation instead of being cleared unconditionally on every processed frame.
+- The 3D investigation scene is only built when a 3D pane can actually be shown (3D/split layout or popup); 2D-only layouts skip selection resolution, dataset scans, and raw-event layer construction entirely.
+- The memoized 3D point-cloud summary hands out its event list behind an `Arc` instead of cloning up to `point_limit` events on every UI read (the scene build, overlay status, and footer status all read it each frame).
+- Raw-event 3D layers share one label allocation per layer instead of cloning a `String` per point, and per-event id hashing plus the occurrence map only run when a selection actually needs to be matched.
+- Point-cloud window recomputes now visit ring events in place (one lock, zero copies) instead of allocating two vectors per retained frame per recompute, and pre-reserve the output from the retained frame counts.
+- The wgpu 3D point renderer fills a persistent instance staging buffer in one pass (no per-frame vec pairs), packs colors as `Unorm8x4` (24-byte instances instead of 36), and picks hover/click points directly from the scene instead of materializing a parallel prepared-point list.
+- The 3D pipeline no longer writes depth for alpha-blended point sprites: a nearby faint (de-emphasised) point previously occluded brighter points drawn later, punching see-through holes in the cloud.
 
 ## Operational Implications
 

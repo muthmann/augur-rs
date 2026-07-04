@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::VecDeque, ops::Range};
+use std::{cell::RefCell, collections::VecDeque, ops::Range, sync::Arc};
 
 use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
 use augur_event_types::FrameWindowEntry;
@@ -49,7 +49,9 @@ struct CachedSummary {
 
 #[derive(Debug, Clone, Default)]
 pub struct VisiblePointCloudEvents {
-    pub events: Vec<CdEvent>,
+    /// Shared so the memoized summary can be handed out per UI frame without
+    /// cloning up to `point_limit` events each time.
+    pub events: Arc<[CdEvent]>,
     pub retained_time_span_ms: Option<f32>,
     pub sampled_count: usize,
     pub effective_time_window_ms: f32,
@@ -198,7 +200,7 @@ impl PointCloudState {
         }
         let sampled_count = events.len();
         VisiblePointCloudEvents {
-            events,
+            events: events.into(),
             retained_time_span_ms,
             sampled_count,
             effective_time_window_ms: retained_time_span_ms
@@ -209,7 +211,7 @@ impl PointCloudState {
 
     fn empty_visible_summary(&self) -> VisiblePointCloudEvents {
         VisiblePointCloudEvents {
-            events: Vec::new(),
+            events: Arc::from(Vec::new()),
             retained_time_span_ms: None,
             sampled_count: 0,
             effective_time_window_ms: self.time_window_ms.max(1.0),
@@ -247,17 +249,28 @@ impl PointCloudState {
 
     fn visible_event_candidates_at(&self, end_ts: u64) -> Vec<CdEvent> {
         let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
-        let mut events = Vec::new();
-        for frame in &self.frames {
-            if frame.window_end_us < start_ts || frame.window_start_us > end_ts {
-                continue;
-            }
-            let Some(mut frame_events) = frame.source.events_for_range(frame.event_range.clone())
-            else {
-                continue;
-            };
-            frame_events.retain(|event| event.timestamp >= start_ts && event.timestamp <= end_ts);
-            events.extend(frame_events);
+        let overlapping = |frame: &&RetainedEventFrame| {
+            frame.window_end_us >= start_ts && frame.window_start_us <= end_ts
+        };
+        let mut events = Vec::with_capacity(
+            self.frames
+                .iter()
+                .filter(overlapping)
+                .map(|frame| frame.event_count)
+                .sum(),
+        );
+        for frame in self.frames.iter().filter(overlapping) {
+            // Zero-copy visit straight out of the shared ring: the previous
+            // per-frame `events_for_range` path allocated two vectors per
+            // retained frame on every recompute.
+            frame
+                .source
+                .for_each_compact_event_in_range(frame.event_range.clone(), |compact| {
+                    let event = CdEvent::from(compact);
+                    if event.timestamp >= start_ts && event.timestamp <= end_ts {
+                        events.push(event);
+                    }
+                });
         }
         events
     }

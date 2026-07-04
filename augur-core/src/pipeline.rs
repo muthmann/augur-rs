@@ -213,6 +213,20 @@ impl LiveEventSource {
         Ok(batches)
     }
 
+    /// Visits every event in `range` under one ring lock without allocating.
+    /// Returns false (visiting nothing) when the range is no longer resident.
+    pub fn for_each_compact_event_in_range(
+        &self,
+        range: Range<u64>,
+        mut visit: impl FnMut(CompactEvent),
+    ) -> bool {
+        self.lock_ring().for_each_slice_in_range(range, |slice| {
+            for event in slice {
+                visit(*event);
+            }
+        })
+    }
+
     pub fn compact_events_for_range(&self, range: Range<u64>) -> Option<Vec<CompactEvent>> {
         let mut events = Vec::new();
         if !self.lock_ring().collect_event_range(range, &mut events) {

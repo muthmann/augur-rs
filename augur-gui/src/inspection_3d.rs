@@ -106,7 +106,9 @@ struct SceneUniforms {
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PointInstanceRaw {
     position: [f32; 3],
-    color: [f32; 4],
+    // Unorm8x4 vertex attribute: normalized to vec4<f32> by the GPU. Keeps
+    // the per-instance stride at 24 bytes instead of 36.
+    color: [u8; 4],
     size: f32,
     selected: f32,
 }
@@ -117,7 +119,9 @@ pub struct Investigation3dPoint {
     pub color: [u8; 4],
     pub size: f32,
     pub item_key: Option<StableRowKey>,
-    pub label: String,
+    /// Shared: layers with thousands of points reuse one allocation instead
+    /// of cloning a `String` per point per frame.
+    pub label: std::sync::Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,16 +340,7 @@ pub struct Investigation3dViewInput<'a> {
     pub max_height: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PreparedPoint<'a> {
-    raw: PointInstanceRaw,
-    item_key: Option<&'a StableRowKey>,
-    label: &'a str,
-    position: Vec3,
-}
-
-type RenderTextureOutput<'a> = (PreviewDisplayTexture, Vec<PreparedPoint<'a>>);
-type RenderTextureResult<'a> = Result<Option<RenderTextureOutput<'a>>, String>;
+type RenderTextureResult = Result<Option<PreviewDisplayTexture>, String>;
 
 #[derive(Debug, Clone, Copy)]
 struct RawHistoryFooterStatus {
@@ -405,13 +400,13 @@ impl Investigation3dRenderer {
         matches!(self, Self::Wgpu(_))
     }
 
-    fn render_texture<'a>(
+    fn render_texture(
         &mut self,
-        scene: &'a Investigation3dScene,
+        scene: &Investigation3dScene,
         state: &Investigation3dState,
         size: [usize; 2],
         selected: Option<&StableRowKey>,
-    ) -> RenderTextureResult<'a> {
+    ) -> RenderTextureResult {
         match self {
             Self::Disabled => Ok(None),
             Self::Wgpu(renderer) => renderer.render(scene, state, size, selected),
@@ -426,6 +421,9 @@ pub(crate) struct WgpuInvestigation3dRenderer {
     bind_group: wgpu::BindGroup,
     instance_buffer: Option<wgpu::Buffer>,
     instance_capacity: usize,
+    /// Reused CPU staging for instance data so per-frame uploads allocate
+    /// nothing.
+    instance_scratch: Vec<PointInstanceRaw>,
     display_texture: Option<wgpu::Texture>,
     display_view: Option<wgpu::TextureView>,
     depth_texture: Option<wgpu::Texture>,
@@ -494,21 +492,21 @@ impl WgpuInvestigation3dRenderer {
                             shader_location: 0,
                         },
                         wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
+                            format: wgpu::VertexFormat::Unorm8x4,
                             offset: std::mem::size_of::<[f32; 3]>() as u64,
                             shader_location: 1,
                         },
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32,
                             offset: (std::mem::size_of::<[f32; 3]>()
-                                + std::mem::size_of::<[f32; 4]>())
+                                + std::mem::size_of::<[u8; 4]>())
                                 as u64,
                             shader_location: 2,
                         },
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32,
                             offset: (std::mem::size_of::<[f32; 3]>()
-                                + std::mem::size_of::<[f32; 4]>()
+                                + std::mem::size_of::<[u8; 4]>()
                                 + std::mem::size_of::<f32>())
                                 as u64,
                             shader_location: 3,
@@ -536,7 +534,12 @@ impl WgpuInvestigation3dRenderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
+                // Points are alpha-blended discs. Writing depth made a nearby
+                // faint (de-emphasised) point occlude a bright point behind it
+                // that happened to be drawn later, punching see-through holes
+                // in the cloud. Blended point sprites render without depth
+                // writes.
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -552,6 +555,7 @@ impl WgpuInvestigation3dRenderer {
             bind_group,
             instance_buffer: None,
             instance_capacity: 0,
+            instance_scratch: Vec::new(),
             display_texture: None,
             display_view: None,
             depth_texture: None,
@@ -643,17 +647,37 @@ impl WgpuInvestigation3dRenderer {
         }));
     }
 
-    fn render<'a>(
+    fn render(
         &mut self,
-        scene: &'a Investigation3dScene,
+        scene: &Investigation3dScene,
         state: &Investigation3dState,
         size: [usize; 2],
         selected: Option<&StableRowKey>,
-    ) -> RenderTextureResult<'a> {
+    ) -> RenderTextureResult {
         self.ensure_target(size);
 
-        let prepared = prepare_scene_points(scene, selected);
-        self.ensure_instance_capacity(prepared.len().max(1));
+        // Single pass straight into the reused staging vec: no intermediate
+        // per-point structs and no per-frame allocations.
+        self.instance_scratch.clear();
+        for layer in scene.layers.iter().filter(|layer| layer.visible) {
+            debug_assert!(
+                !layer.id.is_empty(),
+                "investigation layers should have stable ids"
+            );
+            self.instance_scratch
+                .extend(layer.points.iter().map(|point| PointInstanceRaw {
+                    position: point.position,
+                    color: point.color,
+                    size: point.size.max(0.75),
+                    selected: if point.item_key.as_ref() == selected {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                }));
+        }
+        let instance_count = self.instance_scratch.len();
+        self.ensure_instance_capacity(instance_count.max(1));
 
         let view_proj = state.view_projection(egui::vec2(size[0] as f32, size[1] as f32));
         let uniforms = SceneUniforms {
@@ -665,10 +689,14 @@ impl WgpuInvestigation3dRenderer {
         self.queue()
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        if let Some(instance_buffer) = &self.instance_buffer {
-            let raw: Vec<PointInstanceRaw> = prepared.iter().map(|point| point.raw).collect();
-            self.queue()
-                .write_buffer(instance_buffer, 0, bytemuck::cast_slice(raw.as_slice()));
+        if instance_count > 0 {
+            if let Some(instance_buffer) = &self.instance_buffer {
+                self.queue().write_buffer(
+                    instance_buffer,
+                    0,
+                    bytemuck::cast_slice(self.instance_scratch.as_slice()),
+                );
+            }
         }
 
         let Some(display_view) = &self.display_view else {
@@ -712,9 +740,11 @@ impl WgpuInvestigation3dRenderer {
             });
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.bind_group, &[]);
-            if let Some(instance_buffer) = &self.instance_buffer {
-                render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
-                render_pass.draw(0..6, 0..prepared.len() as u32);
+            if instance_count > 0 {
+                if let Some(instance_buffer) = &self.instance_buffer {
+                    render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+                    render_pass.draw(0..6, 0..instance_count as u32);
+                }
             }
         }
         self.queue().submit(Some(encoder.finish()));
@@ -722,53 +752,11 @@ impl WgpuInvestigation3dRenderer {
         let Some(texture_id) = self.display_texture_id else {
             return Ok(None);
         };
-        Ok(Some((
-            PreviewDisplayTexture::Native {
-                id: texture_id,
-                size,
-            },
-            prepared,
-        )))
+        Ok(Some(PreviewDisplayTexture::Native {
+            id: texture_id,
+            size,
+        }))
     }
-}
-
-fn prepare_scene_points<'a>(
-    scene: &'a Investigation3dScene,
-    selected: Option<&StableRowKey>,
-) -> Vec<PreparedPoint<'a>> {
-    let mut prepared = Vec::new();
-
-    for layer in scene.layers.iter().filter(|layer| layer.visible) {
-        debug_assert!(
-            !layer.id.is_empty(),
-            "investigation layers should have stable ids"
-        );
-        for point in &layer.points {
-            let position = Vec3::from_array(point.position);
-            prepared.push(PreparedPoint {
-                raw: PointInstanceRaw {
-                    position: point.position,
-                    color: [
-                        f32::from(point.color[0]) / 255.0,
-                        f32::from(point.color[1]) / 255.0,
-                        f32::from(point.color[2]) / 255.0,
-                        f32::from(point.color[3]) / 255.0,
-                    ],
-                    size: point.size.max(0.75),
-                    selected: if point.item_key.as_ref() == selected {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                },
-                item_key: point.item_key.as_ref(),
-                label: &point.label,
-                position,
-            });
-        }
-    }
-
-    prepared
 }
 
 /// Height reserved for the status footer drawn below the 3D canvas.
@@ -896,7 +884,7 @@ pub(crate) fn draw_investigation_3d_canvas(
     let paint_rect = rect.intersect(ui.clip_rect());
 
     match paint_texture {
-        Some((texture, prepared)) => {
+        Some(texture) => {
             texture.paint_at(
                 ui,
                 paint_rect,
@@ -907,13 +895,13 @@ pub(crate) fn draw_investigation_3d_canvas(
             }
             let hovered = response
                 .hover_pos()
-                .and_then(|pos| pick_point(rect, pos, state, prepared.as_slice()));
-            output.hovered = hovered.and_then(|point| point.item_key.cloned());
+                .and_then(|pos| pick_point(rect, pos, state, scene));
+            output.hovered = hovered.and_then(|point| point.item_key.clone());
             if let Some(point) = hovered {
                 ui.painter_at(paint_rect).text(
                     paint_rect.left_bottom() + egui::vec2(10.0, -32.0),
                     egui::Align2::LEFT_TOP,
-                    point.label,
+                    &*point.label,
                     egui::FontId::proportional(13.0),
                     egui::Color32::WHITE,
                 );
@@ -921,10 +909,10 @@ pub(crate) fn draw_investigation_3d_canvas(
             if response.clicked() {
                 if let Some(point) = response
                     .interact_pointer_pos()
-                    .and_then(|pos| pick_point(rect, pos, state, prepared.as_slice()))
+                    .and_then(|pos| pick_point(rect, pos, state, scene))
                 {
-                    output.selected = point.item_key.cloned();
-                    output.focus_target = Some(point.position.to_array());
+                    output.selected = point.item_key.clone();
+                    output.focus_target = Some(point.position);
                 }
             }
         }
@@ -1386,8 +1374,8 @@ fn pick_point<'a>(
     rect: egui::Rect,
     pointer: egui::Pos2,
     state: &Investigation3dState,
-    points: &'a [PreparedPoint<'_>],
-) -> Option<&'a PreparedPoint<'a>> {
+    scene: &'a Investigation3dScene,
+) -> Option<&'a Investigation3dPoint> {
     let size = rect.size();
     let view_proj = state.view_projection(size);
     let pointer_ndc = {
@@ -1395,9 +1383,14 @@ fn pick_point<'a>(
         let rel_y = (pointer.y - rect.top()) / rect.height();
         Vec2::new(rel_x * 2.0 - 1.0, 1.0 - rel_y * 2.0)
     };
-    let mut best: Option<(&PreparedPoint<'a>, f32, f32)> = None;
-    for point in points {
-        let clip: Vec4 = view_proj * point.position.extend(1.0);
+    let mut best: Option<(&Investigation3dPoint, f32, f32)> = None;
+    for point in scene
+        .layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .flat_map(|layer| layer.points.iter())
+    {
+        let clip: Vec4 = view_proj * Vec3::from_array(point.position).extend(1.0);
         if clip.w.abs() <= 1e-5 {
             continue;
         }
@@ -1409,7 +1402,7 @@ fn pick_point<'a>(
         let ndc_dx = ndc.x - pointer_ndc.x;
         let ndc_dy = ndc.y - pointer_ndc.y;
         let ndc_dist = (ndc_dx * ndc_dx + ndc_dy * ndc_dy).sqrt();
-        let radius_ndc = point.raw.size * state.point_scale / clip.w.abs().max(0.0001);
+        let radius_ndc = point.size.max(0.75) * state.point_scale / clip.w.abs().max(0.0001);
         let radius_screen = radius_ndc.max(3.0);
         // Convert the NDC distance to an approximate screen distance using
         // the smaller of the two viewport dimensions to be conservative.

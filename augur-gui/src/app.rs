@@ -3019,6 +3019,13 @@ impl CameraApp {
         self.sync_active_analysis_roi();
         self.sync_investigation_layers();
 
+        // The scene is only consumed by 3D viewports. Skip the whole build
+        // (selection resolution, dataset scans, raw-event layer construction)
+        // when no 3D pane can be shown this frame.
+        if !self.active_investigation_layout().shows_3d() && !self.popup_open {
+            return Investigation3dScene::default();
+        }
+
         let selected_event_ids = self.resolve_selection_event_ids();
         let (layer_styles, layer_visibility, active_analysis_roi, table_views) = self
             .with_active_viewer(|viewer| {
@@ -3090,6 +3097,7 @@ impl CameraApp {
             }
 
             let mut points = Vec::new();
+            let point_label: std::sync::Arc<str> = view.descriptor.title.as_str().into();
             let rows =
                 filtered_row_indices(&investigation, &view.descriptor.dataset_id, schema, table);
             let rows = match frame_window {
@@ -3116,7 +3124,7 @@ impl CameraApp {
                         table,
                         row,
                     )),
-                    label: view.descriptor.title.clone(),
+                    label: std::sync::Arc::clone(&point_label),
                 });
             }
 
@@ -3226,25 +3234,29 @@ impl CameraApp {
         });
 
         let selection_active = !selected_event_ids.is_empty();
-        let mut seen_occurrences = HashMap::new();
-        let raw_events_with_ids: Vec<_> = raw_events
-            .iter()
-            .copied()
-            .map(|event| {
-                let occurrence = seen_occurrences
-                    .entry((event.timestamp, event.x, event.y, event.polarity))
-                    .or_insert(0u32);
-                let event_id = Self::candidate_event_id(
-                    event.timestamp,
-                    event.x,
-                    event.y,
-                    event.polarity,
-                    *occurrence,
-                );
-                *occurrence = occurrence.saturating_add(1);
-                (event, event_id)
-            })
-            .collect();
+        // Event-id disambiguation (per-event hashing plus an occurrence map)
+        // only matters when a selection needs to be matched; skip it entirely
+        // on the common unselected path.
+        let raw_event_ids: Option<Vec<u64>> = selection_active.then(|| {
+            let mut seen_occurrences = HashMap::new();
+            raw_events
+                .iter()
+                .map(|event| {
+                    let occurrence = seen_occurrences
+                        .entry((event.timestamp, event.x, event.y, event.polarity))
+                        .or_insert(0u32);
+                    let event_id = Self::candidate_event_id(
+                        event.timestamp,
+                        event.x,
+                        event.y,
+                        event.polarity,
+                        *occurrence,
+                    );
+                    *occurrence = occurrence.saturating_add(1);
+                    event_id
+                })
+                .collect()
+        });
 
         let mut layers = Vec::new();
         for (layer_id, polarity, style) in [
@@ -3258,40 +3270,42 @@ impl CameraApp {
                 continue;
             }
 
-            let points: Vec<_> = raw_events_with_ids
-                .iter()
-                .copied()
-                .filter(|(event, _)| event.polarity == polarity)
-                .map(|(event, event_id)| {
-                    let inside_focus = focus_roi
-                        .as_ref()
-                        .is_none_or(|roi| roi.contains(f64::from(event.x), f64::from(event.y)));
-                    let is_selected = selection_active && selected_event_ids.contains(&event_id);
-                    let emphasised = inside_focus && (!selection_active || is_selected);
-                    let mut color = style.color;
-                    color[3] = if emphasised {
-                        style.color[3]
+            let point_label: std::sync::Arc<str> = style.title.as_str().into();
+            let mut points = Vec::with_capacity(raw_events.len());
+            for (index, event) in raw_events.iter().enumerate() {
+                if event.polarity != polarity {
+                    continue;
+                }
+                let inside_focus = focus_roi
+                    .as_ref()
+                    .is_none_or(|roi| roi.contains(f64::from(event.x), f64::from(event.y)));
+                let is_selected = raw_event_ids
+                    .as_ref()
+                    .is_some_and(|ids| selected_event_ids.contains(&ids[index]));
+                let emphasised = inside_focus && (!selection_active || is_selected);
+                let mut color = style.color;
+                color[3] = if emphasised {
+                    style.color[3]
+                } else {
+                    style.color[3].min(36)
+                };
+                points.push(Investigation3dPoint {
+                    position: raw_event_point_position(
+                        *event,
+                        latest_timestamp,
+                        sensor_height,
+                        effective_time_window_ms,
+                    ),
+                    color,
+                    size: if emphasised {
+                        style.size.max(1.5) * 1.05
                     } else {
-                        style.color[3].min(36)
-                    };
-                    Investigation3dPoint {
-                        position: raw_event_point_position(
-                            event,
-                            latest_timestamp,
-                            sensor_height,
-                            effective_time_window_ms,
-                        ),
-                        color,
-                        size: if emphasised {
-                            style.size.max(1.5) * 1.05
-                        } else {
-                            style.size.max(1.0) * 0.85
-                        },
-                        item_key: None,
-                        label: style.title.clone(),
-                    }
-                })
-                .collect();
+                        style.size.max(1.0) * 0.85
+                    },
+                    item_key: None,
+                    label: std::sync::Arc::clone(&point_label),
+                });
+            }
 
             layers.push(Investigation3dLayer {
                 id: layer_id.into(),
@@ -9932,7 +9946,7 @@ mod tests {
                     color: [1, 2, 3, 255],
                     size: 1.0,
                     item_key: None,
-                    label: "point".to_owned(),
+                    label: "point".into(),
                 }],
             }],
             focus_volume: None,
