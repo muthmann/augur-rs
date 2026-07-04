@@ -48,5 +48,9 @@ can safely overlap on one shared device handle.
 - Sensor-side effects of a reconfigure (changed sensitivity, brief settling
   disturbance) are inherent and are surfaced to the user via the GUI
   confirmation dialog rather than hidden.
-- A future async multi-URB read path can slot in behind `PacketStreamReader`
-  without touching pipeline threading again.
+- The EVK4 stream reader is an async multi-URB implementation
+  (`augur-prophesee::async_stream::AsyncBulkStreamReader`): eight 64 KiB bulk
+  transfers stay queued in the kernel, eliminating host-side dead time
+  between reads. Completion order equals submission order for bulk IN URBs
+  on one endpoint, so stream bytes stay in order. Synchronous reads remain
+  as an automatic fallback if async setup fails.

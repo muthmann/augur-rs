@@ -5,6 +5,7 @@ use augur_core::{
 };
 
 use crate::{
+    async_stream::{AsyncBulkStreamReader, QUEUED_TRANSFERS},
     debug,
     sensors::{Imx636, PseeSensor},
     transport::Transport,
@@ -180,9 +181,20 @@ impl<S: PseeSensor> PacketStreamCamera for Evk4Camera<S> {
     }
 
     fn split_stream_reader(&mut self) -> Option<Box<dyn PacketStreamReader>> {
-        Some(Box::new(Evk4StreamReader {
-            transport: self.transport.clone(),
-        }))
+        // Prefer the async multi-URB reader: it keeps transfers queued in the
+        // kernel so there is no dead time between reads. Fall back to
+        // synchronous single-transfer reads if setup fails.
+        match AsyncBulkStreamReader::new(self.transport.clone(), QUEUED_TRANSFERS) {
+            Ok(reader) => Some(Box::new(reader)),
+            Err(err) => {
+                debug::log(format!(
+                    "async stream reader unavailable ({err}); using synchronous stream reads"
+                ));
+                Some(Box::new(Evk4StreamReader {
+                    transport: self.transport.clone(),
+                }))
+            }
+        }
     }
 }
 

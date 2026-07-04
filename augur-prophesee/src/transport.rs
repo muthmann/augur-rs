@@ -117,6 +117,22 @@ impl Transport {
         &self.board_info
     }
 
+    pub(crate) fn raw_context(&self) -> *mut rusb::ffi::libusb_context {
+        self.shared._ctx.as_raw()
+    }
+
+    pub(crate) fn raw_handle(&self) -> *mut rusb::ffi::libusb_device_handle {
+        self.shared.handle.as_raw()
+    }
+
+    pub(crate) fn stream_endpoint(&self) -> u8 {
+        self.ep_stream_in
+    }
+
+    pub(crate) fn stream_timeout(&self) -> Duration {
+        self.stream_timeout
+    }
+
     pub fn interface_number(&self) -> u8 {
         self.interface
     }

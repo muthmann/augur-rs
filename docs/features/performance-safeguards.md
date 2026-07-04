@@ -13,6 +13,7 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
 - The USB reader does not scan every packet to estimate event counts. Ingress bytes remain authoritative on the capture path, while decoded-event stats are measured on the lossy preview side.
 - Camera control and stream reads now run on separate threads for split-capable cameras (EVK4): sensor reconfiguration (USB control transfers) executes on a dedicated control thread while the stream thread keeps reading, so applying settings during a recording no longer pauses reads or overflows the device FIFO (see ADR 023). A regression test (`split_camera_keeps_reading_during_runtime_reconfigure`) pins this.
 - The GUI asks for confirmation before applying settings during an active recording, because the reconfigure itself (bias/ROI/filter changes and a brief sensor disturbance) is still part of the recorded data even though the stream stays gap-free.
+- EVK4 stream reads use an asynchronous multi-URB reader (8 × 64 KiB bulk transfers queued in the kernel at all times), so the host keeps receiving data between `read_packet` calls with no dead time. If async setup fails, the reader falls back to synchronous single-transfer reads and logs the reason.
 
 ## Preview / GUI Changes
 

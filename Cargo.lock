@@ -666,6 +666,7 @@ name = "augur-prophesee"
 version = "1.0.0"
 dependencies = [
  "augur-core",
+ "libc",
  "rusb",
 ]
 
