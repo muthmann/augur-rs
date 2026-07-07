@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -33,13 +33,17 @@ use augur_plugin_api::{
 };
 use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
-    run_offline_analysis, AnalysisPassContext, EventHistoryMaterializationCache, LiveAnalysisJob,
-    LiveAnalysisResult, LiveAnalysisWorker, LiveHostDatasetSnapshot, LivePluginHostSnapshot,
-    LivePluginState, LivePluginStateSnapshot, OfflineAnalysisConfig, OfflineAnalysisOptions,
-    OfflineAnalysisSummary, OfflineProgress,
+    json_value_to_toml, open_directory, AnalysisPassContext, EventHistoryMaterializationCache,
+    LiveAnalysisJob, LiveAnalysisResult, LiveAnalysisWorker, LiveHostDatasetSnapshot,
+    LivePluginHostSnapshot, LivePluginState, LivePluginStateSnapshot, OfflineAnalysisConfig,
+    OfflinePluginConfig,
 };
 
 use crate::{
+    analysis_runs::{
+        AnalysisDialogContext, AnalysisPanelAction, AnalysisRunEvent, AnalysisRunState,
+        AnalysisRunsState, AnalysisStartRequest, PluginChoice,
+    },
     export::{export_tiff_stack, ExportEventSource, TiffStackExportParams},
     export_dialog::{ExportDialog, ExportDialogAction},
     external_tools::{
@@ -587,14 +591,6 @@ struct TiffStackExportTask {
     rx: mpsc::Receiver<Result<usize, String>>,
 }
 
-struct OfflineAnalysisTask {
-    output_dir: PathBuf,
-    rx: mpsc::Receiver<Result<OfflineAnalysisSummary, String>>,
-    progress_rx: mpsc::Receiver<OfflineProgress>,
-    stop: Arc<AtomicBool>,
-    latest_progress: Option<OfflineProgress>,
-}
-
 struct PopupSharedData {
     viewer: ViewerState,
     investigation_renderer: Investigation3dRenderer,
@@ -696,10 +692,14 @@ impl Default for ImageJDialogState {
     }
 }
 
+/// Which producer's plugin host-view snapshots the workspace currently shows:
+/// the live worker's approximate preview or a finished analysis run's exact
+/// results. `None` means local synchronous output (paused-scrub recompute) or
+/// no plugin output at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeSnapshotSource {
     Worker,
-    Offline,
+    Run(u64),
 }
 
 fn format_timestamp_now() -> String {
@@ -824,7 +824,7 @@ pub struct CameraApp {
     imagej_dialog: ImageJDialogState,
     export_dialog: ExportDialog,
     export_task: Option<TiffStackExportTask>,
-    offline_analysis_task: Option<OfflineAnalysisTask>,
+    analysis_runs: AnalysisRunsState,
     external_tool: Option<Box<dyn ExternalTool>>,
     python_ingress: Option<PythonIngressServer>,
     python_stream_name: Option<String>,
@@ -989,7 +989,7 @@ impl CameraApp {
             imagej_dialog: ImageJDialogState::default(),
             export_dialog: ExportDialog::default(),
             export_task: None,
-            offline_analysis_task: None,
+            analysis_runs: AnalysisRunsState::default(),
             external_tool: None,
             python_ingress: None,
             python_stream_name: None,
@@ -1374,7 +1374,79 @@ impl CameraApp {
         );
     }
 
+    /// One-line provenance row: says whether the workspace currently shows
+    /// approximate live output, a run's exact results, or a synchronous
+    /// current-frame recompute.
+    fn render_workspace_data_source(&mut self, ui: &mut egui::Ui) {
+        let runtime_plugins_enabled = self
+            .plugin_manager
+            .records()
+            .iter()
+            .any(|record| record.plugin().is_some_and(|plugin| plugin.enabled()));
+        let (chip_text, tone, hover) = match self.runtime_snapshot_source {
+            Some(RuntimeSnapshotSource::Run(id)) => {
+                let run = self.analysis_runs.run(id);
+                let name = run
+                    .map(|run| run.name.clone())
+                    .unwrap_or_else(|| "analysis run".to_owned());
+                let detail = run
+                    .map(|run| format!(" \u{2014} {}, {}", run.range_label, run.window_label))
+                    .unwrap_or_default();
+                (
+                    name,
+                    crate::theme::Tone::Success,
+                    format!("Exact results from a deterministic analysis run{detail}."),
+                )
+            }
+            Some(RuntimeSnapshotSource::Worker) => (
+                "Live preview \u{2248}".to_owned(),
+                crate::theme::Tone::Info,
+                "Approximate live plugin output — result cadence can lag under load. \
+                 Run an analysis for exact results."
+                    .to_owned(),
+            ),
+            None if runtime_plugins_enabled => (
+                "Current frame".to_owned(),
+                crate::theme::Tone::Neutral,
+                "Plugin output computed synchronously for the displayed frame.".to_owned(),
+            ),
+            None => (
+                "No plugin data".to_owned(),
+                crate::theme::Tone::Neutral,
+                "Enable a plugin for a live preview, or run an analysis for exact results."
+                    .to_owned(),
+            ),
+        };
+        let mut open_runs = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Data source")
+                    .size(11.0)
+                    .color(crate::theme::palette_for_visuals(ui.visuals()).fg_2),
+            );
+            crate::theme::chip(ui, &chip_text, tone);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::theme::icon_button(
+                    ui,
+                    egui_phosphor::regular::FLASK,
+                    "Analysis runs — exact, exportable results",
+                )
+                .clicked()
+                {
+                    open_runs = true;
+                }
+            });
+        })
+        .response
+        .on_hover_text(hover);
+        if open_runs {
+            self.analysis_runs.panel_open = true;
+        }
+        ui.add_space(crate::theme::sp::SP_1);
+    }
+
     fn render_investigation_inspector(&mut self, ui: &mut egui::Ui) {
+        self.render_workspace_data_source(ui);
         let (
             mut link_roi_between_2d_and_3d,
             _active_roi,
@@ -5612,111 +5684,201 @@ impl CameraApp {
         }
     }
 
-    fn start_offline_analysis_for_file(&mut self, input_path: PathBuf) {
-        if self.offline_analysis_task.is_some() {
-            return;
-        }
-        let Some(parent_dir) = rfd::FileDialog::new().pick_folder() else {
-            return;
+    /// Open the run-configuration dialog, seeded with the open replay (when
+    /// there is one) and the current plugin enablement.
+    fn open_analysis_dialog(&mut self) {
+        let plugins: Vec<PluginChoice> = self
+            .plugin_manager
+            .records()
+            .iter()
+            .filter_map(|record| {
+                let plugin = record.plugin()?;
+                Some(PluginChoice {
+                    name: plugin.name().to_owned(),
+                    phase: record.phase_label(),
+                    selected: plugin.enabled(),
+                })
+            })
+            .collect();
+        let (input, timeline) = if self.mode == AppMode::Replaying {
+            let path = self.replay_path.as_ref().map(PathBuf::from);
+            let timeline = self.replay_file_info.as_ref().map(|info| {
+                let first = info.first_timestamp_us;
+                (first, first.saturating_add(info.total_duration_us))
+            });
+            (path, timeline)
+        } else {
+            (None, None)
         };
-        let stem = input_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("analysis");
-        let output_dir = parent_dir.join(format!("{stem}_analysis_{}", format_timestamp_now()));
-        let (tx, rx) = mpsc::channel();
-        let (progress_tx, progress_rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let config = OfflineAnalysisConfig {
-            acq_time_ms: Some(self.acq_time_ms),
-            ..OfflineAnalysisConfig::default()
-        };
-        let worker_output_dir = output_dir.clone();
+        self.analysis_runs
+            .open_dialog(input, timeline, self.acq_time_ms, plugins);
+    }
 
-        thread::spawn(move || {
-            let result = run_offline_analysis(
-                OfflineAnalysisOptions {
-                    input_path,
-                    output_dir: worker_output_dir,
-                    plugins_dir: None,
-                    config,
-                    stop: Some(worker_stop),
-                },
-                |progress| {
-                    let _ = progress_tx.send(progress);
+    /// Turn a validated dialog request into a full offline config by
+    /// snapshotting the selected plugins' current GUI settings, then start
+    /// the background run.
+    fn start_analysis_run(&mut self, request: AnalysisStartRequest) {
+        let mut plugins = BTreeMap::new();
+        for record in self.plugin_manager.records() {
+            let Some(plugin) = record.plugin() else {
+                continue;
+            };
+            let selected = request
+                .selected_plugins
+                .iter()
+                .any(|name| name == plugin.name());
+            let mut settings = BTreeMap::new();
+            if selected {
+                for section in &plugin.settings_schema().sections {
+                    for item in &section.items {
+                        if let Ok(Some(value)) = plugin.get_setting_value(&item.key) {
+                            if let Some(value) = json_value_to_toml(&value) {
+                                settings.insert(item.key.clone(), value);
+                            }
+                        }
+                    }
+                }
+            }
+            plugins.insert(
+                plugin.name().to_owned(),
+                OfflinePluginConfig {
+                    enabled: Some(selected),
+                    settings,
+                    ..OfflinePluginConfig::default()
                 },
             );
-            let _ = tx.send(result);
-        });
-
-        self.offline_analysis_task = Some(OfflineAnalysisTask {
-            output_dir,
-            rx,
-            progress_rx,
-            stop,
-            latest_progress: None,
-        });
-        self.analysis_notice = Some("Offline analysis started.".into());
+        }
+        let config = OfflineAnalysisConfig {
+            t_start_us: request.t_start_us,
+            t_end_us: request.t_end_us,
+            acq_time_us: Some(request.acq_time_us),
+            acq_time_ms: None,
+            plugins,
+        };
+        self.analysis_runs.start_run(&request, config);
+        self.analysis_notice = Some(format!("Analysis run '{}' started.", request.name));
     }
 
-    fn open_offline_analysis_file_dialog(&mut self) {
-        if self.offline_analysis_task.is_some() {
-            return;
-        }
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Replay Files", &["raw", "csv", "bin", "npy", "h5", "hdf5"])
-            .pick_file()
-        {
-            self.start_offline_analysis_for_file(path);
+    fn poll_analysis_runs(&mut self) {
+        for event in self.analysis_runs.poll() {
+            match event {
+                AnalysisRunEvent::Finished { id } => {
+                    let Some(run) = self.analysis_runs.run(id) else {
+                        continue;
+                    };
+                    self.toast_queue.push(
+                        format!(
+                            "Analysis run '{}' complete: {}",
+                            run.name,
+                            run.output_dir.display()
+                        ),
+                        crate::toast::ToastTone::Success,
+                    );
+                    // Only take over the workspace when nothing is actively
+                    // streaming into it; otherwise the next live result would
+                    // immediately replace the run's results again.
+                    let playback_active = match self.mode {
+                        AppMode::Replaying => !self.replay_paused,
+                        AppMode::Idle => false,
+                        _ => true,
+                    };
+                    if !playback_active {
+                        self.show_analysis_run_results(id);
+                    }
+                }
+                AnalysisRunEvent::Failed { id, error } => {
+                    let name = self
+                        .analysis_runs
+                        .run(id)
+                        .map(|run| run.name.clone())
+                        .unwrap_or_else(|| "analysis".to_owned());
+                    self.last_error = Some(error.clone());
+                    self.analysis_notice = Some(format!("Analysis run '{name}' failed: {error}"));
+                    self.toast_queue.push(error, crate::toast::ToastTone::Error);
+                }
+            }
         }
     }
 
-    fn poll_offline_analysis_task(&mut self) {
-        let Some(mut task) = self.offline_analysis_task.take() else {
+    /// Publish a finished run's host-view snapshots to the workspace. Pauses
+    /// replay first so the next live result does not overwrite them.
+    fn show_analysis_run_results(&mut self, id: u64) {
+        let Some(run) = self.analysis_runs.run(id) else {
             return;
         };
-        while let Ok(progress) = task.progress_rx.try_recv() {
-            task.latest_progress = Some(progress);
+        let AnalysisRunState::Completed { host_snapshots, .. } = &run.state else {
+            return;
+        };
+        let snapshots = host_snapshots.clone();
+        let name = run.name.clone();
+        // Pausing bumps the analysis epoch and clears runtime snapshots, so
+        // it must happen before the run's snapshots are published.
+        if self.mode == AppMode::Replaying && !self.replay_paused {
+            self.set_replay_paused(true);
         }
-        if let Some(progress) = task.latest_progress {
-            self.analysis_notice = Some(format!(
-                "Offline analysis: {}/{} window(s).",
-                progress.processed_windows,
-                progress.total_windows.max(1)
-            ));
+        self.live_host_snapshots = snapshots;
+        self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Run(id));
+        self.host_view_registry_dirty = true;
+        self.clear_host_view_dataset_cache();
+        self.refresh_host_view_registry_if_dirty();
+        self.analysis_notice = Some(format!("Showing results of analysis run '{name}'."));
+    }
+
+    /// Draw the Analysis Runs panel and the New Analysis dialog, and apply
+    /// the actions they request.
+    fn handle_analysis_ui(&mut self, ctx: &egui::Context) {
+        let viewed_run = match self.runtime_snapshot_source {
+            Some(RuntimeSnapshotSource::Run(id)) => Some(id),
+            _ => None,
+        };
+        for action in self.analysis_runs.show_panel(ctx, viewed_run) {
+            match action {
+                AnalysisPanelAction::NewAnalysis => self.open_analysis_dialog(),
+                AnalysisPanelAction::ViewResults(id) => self.show_analysis_run_results(id),
+                AnalysisPanelAction::OpenFolder(id) => {
+                    if let Some(run) = self.analysis_runs.run(id) {
+                        if let Err(err) = open_directory(&run.output_dir) {
+                            self.toast_queue.push(err, crate::toast::ToastTone::Error);
+                        }
+                    }
+                }
+                AnalysisPanelAction::Remove(id) => {
+                    self.analysis_runs.remove_run(id);
+                    if viewed_run == Some(id) {
+                        self.clear_runtime_snapshots();
+                        self.host_view_registry_dirty = true;
+                        self.clear_host_view_dataset_cache();
+                        self.refresh_host_view_registry_if_dirty();
+                    }
+                }
+            }
         }
 
-        match task.rx.try_recv() {
-            Ok(Ok(summary)) => {
-                self.live_host_snapshots = summary.host_snapshots;
-                self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Offline);
-                self.host_view_registry_dirty = true;
-                self.clear_host_view_dataset_cache();
-                self.refresh_host_view_registry_if_dirty();
-                self.analysis_notice = Some(format!(
-                    "Offline analysis exported {} file(s) to {}.",
-                    summary.exported_files.len(),
-                    task.output_dir.display()
-                ));
-                self.toast_queue.push(
-                    format!("Offline analysis complete: {}", task.output_dir.display()),
-                    crate::toast::ToastTone::Success,
-                );
+        let playhead_us = if self.mode == AppMode::Replaying {
+            match (
+                self.analysis_runs.dialog.input_path(),
+                self.replay_path.as_deref(),
+                self.latest_frame.as_ref(),
+            ) {
+                (Some(input), Some(replay), Some(frame)) if input == Path::new(replay) => {
+                    Some(frame.window_end_us)
+                }
+                _ => None,
             }
-            Ok(Err(err)) => {
-                self.last_error = Some(err.clone());
-                self.analysis_notice = Some(format!("Offline analysis failed: {err}"));
-                self.toast_queue.push(err, crate::toast::ToastTone::Error);
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                self.offline_analysis_task = Some(task);
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let message = "Offline analysis task ended unexpectedly".to_owned();
-                self.last_error = Some(message.clone());
-                self.analysis_notice = Some(message);
-            }
+        } else {
+            None
+        };
+        let dialog_ctx = AnalysisDialogContext {
+            playhead_us,
+            run_active: self.analysis_runs.any_running(),
+        };
+        if let Some(request) = self.analysis_runs.show_dialog(ctx, &dialog_ctx) {
+            self.start_analysis_run(request);
+        }
+        // Keep progress and probe results flowing while nothing else drives
+        // repaints (e.g. paused replay with a run executing).
+        if self.analysis_runs.any_running() || self.analysis_runs.dialog.open {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -6626,8 +6788,11 @@ impl CameraApp {
 
     fn dispatch_live_analysis(&mut self, frame: &PreviewFrame) {
         self.publish_pending_action_requests();
-        self.analysis_notice =
-            Some("Live analysis is approximate — run Analyze Whole File for exact outputs.".into());
+        self.analysis_notice = Some(
+            "Live plugin output is a preview — start an analysis (Analysis \u{25B8} New \
+             Analysis…) for exact results."
+                .into(),
+        );
         let epoch = self.current_analysis_epoch();
         let global_settings_json = self.cached_global_settings_json();
         // The worker's persistent map stays authoritative between jobs so
@@ -7082,7 +7247,7 @@ impl eframe::App for CameraApp {
         self.poll_replay_open_task();
         self.poll_python_ingress_requests();
         self.poll_tiff_stack_export_task();
-        self.poll_offline_analysis_task();
+        self.poll_analysis_runs();
         self.poll_live_analysis_results();
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
@@ -7138,18 +7303,6 @@ impl eframe::App for CameraApp {
                             self.open_tiff_stack_export_dialog();
                             ui.close_menu();
                         }
-                        if ui
-                            .add_enabled(
-                                self.replay_path.is_some() && self.offline_analysis_task.is_none(),
-                                egui::Button::new("Analyze Whole File…"),
-                            )
-                            .clicked()
-                        {
-                            if let Some(path) = self.replay_path.as_ref().map(PathBuf::from) {
-                                self.start_offline_analysis_for_file(path);
-                            }
-                            ui.close_menu();
-                        }
                         ui.separator();
                         if ui.button("Close Replay").clicked() {
                             self.stop_pipeline();
@@ -7201,35 +7354,6 @@ impl eframe::App for CameraApp {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui
-                            .add_enabled(
-                                mode != AppMode::Recording && self.offline_analysis_task.is_none(),
-                                egui::Button::new("Analyze Whole File…"),
-                            )
-                            .clicked()
-                        {
-                            self.open_offline_analysis_file_dialog();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                    }
-                    if let Some(task) = &self.offline_analysis_task {
-                        ui.separator();
-                        let label = task
-                            .latest_progress
-                            .map(|progress| {
-                                format!(
-                                    "Analyzing: {}/{}",
-                                    progress.processed_windows,
-                                    progress.total_windows.max(1)
-                                )
-                            })
-                            .unwrap_or_else(|| "Analyzing…".to_owned());
-                        ui.add_enabled(false, egui::Label::new(label));
-                        if ui.button("Cancel Analysis").clicked() {
-                            task.stop.store(true, Ordering::Relaxed);
-                            ui.close_menu();
-                        }
                     }
                     if ui
                         .add_enabled(
@@ -7296,6 +7420,38 @@ impl eframe::App for CameraApp {
                             }
                         }
                         ui.close_menu();
+                    }
+                });
+
+                // ── Analysis ──────────────────────────────────────────────────
+                ui.menu_button("Analysis", |ui| {
+                    if ui
+                        .add_enabled(
+                            mode != AppMode::Recording,
+                            egui::Button::new("New Analysis…"),
+                        )
+                        .clicked()
+                    {
+                        self.open_analysis_dialog();
+                        ui.close_menu();
+                    }
+                    let runs_label = if self.analysis_runs.runs().is_empty() {
+                        "Analysis Runs".to_owned()
+                    } else {
+                        format!("Analysis Runs ({})", self.analysis_runs.runs().len())
+                    };
+                    if ui.button(runs_label).clicked() {
+                        self.analysis_runs.panel_open = true;
+                        ui.close_menu();
+                    }
+                    if self.analysis_runs.any_running() {
+                        ui.separator();
+                        ui.add_enabled(
+                            false,
+                            egui::Label::new(
+                                egui::RichText::new("An analysis is running…").weak(),
+                            ),
+                        );
                     }
                 });
 
@@ -8913,6 +9069,7 @@ impl eframe::App for CameraApp {
             self.apply_aux_window_changes(ctx, aux);
         }
         self.show_imagej_dialog(ctx);
+        self.handle_analysis_ui(ctx);
         if let Some(action) = self.export_dialog.show(ctx) {
             match action {
                 ExportDialogAction::Export(params) => self.start_tiff_stack_export(params),

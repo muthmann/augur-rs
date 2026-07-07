@@ -69,16 +69,18 @@ through the existing host-view UI.
 
 ## Offline Pipeline
 
-`augur-cli analyze <file> --config <toml> --out <dir>` and the GUI
-`Analyze Whole File...` action both call `run_offline_analysis` in
-`augur-runtime`.
+`augur-cli analyze <file> --config <toml> --out <dir>` and GUI analysis runs
+(`Analysis ▸ New Analysis…`, see `analysis-runs.md` and ADR 025) both call
+`run_offline_analysis` in `augur-runtime`. Runs are the primary analysis
+workflow; the live worker output is a preview.
 
 The offline runner:
 
 - opens raw and decoded event files through the core replay sources
 - loads runtime plugins and applies all configured settings before the first
   window
-- processes deterministic half-open timestamp windows
+- processes deterministic half-open timestamp windows over `[t_start, t_end)`
+  (both bounds optional; `t_end_us` clamps the final window)
 - feeds empty windows to accumulating plugins
 - emits a final partial window instead of dropping tail events
 - exports TableV1 datasets as CSV, Image2dV1 datasets as PNG, and Series1dV1
@@ -87,8 +89,9 @@ The offline runner:
   existing host-view UI can inspect the completed offline result
 - writes to a temporary directory and renames it only after a successful run
 
-The config format supports top-level `t_start_us`, `acq_time_us` or
-`acq_time_ms`, plus per-plugin entries:
+The config format supports top-level `t_start_us`, `t_end_us`, `acq_time_us`
+or `acq_time_ms`, plus per-plugin entries (`augur-cli analyze` additionally
+accepts `--t-start-us` / `--t-end-us` overrides):
 
 ```toml
 t_start_us = 0

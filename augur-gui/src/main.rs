@@ -1,3 +1,4 @@
+mod analysis_runs;
 mod app;
 mod colormap;
 mod export;
