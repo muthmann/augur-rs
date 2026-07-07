@@ -57,6 +57,12 @@ enum Command {
         out: PathBuf,
         #[arg(long)]
         plugins_dir: Option<PathBuf>,
+        /// Analyze from this timestamp [us] (overrides the config file)
+        #[arg(long)]
+        t_start_us: Option<u64>,
+        /// Analyze up to, excluding, this timestamp [us] (overrides the config file)
+        #[arg(long)]
+        t_end_us: Option<u64>,
     },
     Config {
         #[command(subcommand)]
@@ -120,7 +126,9 @@ fn main() -> Result<()> {
             config,
             out,
             plugins_dir,
-        } => analyze(input, config, out, plugins_dir),
+            t_start_us,
+            t_end_us,
+        } => analyze(input, config, out, plugins_dir, t_start_us, t_end_us),
         Command::Config { cmd } => config_cmd(cmd),
     }
 }
@@ -225,19 +233,29 @@ fn analyze(
     config_path: Option<PathBuf>,
     out: PathBuf,
     plugins_dir: Option<PathBuf>,
+    t_start_us: Option<u64>,
+    t_end_us: Option<u64>,
 ) -> Result<()> {
-    let config = match config_path {
+    let mut config = match config_path {
         Some(path) => OfflineAnalysisConfig::from_toml_file(&path)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("failed loading analysis config {}", path.display()))?,
         None => OfflineAnalysisConfig::default(),
     };
+    if t_start_us.is_some() {
+        config.t_start_us = t_start_us;
+    }
+    if t_end_us.is_some() {
+        config.t_end_us = t_end_us;
+    }
 
-    let running = Arc::new(AtomicBool::new(true));
+    // `stop` is a cancellation flag: `true` aborts the run. Ctrl+C requests
+    // cancellation; the runner cleans up its partial output directory.
+    let stop = Arc::new(AtomicBool::new(false));
     {
-        let running_flag = Arc::clone(&running);
+        let stop_flag = Arc::clone(&stop);
         ctrlc::set_handler(move || {
-            running_flag.store(false, Ordering::Relaxed);
+            stop_flag.store(true, Ordering::Relaxed);
         })
         .context("failed installing Ctrl+C handler")?;
     }
@@ -249,7 +267,7 @@ fn analyze(
             output_dir: out,
             plugins_dir,
             config,
-            stop: Some(Arc::clone(&running)),
+            stop: Some(Arc::clone(&stop)),
         },
         |progress| {
             println!(
