@@ -73,6 +73,8 @@ impl Iterator for TimestampWindower {
 #[derive(Debug, Clone, Default)]
 pub struct OfflineAnalysisConfig {
     pub t_start_us: Option<u64>,
+    /// Exclusive end of the analyzed range: windows cover `[t_start, t_end)`.
+    pub t_end_us: Option<u64>,
     pub acq_time_us: Option<u64>,
     pub acq_time_ms: Option<u64>,
     pub plugins: BTreeMap<String, OfflinePluginConfig>,
@@ -117,6 +119,8 @@ impl<'de> Deserialize<'de> for OfflineAnalysisConfig {
             #[serde(default)]
             t_start_us: Option<u64>,
             #[serde(default)]
+            t_end_us: Option<u64>,
+            #[serde(default)]
             acq_time_us: Option<u64>,
             #[serde(default)]
             acq_time_ms: Option<u64>,
@@ -127,6 +131,7 @@ impl<'de> Deserialize<'de> for OfflineAnalysisConfig {
         let raw = RawConfig::deserialize(deserializer)?;
         Ok(Self {
             t_start_us: raw.t_start_us,
+            t_end_us: raw.t_end_us,
             acq_time_us: raw.acq_time_us,
             acq_time_ms: raw.acq_time_ms,
             plugins: raw.plugins,
@@ -258,6 +263,24 @@ impl OfflineInput {
     }
 }
 
+/// Timeline metadata for a replay file, used to offer range selection
+/// before an analysis run without keeping the file open.
+#[derive(Debug, Clone)]
+pub struct ReplayFileProbe {
+    pub info: ReplayFileInfo,
+    pub first_event_ts_us: u64,
+    pub last_event_ts_us: u64,
+}
+
+pub fn probe_replay_file(path: &Path) -> Result<ReplayFileProbe, String> {
+    let input = OfflineInput::open(path)?;
+    Ok(ReplayFileProbe {
+        first_event_ts_us: input.first_event_ts_us(),
+        last_event_ts_us: input.last_event_ts_us(),
+        info: input.info().clone(),
+    })
+}
+
 pub fn run_offline_analysis(
     options: OfflineAnalysisOptions,
     mut progress: impl FnMut(OfflineProgress),
@@ -269,7 +292,20 @@ pub fn run_offline_analysis(
         .config
         .t_start_us
         .unwrap_or_else(|| input.first_event_ts_us());
-    let last_event_ts_us = input.last_event_ts_us();
+    // Clamp the analyzed range to a configured exclusive end: the last
+    // window may not reach past `t_end_us`, matching half-open semantics.
+    let last_event_ts_us = match options.config.t_end_us {
+        Some(t_end_us) => {
+            if t_end_us <= t_start_us {
+                return Err(format!(
+                    "analysis range [{t_start_us}, {t_end_us}) us is empty; \
+                     t_end_us must be greater than t_start_us"
+                ));
+            }
+            input.last_event_ts_us().min(t_end_us - 1)
+        }
+        None => input.last_event_ts_us(),
+    };
     let total_windows =
         TimestampWindower::new(t_start_us, acq_time_us, last_event_ts_us).count() as u64;
 
@@ -640,6 +676,36 @@ fn write_csv_cell(mut writer: impl Write, value: &str) -> std::io::Result<()> {
     writer.write_all(b"\"")
 }
 
+/// Inverse of `toml_value_to_json`, used by hosts that snapshot live JSON
+/// plugin settings into an `OfflineAnalysisConfig`. JSON nulls have no TOML
+/// representation and are skipped.
+pub fn json_value_to_toml(value: &serde_json::Value) -> Option<toml::Value> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(value) => Some(toml::Value::Boolean(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Some(toml::Value::Integer(value))
+            } else {
+                value.as_f64().map(toml::Value::Float)
+            }
+        }
+        serde_json::Value::String(value) => Some(toml::Value::String(value.clone())),
+        serde_json::Value::Array(values) => Some(toml::Value::Array(
+            values.iter().filter_map(json_value_to_toml).collect(),
+        )),
+        serde_json::Value::Object(map) => {
+            let mut table = toml::value::Table::new();
+            for (key, value) in map {
+                if let Some(value) = json_value_to_toml(value) {
+                    table.insert(key.clone(), value);
+                }
+            }
+            Some(toml::Value::Table(table))
+        }
+    }
+}
+
 fn toml_value_to_json(value: toml::Value) -> Result<serde_json::Value, String> {
     let json = match value {
         toml::Value::String(value) => serde_json::Value::String(value),
@@ -717,10 +783,91 @@ mod tests {
     }
 
     #[test]
+    fn offline_analysis_clamps_windows_to_configured_end() {
+        let root = unique_temp_dir("offline-range");
+        fs::create_dir_all(&root).expect("temp root");
+        let input = root.join("events.csv");
+        fs::write(
+            &input,
+            "%geometry:8,8\n1,1,1,10\n2,1,0,11\n3,1,1,15\n4,2,1,25\n",
+        )
+        .expect("write csv replay");
+        let plugins_dir = root.join("plugins");
+        fs::create_dir_all(&plugins_dir).expect("plugins dir");
+
+        let mut windows = Vec::new();
+        let summary = run_offline_analysis(
+            OfflineAnalysisOptions {
+                input_path: input,
+                output_dir: root.join("out"),
+                plugins_dir: Some(plugins_dir),
+                config: OfflineAnalysisConfig {
+                    t_start_us: Some(10),
+                    t_end_us: Some(20),
+                    acq_time_us: Some(5),
+                    ..OfflineAnalysisConfig::default()
+                },
+                stop: None,
+            },
+            |progress| windows.push((progress.window_start_us, progress.window_end_us)),
+        )
+        .expect("offline run");
+
+        assert_eq!(summary.processed_windows, 2);
+        assert_eq!(windows, vec![(10, 15), (15, 20)]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_analysis_rejects_empty_range() {
+        let root = unique_temp_dir("offline-empty-range");
+        fs::create_dir_all(&root).expect("temp root");
+        let input = root.join("events.csv");
+        fs::write(&input, "%geometry:8,8\n1,1,1,10\n").expect("write csv replay");
+        let plugins_dir = root.join("plugins");
+        fs::create_dir_all(&plugins_dir).expect("plugins dir");
+
+        let err = run_offline_analysis(
+            OfflineAnalysisOptions {
+                input_path: input,
+                output_dir: root.join("out"),
+                plugins_dir: Some(plugins_dir),
+                config: OfflineAnalysisConfig {
+                    t_start_us: Some(20),
+                    t_end_us: Some(20),
+                    ..OfflineAnalysisConfig::default()
+                },
+                stop: None,
+            },
+            |_| {},
+        )
+        .expect_err("empty range must be rejected");
+        assert!(err.contains("range"), "unexpected error: {err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_reports_event_timeline_bounds() {
+        let root = unique_temp_dir("offline-probe");
+        fs::create_dir_all(&root).expect("temp root");
+        let input = root.join("events.csv");
+        fs::write(&input, "%geometry:8,8\n1,1,1,10\n2,1,0,11\n3,1,1,15\n")
+            .expect("write csv replay");
+
+        let probe = probe_replay_file(&input).expect("probe");
+        assert_eq!(probe.first_event_ts_us, 10);
+        assert_eq!(probe.last_event_ts_us, 15);
+        assert_eq!(probe.info.width, 8);
+        assert_eq!(probe.info.height, 8);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn toml_plugin_config_supports_inline_and_nested_settings() {
         let config: OfflineAnalysisConfig = toml::from_str(
             r#"
             acq_time_ms = 2
+            t_end_us = 42
 
             [plugins.demo]
             enabled = true
@@ -733,6 +880,7 @@ mod tests {
         .expect("config");
         let settings = config.plugins["demo"].setting_values();
         assert_eq!(config.acq_time_us_or_default(1), 2_000);
+        assert_eq!(config.t_end_us, Some(42));
         assert_eq!(settings["threshold"].as_float(), Some(1.5));
         assert_eq!(settings["mode"].as_str(), Some("fast"));
     }

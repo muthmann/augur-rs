@@ -17,8 +17,9 @@ use std::{
 mod offline;
 
 pub use offline::{
-    run_offline_analysis, OfflineAnalysisConfig, OfflineAnalysisOptions, OfflineAnalysisSummary,
-    OfflineProgress, TimestampWindow, TimestampWindower,
+    json_value_to_toml, probe_replay_file, run_offline_analysis, OfflineAnalysisConfig,
+    OfflineAnalysisOptions, OfflineAnalysisSummary, OfflinePluginConfig, OfflineProgress,
+    ReplayFileProbe, TimestampWindow, TimestampWindower,
 };
 
 use augur_core::{
@@ -2045,7 +2046,7 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-fn open_directory(path: &Path) -> Result<(), String> {
+pub fn open_directory(path: &Path) -> Result<(), String> {
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(path).status()
     } else if cfg!(target_os = "windows") {
