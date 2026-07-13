@@ -14,6 +14,8 @@ pub struct CameraConfig {
     pub pixel_mask: PixelMaskConfig,
     pub digital_filter: DigitalFilterConfig,
     #[serde(default)]
+    pub external_triggers: ExternalTriggerConfig,
+    #[serde(default)]
     pub global: GlobalSettingsConfig,
 }
 
@@ -24,6 +26,7 @@ impl Default for CameraConfig {
             roi: RoiConfig::full_frame(),
             pixel_mask: PixelMaskConfig::default(),
             digital_filter: DigitalFilterConfig::default(),
+            external_triggers: ExternalTriggerConfig::default(),
             global: GlobalSettingsConfig::default(),
         }
     }
@@ -41,6 +44,11 @@ impl CameraConfig {
         if self.digital_filter.stc_threshold_us == 0 {
             return Err(CameraError::Config(
                 "stc_threshold_us must be greater than 0".into(),
+            ));
+        }
+        if self.external_triggers.channel != 0 {
+            return Err(CameraError::Config(
+                "only external trigger channel 0 is supported".into(),
             ));
         }
         Ok(())
@@ -183,6 +191,15 @@ impl Default for DigitalFilterConfig {
     }
 }
 
+/// External trigger input (EVK4 TRIG_IN). When enabled, the sensor inserts
+/// EVT3 `EXT_TRIGGER` events into the stream on each edge of the selected
+/// channel, timestamped on the same clock as CD events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExternalTriggerConfig {
+    pub enabled: bool,
+    pub channel: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +249,20 @@ mod tests {
 
         let err = cfg.validate(1280, 720).expect_err("must reject");
         assert!(err.to_string().contains("cannot both be enabled"));
+    }
+
+    #[test]
+    fn rejects_unsupported_external_trigger_channel() {
+        let cfg = CameraConfig {
+            external_triggers: ExternalTriggerConfig {
+                enabled: true,
+                channel: 1,
+            },
+            ..CameraConfig::default()
+        };
+
+        let err = cfg.validate(1280, 720).expect_err("must reject");
+        assert!(err.to_string().contains("channel 0"));
     }
 
     #[test]
@@ -285,5 +316,6 @@ mod tests {
         .expect("legacy toml without global must load");
 
         assert_eq!(cfg.global, GlobalSettingsConfig::default());
+        assert_eq!(cfg.external_triggers, ExternalTriggerConfig::default());
     }
 }

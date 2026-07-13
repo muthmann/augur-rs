@@ -612,6 +612,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -635,6 +636,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -668,6 +670,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -707,6 +710,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -740,6 +744,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -769,6 +774,7 @@ mod tests {
             }]),
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 10,
         };
@@ -799,6 +805,7 @@ mod tests {
             }]),
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 25,
         };
@@ -835,6 +842,7 @@ mod tests {
             }]),
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 25,
         };
@@ -863,6 +871,7 @@ mod tests {
             }]),
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 10,
         };
@@ -890,6 +899,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };

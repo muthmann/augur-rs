@@ -14,7 +14,7 @@ use std::{
 
 use augur_event_types::{
     BackpressureBehavior, CompactEvent, ConsumerCursor, CursorId, CursorPolicy, EventChunk,
-    EventRing, EventSource, FetchError, FrameWindowEntry, RingAppendError,
+    EventRing, EventSource, ExternalTriggerEvent, FetchError, FrameWindowEntry, RingAppendError,
 };
 use crossbeam_channel::{
     bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
@@ -24,7 +24,7 @@ use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3Trigger
 use crate::{
     camera::{PacketStreamCamera, PacketStreamReader},
     config::CameraConfig,
-    evt3_timestamps::Evt3TimestampUnwrapper,
+    evt3_timestamps::{Evt3TimestampUnwrapper, SecondaryTimestampMapper},
     metadata::{RecordingMetadata, RecordingSidecar},
     CameraError, Result,
 };
@@ -263,6 +263,13 @@ impl EventSource for LiveEventSource {
 pub trait PreviewDecoder: Send + 'static {
     fn decode_bytes(&mut self, bytes: &[u8], out: &mut Vec<CdEvent>) -> Result<()>;
 
+    /// Appends the external trigger edges decoded by the most recent
+    /// `decode_bytes` call to `out`, draining the decoder's internal buffer.
+    /// Decoders without a trigger concept keep the default no-op.
+    fn take_triggers(&mut self, out: &mut Vec<ExternalTriggerEvent>) {
+        let _ = out;
+    }
+
     fn finish_stream(&mut self) -> Result<()> {
         Ok(())
     }
@@ -281,7 +288,9 @@ pub struct Evt3CorePreviewDecoder {
     inner: Evt3Decoder,
     cd_scratch: Vec<Evt3CdEvent>,
     trigger_scratch: Vec<Evt3TriggerEvent>,
+    pending_triggers: Vec<ExternalTriggerEvent>,
     timestamp_unwrapper: Evt3TimestampUnwrapper,
+    trigger_timestamp_mapper: SecondaryTimestampMapper,
 }
 
 impl Evt3CorePreviewDecoder {
@@ -315,7 +324,27 @@ impl PreviewDecoder for Evt3CorePreviewDecoder {
             });
         }
 
+        // Triggers arrive in their own vector, so they are unwrapped against
+        // the CD stream's rollover epoch instead of being fed through the CD
+        // unwrapper (which would clamp mid-packet trigger times forward).
+        self.pending_triggers.reserve(self.trigger_scratch.len());
+        for trigger in &self.trigger_scratch {
+            let timestamp_us = self.trigger_timestamp_mapper.map_timestamp(
+                trigger.timestamp,
+                self.timestamp_unwrapper.reference_timestamp_us(),
+            );
+            self.pending_triggers.push(ExternalTriggerEvent::new(
+                timestamp_us,
+                trigger.id,
+                trigger.value != 0,
+            ));
+        }
+
         Ok(())
+    }
+
+    fn take_triggers(&mut self, out: &mut Vec<ExternalTriggerEvent>) {
+        out.append(&mut self.pending_triggers);
     }
 
     fn finish_stream(&mut self) -> Result<()> {
@@ -342,6 +371,11 @@ pub struct PreviewFrame {
     pub events: Option<Vec<CdEvent>>,
     pub event_range: Option<Range<u64>>,
     pub event_source: Option<LiveEventSource>,
+    /// External trigger edges whose timestamps fall inside this frame's
+    /// accumulation window, in timestamp order. Delivery through the bounded
+    /// preview channel is best-effort; exact trigger data is recomputed from
+    /// the recorded RAW file.
+    pub external_triggers: Vec<ExternalTriggerEvent>,
     pub window_start_us: u64,
     pub window_end_us: u64,
 }
@@ -378,6 +412,7 @@ impl PreviewFrame {
 
 pub fn accumulate_compact_frame(
     events: &[CompactEvent],
+    external_triggers: &[ExternalTriggerEvent],
     width: u16,
     height: u16,
     window_start_us: u64,
@@ -441,6 +476,12 @@ pub fn accumulate_compact_frame(
         events: raw_events,
         event_range: None,
         event_source: None,
+        external_triggers: augur_event_types::inclusive_trigger_window(
+            external_triggers,
+            window_start_us,
+            window_end_us,
+        )
+        .to_vec(),
         window_start_us,
         window_end_us,
     }
@@ -803,6 +844,18 @@ fn reset_preview_frame_accumulators(
     *frame_start_ts = None;
 }
 
+/// Splits off the pending triggers that belong to a frame ending at
+/// `window_end_us`. Pending triggers are timestamp-ordered, so this is the
+/// prefix with `timestamp_us <= window_end_us`.
+fn split_frame_triggers(
+    pending_triggers: &mut Vec<ExternalTriggerEvent>,
+    window_end_us: u64,
+) -> Vec<ExternalTriggerEvent> {
+    let split = pending_triggers.partition_point(|trigger| trigger.timestamp_us <= window_end_us);
+    let remainder = pending_triggers.split_off(split);
+    std::mem::replace(pending_triggers, remainder)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_preview_frame(
     frame_tx: &Sender<PreviewFrame>,
@@ -811,6 +864,7 @@ fn emit_preview_frame(
     recording_cursor: Option<CursorId>,
     frame_buffers: &mut PreviewFrameBuffers,
     frame_events: &mut Vec<CdEvent>,
+    pending_triggers: &mut Vec<ExternalTriggerEvent>,
     capture_raw_events: bool,
     on_count: &mut u64,
     off_count: &mut u64,
@@ -823,6 +877,11 @@ fn emit_preview_frame(
     let Some(window_start_us) = *frame_start_ts else {
         return;
     };
+
+    // Triggers assigned to this frame leave the pending queue either way:
+    // if the frame is dropped below, its triggers drop with it (live preview
+    // delivery is best-effort; replayed RAW data is exact).
+    let frame_triggers = split_frame_triggers(pending_triggers, window_end_us);
 
     let event_range = if !capture_raw_events || frame_events.is_empty() {
         None
@@ -889,6 +948,7 @@ fn emit_preview_frame(
         events: raw_events,
         event_range,
         event_source: Some(event_source.clone()),
+        external_triggers: frame_triggers,
         window_start_us,
         window_end_us,
     };
@@ -1487,10 +1547,12 @@ where
     let preview_thread = thread::spawn(move || {
         let mut events = Vec::<CdEvent>::with_capacity(4_096);
         let mut frame_events = Vec::<CdEvent>::with_capacity(8_192);
+        let mut pending_triggers = Vec::<ExternalTriggerEvent>::with_capacity(64);
         let mut frame_buffers = take_preview_frame_buffers(pixel_count);
         let mut on_count = 0_u64;
         let mut off_count = 0_u64;
         let mut frame_start_ts: Option<u64> = None;
+        let mut last_event_ts: Option<u64> = None;
 
         loop {
             match preview_rx.recv_timeout(Duration::from_millis(2)) {
@@ -1512,14 +1574,36 @@ where
                         );
                         break;
                     }
+                    let pending_trigger_watermark = pending_triggers.len();
+                    decoder.take_triggers(&mut pending_triggers);
+                    let packet_triggers = &pending_triggers[pending_trigger_watermark..];
                     if let Ok(mut s) = stats_preview.lock() {
                         s.record_packet(Instant::now(), 0, events.len() as u64);
-                        if let (Some(first), Some(last)) = (
-                            events.first().map(|event| event.timestamp),
-                            events.last().map(|event| event.timestamp),
-                        ) {
+                        let first = events
+                            .first()
+                            .map(|event| event.timestamp)
+                            .into_iter()
+                            .chain(packet_triggers.first().map(|t| t.timestamp_us))
+                            .min();
+                        let last = events
+                            .last()
+                            .map(|event| event.timestamp)
+                            .into_iter()
+                            .chain(packet_triggers.last().map(|t| t.timestamp_us))
+                            .max();
+                        if let (Some(first), Some(last)) = (first, last) {
                             s.record_event_timestamps(first, last);
                         }
+                    }
+                    // A window may open on a trigger edge: trigger-only
+                    // streams (A2-style setups) must still produce frames.
+                    if let Some(first_trigger_ts) = pending_triggers.first().map(|t| t.timestamp_us)
+                    {
+                        let window_open_ts = events
+                            .first()
+                            .map(|event| event.timestamp.min(first_trigger_ts))
+                            .unwrap_or(first_trigger_ts);
+                        frame_start_ts.get_or_insert(window_open_ts);
                     }
                     let accumulate_started = Instant::now();
                     let capture_raw_events = raw_events_preview.load(Ordering::Relaxed);
@@ -1556,6 +1640,7 @@ where
                             new_on.abs_diff(new_off),
                         );
                         frame_start_ts.get_or_insert(ev.timestamp);
+                        last_event_ts = Some(ev.timestamp);
 
                         if frame_start_ts.is_some_and(|t0| {
                             ev.timestamp.saturating_sub(t0) >= acq_preview.load(Ordering::Relaxed)
@@ -1567,6 +1652,7 @@ where
                                 recording_event_cursor,
                                 &mut frame_buffers,
                                 &mut frame_events,
+                                &mut pending_triggers,
                                 capture_raw_events,
                                 &mut on_count,
                                 &mut off_count,
@@ -1577,6 +1663,41 @@ where
                                 ev.timestamp,
                             );
                         }
+                    }
+                    // Windows must also close when only triggers advance the
+                    // clock, otherwise trigger-only stretches never emit.
+                    loop {
+                        let Some(last_trigger_ts) = pending_triggers.last().map(|t| t.timestamp_us)
+                        else {
+                            break;
+                        };
+                        let Some(t0) = frame_start_ts
+                            .or_else(|| pending_triggers.first().map(|t| t.timestamp_us))
+                        else {
+                            break;
+                        };
+                        frame_start_ts.get_or_insert(t0);
+                        let acq_us = acq_preview.load(Ordering::Relaxed);
+                        if last_trigger_ts.saturating_sub(t0) < acq_us {
+                            break;
+                        }
+                        emit_preview_frame(
+                            &frame_tx,
+                            &stats_preview,
+                            &event_source_preview,
+                            recording_event_cursor,
+                            &mut frame_buffers,
+                            &mut frame_events,
+                            &mut pending_triggers,
+                            capture_raw_events,
+                            &mut on_count,
+                            &mut off_count,
+                            &mut frame_start_ts,
+                            width,
+                            height,
+                            pixel_count,
+                            t0.saturating_add(acq_us),
+                        );
                     }
                     let accumulate_elapsed = accumulate_started.elapsed();
                     if let Ok(mut s) = stats_preview.lock() {
@@ -1598,6 +1719,43 @@ where
                 &stop_preview,
                 "preview",
                 format!("preview stream finalize failed: {err}"),
+            );
+        }
+
+        // End of stream: flush the final partial window when it carries
+        // pending trigger edges, so triggers are never silently discarded
+        // at EOF (trigger-only recordings depend on this to be visible at
+        // all). CD-only partial windows keep the historical behavior of not
+        // emitting a below-acq-width tail frame.
+        decoder.take_triggers(&mut pending_triggers);
+        if frame_start_ts.is_none() {
+            frame_start_ts = pending_triggers.first().map(|t| t.timestamp_us);
+        }
+        if let (Some(t0), false) = (frame_start_ts, pending_triggers.is_empty()) {
+            let window_end_us = pending_triggers
+                .last()
+                .map(|t| t.timestamp_us)
+                .into_iter()
+                .chain(last_event_ts)
+                .max()
+                .unwrap_or(t0)
+                .max(t0);
+            emit_preview_frame(
+                &frame_tx,
+                &stats_preview,
+                &event_source_preview,
+                recording_event_cursor,
+                &mut frame_buffers,
+                &mut frame_events,
+                &mut pending_triggers,
+                raw_events_preview.load(Ordering::Relaxed),
+                &mut on_count,
+                &mut off_count,
+                &mut frame_start_ts,
+                width,
+                height,
+                pixel_count,
+                window_end_us,
             );
         }
     });
@@ -1945,6 +2103,96 @@ mod tests {
     }
 
     #[test]
+    fn decodes_external_triggers_with_unwrapped_timestamps() {
+        let words = [
+            (0x8 << 12) | 0x001,        // TIME_HIGH
+            (0x6 << 12) | 0x002,        // TIME_LOW -> t = (1<<12)|2
+            (0xA << 12) | (3 << 8) | 1, // EXT_TRIGGER rising, id=3
+            (0x6 << 12) | 0x004,        // TIME_LOW -> t = (1<<12)|4
+            (0xA << 12) | (3 << 8),     // EXT_TRIGGER falling, id=3
+        ];
+        let mut decoder = Evt3CorePreviewDecoder::default();
+        let mut events = Vec::new();
+        let mut triggers = Vec::new();
+
+        decoder
+            .decode_bytes(&words_to_bytes(&words), &mut events)
+            .expect("decoder must succeed");
+        decoder.take_triggers(&mut triggers);
+
+        assert!(events.is_empty());
+        assert_eq!(triggers.len(), 2);
+        assert_eq!(triggers[0].timestamp_us, (1_u64 << 12) | 2);
+        assert_eq!(triggers[0].id, 3);
+        assert!(triggers[0].is_rising());
+        assert_eq!(triggers[1].timestamp_us, (1_u64 << 12) | 4);
+        assert!(!triggers[1].is_rising());
+
+        let mut drained_again = Vec::new();
+        decoder.take_triggers(&mut drained_again);
+        assert!(drained_again.is_empty(), "take_triggers must drain");
+    }
+
+    #[test]
+    fn assigns_triggers_to_the_cd_epoch_across_rollover_straddle() {
+        let period = crate::evt3_timestamps::EVT3_TIMESTAMP_PERIOD_US;
+        // Chunk 1: CD event just before the 24-bit rollover.
+        let first_chunk =
+            words_to_bytes(&[(0x8 << 12) | 0xFFF, (0x6 << 12) | 0xFF0, 8, (0x2 << 12) | 4]);
+        // Chunk 2: post-rollover trigger + CD event, raw timestamps small again.
+        let second_chunk = words_to_bytes(&[
+            (0x8 << 12),
+            (0x6 << 12) | 0x010,
+            (0xA << 12) | 1, // EXT_TRIGGER rising, id=0, raw t = 0x10
+            8,
+            (0x2 << 12) | 5,
+        ]);
+        let mut decoder = Evt3CorePreviewDecoder::default();
+        let mut events = Vec::new();
+        let mut triggers = Vec::new();
+
+        decoder
+            .decode_bytes(&first_chunk, &mut events)
+            .expect("first chunk must decode");
+        decoder
+            .decode_bytes(&second_chunk, &mut events)
+            .expect("second chunk must decode");
+        decoder.take_triggers(&mut triggers);
+
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(
+            triggers[0].timestamp_us,
+            period + 16,
+            "the trigger must land in the post-rollover epoch, not epoch 0"
+        );
+    }
+
+    #[test]
+    fn assigns_trigger_only_packet_to_the_cd_epoch_after_rollover() {
+        let period = crate::evt3_timestamps::EVT3_TIMESTAMP_PERIOD_US;
+        // CD stream parks just before the rollover, then a trigger-only
+        // packet arrives after the wrap with no CD event to re-anchor it.
+        let cd_chunk =
+            words_to_bytes(&[(0x8 << 12) | 0xFFF, (0x6 << 12) | 0xFF0, 8, (0x2 << 12) | 4]);
+        let trigger_only_chunk =
+            words_to_bytes(&[(0x8 << 12), (0x6 << 12) | 0x010, (0xA << 12) | 1]);
+        let mut decoder = Evt3CorePreviewDecoder::default();
+        let mut events = Vec::new();
+        let mut triggers = Vec::new();
+
+        decoder
+            .decode_bytes(&cd_chunk, &mut events)
+            .expect("cd chunk must decode");
+        decoder
+            .decode_bytes(&trigger_only_chunk, &mut events)
+            .expect("trigger chunk must decode");
+        decoder.take_triggers(&mut triggers);
+
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].timestamp_us, period + 16);
+    }
+
+    #[test]
     fn seeds_evt3_timestamp_epoch_for_mid_file_decode() {
         let bytes = words_to_bytes(&[(0x8 << 12), (0x6 << 12) | 0x010, 8, (0x2 << 12) | 5]);
         let mut decoder = Evt3CorePreviewDecoder::with_expected_timestamp(
@@ -2136,6 +2384,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 10,
             window_end_us: 20,
         };
@@ -2307,6 +2556,7 @@ mod tests {
                 events: None,
                 event_range: None,
                 event_source: None,
+                external_triggers: Vec::new(),
                 window_start_us: 0,
                 window_end_us: 0,
             })
@@ -2319,6 +2569,7 @@ mod tests {
             None,
             &mut buffers,
             &mut events,
+            &mut Vec::new(),
             false,
             &mut on_count,
             &mut off_count,
@@ -2358,6 +2609,7 @@ mod tests {
                 events: None,
                 event_range: None,
                 event_source: None,
+                external_triggers: Vec::new(),
                 window_start_us: 0,
                 window_end_us: 0,
             })
@@ -2370,6 +2622,7 @@ mod tests {
             None,
             &mut buffers,
             &mut events,
+            &mut Vec::new(),
             true,
             &mut on_count,
             &mut off_count,
@@ -2407,6 +2660,7 @@ mod tests {
             None,
             &mut buffers,
             &mut events,
+            &mut Vec::new(),
             true,
             &mut on_count,
             &mut off_count,
@@ -2821,6 +3075,93 @@ mod tests {
                 .is_err(),
             "the remaining events stay below the larger acquisition window"
         );
+
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    #[test]
+    fn preview_pipeline_assigns_triggers_to_frame_windows() {
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 1;
+
+        // One packet: CD at t=0, trigger at t=600, CD at t=1200 closes the
+        // 1 ms window; the trigger must ride inside that frame.
+        let packet = words_to_bytes(&[
+            (0x8 << 12),         // TIME_HIGH 0
+            (0x6 << 12),         // TIME_LOW 0
+            8,                   // ADDR_Y
+            (0x2 << 12) | 4,     // CD event t=0
+            (0x6 << 12) | 600,   // TIME_LOW 600
+            (0xA << 12) | 1,     // trigger rising, id=0, t=600
+            (0x6 << 12) | 1_200, // TIME_LOW 1200
+            8,                   // ADDR_Y
+            (0x2 << 12) | 5,     // CD event t=1200
+        ]);
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![packet],
+                next_packet: 0,
+                release_after_first: None,
+            },
+            Evt3CorePreviewDecoder::default(),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        let frame = recv_preview_frame(&controller);
+        assert_eq!(frame.window_start_us, 0);
+        assert_eq!(frame.window_end_us, 1_200);
+        assert_eq!(frame.on_count + frame.off_count, 2);
+        assert_eq!(frame.external_triggers.len(), 1);
+        assert_eq!(frame.external_triggers[0].timestamp_us, 600);
+        assert!(frame.external_triggers[0].is_rising());
+
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    #[test]
+    fn preview_pipeline_emits_trigger_only_frames_and_flushes_at_eof() {
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 1;
+
+        // No CD events at all: two triggers inside the first window, one
+        // 1.4 ms later. The first frame closes on trigger time alone; the
+        // trailing trigger must be flushed at EOF instead of vanishing.
+        let packet = words_to_bytes(&[
+            (0x8 << 12),         // TIME_HIGH 0
+            (0x6 << 12) | 100,   // TIME_LOW 100
+            (0xA << 12) | 1,     // trigger rising t=100
+            (0x6 << 12) | 200,   // TIME_LOW 200
+            (0xA << 12),         // trigger falling t=200
+            (0x6 << 12) | 1_500, // TIME_LOW 1500
+            (0xA << 12) | 1,     // trigger rising t=1500
+        ]);
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![packet],
+                next_packet: 0,
+                release_after_first: None,
+            },
+            Evt3CorePreviewDecoder::default(),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        let first = recv_preview_frame(&controller);
+        assert_eq!(first.window_start_us, 100);
+        assert_eq!(first.window_end_us, 1_100);
+        assert_eq!(first.on_count + first.off_count, 0);
+        assert_eq!(first.external_triggers.len(), 2);
+        assert!(first.external_triggers[0].is_rising());
+        assert!(!first.external_triggers[1].is_rising());
+
+        let flushed = recv_preview_frame(&controller);
+        assert_eq!(flushed.external_triggers.len(), 1);
+        assert_eq!(flushed.external_triggers[0].timestamp_us, 1_500);
 
         controller.shutdown().expect("pipeline must shut down");
     }

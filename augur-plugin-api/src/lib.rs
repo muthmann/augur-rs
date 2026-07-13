@@ -18,14 +18,17 @@ pub use context::{
 };
 pub use event_store::EventStore;
 pub use ffi::{
-    AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
-    FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape,
-    FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-    FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
-    PluginDiscontinuity, PluginDiscontinuityFn, PluginEntry, PluginInput, PluginStateKind,
-    PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, ExecutionMode,
+    FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiExecutionContext,
+    FfiExternalTriggerEvent, FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel,
+    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
+    HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn, PluginDiscontinuity,
+    PluginDiscontinuityFn, PluginEntry, PluginInput, PluginStateKind, PluginStateKindFn,
+    PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
-pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
+pub use helpers::{
+    EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin, PluginFrame,
+};
 pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
 
 #[doc(hidden)]
@@ -113,7 +116,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<PluginDiscontinuityFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginStateKind>(), 4);
         assert_eq!(std::mem::size_of::<PluginDiscontinuity>(), 4);
-        assert_eq!(PLUGIN_ABI_VERSION, 4);
+        assert_eq!(std::mem::size_of::<crate::FfiExternalTriggerEvent>(), 16);
+        assert_eq!(std::mem::align_of::<crate::FfiExternalTriggerEvent>(), 8);
+        assert_eq!(std::mem::size_of::<crate::ExecutionMode>(), 4);
+        assert_eq!(std::mem::size_of::<crate::FfiExecutionContext>(), 32);
+        assert_eq!(PLUGIN_ABI_VERSION, 5);
     }
 
     #[test]

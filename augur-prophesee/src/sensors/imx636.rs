@@ -1,7 +1,7 @@
 use std::{collections::HashSet, fs, thread, time::Duration};
 
 use augur_core::{
-    config::{BiasConfig, DigitalFilterConfig, PixelMaskConfig, RoiConfig},
+    config::{BiasConfig, DigitalFilterConfig, ExternalTriggerConfig, PixelMaskConfig, RoiConfig},
     CameraError, Result,
 };
 
@@ -19,6 +19,7 @@ const REG_ROI_WIN_CTRL: u32 = 0x0034;
 const REG_ROI_WIN_START_ADDR: u32 = 0x0038;
 const REG_ROI_WIN_END_ADDR: u32 = 0x003C;
 const REG_IPH_MIRR_CTRL: u32 = 0x0074;
+const REG_DIG_PAD2_CTRL: u32 = 0x0044;
 
 const REG_BIAS_FO: u32 = 0x1004;
 const REG_BIAS_HPF: u32 = 0x100C;
@@ -37,6 +38,7 @@ const REG_STC_INVALIDATION: u32 = 0xD0C0;
 const REG_STC_INITIALIZATION: u32 = 0xD0C4;
 
 const REG_TIME_BASE_CTRL: u32 = 0x9008;
+const REG_EDF_RESERVED_7004: u32 = 0x7004;
 
 const BIAS_CONF: u32 = 0x11A1_0000;
 
@@ -56,7 +58,7 @@ struct StcThresholdParam {
     dt_fifo_timeout: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegOp {
     Write { address: u32, value: u32 },
     WriteField { address: u32, value: u32, mask: u32 },
@@ -301,6 +303,23 @@ impl Imx636 {
     }
 }
 
+impl Imx636 {
+    fn external_trigger_sequence(cfg: &ExternalTriggerConfig) -> Result<&'static [RegOp]> {
+        if cfg.channel != 0 {
+            return Err(CameraError::Config(
+                "only external trigger channel 0 is supported on IMX636".into(),
+            ));
+        }
+        Ok(if cfg.enabled {
+            // OpenEB: hal_psee_plugins/src/devices/gen41/gen41_tz_trigger_event.cpp
+            // (Gen41TzTriggerEvent::enable)
+            IMX636_EXTERNAL_TRIGGER_ENABLE_CH0
+        } else {
+            IMX636_EXTERNAL_TRIGGER_DISABLE_CH0
+        })
+    }
+}
+
 impl PseeSensor for Imx636 {
     fn name(&self) -> &'static str {
         "IMX636"
@@ -508,6 +527,15 @@ impl PseeSensor for Imx636 {
         Ok(())
     }
 
+    fn set_external_trigger(
+        &mut self,
+        transport: &mut Transport,
+        cfg: &ExternalTriggerConfig,
+    ) -> Result<()> {
+        let sequence = Self::external_trigger_sequence(cfg)?;
+        self.apply_sequence(transport, sequence)
+    }
+
     fn start_streaming(&mut self, transport: &mut Transport) -> Result<()> {
         self.apply_sequence(transport, ISSD_START)
     }
@@ -609,6 +637,14 @@ const ISSD_INIT: &[RegOp] = &[
     RegOp::delay_us(1000),
     RegOp::write(0x00009000, 0x00000200),
 ];
+
+const IMX636_EXTERNAL_TRIGGER_ENABLE_CH0: &[RegOp] = &[
+    RegOp::write_field(REG_DIG_PAD2_CTRL, 0xF000, 0xF000),
+    RegOp::write_field(REG_EDF_RESERVED_7004, 0x0400, 0x0400),
+];
+
+const IMX636_EXTERNAL_TRIGGER_DISABLE_CH0: &[RegOp] =
+    &[RegOp::write_field(REG_EDF_RESERVED_7004, 0, 0x0400)];
 
 const ISSD_START: &[RegOp] = &[
     RegOp::write(0x0000B000, 0x000002F9),
@@ -1160,3 +1196,53 @@ const STC_THRESHOLD_PARAMS: [StcThresholdParam; 100] = [
         dt_fifo_timeout: 564,
     }, // 100ms
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_trigger_enable_sequence_enables_channel_zero() {
+        let cfg = ExternalTriggerConfig {
+            enabled: true,
+            channel: 0,
+        };
+
+        let sequence = Imx636::external_trigger_sequence(&cfg).expect("channel 0 is supported");
+
+        assert_eq!(
+            sequence,
+            [
+                RegOp::write_field(REG_DIG_PAD2_CTRL, 0xF000, 0xF000),
+                RegOp::write_field(REG_EDF_RESERVED_7004, 0x0400, 0x0400),
+            ]
+        );
+    }
+
+    #[test]
+    fn external_trigger_disable_sequence_clears_channel_zero() {
+        let cfg = ExternalTriggerConfig {
+            enabled: false,
+            channel: 0,
+        };
+
+        let sequence = Imx636::external_trigger_sequence(&cfg).expect("channel 0 is supported");
+
+        assert_eq!(
+            sequence,
+            [RegOp::write_field(REG_EDF_RESERVED_7004, 0, 0x0400)]
+        );
+    }
+
+    #[test]
+    fn external_trigger_sequence_rejects_other_channels() {
+        let cfg = ExternalTriggerConfig {
+            enabled: true,
+            channel: 1,
+        };
+
+        let err = Imx636::external_trigger_sequence(&cfg).expect_err("channel must be rejected");
+
+        assert!(err.to_string().contains("channel 0"));
+    }
+}

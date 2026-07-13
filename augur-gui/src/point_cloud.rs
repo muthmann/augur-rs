@@ -312,6 +312,7 @@ mod tests {
             events: None,
             event_range: Some(event_range),
             event_source: Some(source),
+            external_triggers: Vec::new(),
             window_start_us,
             window_end_us,
         }

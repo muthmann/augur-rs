@@ -268,6 +268,7 @@ fn analyze(
             plugins_dir,
             config,
             stop: Some(Arc::clone(&stop)),
+            session_id: None,
         },
         |progress| {
             println!(

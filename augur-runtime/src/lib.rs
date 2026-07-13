@@ -31,12 +31,12 @@ use augur_core::{
 };
 use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
 use augur_plugin_api::{
-    AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
-    FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel, FfiPluginContext,
-    FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker, HostDatasetDescriptor,
-    HostDatasetKind, HostViewRegistry, Image2dV1, PluginCapabilities, PluginDiscontinuity,
-    PluginEntry, PluginInput, PluginStateKind, PluginVTable, Series1dV1, SettingsSchema,
-    StatusEntry, TableDatasetV1, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    AnalysisSeverity, ExecutionContext, FfiCdEvent, FfiColorRgba, FfiEventFrame,
+    FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel,
+    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
+    HostDatasetDescriptor, HostDatasetKind, HostViewRegistry, Image2dV1, PluginCapabilities,
+    PluginDiscontinuity, PluginEntry, PluginInput, PluginStateKind, PluginVTable, Series1dV1,
+    SettingsSchema, StatusEntry, TableDatasetV1, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -266,6 +266,10 @@ impl Drop for LiveAnalysisWorker {
 pub struct LiveAnalysisJob {
     pub epoch: u64,
     pub frame: PreviewFrame,
+    /// Where this job runs and whether hardware effects are permitted.
+    /// Defaults to fail-closed (replay, no effects); the dispatching host
+    /// sets `LiveCapture` + effects for the active live-capture worker only.
+    pub execution: ExecutionContext,
     pub global_settings_json: Option<Vec<u8>>,
     /// Full replacement snapshot of the persistent context bus. The GUI sends
     /// one when it owned the bus since the last live job (startup and
@@ -288,6 +292,7 @@ impl LiveAnalysisJob {
         let LiveAnalysisJob {
             epoch,
             frame,
+            execution,
             global_settings_json,
             persistent_seed,
             persistent_updates,
@@ -295,6 +300,7 @@ impl LiveAnalysisJob {
         } = next;
         self.epoch = epoch;
         self.frame = frame;
+        self.execution = execution;
         self.global_settings_json = global_settings_json;
         if persistent_seed.is_some() {
             // A newer full snapshot already contains every older update.
@@ -974,6 +980,7 @@ impl DynPlugin {
             height: frame.height,
             pixels: FfiSlice::from_slice(&frame.pixels),
             events: FfiSlice::from_slice(raw_events),
+            external_triggers: FfiSlice::from_slice(&frame.external_triggers),
             window_start_us: frame.window_start_us,
             window_end_us: frame.window_end_us,
         };
@@ -1003,6 +1010,7 @@ impl DynPlugin {
             get: get_context_value,
             publish_persistent: publish_persistent_context_value,
             get_persistent: get_persistent_context_value,
+            execution: pass.execution.as_ffi(),
         };
         let ffi_event_store = FfiEventStoreHandle {
             ctx: (&store_bridge as *const EventStoreBridge).cast(),
@@ -1428,6 +1436,7 @@ fn process_live_analysis_job(
     let pass = AnalysisPassContext {
         event_store,
         history_cache: &history_cache,
+        execution: &job.execution,
     };
     for phase in [
         PluginInput::FrameOnly,
@@ -1582,6 +1591,9 @@ pub struct EventHistoryMaterializationCache {
 pub struct AnalysisPassContext<'a> {
     pub event_store: &'a PluginEventHistory,
     pub history_cache: &'a EventHistoryMaterializationCache,
+    /// Execution mode / effects gate for this pass, delivered to plugins
+    /// through `HostContext::execution()`.
+    pub execution: &'a ExecutionContext,
 }
 
 struct EventStoreBridge<'a> {
@@ -2121,6 +2133,7 @@ mod tests {
             events: None,
             event_range: Some(event_range),
             event_source: Some(source),
+            external_triggers: Vec::new(),
             window_start_us,
             window_end_us,
         }
@@ -2140,6 +2153,7 @@ mod tests {
             events: None,
             event_range: None,
             event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         }
@@ -2371,6 +2385,7 @@ mod tests {
         worker.analyze(LiveAnalysisJob {
             epoch: 1,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::new(),
@@ -2384,6 +2399,7 @@ mod tests {
         worker.analyze(LiveAnalysisJob {
             epoch: 2,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::new(),
@@ -2413,6 +2429,7 @@ mod tests {
         worker.analyze(LiveAnalysisJob {
             epoch: 1,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: Some(seed),
             persistent_updates: HashMap::new(),
@@ -2430,6 +2447,7 @@ mod tests {
         worker.analyze(LiveAnalysisJob {
             epoch: 2,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::new(),
@@ -2452,6 +2470,7 @@ mod tests {
         let mut job = LiveAnalysisJob {
             epoch: 1,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::from([("host.queue".to_owned(), Some(b"first".to_vec()))]),
@@ -2460,6 +2479,7 @@ mod tests {
         job.coalesce_with(LiveAnalysisJob {
             epoch: 2,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::from([("host.other".to_owned(), None)]),
@@ -2486,6 +2506,7 @@ mod tests {
         let mut job = LiveAnalysisJob {
             epoch: 1,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: Some(HashMap::from([("stale".to_owned(), b"a".to_vec())])),
             persistent_updates: HashMap::from([("stale.update".to_owned(), Some(b"b".to_vec()))]),
@@ -2494,6 +2515,7 @@ mod tests {
         job.coalesce_with(LiveAnalysisJob {
             epoch: 2,
             frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
             persistent_seed: Some(HashMap::from([("fresh".to_owned(), b"c".to_vec())])),
             persistent_updates: HashMap::new(),

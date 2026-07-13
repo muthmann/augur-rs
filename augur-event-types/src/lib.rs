@@ -71,6 +71,52 @@ pub fn inclusive_window(events: &[CompactEvent], start_us: u64, end_us: u64) -> 
     &events[start..end]
 }
 
+/// An EVT3 `EXT_TRIGGER` edge on the camera clock.
+///
+/// The layout is a fixed 16-byte `#[repr(C)]` record so the same type can
+/// cross the dynamic plugin ABI unchanged. `level` is stored as a raw byte
+/// (0 = falling, 1 = rising); use [`ExternalTriggerEvent::is_rising`] for the
+/// ergonomic view.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ExternalTriggerEvent {
+    /// Camera-clock timestamp, unwrapped across the 24-bit EVT3 rollover.
+    pub timestamp_us: u64,
+    /// EVT3 trigger channel id.
+    pub id: u8,
+    /// Edge level: 0 = falling, 1 = rising.
+    pub level: u8,
+    pub _reserved: [u8; 6],
+}
+
+impl ExternalTriggerEvent {
+    pub const fn new(timestamp_us: u64, id: u8, rising: bool) -> Self {
+        Self {
+            timestamp_us,
+            id,
+            level: rising as u8,
+            _reserved: [0; 6],
+        }
+    }
+
+    pub const fn is_rising(self) -> bool {
+        self.level != 0
+    }
+}
+
+/// Returns the sub-slice of an ascending-timestamp trigger slice whose
+/// timestamps fall within the inclusive window `[start_us, end_us]`.
+pub fn inclusive_trigger_window(
+    triggers: &[ExternalTriggerEvent],
+    start_us: u64,
+    end_us: u64,
+) -> &[ExternalTriggerEvent] {
+    let start = triggers.partition_point(|trigger| trigger.timestamp_us < start_us);
+    let end = triggers.partition_point(|trigger| trigger.timestamp_us <= end_us);
+    &triggers[start..end]
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CursorId(u64);
@@ -164,6 +210,9 @@ impl FrameIndex {
 #[derive(Clone, Debug)]
 pub struct EventChunk {
     pub events: Vec<CompactEvent>,
+    /// External trigger edges inside `[start_us, end_us]`. Sources that do
+    /// not carry triggers (decoded imports, the live ring) leave this empty.
+    pub triggers: Vec<ExternalTriggerEvent>,
     pub start_us: u64,
     pub end_us: u64,
 }
@@ -681,6 +730,7 @@ impl EventSource for EventRing {
         } else {
             Ok(EventChunk {
                 events,
+                triggers: Vec::new(),
                 start_us,
                 end_us,
             })
@@ -702,6 +752,32 @@ mod tests {
     fn compact_event_layout_is_ffi_stable() {
         assert_eq!(std::mem::size_of::<CompactEvent>(), 16);
         assert_eq!(std::mem::align_of::<CompactEvent>(), 8);
+    }
+
+    #[test]
+    fn external_trigger_event_layout_is_ffi_stable() {
+        use super::ExternalTriggerEvent;
+        assert_eq!(std::mem::size_of::<ExternalTriggerEvent>(), 16);
+        assert_eq!(std::mem::align_of::<ExternalTriggerEvent>(), 8);
+
+        let rising = ExternalTriggerEvent::new(42, 3, true);
+        assert!(rising.is_rising());
+        assert_eq!(rising.id, 3);
+        assert_eq!(rising.timestamp_us, 42);
+        assert!(!ExternalTriggerEvent::new(42, 0, false).is_rising());
+    }
+
+    #[test]
+    fn inclusive_trigger_window_selects_inclusive_bounds() {
+        use super::{inclusive_trigger_window, ExternalTriggerEvent};
+        let triggers = [
+            ExternalTriggerEvent::new(10, 0, true),
+            ExternalTriggerEvent::new(20, 0, false),
+            ExternalTriggerEvent::new(30, 0, true),
+        ];
+        assert_eq!(inclusive_trigger_window(&triggers, 10, 20).len(), 2);
+        assert_eq!(inclusive_trigger_window(&triggers, 11, 19).len(), 0);
+        assert_eq!(inclusive_trigger_window(&triggers, 0, 100).len(), 3);
     }
 
     #[test]

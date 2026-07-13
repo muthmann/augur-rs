@@ -216,6 +216,7 @@ impl AnalysisRunsState {
         let worker_stop = Arc::clone(&stop);
         let input_path = request.input_path.clone();
         let output_dir = request.output_dir.clone();
+        let session_id = request.name.clone();
         thread::spawn(move || {
             let result = run_offline_analysis(
                 OfflineAnalysisOptions {
@@ -224,6 +225,7 @@ impl AnalysisRunsState {
                     plugins_dir: None,
                     config,
                     stop: Some(worker_stop),
+                    session_id: Some(session_id),
                 },
                 |progress| {
                     let _ = progress_tx.send(progress);

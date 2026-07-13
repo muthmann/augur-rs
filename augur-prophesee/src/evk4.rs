@@ -130,6 +130,11 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
     fn configure(&mut self, config: &CameraConfig) -> Result<()> {
         let (w, h) = self.sensor.geometry();
         config.validate(w, h)?;
+        if self.streaming && config.external_triggers != self.config.external_triggers {
+            return Err(CameraError::Config(
+                "external triggers cannot be toggled while streaming".into(),
+            ));
+        }
         self.sensor
             .set_biases(&mut self.transport, &config.biases)?;
         self.sensor.set_roi(&mut self.transport, &config.roi)?;
@@ -137,6 +142,10 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
             .set_pixel_mask(&mut self.transport, &config.pixel_mask)?;
         self.sensor
             .set_digital_filter(&mut self.transport, &config.digital_filter)?;
+        if !self.streaming || config.external_triggers != self.config.external_triggers {
+            self.sensor
+                .set_external_trigger(&mut self.transport, &config.external_triggers)?;
+        }
         self.config = config.clone();
         Ok(())
     }

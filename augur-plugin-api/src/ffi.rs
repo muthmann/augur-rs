@@ -3,6 +3,7 @@ use std::{ffi::c_void, str::Utf8Error};
 use serde::{Deserialize, Serialize};
 
 pub type FfiCdEvent = augur_event_types::CompactEvent;
+pub type FfiExternalTriggerEvent = augur_event_types::ExternalTriggerEvent;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,8 +251,46 @@ pub struct FfiPreviewFrame {
     pub height: u16,
     pub pixels: FfiSlice<u16>,
     pub events: FfiSlice<FfiCdEvent>,
+    /// EVT3 `EXT_TRIGGER` edges inside this frame's window, camera-clock
+    /// timestamps, in timestamp order.
+    pub external_triggers: FfiSlice<FfiExternalTriggerEvent>,
     pub window_start_us: u64,
     pub window_end_us: u64,
+}
+
+/// Where a plugin invocation is running and whether hardware side effects
+/// are permitted. Plugins that talk to lab instruments must fail closed
+/// unless `mode == LiveCapture` **and** `effects_allowed != 0`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    LiveCapture = 0,
+    Replay = 1,
+    OfflineAnalysis = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiExecutionContext {
+    pub mode: ExecutionMode,
+    /// Boolean as a fixed-layout byte: nonzero = effects allowed.
+    pub effects_allowed: u8,
+    pub _reserved: [u8; 7],
+    /// Optional host-assigned session identifier (empty = none).
+    pub session_id: FfiString,
+}
+
+impl FfiExecutionContext {
+    /// The most restrictive context: replay semantics, no effects.
+    pub const fn fail_closed() -> Self {
+        Self {
+            mode: ExecutionMode::Replay,
+            effects_allowed: 0,
+            _reserved: [0; 7],
+            session_id: FfiString::empty(),
+        }
+    }
 }
 
 pub type AddHighlightPixelsFn = unsafe extern "C" fn(*mut c_void, FfiSlice<FfiPixel>, FfiColorRgba);
@@ -290,7 +329,7 @@ pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCap
 pub type PluginStateKindFn = unsafe extern "C" fn(*const c_void) -> PluginStateKind;
 pub type PluginDiscontinuityFn = unsafe extern "C" fn(*mut c_void, PluginDiscontinuity);
 
-pub const PLUGIN_ABI_VERSION: u64 = 4;
+pub const PLUGIN_ABI_VERSION: u64 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -311,6 +350,7 @@ pub struct FfiPluginContext {
     pub get: ContextGetFn,
     pub publish_persistent: ContextPublishFn,
     pub get_persistent: ContextGetFn,
+    pub execution: FfiExecutionContext,
 }
 
 #[repr(C)]

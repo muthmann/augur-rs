@@ -26,10 +26,11 @@ use augur_core::{
 };
 use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
 use augur_plugin_api::{
-    FfiCdEvent, GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
-    HostActionScopePayload, HostDatasetKind, HostViewKind, Image2dV1, PluginDiscontinuity,
-    PluginInput, Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1,
-    CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
+    ExecutionContext, ExecutionMode, FfiCdEvent, GlobalSettings, HostActionRequest,
+    HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostDatasetKind, HostViewKind,
+    Image2dV1, PluginDiscontinuity, PluginInput, Series1dV1, SettingsSchema, TableColumnValues,
+    TableDatasetV1, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+    HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
@@ -497,6 +498,7 @@ fn replay_snapshot_frame(frame: &PreviewFrame) -> PreviewFrame {
         },
         event_range: frame.event_range.clone(),
         event_source: frame.event_source.clone(),
+        external_triggers: frame.external_triggers.clone(),
         window_start_us: frame.window_start_us,
         window_end_us: frame.window_end_us,
     }
@@ -6703,6 +6705,24 @@ impl CameraApp {
         self.publish_pending_action_requests();
     }
 
+    /// Execution context for plugin passes started by this GUI instance.
+    ///
+    /// `request_effects` is honored only for the live-capture worker path:
+    /// synchronous GUI passes and every replay/offline pass stay effects-free,
+    /// so a replayed recording can never re-arm laboratory hardware.
+    fn plugin_execution_context(&self, request_effects: bool) -> ExecutionContext {
+        let mode = if self.replay_controls.is_some() {
+            ExecutionMode::Replay
+        } else {
+            ExecutionMode::LiveCapture
+        };
+        ExecutionContext {
+            mode,
+            effects_allowed: request_effects && mode == ExecutionMode::LiveCapture,
+            session_id: None,
+        }
+    }
+
     fn run_analysis(&mut self, frame: &PreviewFrame, append_current_frame_to_event_store: bool) {
         self.clear_runtime_snapshots();
         self.analysis_output = AnalysisOutput::default();
@@ -6738,9 +6758,11 @@ impl CameraApp {
         };
 
         let history_cache = EventHistoryMaterializationCache::default();
+        let execution = self.plugin_execution_context(false);
         let pass = AnalysisPassContext {
             event_store: &self.event_store,
             history_cache: &history_cache,
+            execution: &execution,
         };
         for phase in [
             PluginInput::FrameOnly,
@@ -6813,6 +6835,7 @@ impl CameraApp {
         self.live_analysis_worker.analyze(LiveAnalysisJob {
             epoch,
             frame: frame.clone(),
+            execution: self.plugin_execution_context(true),
             global_settings_json,
             persistent_seed,
             persistent_updates,
@@ -10268,6 +10291,7 @@ mod tests {
             events: None,
             event_range: Some(event_range),
             event_source: Some(source),
+            external_triggers: Vec::new(),
             window_start_us,
             window_end_us,
         }
@@ -10390,6 +10414,7 @@ mod tests {
             events: Some(events.clone()),
             event_range: Some(event_range),
             event_source: Some(source),
+            external_triggers: Vec::new(),
             window_start_us: 40,
             window_end_us: 45,
         };

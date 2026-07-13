@@ -92,6 +92,7 @@ fn synthetic_frame(width: u16, height: u16, density: FixtureDensity) -> PreviewF
         events: Some(events),
         event_range: None,
         event_source: None,
+        external_triggers: Vec::new(),
         window_start_us: 0,
         window_end_us: timestamp.max(1),
     }

@@ -94,6 +94,9 @@ impl EventSource for DecodedReplayEventSource {
                 .copied()
                 .map(CompactEvent::from)
                 .collect(),
+            // Decoded imports (CSV/HDF5/packed) carry no trigger channel in
+            // v1; only EVT3 RAW sources deliver external triggers.
+            triggers: Vec::new(),
             start_us,
             end_us,
         })

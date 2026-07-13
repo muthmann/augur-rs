@@ -192,6 +192,27 @@ pub fn draw_settings(
     ui.separator();
     crate::theme::collapse(
         ui,
+        "settings_external_triggers",
+        "External Triggers",
+        false,
+        None,
+        |ui| {
+            ui.weak(
+                "EVK4 TRIG_IN monitoring. Channel 0 is the only supported input in this release.",
+            );
+            changed |= ui
+                .checkbox(
+                    &mut cfg.external_triggers.enabled,
+                    "Enable channel 0 (TRIG_IN)",
+                )
+                .on_hover_text("Inserts EXT_TRIGGER events into the EVT3 stream when an edge arrives on the EVK4 TRIG_IN pin, timestamped on the camera clock. Cannot change while streaming.")
+                .changed();
+        },
+    );
+
+    ui.separator();
+    crate::theme::collapse(
+        ui,
         "settings_filters",
         "Digital Filters",
         false,

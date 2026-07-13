@@ -14,10 +14,10 @@ use augur_core::{
     pipeline::accumulate_compact_frame,
     replay::{RawFileCamera, RawReplayEventSource, ReplayFileInfo},
 };
-use augur_event_types::{CompactEvent, EventSource, FetchError};
+use augur_event_types::{CompactEvent, EventSource, ExternalTriggerEvent, FetchError};
 use augur_plugin_api::{
-    GlobalSettings, HostDatasetKind, Image2dV1, PluginInput, Series1dV1, TableColumnValues,
-    TableDatasetV1, TableSchema, CTX_GLOBAL_SETTINGS,
+    ExecutionContext, ExecutionMode, GlobalSettings, HostDatasetKind, Image2dV1, PluginInput,
+    Series1dV1, TableColumnValues, TableDatasetV1, TableSchema, CTX_GLOBAL_SETTINGS,
 };
 use image::{ImageFormat, RgbaImage};
 use serde::Deserialize;
@@ -146,6 +146,9 @@ pub struct OfflineAnalysisOptions {
     pub plugins_dir: Option<PathBuf>,
     pub config: OfflineAnalysisConfig,
     pub stop: Option<Arc<AtomicBool>>,
+    /// Optional identifier (e.g. analysis-run name) exposed to plugins via
+    /// `ExecutionContext::session_id`.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,9 +242,13 @@ impl OfflineInput {
         }
     }
 
-    fn fetch_half_open(&self, start_us: u64, end_us: u64) -> Result<Vec<CompactEvent>, String> {
+    fn fetch_half_open(
+        &self,
+        start_us: u64,
+        end_us: u64,
+    ) -> Result<(Vec<CompactEvent>, Vec<ExternalTriggerEvent>), String> {
         if start_us >= end_us {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let inclusive_end = end_us.saturating_sub(1);
         let chunk = match self {
@@ -249,15 +256,25 @@ impl OfflineInput {
             Self::Raw { source, .. } => source.fetch_range(start_us, inclusive_end),
         };
         match chunk {
-            Ok(chunk) => Ok(chunk
-                .events
-                .into_iter()
-                .filter(|event| {
-                    let ts = event.timestamp_us();
-                    ts >= start_us && ts < end_us
-                })
-                .collect()),
-            Err(FetchError::OutOfTimeline) => Ok(Vec::new()),
+            Ok(chunk) => {
+                let events = chunk
+                    .events
+                    .into_iter()
+                    .filter(|event| {
+                        let ts = event.timestamp_us();
+                        ts >= start_us && ts < end_us
+                    })
+                    .collect();
+                let triggers = chunk
+                    .triggers
+                    .into_iter()
+                    .filter(|trigger| {
+                        trigger.timestamp_us >= start_us && trigger.timestamp_us < end_us
+                    })
+                    .collect();
+                Ok((events, triggers))
+            }
+            Err(FetchError::OutOfTimeline) => Ok((Vec::new(), Vec::new())),
             Err(err) => Err(format!("fetching [{start_us}, {end_us}) failed: {err}")),
         }
     }
@@ -341,9 +358,10 @@ pub fn run_offline_analysis(
             return Err("offline analysis cancelled".into());
         }
 
-        let events = input.fetch_half_open(window.start_us, window.end_us)?;
+        let (events, triggers) = input.fetch_half_open(window.start_us, window.end_us)?;
         let frame = accumulate_compact_frame(
             &events,
+            &triggers,
             info.width,
             info.height,
             window.start_us,
@@ -371,9 +389,15 @@ pub fn run_offline_analysis(
 
         let mut analysis_output = augur_core::analysis::AnalysisOutput::default();
         let history_cache = EventHistoryMaterializationCache::default();
+        let execution = ExecutionContext {
+            mode: ExecutionMode::OfflineAnalysis,
+            effects_allowed: false,
+            session_id: options.session_id.clone(),
+        };
         let pass = AnalysisPassContext {
             event_store: &event_store,
             history_cache: &history_cache,
+            execution: &execution,
         };
         for phase in [
             PluginInput::FrameOnly,
@@ -808,6 +832,7 @@ mod tests {
                     ..OfflineAnalysisConfig::default()
                 },
                 stop: None,
+                session_id: None,
             },
             |progress| windows.push((progress.window_start_us, progress.window_end_us)),
         )
@@ -838,6 +863,7 @@ mod tests {
                     ..OfflineAnalysisConfig::default()
                 },
                 stop: None,
+                session_id: None,
             },
             |_| {},
         )
@@ -910,6 +936,7 @@ mod tests {
                 plugins_dir: Some(plugins_dir.clone()),
                 config: config.clone(),
                 stop: Some(Arc::new(AtomicBool::new(false))),
+                session_id: None,
             },
             |_| {},
         )
@@ -921,6 +948,7 @@ mod tests {
                 plugins_dir: Some(plugins_dir),
                 config,
                 stop: Some(Arc::new(AtomicBool::new(false))),
+                session_id: None,
             },
             |_| {},
         )

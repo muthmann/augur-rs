@@ -19,6 +19,18 @@ pub trait PseeSensor: Send {
         transport: &mut Transport,
         filter: &DigitalFilterConfig,
     ) -> Result<()>;
+    fn set_external_trigger(
+        &mut self,
+        _transport: &mut Transport,
+        cfg: &ExternalTriggerConfig,
+    ) -> Result<()> {
+        if cfg.enabled {
+            return Err(augur_core::CameraError::Config(
+                "this sensor does not support external trigger input".into(),
+            ));
+        }
+        Ok(())
+    }
     fn start_streaming(&mut self, transport: &mut Transport) -> Result<()>;
     fn stop_streaming(&mut self, transport: &mut Transport) -> Result<()>;
 }

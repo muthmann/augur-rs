@@ -10,13 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use augur_event_types::{CompactEvent, EventChunk, EventSource, FetchError};
+use augur_event_types::{CompactEvent, EventChunk, EventSource, ExternalTriggerEvent, FetchError};
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
     camera::{DeviceInfo, EventCamera, PacketStreamCamera},
     config::CameraConfig,
-    evt3_timestamps::{Evt3TimestampUnwrapper, EVT3_TIMESTAMP_PERIOD_US},
+    evt3_timestamps::{Evt3TimestampUnwrapper, SecondaryTimestampMapper, EVT3_TIMESTAMP_PERIOD_US},
     metadata::RecordingMetadata,
     CameraError, Result,
 };
@@ -101,6 +101,7 @@ pub struct RawFileCamera {
     timing_cd_scratch: Vec<Evt3CdEvent>,
     timing_trigger_scratch: Vec<Evt3TriggerEvent>,
     timestamp_unwrapper: Evt3TimestampUnwrapper,
+    trigger_timestamp_mapper: SecondaryTimestampMapper,
     last_speed_epoch: u32,
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
@@ -143,9 +144,11 @@ impl EventSource for RawReplayEventSource {
 
         let mut decoder = Evt3Decoder::default();
         let mut timestamp_unwrapper = Evt3TimestampUnwrapper::default();
+        let mut trigger_mapper = SecondaryTimestampMapper::default();
         let mut cd_events = Vec::<Evt3CdEvent>::with_capacity(4_096);
         let mut trigger_events = Vec::<Evt3TriggerEvent>::with_capacity(256);
         let mut compact_events = Vec::new();
+        let mut triggers = Vec::new();
         let mut buf = vec![0_u8; 128 * 1024];
 
         loop {
@@ -157,11 +160,12 @@ impl EventSource for RawReplayEventSource {
                 .decode_bytes(&buf[..read], &mut cd_events, &mut trigger_events)
                 .map_err(|err| FetchError::Decode(err.to_string()))?;
 
+            let mut packet_passed_end = false;
             for event in &cd_events {
                 let timestamp = timestamp_unwrapper.map_timestamp(event.timestamp);
                 if timestamp > end_us {
-                    decoder.finish_stream_lenient();
-                    return finish_raw_replay_fetch(compact_events, start_us, end_us);
+                    packet_passed_end = true;
+                    break;
                 }
                 if timestamp >= start_us {
                     compact_events.push(CompactEvent::new(
@@ -172,25 +176,51 @@ impl EventSource for RawReplayEventSource {
                     ));
                 }
             }
+            // Triggers are mapped after the packet's CD events so the epoch
+            // reference is current; they are filtered by the same window.
+            for trigger in &trigger_events {
+                let timestamp_us = trigger_mapper.map_timestamp(
+                    trigger.timestamp,
+                    timestamp_unwrapper.reference_timestamp_us(),
+                );
+                if timestamp_us > end_us {
+                    packet_passed_end = true;
+                    break;
+                }
+                if timestamp_us >= start_us {
+                    triggers.push(ExternalTriggerEvent::new(
+                        timestamp_us,
+                        trigger.id,
+                        trigger.value != 0,
+                    ));
+                }
+            }
             cd_events.clear();
             trigger_events.clear();
+            if packet_passed_end {
+                break;
+            }
         }
         decoder.finish_stream_lenient();
 
-        finish_raw_replay_fetch(compact_events, start_us, end_us)
+        finish_raw_replay_fetch(compact_events, triggers, start_us, end_us)
     }
 }
 
 fn finish_raw_replay_fetch(
     events: Vec<CompactEvent>,
+    triggers: Vec<ExternalTriggerEvent>,
     start_us: u64,
     end_us: u64,
 ) -> std::result::Result<EventChunk, FetchError> {
-    if events.is_empty() {
+    // A trigger-only window is a valid result: A2-style protocols must be
+    // able to observe their t=0 markers without a coincident CD event.
+    if events.is_empty() && triggers.is_empty() {
         Err(FetchError::OutOfTimeline)
     } else {
         Ok(EventChunk {
             events,
+            triggers,
             start_us,
             end_us,
         })
@@ -263,6 +293,7 @@ impl RawFileCamera {
                 timestamp_unwrapper: Evt3TimestampUnwrapper::with_expected_timestamp(
                     initial_timestamp_us,
                 ),
+                trigger_timestamp_mapper: SecondaryTimestampMapper::default(),
                 last_speed_epoch: controls.speed_epoch.load(Ordering::Relaxed),
                 playback_started_at: None,
                 paused_at: None,
@@ -370,6 +401,16 @@ impl RawFileCamera {
         let mut last_timestamp_us = None;
         for event in &self.timing_cd_scratch {
             last_timestamp_us = Some(self.timestamp_unwrapper.map_timestamp(event.timestamp));
+        }
+        // Trigger edges advance replay time too — a trigger-only recording
+        // must still progress through playback and report a duration.
+        for trigger in &self.timing_trigger_scratch {
+            let timestamp_us = self.trigger_timestamp_mapper.map_timestamp(
+                trigger.timestamp,
+                self.timestamp_unwrapper.reference_timestamp_us(),
+            );
+            last_timestamp_us =
+                Some(last_timestamp_us.map_or(timestamp_us, |last: u64| last.max(timestamp_us)));
         }
 
         if let Some(last_timestamp_us) = last_timestamp_us {
@@ -786,10 +827,22 @@ fn scan_timestamp_window(file: &File, start: u64, len: u64) -> Result<(Option<u6
         .map_err(|e| CameraError::Other(format!("failed to scan replay timestamps: {e}")))?;
     decoder.finish_stream_lenient();
 
-    Ok((
-        cd_events.first().map(|event| event.timestamp),
-        cd_events.last().map(|event| event.timestamp),
-    ))
+    // Trigger edges count toward the recording's time span: a trigger-only
+    // (or trigger-bracketed) recording must still report first/last
+    // timestamps so replay duration and seeking work.
+    let first = cd_events
+        .first()
+        .map(|event| event.timestamp)
+        .into_iter()
+        .chain(trigger_events.first().map(|trigger| trigger.timestamp))
+        .min();
+    let last = cd_events
+        .last()
+        .map(|event| event.timestamp)
+        .into_iter()
+        .chain(trigger_events.last().map(|trigger| trigger.timestamp))
+        .max();
+    Ok((first, last))
 }
 
 fn align_evt3_word_offset(data_offset: u64, absolute_offset: u64) -> u64 {
@@ -960,6 +1013,75 @@ mod tests {
             source.fetch_range(5_000, 6_000),
             Err(FetchError::OutOfTimeline)
         ));
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn raw_replay_event_source_returns_triggers_in_range() {
+        let path = temp_path("trigger-source");
+        // CD event at t=0x1010, trigger at t=0x1015, CD event at t=0x1020.
+        let body = words_to_bytes(&[
+            (0x8 << 12) | 0x001,
+            (0x6 << 12) | 0x010,
+            7,
+            (0x2 << 12) | 100,
+            (0x6 << 12) | 0x015,
+            (0xA << 12) | (2 << 8) | 1, // rising, id=2
+            (0x6 << 12) | 0x020,
+            7,
+            (0x2 << 12) | 101,
+        ]);
+        write_raw_with_body(&path, &body);
+        let (_camera, _controls, info) = RawFileCamera::open(&path).expect("raw file must open");
+        let source = RawReplayEventSource::new(&path, info);
+
+        let chunk = source
+            .fetch_range(0x1000, 0x1030)
+            .expect("range fetch succeeds");
+        assert_eq!(chunk.events.len(), 2);
+        assert_eq!(chunk.triggers.len(), 1);
+        assert_eq!(chunk.triggers[0].timestamp_us, 0x1015);
+        assert_eq!(chunk.triggers[0].id, 2);
+        assert!(chunk.triggers[0].is_rising());
+
+        // A trigger-only window is a valid, non-empty result.
+        let trigger_only = source
+            .fetch_range(0x1012, 0x1018)
+            .expect("trigger-only window must not be OutOfTimeline");
+        assert!(trigger_only.events.is_empty());
+        assert_eq!(trigger_only.triggers.len(), 1);
+
+        fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn trigger_only_recording_reports_duration_and_advances_replay() {
+        let path = temp_path("trigger-only");
+        // Two triggers, no CD events at all.
+        let body = words_to_bytes(&[
+            (0x8 << 12) | 0x001,
+            (0x6 << 12) | 0x010,
+            (0xA << 12) | 1,
+            (0x6 << 12) | 0x020,
+            (0xA << 12),
+        ]);
+        write_raw_with_body(&path, &body);
+
+        let (mut camera, controls, info) = RawFileCamera::open(&path).expect("raw file must open");
+        assert_eq!(info.first_timestamp_us, 0x1010);
+        assert_eq!(info.total_duration_us, 0x10);
+
+        camera.start_streaming().expect("start must succeed");
+        let mut buf = [0_u8; 64];
+        camera
+            .read_packet(&mut buf)
+            .expect("trigger-only packet read must succeed");
+        assert_eq!(
+            controls.current_timestamp_us.load(Ordering::Relaxed),
+            0x1020,
+            "trigger edges must advance replay time"
+        );
 
         fs::remove_file(path).expect("temp file must be removed");
     }
