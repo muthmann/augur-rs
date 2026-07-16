@@ -689,6 +689,7 @@ pub struct DynPlugin {
     capabilities: PluginCapabilities,
     cached_setting_values: HashMap<String, CachedSettingValue>,
     cached_status_entries: Option<CachedStatusEntries>,
+    schema_fetched_at: Option<Instant>,
     ui_dirty: bool,
 }
 
@@ -720,6 +721,7 @@ impl DynPlugin {
             capabilities: PluginCapabilities::default(),
             cached_setting_values: HashMap::new(),
             cached_status_entries: None,
+            schema_fetched_at: None,
             ui_dirty: false,
         };
         if let Err(err) = plugin.refresh_cached_metadata() {
@@ -819,6 +821,24 @@ impl DynPlugin {
 
     pub fn settings_schema(&self) -> &SettingsSchema {
         &self.cached_schema
+    }
+
+    /// Re-reads the settings schema from the plugin at the UI cache cadence.
+    /// Plugins may build schemas from live state (e.g. the currently attached
+    /// serial ports), so a schema cached only at load time goes stale.
+    pub fn refresh_settings_schema_if_stale(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if let Some(fetched_at) = self.schema_fetched_at {
+            if now.duration_since(fetched_at) < PLUGIN_UI_CACHE_INTERVAL {
+                return Ok(());
+            }
+        }
+        self.schema_fetched_at = Some(now);
+        let schema: SettingsSchema = self.read_json(self.vtable.settings_schema)?;
+        if schema != self.cached_schema {
+            self.cached_schema = schema;
+        }
+        Ok(())
     }
 
     pub fn enabled(&self) -> bool {

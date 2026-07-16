@@ -11,6 +11,11 @@ pub fn render_plugin_settings(
 ) -> Result<bool, String> {
     let mut changed = false;
 
+    // Schemas can depend on live plugin state (serial port lists, dynamic
+    // slider bounds); refresh at the UI cache cadence instead of trusting
+    // the load-time snapshot.
+    plugin.refresh_settings_schema_if_stale()?;
+
     if show_header {
         crate::theme::section_subhead(ui, plugin.name());
         if !plugin.description().is_empty() {
