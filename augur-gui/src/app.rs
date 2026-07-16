@@ -110,6 +110,9 @@ const DOCK_DEFAULT_HEIGHT: f32 = 220.0;
 const DOCK_MIN_HEIGHT: f32 = 120.0;
 const DOCK_MAX_SCREEN_FRACTION: f32 = 0.45;
 const REPLAY_FRAME_HISTORY_CAPACITY: usize = 8;
+/// Poll cadence for plugin datasets that update from their own threads
+/// (serial readers, mocks) while no camera/replay stream drives repaints.
+const HOST_VIEW_LIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RAW_EVENTS_ON_LAYER_ID: &str = "host.raw_events.on";
 const RAW_EVENTS_OFF_LAYER_ID: &str = "host.raw_events.off";
 const RAW_EVENTS_ON_COLOR: [u8; 4] = crate::theme::RAW_EVENT_ON_RGBA;
@@ -833,6 +836,9 @@ pub struct CameraApp {
     host_view_registry: ResolvedHostViewRegistry,
     host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
+    /// Last dataset generation pushed to each open host-view window, so the
+    /// deferred viewport can be woken exactly when its data changes.
+    host_view_window_seen_generation: HashMap<String, u64>,
     host_view_render_state: HashMap<String, HostViewRenderState>,
     host_view_dataset_cache: HashMap<String, HostDatasetCacheEntry>,
     host_view_resolution_warnings: Vec<String>,
@@ -998,6 +1004,7 @@ impl CameraApp {
             host_view_registry: ResolvedHostViewRegistry::default(),
             host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
+            host_view_window_seen_generation: HashMap::new(),
             host_view_render_state: HashMap::new(),
             host_view_dataset_cache: HashMap::new(),
             host_view_resolution_warnings: Vec::new(),
@@ -4551,6 +4558,20 @@ impl CameraApp {
             let viewport_id =
                 egui::ViewportId::from_hash_of(("host_view_window", &view.descriptor.id));
             let title = format!("{} — AugurRS", view.descriptor.title);
+
+            // Deferred viewports only repaint on their own input events;
+            // wake the window whenever its dataset actually changed so live
+            // plots keep animating while the cursor rests.
+            let effective_generation = cache_entry
+                .as_ref()
+                .map(|entry| entry.effective_generation)
+                .unwrap_or(0);
+            let seen = self
+                .host_view_window_seen_generation
+                .insert(view.descriptor.id.clone(), effective_generation);
+            if seen != Some(effective_generation) {
+                ctx.request_repaint_of(viewport_id);
+            }
 
             match (&view.descriptor.kind, &dataset.descriptor.kind) {
                 (HostViewKind::TableWindow, HostDatasetKind::TableV1(schema)) => {
@@ -9552,6 +9573,13 @@ impl eframe::App for CameraApp {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);
+        } else if self.host_view_registry.datasets().next().is_some() {
+            // Plugin datasets can update from their own threads (serial
+            // readers, mocks) without any camera or replay stream driving
+            // repaints; keep polling so their views, windows, and status
+            // entries stay live instead of freezing until the next input
+            // event.
+            ctx.request_repaint_after(HOST_VIEW_LIVE_POLL_INTERVAL);
         }
     }
 
