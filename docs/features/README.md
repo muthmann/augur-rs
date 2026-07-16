@@ -49,5 +49,6 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Host View Registry](./host-view-registry.md) — generic dataset/view descriptors, precedence rules, host-rendered tables, plots, and images
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [Output File Timestamps](./output-file-timestamps.md) — overwrite protection and automatic timestamp suffixes for recordings
+- [Photodiode Lab Workflow (design)](./photodiode-lab-workflow-design.md) — proposal: raw export with device-clock timestamps, photodiode ⊕ modulation overlay via firmware phase markers, freeze-for-inspection, cursors/stats/FFT
 
 Community runtime plugins, the plugin template, and contributor docs are maintained in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.
