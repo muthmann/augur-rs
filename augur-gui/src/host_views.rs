@@ -13,7 +13,7 @@ use augur_plugin_api::{
     TableSchema,
 };
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{CoordinatesFormatter, Corner, Legend, Line, Plot, PlotPoints, Points, VLine};
 use image::{ImageFormat, RgbaImage};
 
 use crate::{
@@ -1244,6 +1244,68 @@ pub fn render_scatter2d_view(
     actions
 }
 
+/// Measurement cursors on a series plot, kept in egui memory so they work
+/// identically in the analysis panel, the dock, and deferred windows.
+#[derive(Clone, Copy, Default)]
+struct SeriesCursors {
+    a: Option<f64>,
+    b: Option<f64>,
+}
+
+/// Statistics of the series points inside the visible x-range: mean of the
+/// primary (first) line plus min/max across all lines. Computed from the
+/// published points, so envelope lines make min/max exact even when the
+/// primary trace is bucket-averaged.
+fn series_visible_stats(
+    dataset: &Series1dV1,
+    x_min: f64,
+    x_max: f64,
+) -> Option<(f64, f64, f64, usize)> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut primary_sum = 0.0;
+    let mut primary_n = 0_usize;
+    for (index, line) in dataset.lines.iter().enumerate() {
+        for point in &line.points {
+            if point.x < x_min || point.x > x_max {
+                continue;
+            }
+            min = min.min(point.y);
+            max = max.max(point.y);
+            if index == 0 {
+                primary_sum += point.y;
+                primary_n += 1;
+            }
+        }
+    }
+    (primary_n > 0).then(|| (primary_sum / primary_n as f64, min, max, primary_n))
+}
+
+/// y-value of the primary line at the point nearest to `x`.
+fn primary_y_near(dataset: &Series1dV1, x: f64) -> Option<f64> {
+    dataset
+        .lines
+        .first()?
+        .points
+        .iter()
+        .min_by(|a, b| {
+            (a.x - x)
+                .abs()
+                .partial_cmp(&(b.x - x).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|point| point.y)
+}
+
+fn format_si(value: f64) -> String {
+    let magnitude = value.abs();
+    if magnitude == 0.0 || (0.01..10_000.0).contains(&magnitude) {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.3e}")
+    }
+}
+
 pub fn render_line_series_view(
     ui: &mut egui::Ui,
     view_id: &str,
@@ -1259,11 +1321,18 @@ pub fn render_line_series_view(
         return;
     }
 
-    Plot::new(format!("{view_id}_series"))
+    let cursor_id = egui::Id::new(("series_cursors", view_id));
+    let mut cursors: SeriesCursors = ui
+        .ctx()
+        .data_mut(|data| data.get_temp(cursor_id))
+        .unwrap_or_default();
+
+    let inner = Plot::new(format!("{view_id}_series"))
         .legend(Legend::default())
         .height(280.0)
         .x_axis_label(&dataset.x_label)
         .y_axis_label(&dataset.y_label)
+        .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default())
         .show(ui, |plot_ui| {
             for (index, series) in dataset.lines.iter().enumerate() {
                 if series.points.is_empty() {
@@ -1278,10 +1347,88 @@ pub fn render_line_series_view(
                 };
                 plot_ui.line(Line::new(points).name(name));
             }
+            if let Some(a) = cursors.a {
+                plot_ui.vline(VLine::new(a).name("A"));
+            }
+            if let Some(b) = cursors.b {
+                plot_ui.vline(VLine::new(b).name("B"));
+            }
+            if plot_ui.response().clicked() {
+                if let Some(coord) = plot_ui.pointer_coordinate() {
+                    let shift = plot_ui.ctx().input(|input| input.modifiers.shift);
+                    if shift {
+                        cursors.b = Some(coord.x);
+                    } else {
+                        cursors.a = Some(coord.x);
+                    }
+                }
+            }
+            plot_ui.plot_bounds()
         });
+    let bounds = inner.inner;
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(cursor_id, cursors));
 
     ui.separator();
     ui.horizontal_wrapped(|ui| {
+        if let Some((mean, min, max, points)) =
+            series_visible_stats(dataset, bounds.min()[0], bounds.max()[0])
+        {
+            ui.label(format!(
+                "visible: mean {}  min {}  max {}  Vpp {}  ({points} pts)",
+                format_si(mean),
+                format_si(min),
+                format_si(max),
+                format_si(max - min),
+            ))
+            .on_hover_text(
+                "Statistics over the points inside the current x-range: mean of the \
+                 primary line, min/max across all lines (envelope lines included).",
+            );
+            ui.separator();
+        }
+        match (cursors.a, cursors.b) {
+            (Some(a), Some(b)) => {
+                let dx = (b - a).abs();
+                let dy = match (primary_y_near(dataset, a), primary_y_near(dataset, b)) {
+                    (Some(ya), Some(yb)) => Some(yb - ya),
+                    _ => None,
+                };
+                let mut readout = format!(
+                    "A {}  B {}  Δx {}",
+                    format_si(a),
+                    format_si(b),
+                    format_si(dx)
+                );
+                if dx > 0.0 {
+                    // Only claim a frequency unit when the x-axis is seconds.
+                    let unit = if dataset.x_label.contains("[s]") {
+                        " Hz"
+                    } else {
+                        ""
+                    };
+                    readout.push_str(&format!("  1/Δx {}{unit}", format_si(1.0 / dx)));
+                }
+                if let Some(dy) = dy {
+                    readout.push_str(&format!("  Δy {}", format_si(dy)));
+                }
+                ui.label(readout);
+            }
+            (Some(a), None) => {
+                ui.label(format!("A {}  (shift-click sets B)", format_si(a)));
+            }
+            _ => {
+                ui.weak("click: cursor A · shift-click: cursor B")
+                    .on_hover_text(
+                        "Two x-cursors with Δx, 1/Δx (frequency), and Δy on the primary line.",
+                    );
+            }
+        }
+        if (cursors.a.is_some() || cursors.b.is_some()) && ui.small_button("Clear").clicked() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(cursor_id, SeriesCursors::default()));
+        }
+        ui.separator();
         ui.label(format!("Lines: {}", dataset.lines.len()));
         ui.separator();
         ui.label(format!("Points: {}", dataset.total_points()));
