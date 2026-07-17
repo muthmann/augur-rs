@@ -1513,6 +1513,10 @@ pub struct SeriesWindowViewportData {
     pub close_requested: bool,
     pub frozen: bool,
     pub freeze_toggle_requested: bool,
+    pub export_png_requested: bool,
+    /// Screenshot captured by the viewport in response to a PNG export
+    /// request; the app takes it and writes the file.
+    pub screenshot: Option<Arc<ColorImage>>,
 }
 
 /// Freeze/resume toggle shown in every host-view window. Returns true when
@@ -1871,6 +1875,13 @@ pub fn render_series_window_viewport(
         ui.horizontal(|ui| {
             if freeze_toggle_button(ui, frozen) {
                 data.freeze_toggle_requested = true;
+            }
+            if ui
+                .button("Save PNG")
+                .on_hover_text("Save this window as a PNG image")
+                .clicked()
+            {
+                data.export_png_requested = true;
             }
         });
         (

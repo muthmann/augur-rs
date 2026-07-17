@@ -5185,6 +5185,8 @@ impl CameraApp {
                         close_requested: false,
                         frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
                         freeze_toggle_requested: false,
+                        export_png_requested: false,
+                        screenshot: None,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
@@ -5206,6 +5208,21 @@ impl CameraApp {
                                             &shared_for_viewport,
                                         );
                                     });
+                                    // Screenshots requested for PNG export
+                                    // arrive as input events on THIS viewport.
+                                    let screenshot = ctx.input(|i| {
+                                        i.events.iter().find_map(|event| match event {
+                                            egui::Event::Screenshot { image, .. } => {
+                                                Some(image.clone())
+                                            }
+                                            _ => None,
+                                        })
+                                    });
+                                    if let Some(image) = screenshot {
+                                        if let Ok(mut data) = shared_for_viewport.lock() {
+                                            data.screenshot = Some(image);
+                                        }
+                                    }
                                     if ctx.input(|i| i.viewport().close_requested()) {
                                         if let Ok(mut data) = shared_for_viewport.lock() {
                                             data.close_requested = true;
@@ -5235,13 +5252,19 @@ impl CameraApp {
                         },
                     );
 
-                    let (close, freeze_toggle) = {
+                    let (close, freeze_toggle, export_png, screenshot) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
-                        let result = (data.close_requested, data.freeze_toggle_requested);
+                        let result = (
+                            data.close_requested,
+                            data.freeze_toggle_requested,
+                            data.export_png_requested,
+                            data.screenshot.take(),
+                        );
                         data.close_requested = false;
                         data.freeze_toggle_requested = false;
+                        data.export_png_requested = false;
                         result
                     };
                     if close {
@@ -5251,9 +5274,39 @@ impl CameraApp {
                     if freeze_toggle {
                         self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
                     }
+                    if export_png {
+                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Screenshot);
+                        ctx.request_repaint_of(viewport_id);
+                    }
+                    if let Some(image) = screenshot {
+                        self.save_series_window_png(&view, &image);
+                    }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Writes a captured series-window screenshot to a user-chosen PNG path.
+    fn save_series_window_png(&mut self, view: &ResolvedHostView, image: &egui::ColorImage) {
+        let default_name = format!(
+            "{}.png",
+            view.descriptor.title.to_lowercase().replace(' ', "_")
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        if let Err(err) = crate::host_views::export_image_to_path(&path, image) {
+            self.last_error = Some(err);
+        } else {
+            self.toast_queue.push(
+                format!("Saved {}", path.display()),
+                crate::toast::ToastTone::Info,
+            );
         }
     }
 
