@@ -10094,6 +10094,11 @@ fn seed_default_params(schema: &SettingsSchema) -> serde_json::Value {
                     serde_json::json!(*default)
                 }
                 SettingKind::Enum { default, .. } => serde_json::json!(*default as u64),
+                SettingKind::Text { default } | SettingKind::Path { default, .. } => {
+                    serde_json::json!(default.clone())
+                }
+                // Buttons are momentary triggers, not persisted state.
+                SettingKind::Button => continue,
             };
             map.insert(item.key.clone(), default);
         }
@@ -10227,6 +10232,59 @@ fn render_action_modal_schema(
                                 object.insert(item.key.clone(), json!(value as u64));
                             }
                         }
+                        SettingKind::Text { default } => {
+                            let mut value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| default.clone());
+                            let changed = ui
+                                .horizontal(|ui| {
+                                    ui.label(&item.label);
+                                    ui.text_edit_singleline(&mut value).changed()
+                                })
+                                .inner;
+                            if changed {
+                                object.insert(item.key.clone(), json!(value));
+                            }
+                        }
+                        SettingKind::Path { dialog, default } => {
+                            let value = object
+                                .get(&item.key)
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .unwrap_or_else(|| default.clone());
+                            ui.horizontal(|ui| {
+                                ui.label(&item.label);
+                                let shown = if value.is_empty() {
+                                    "(not set)"
+                                } else {
+                                    &value
+                                };
+                                ui.label(egui::RichText::new(shown).monospace().small());
+                                if ui.button("Browse…").clicked() {
+                                    let file_dialog = rfd::FileDialog::new();
+                                    let selection = match dialog {
+                                        augur_plugin_api::PathDialogKind::OpenFile => {
+                                            file_dialog.pick_file()
+                                        }
+                                        augur_plugin_api::PathDialogKind::SaveFile => {
+                                            file_dialog.save_file()
+                                        }
+                                        augur_plugin_api::PathDialogKind::Directory => {
+                                            file_dialog.pick_folder()
+                                        }
+                                    };
+                                    if let Some(path) = selection {
+                                        object.insert(
+                                            item.key.clone(),
+                                            json!(path.display().to_string()),
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        // Momentary triggers make no sense as captured
+                        // parameters of a modal; skip them.
+                        SettingKind::Button => {}
                     }
                 }
             });

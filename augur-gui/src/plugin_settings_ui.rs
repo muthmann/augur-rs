@@ -201,6 +201,74 @@ fn render_setting_item(
                 return plugin.set_setting_value(&item.key, &json!(value));
             }
         }
+        SettingKind::Text { default } => {
+            let mut value = plugin
+                .get_setting_value_cached(&item.key)?
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| default.clone());
+            crate::theme::field_label(ui, &item.label, None);
+            let response = ui
+                .push_id(widget_id, |ui| ui.text_edit_singleline(&mut value))
+                .inner;
+            maybe_add_tooltip(&response, item.tooltip.as_deref());
+            // Commit per keystroke: `set_setting_value` invalidates the UI
+            // cache, so the widget reads back exactly what was typed instead
+            // of an older cached value clobbering the edit.
+            if response.changed() {
+                return plugin.set_setting_value(&item.key, &json!(value));
+            }
+        }
+        SettingKind::Path { dialog, default } => {
+            let value = plugin
+                .get_setting_value_cached(&item.key)?
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| default.clone());
+            crate::theme::field_label(ui, &item.label, None);
+            let mut picked: Option<String> = None;
+            let response = ui
+                .push_id(widget_id, |ui| {
+                    ui.horizontal(|ui| {
+                        let shown = if value.is_empty() {
+                            "(not set)"
+                        } else {
+                            &value
+                        };
+                        ui.label(egui::RichText::new(shown).monospace().small());
+                        if ui.button("Browse…").clicked() {
+                            let file_dialog = rfd::FileDialog::new();
+                            let selection = match dialog {
+                                augur_plugin_api::PathDialogKind::OpenFile => {
+                                    file_dialog.pick_file()
+                                }
+                                augur_plugin_api::PathDialogKind::SaveFile => {
+                                    file_dialog.save_file()
+                                }
+                                augur_plugin_api::PathDialogKind::Directory => {
+                                    file_dialog.pick_folder()
+                                }
+                            };
+                            if let Some(path) = selection {
+                                picked = Some(path.display().to_string());
+                            }
+                        }
+                    })
+                    .response
+                })
+                .inner;
+            maybe_add_tooltip(&response, item.tooltip.as_deref());
+            if let Some(path) = picked {
+                return plugin.set_setting_value(&item.key, &json!(path));
+            }
+        }
+        SettingKind::Button => {
+            let response = ui.push_id(widget_id, |ui| ui.button(&item.label)).inner;
+            maybe_add_tooltip(&response, item.tooltip.as_deref());
+            // Momentary trigger: one `set_setting(key, true)` per click, the
+            // frame-independent action channel (works with no camera).
+            if response.clicked() {
+                return plugin.set_setting_value(&item.key, &json!(true));
+            }
+        }
     }
 
     Ok(false)

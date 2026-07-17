@@ -29,7 +29,9 @@ pub use ffi::{
 pub use helpers::{
     EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin, PluginFrame,
 };
-pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
+pub use settings::{
+    PathDialogKind, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+};
 
 #[doc(hidden)]
 pub mod __private {
@@ -84,7 +86,9 @@ mod tests {
             TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
             TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
         },
-        settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
+        settings::{
+            PathDialogKind, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+        },
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
         FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape,
         FfiPixel, FfiSlice, FfiString, FfiSubpixelMarker, HostViewDatasetGenerationFn,
@@ -145,6 +149,29 @@ mod tests {
                             variants: vec!["One".into(), "Two".into()],
                             default: 1,
                         },
+                    },
+                    SettingItem {
+                        key: "run_name".into(),
+                        label: "Run name".into(),
+                        tooltip: None,
+                        kind: SettingKind::Text {
+                            default: "run".into(),
+                        },
+                    },
+                    SettingItem {
+                        key: "data_dir".into(),
+                        label: "Data directory".into(),
+                        tooltip: None,
+                        kind: SettingKind::Path {
+                            dialog: PathDialogKind::Directory,
+                            default: String::new(),
+                        },
+                    },
+                    SettingItem {
+                        key: "save_snapshot".into(),
+                        label: "Save snapshot".into(),
+                        tooltip: None,
+                        kind: SettingKind::Button,
                     },
                 ],
             }],

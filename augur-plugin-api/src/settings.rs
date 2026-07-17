@@ -54,6 +54,31 @@ pub enum SettingKind {
         variants: Vec<String>,
         default: usize,
     },
+    /// Free-form text (names, prefixes). Exchanged as a JSON string.
+    Text {
+        default: String,
+    },
+    /// Filesystem path chosen through a native dialog the host renders next
+    /// to an editable text field. Exchanged as a JSON string.
+    Path {
+        dialog: PathDialogKind,
+        default: String,
+    },
+    /// Momentary action button. The host sends `set_setting(key, true)` once
+    /// per click; the plugin treats every call as an edge, never as state,
+    /// and `get_setting` should return `false`. This is the frame-independent
+    /// trigger channel — it works with no camera attached, unlike host-view
+    /// actions, which are only delivered inside `process_frame`.
+    Button,
+}
+
+/// Which native dialog the host opens for a [`SettingKind::Path`] item.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PathDialogKind {
+    OpenFile,
+    SaveFile,
+    Directory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
