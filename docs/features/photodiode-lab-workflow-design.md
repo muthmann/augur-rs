@@ -91,8 +91,106 @@ rendered snapshot.
 5. **Record photodiode stream alongside camera recordings** (.pdq + sidecar
    next to the .raw), so analysis runs can correlate offline.
 
-## Suggested order
+## 5. Path to 500 kSa/s – 1 MSa/s (ADC/DMA backend)
 
-Freeze toggle (host, small) → raw export action (plugin, small) → cursors +
-stats (host, medium) → phase markers (firmware 0.5.0 + plugin, medium) →
-overlay view ADR (host, large).
+Decisions from the 2026-07-17 review: 20 kSa/s is not enough; target the
+ADC/DMA backend. Overlay alignment will use a hardware EXT_TRIGGER from the
+Teensy to the camera (no phase-marker firmware needed for that use).
+
+**How the stream works today (0.4.0).** A PIT `IntervalTimer` ISR fires at the
+sample rate and calls blocking `analogRead()` (~2–3 µs); samples fill
+fixed-size blocks in a ring; the foreground loop packages ready blocks into
+CRC32 PDA1 frames and writes them non-blockingly to the second USB CDC port.
+Timing: the sample *instant* is the ISR entry — nominally period-exact from
+the hardware timer but software-jittered by interrupt latency and by the MOD
+engine's SPI ISR (up to 40 kHz). The authoritative clock is the sample index;
+`first/last_tick_us` per block let the host audit the real cadence. This
+portable backend saturates around 100 kSa/s and burns ~25–30 % CPU there.
+
+**Backend plan (firmware 0.5.0).**
+- Hardware-triggered conversions: QTimer/PIT → ADC_ETC → ADC1 in 12-bit
+  high-speed mode, results moved by **DMA** into a double-buffered ring in
+  RAM2 (`DMAMEM`, with dcache invalidation). Sample spacing becomes exactly
+  the hardware timer period — zero ISR jitter, near-zero CPU in the sampling
+  path; the CPU only packages frames per half-buffer completion.
+- Rate: 500 kSa/s comfortable, ~1 MSa/s at the ADC spec limit (expect
+  ~10.5–11 ENOB there; verify against the front end). Pin 18/A4 is reachable
+  from both ADCs, so two-ADC interleaving to ~2 MSa/s stays open later.
+- Frames: grow `samples_per_block` (256 → 2048) at high rates so header+CRC
+  overhead stays ≈1 %; wire format is unchanged (`sample_rate_hz` header
+  field already carries any rate). USB HS moves 2 MB/s without strain, but
+  switch the CRC to a table-driven implementation at these rates.
+- Side effects to check on the bench: MOD SPI ISR vs. DMA interrupt priority;
+  RAM2 budget for the DMA ring; and — the real new limit — the **analog front
+  end**: transimpedance bandwidth and an anti-aliasing RC sized for the new
+  Nyquist, otherwise HF noise folds into the low-voltage signal.
+- Host side at ≥500 kSa/s: the plugin's per-repaint full-window rescan must
+  become an **incremental min/max/sum pyramid** maintained on ingest
+  (e.g. 64:1 and 4096:1 levels), and the cache length becomes a setting
+  (default 20 s; 1 MSa/s × 20 s = 40 MB of codes) instead of a fixed 130 s.
+
+**Verdict on "is streaming raw the best approach":** yes for this system —
+USB HS affords raw up to ~2 MSa/s, keeping firmware dumb and every sample
+available to the host for caching/recording. On-device decimation only pays
+off beyond that or for multi-channel.
+
+## 6. Saving: monitor cache vs. recording (approved direction)
+
+Two modes, one lean "Data" settings section, shared writer (`stage-a-io`'s
+`PdqWriter` + `RunSidecar`, plus CSV for quick plots):
+
+- **Monitor mode (always on):** rolling cache of `cache_s` seconds (default
+  20 s, the existing ring) — one **Save cache snapshot** control dumps it.
+- **Recording mode:** explicit start/stop; the reader thread tees frames to
+  disk from the moment recording starts, so length is disk-bound, not
+  RAM-bound. Auto-named files (`pd_YYYYmmdd_HHMMSS.pdq` + `.json` sidecar +
+  optional `.csv`) in a user-chosen data directory.
+
+**Gap to close first:** plugin settings today have no text/path/button kinds,
+and host actions are only delivered inside `process_frame` — which never runs
+for the camera-less Stage-A bench. Plan: extend `SettingKind` with `Text`,
+`Path` (host renders a native file dialog), and `Button` (momentary trigger
+routed through `set_setting`, which *is* frame-independent). This one API
+addition serves the recorder UI, the protocol file below, and every future
+device plugin.
+
+## 7. Protocols and cross-plugin / plugin-host control
+
+- **Protocol into stage-a-modulation (approved):** don't build cross-plugin
+  remote control for this — put the protocol executor *inside* the modulation
+  plugin, which already owns the command port and a worker thread. A TOML
+  protocol file (steps: `t`, `wave`, `level`, `min`, `freq_mhz`, loop count)
+  loaded via the new `Path` setting (interim: an enum of files found in a
+  `protocols/` directory, the same pattern as the port enum), run/stop
+  controls, progress published as a table dataset. Host-OS step timing is
+  ±ms; if a protocol ever needs µs-exact steps, the step table moves into
+  the firmware as a new command (later ADR).
+- **Plugin → plugin control (general):** today the only channel is the
+  persistent context bus, and it is delivered per frame — unusable without a
+  camera. The architecture's intended pattern (ADR 006 in augur-plugins) is
+  *ownership*, not puppeteering: a future experiment plugin links
+  `stage-a-io` and owns the command port itself (modulation plugin disabled
+  while the experiment is armed). A host-routed `set_setting` request API
+  (plugin asks host to set another plugin's setting) is feasible and
+  frame-independent, but needs an ADR: single-writer arbitration, ordering,
+  and UI visibility of who changed what.
+- **Plugin → host application control (recording, filenames):** deliberately
+  impossible today (fail-closed `ExecutionContext`, ADR 026). Feasible as an
+  explicit, allowlisted host-command queue mirroring `HostActionRequest` in
+  reverse — verbs like `StartRecording { name }` / `StopRecording`, surfaced
+  in the UI (toast + log) and gated by a per-plugin permission. Camera
+  recording implies frames are flowing, so the existing worker output path
+  can carry it. Needs an ADR before any implementation.
+
+## Suggested order (updated 2026-07-17, approved items marked ★)
+
+1. ★ Freeze toggle (host, small) — discussed & approved
+2. ★ SettingKind `Text`/`Path`/`Button` (API + host, small-medium) —
+   unblocks recorder UI and protocol loading
+3. ★ Monitor-cache save + recording mode in the photodiode plugin (medium)
+4. ★ Cursors + window statistics (host, medium)
+5. ★ FFT/spectrum view, absolute-time axis, PNG export (host, medium)
+6. Protocol executor in stage-a-modulation (plugin, medium)
+7. ADC/DMA backend firmware 0.5.0 → 500 kSa/s–1 MSa/s (+ plugin pyramid
+   decimation + cache-length setting) (large)
+8. ADRs: plugin→plugin setting requests; plugin→host command queue (design)
