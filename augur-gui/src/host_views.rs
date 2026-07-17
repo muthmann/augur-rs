@@ -1307,6 +1307,8 @@ pub struct TableWindowViewportData {
     pub page_size_requested: Option<TablePageSize>,
     pub page_index_requested: Option<usize>,
     pub replay_origin_us: Option<u64>,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1322,6 +1324,8 @@ pub struct DensityWindowViewportData {
     pub export_csv_requested: bool,
     pub export_image_requested: Option<HostViewImageFormat>,
     pub clear_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1335,6 +1339,8 @@ pub struct ImageWindowViewportData {
     pub close_requested: bool,
     pub export_image_requested: Option<HostViewImageFormat>,
     pub clear_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1348,6 +1354,8 @@ pub struct ScatterWindowViewportData {
     pub close_requested: bool,
     pub export_csv_requested: bool,
     pub clear_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1356,12 +1364,35 @@ pub struct SeriesWindowViewportData {
     pub empty_message: String,
     pub error_message: Option<String>,
     pub close_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
+}
+
+/// Freeze/resume toggle shown in every host-view window. Returns true when
+/// the user toggled it this frame. While frozen the host pins the dataset
+/// snapshot for inspection/export; plugin acquisition keeps running.
+pub fn freeze_toggle_button(ui: &mut egui::Ui, frozen: bool) -> bool {
+    ui.selectable_label(frozen, if frozen { "❄ Frozen" } else { "❄ Freeze" })
+        .on_hover_text(
+            "Pause display updates to inspect or export this exact snapshot. \
+             Acquisition continues in the background; resume jumps to now.",
+        )
+        .clicked()
 }
 
 pub fn render_table_window_viewport(
     ui: &mut egui::Ui,
     shared: &Arc<Mutex<TableWindowViewportData>>,
 ) {
+    {
+        let mut data = shared.lock().expect("table viewport mutex poisoned");
+        let frozen = data.frozen;
+        ui.horizontal(|ui| {
+            if freeze_toggle_button(ui, frozen) {
+                data.freeze_toggle_requested = true;
+            }
+        });
+    }
     let (
         dataset_id,
         generation,
@@ -1455,6 +1486,9 @@ pub fn render_density_window_viewport(
         let mut data = shared.lock().expect("density viewport mutex poisoned");
 
         ui.horizontal_wrapped(|ui| {
+            if freeze_toggle_button(ui, data.frozen) {
+                data.freeze_toggle_requested = true;
+            }
             if ui.button("Export CSV").clicked() {
                 data.export_csv_requested = true;
             }
@@ -1554,6 +1588,9 @@ pub fn render_image_window_viewport(
         let mut data = shared.lock().expect("image viewport mutex poisoned");
 
         ui.horizontal_wrapped(|ui| {
+            if freeze_toggle_button(ui, data.frozen) {
+                data.freeze_toggle_requested = true;
+            }
             ui.menu_button("Export Image", |ui| {
                 if ui.button("PNG").clicked() {
                     data.export_image_requested = Some(HostViewImageFormat::Png);
@@ -1637,7 +1674,13 @@ pub fn render_scatter_window_viewport(
     shared: &Arc<Mutex<ScatterWindowViewportData>>,
 ) {
     let (schema, dataset, x_column, y_column, empty_message, error_message) = {
-        let data = shared.lock().expect("scatter viewport mutex poisoned");
+        let mut data = shared.lock().expect("scatter viewport mutex poisoned");
+        let frozen = data.frozen;
+        ui.horizontal(|ui| {
+            if freeze_toggle_button(ui, frozen) {
+                data.freeze_toggle_requested = true;
+            }
+        });
         (
             data.schema.clone(),
             data.dataset.clone(),
@@ -1676,7 +1719,13 @@ pub fn render_series_window_viewport(
     shared: &Arc<Mutex<SeriesWindowViewportData>>,
 ) {
     let (dataset, empty_message, error_message) = {
-        let data = shared.lock().expect("series viewport mutex poisoned");
+        let mut data = shared.lock().expect("series viewport mutex poisoned");
+        let frozen = data.frozen;
+        ui.horizontal(|ui| {
+            if freeze_toggle_button(ui, frozen) {
+                data.freeze_toggle_requested = true;
+            }
+        });
         (
             data.dataset.clone(),
             data.empty_message.clone(),

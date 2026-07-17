@@ -839,6 +839,12 @@ pub struct CameraApp {
     /// Last dataset generation pushed to each open host-view window, so the
     /// deferred viewport can be woken exactly when its data changes.
     host_view_window_seen_generation: HashMap<String, u64>,
+    /// Datasets whose displayed snapshot is pinned for inspection/export.
+    /// Acquisition keeps running; unfreezing jumps back to live data.
+    host_view_frozen_datasets: HashSet<String>,
+    /// Global freeze: pins every host-view dataset snapshot at once for a
+    /// consistent cross-plugin cut.
+    host_views_frozen_all: bool,
     host_view_render_state: HashMap<String, HostViewRenderState>,
     host_view_dataset_cache: HashMap<String, HostDatasetCacheEntry>,
     host_view_resolution_warnings: Vec<String>,
@@ -1005,6 +1011,8 @@ impl CameraApp {
             host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
             host_view_window_seen_generation: HashMap::new(),
+            host_view_frozen_datasets: HashSet::new(),
+            host_views_frozen_all: false,
             host_view_render_state: HashMap::new(),
             host_view_dataset_cache: HashMap::new(),
             host_view_resolution_warnings: Vec::new(),
@@ -2873,7 +2881,25 @@ impl CameraApp {
         })
     }
 
+    fn host_view_dataset_frozen(&self, dataset_id: &str) -> bool {
+        self.host_views_frozen_all || self.host_view_frozen_datasets.contains(dataset_id)
+    }
+
+    fn toggle_host_view_dataset_frozen(&mut self, dataset_id: &str) {
+        if !self.host_view_frozen_datasets.remove(dataset_id) {
+            self.host_view_frozen_datasets.insert(dataset_id.to_owned());
+        }
+    }
+
     fn ensure_host_view_dataset_cached(&mut self, dataset_id: &str) {
+        // A frozen dataset keeps its pinned snapshot (views, tables, and CSV
+        // export all read this cache). A frozen dataset that was never
+        // loaded still loads once so a freshly opened view shows data.
+        if self.host_view_dataset_frozen(dataset_id)
+            && self.host_view_dataset_cache.contains_key(dataset_id)
+        {
+            return;
+        }
         let refresh_seq = self.host_dataset_refresh_seq;
         let provider_generation = match self.current_host_view_dataset_generation(dataset_id) {
             Ok(generation) => generation,
@@ -4634,6 +4660,8 @@ impl CameraApp {
                             .replay_file_info
                             .as_ref()
                             .map(|info| info.first_timestamp_us),
+                        frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
+                        freeze_toggle_requested: false,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let window_title = title.clone();
@@ -4675,13 +4703,22 @@ impl CameraApp {
                         },
                     );
 
-                    let (close, export_csv, selected_row, sort_column, page_size, page_index) = {
+                    let (
+                        close,
+                        export_csv,
+                        freeze_toggle,
+                        selected_row,
+                        sort_column,
+                        page_size,
+                        page_index,
+                    ) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
                         let result = (
                             data.close_requested,
                             data.export_csv_requested,
+                            data.freeze_toggle_requested,
                             data.selected_row_requested.take(),
                             data.sort_column_requested.take(),
                             data.page_size_requested.take(),
@@ -4689,6 +4726,7 @@ impl CameraApp {
                         );
                         data.close_requested = false;
                         data.export_csv_requested = false;
+                        data.freeze_toggle_requested = false;
                         result
                     };
                     if close {
@@ -4697,6 +4735,9 @@ impl CameraApp {
                     }
                     if export_csv {
                         self.export_host_view_csv(&view);
+                    }
+                    if freeze_toggle {
+                        self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
                     }
                     if let Some(selected_row) = selected_row {
                         self.with_active_viewer_mut(|viewer| {
@@ -4793,6 +4834,8 @@ impl CameraApp {
                         export_csv_requested: false,
                         export_image_requested: None,
                         clear_requested: false,
+                        frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
+                        freeze_toggle_requested: false,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
@@ -4843,7 +4886,7 @@ impl CameraApp {
                         },
                     );
 
-                    let (next_settings, close, clear, export_csv, export_image) = {
+                    let (next_settings, close, clear, export_csv, export_image, freeze_toggle) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
@@ -4853,12 +4896,17 @@ impl CameraApp {
                             data.clear_requested,
                             data.export_csv_requested,
                             data.export_image_requested.take(),
+                            data.freeze_toggle_requested,
                         );
                         data.close_requested = false;
                         data.export_csv_requested = false;
                         data.clear_requested = false;
+                        data.freeze_toggle_requested = false;
                         result
                     };
+                    if freeze_toggle {
+                        self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
+                    }
 
                     self.host_view_render_state
                         .entry(view.descriptor.id.clone())
@@ -4904,6 +4952,8 @@ impl CameraApp {
                         close_requested: false,
                         export_csv_requested: false,
                         clear_requested: false,
+                        frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
+                        freeze_toggle_requested: false,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
@@ -4954,7 +5004,7 @@ impl CameraApp {
                         },
                     );
 
-                    let (close, clear, export_csv) = {
+                    let (close, clear, export_csv, freeze_toggle) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
@@ -4962,10 +5012,12 @@ impl CameraApp {
                             data.close_requested,
                             data.clear_requested,
                             data.export_csv_requested,
+                            data.freeze_toggle_requested,
                         );
                         data.close_requested = false;
                         data.clear_requested = false;
                         data.export_csv_requested = false;
+                        data.freeze_toggle_requested = false;
                         result
                     };
                     if close {
@@ -4977,6 +5029,9 @@ impl CameraApp {
                     }
                     if export_csv {
                         self.export_host_view_csv(&view);
+                    }
+                    if freeze_toggle {
+                        self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
                     }
                 }
                 (HostViewKind::ImageWindow, HostDatasetKind::Image2dV1) => {
@@ -5023,6 +5078,8 @@ impl CameraApp {
                         close_requested: false,
                         export_image_requested: None,
                         clear_requested: false,
+                        frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
+                        freeze_toggle_requested: false,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
@@ -5073,7 +5130,7 @@ impl CameraApp {
                         },
                     );
 
-                    let (next_settings, close, clear, export_image) = {
+                    let (next_settings, close, clear, export_image, freeze_toggle) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
@@ -5082,9 +5139,11 @@ impl CameraApp {
                             data.close_requested,
                             data.clear_requested,
                             data.export_image_requested.take(),
+                            data.freeze_toggle_requested,
                         );
                         data.close_requested = false;
                         data.clear_requested = false;
+                        data.freeze_toggle_requested = false;
                         result
                     };
 
@@ -5104,6 +5163,9 @@ impl CameraApp {
                     if let Some(format) = export_image {
                         self.export_host_view_image(&view, format);
                     }
+                    if freeze_toggle {
+                        self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
+                    }
                 }
                 (HostViewKind::LineSeriesWindow, HostDatasetKind::Series1dV1) => {
                     let (series_arc, error_message) = match &cache_entry {
@@ -5121,6 +5183,8 @@ impl CameraApp {
                         empty_message: dataset.descriptor.empty_message.clone(),
                         error_message,
                         close_requested: false,
+                        frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
+                        freeze_toggle_requested: false,
                     }));
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
@@ -5171,17 +5235,21 @@ impl CameraApp {
                         },
                     );
 
-                    let close = {
+                    let (close, freeze_toggle) = {
                         let Ok(mut data) = shared.lock() else {
                             continue;
                         };
-                        let close = data.close_requested;
+                        let result = (data.close_requested, data.freeze_toggle_requested);
                         data.close_requested = false;
-                        close
+                        data.freeze_toggle_requested = false;
+                        result
                     };
                     if close {
                         self.host_view_window_open
                             .insert(view.descriptor.id.clone(), false);
+                    }
+                    if freeze_toggle {
+                        self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
                     }
                 }
                 _ => {}
@@ -7886,6 +7954,13 @@ impl eframe::App for CameraApp {
 
                 // ── View ──────────────────────────────────────────────────────
                 ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.host_views_frozen_all, "Freeze live views")
+                        .on_hover_text(
+                            "Pin every plugin view's snapshot at once for a consistent \
+                             cross-plugin cut. Acquisition keeps running; unchecking \
+                             jumps back to live data.",
+                        );
+                    ui.separator();
                     if ui
                         .add(
                             egui::Button::new(if self.settings_panel_open {
