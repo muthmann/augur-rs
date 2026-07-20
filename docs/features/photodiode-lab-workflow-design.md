@@ -172,15 +172,15 @@ device plugin.
   `stage-a-io` and owns the command port itself (modulation plugin disabled
   while the experiment is armed). A host-routed `set_setting` request API
   (plugin asks host to set another plugin's setting) is feasible and
-  frame-independent, but needs an ADR: single-writer arbitration, ordering,
-  and UI visibility of who changed what.
+  frame-independent; the design — single-writer arbitration, "manual wins",
+  and a mandatory "driven by" badge — is written up in **ADR 027**
+  (proposed).
 - **Plugin → host application control (recording, filenames):** deliberately
-  impossible today (fail-closed `ExecutionContext`, ADR 026). Feasible as an
-  explicit, allowlisted host-command queue mirroring `HostActionRequest` in
-  reverse — verbs like `StartRecording { name }` / `StopRecording`, surfaced
-  in the UI (toast + log) and gated by a per-plugin permission. Camera
-  recording implies frames are flowing, so the existing worker output path
-  can carry it. Needs an ADR before any implementation.
+  impossible today (fail-closed `ExecutionContext`, ADR 026). The design for
+  an explicit, allowlisted host-command queue mirroring `HostActionRequest`
+  in reverse — a closed verb set (`StartRecording { name }` /
+  `StopRecording`), per-plugin consent, sanitised filenames confined to the
+  data directory, and visible execution — is in **ADR 028** (proposed).
 
 ## Suggested order (updated 2026-07-17, approved items marked ★)
 
