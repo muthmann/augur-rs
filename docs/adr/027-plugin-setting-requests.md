@@ -1,90 +1,71 @@
-# ADR 027: Host-Routed Plugin Setting Requests
+# ADR 027: Worker-Owned Semantic Plugin Services
 
 ## Status
 
-Proposed (2026-07-17). Not implemented — this ADR records the intended design
-so it is not re-derived ad hoc when the first cross-plugin use case ships.
+Accepted (2026-07-20), implemented with dynamic plugin ABI v6.
 
 ## Context
 
-The Stage-A bench work surfaced a recurring desire: let one plugin change
-another plugin's settings — e.g. a future experiment plugin driving the
-`stage-a-modulation` plugin's wave/level/frequency, or a calibration plugin
-nudging the `stage-a-photodiode` reference. Today there is no supported
-channel for this:
-
-- The persistent context bus (ADR 006/009) is read/written only during
-  `process_frame`, which the host calls **only while camera frames flow**.
-  The Stage-A plugins are frame-independent (device threads driven by
-  settings), so a frame-gated bus cannot reach them on the bench.
-- `HostActionRequest` (ADR 018) flows host → plugin, is scoped to
-  dataset/row/cluster selections, and is also consumed in `process_frame`.
-  It is the wrong shape and the wrong delivery point for "set another
-  plugin's knob".
-- The architecture's established answer to "plugin A needs plugin B's
-  behaviour" is **ownership**, not remote control (ADR 012, and ADR 006 in
-  augur-plugins): a plugin that needs the command port links `stage-a-io`
-  and owns the port itself. That remains the preferred pattern where it
-  applies. This ADR covers the residual case where two *independently
-  useful* plugins must coordinate without merging.
+Laboratory workflows need to coordinate independently useful device plugins.
+For Stage-A, `stage-a-modulation` and `stage-a-photodiode` must remain the only
+owners of their Teensy serial ports while an A1 workflow coordinates them.
+The frame context bus cannot do this: it runs only when camera frames arrive.
+Calling a target plugin's generic `set_setting` on the GUI instance is also
+unsafe. The GUI and live worker hold separate plugin instances, so it would
+make the inert UI mirror perform hardware effects and would split ownership.
 
 ## Decision
 
-Add a **host-routed setting request** channel, delivered through the
-frame-independent `set_setting` path rather than the frame bus.
+Augur provides a frame-independent semantic service control plane:
 
-- Plugins may emit `PluginSettingRequest { target_plugin, key, value,
-  request_id }` via a new `HostOutput`-adjacent queue that the host drains
-  every GUI tick (not only during `process_frame`). Emission is possible
-  from `set_setting`/`status_entries` context, so a button-driven request
-  works with no camera.
-- The **host is the single arbiter**. It validates the target exists and is
-  enabled, then applies the request by calling the target plugin's
-  `set_setting(key, value)` on the UI thread — the exact path a human
-  toggle uses, so all existing clamping/validation/immediate-transfer logic
-  is reused and no new write path into device state is created.
-- **Single-writer arbitration:** a target setting is "claimed" by at most
-  one requesting plugin at a time. A second requester for the same
-  `(target, key)` is rejected (surfaced as an error to the requester), never
-  silently interleaved. Manual UI edits always win and clear the claim —
-  the human is the ultimate authority.
-- **Visibility is mandatory.** Every applied request raises a toast and a
-  log line naming source → target → key = value, and the target plugin's
-  settings row shows a "driven by <source>" badge while a claim is held.
-  Hidden cross-plugin mutation is the main risk and is designed out.
-- Requests are allowlisted per target: a plugin declares
-  `accepts_setting_requests: bool` (default false) in its manifest, so a
-  plugin cannot be puppeteered unless it opts in.
+- A plugin participating in routing declares a stable, unique `id` in
+  `plugin.toml`. Display names are never routing identities.
+- Only the `LiveWorker` plugin instance receives periodic `process_control`
+  calls and `handle_service_request` calls. The worker ticks every 50 ms even
+  when no camera frames arrive.
+- Requests name a target plugin ID, target-defined semantic service verb,
+  request ID, and JSON payload. The host overwrites source identity, routes to
+  an enabled target, and returns an explicit accepted/rejected reply.
+- Request IDs are idempotency keys scoped to the source plugin. Exact retries
+  receive the cached reply; reuse with different content is rejected.
+  Because the counter lives in the plugin instance and restarts at 1 when that
+  instance is recreated, the reply cache is cleared on plugin reload and on a
+  discontinuity. Without that reset a recycled ID could be answered from cache
+  **without the target plugin ever running** — a repeated `output_off.v1` would
+  report `Accepted` while the device was never touched. The cache is also
+  bounded, evicting oldest-first, so a long session cannot grow it without
+  limit.
+- Targets publish revisioned, read-only control snapshots. The worker sends
+  snapshots and authoritative status entries to the GUI; they are not a
+  mutable shared-state bus.
+- The periodic control result also transports generation-cached host-view
+  datasets from the authoritative worker. Analysis and control publications
+  share a monotonic sequence; the GUI accepts only the newest publication.
+  This keeps device telemetry visible without camera frames and prevents
+  cross-channel receive order from rolling a dataset back.
+- Runtime roles are explicit: `UiMirror`, `LiveWorker`, and
+  `OfflineAnalysis`. Roles are assigned before copied settings are applied.
+  Hardware plugins must perform effects only when both the role is
+  `LiveWorker` and `ExecutionContext::hardware_effects_allowed()` is true.
+- Live-effect revocation is synchronously acknowledged by the worker on
+  replay/mode transitions and shutdown.
+
+Atomic domain operations, validation, leases, and safe-state behaviour belong
+to the target service. The host remains domain-neutral and does not proxy
+individual settings.
 
 ## Consequences
 
-### Positive
-
-- Frame-independent, so it works on the camera-less bench where the context
-  bus does not.
-- Reuses `set_setting`, inheriting every plugin's own validation; the host
-  learns nothing domain-specific.
-- Ownership stays the default; this is the explicit, auditable escape hatch
-  for the genuine two-plugin case.
-
-### Negative / Risks
-
-- Introduces a second write path to plugin settings (host UI + peer
-  plugin). Arbitration and the "manual wins" rule must be watertight or two
-  actors fight over one knob.
-- Ordering across a burst of requests is host-tick-quantised; a requester
-  wanting a precise sequence must serialise it itself (or own the device).
-
-### Neutral
-
-- The wire type mirrors `HostActionRequest` in the opposite direction, so
-  the dedupe-by-`request_id` machinery and JSON-value payloads are already
-  familiar.
+The modulation and photodiode plugins can remain the sole Teensy owners while
+workflow plugins coordinate them without opening serial ports. Control works
+on a camera-less bench, including host-rendered owner telemetry; identity
+spoofing is prevented by the host, and GUI or offline mirrors stay inert.
+Plugin authors must rebuild for ABI v6 and must design explicit semantic
+service contracts rather than exposing arbitrary setting mutation.
 
 ## References
 
-- ADR 006: Host-Owned Dataset/View Registry for Plugin Outputs
-- ADR 009: Host-Owned Global Settings Contract
-- ADR 018: Host Action Bus For Plugin-Declared Actions
-- ADR 012: Generic Plugin Boundary With Companion Domain-Type Crates
-- `docs/features/photodiode-lab-workflow-design.md` (§7)
+- ADR 024: Host/Worker Plugin State Ownership
+- ADR 026: External Triggers and Execution Context
+- ADR 028: Allowlisted Plugin to Host Commands
+- `docs/features/plugin-service-control-plane.md`

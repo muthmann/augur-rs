@@ -39,5 +39,5 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 024: Host/Worker Plugin State Ownership](./024-host-worker-plugin-state-ownership.md)
 - [ADR 025: Analysis Runs As The Primary Analysis Interface](./025-analysis-runs-primary-interface.md)
 - [ADR 026: External-Trigger Delivery And Plugin Execution Context (ABI v5)](./026-external-triggers-and-execution-context.md)
-- [ADR 027: Host-Routed Plugin Setting Requests](./027-plugin-setting-requests.md) *(proposed)*
-- [ADR 028: Allowlisted Plugin → Host Command Queue](./028-plugin-host-command-queue.md) *(proposed)*
+- [ADR 027: Worker-Owned Semantic Plugin Services](./027-plugin-setting-requests.md)
+- [ADR 028: Allowlisted Plugin to Host Recording Commands](./028-plugin-host-command-queue.md)
