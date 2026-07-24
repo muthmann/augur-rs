@@ -45,9 +45,28 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
   fetching datasets whose generation is unchanged; results carry `Arc`-shared
   decoded payloads, so the GUI thread no longer parses dataset JSON or pays a
   per-frame re-serialization for unchanged tables/images/series.
+- Worker host-view snapshots are also published on the 50 ms frame-independent
+  control path. Analysis and control publications share a monotonic sequence,
+  preventing stale cross-channel replacements without disabling generation
+  caching.
 - Worker results only trigger a host-view registry re-resolution when the
   registries actually changed, and density/image view textures re-render only
   on a real generation change — not on every frame.
+- Providers that expose no generation counter get a **content-derived**
+  generation (a hash of the fetched dataset bytes) in the worker. The worker
+  therefore skips the JSON decode for unchanged data, and — because the
+  generation no longer flips to `0` — the GUI keeps its decoded cache instead
+  of re-parsing every dataset 20×/s on a fully idle app. The GUI's dataset
+  refresh sequence is bumped only when a registry or a dataset generation
+  actually changed.
+- Plugin control-plane state is bounded and reset with the plugin instances
+  that key it: request/reply dedupe maps evict oldest-answered-first, reply
+  inboxes for disabled or unloaded plugins are pruned each tick, and every
+  entry is cleared on plugin reload. Previously all four maps grew for the
+  whole process lifetime (~29 k permanent entries per 8-hour session at
+  1 request/s).
+- The live worker's command handling is shared between its idle path and its
+  pre-job drain instead of being duplicated, so the two cannot drift apart.
 - The 3D investigation scene is only built when a 3D pane can actually be shown (3D/split layout or popup); 2D-only layouts skip selection resolution, dataset scans, and raw-event layer construction entirely.
 - The memoized 3D point-cloud summary hands out its event list behind an `Arc` instead of cloning up to `point_limit` events on every UI read (the scene build, overlay status, and footer status all read it each frame).
 - Raw-event 3D layers share one label allocation per layer instead of cloning a `String` per point, and per-event id hashing plus the occurrence map only run when a selection actually needs to be matched.

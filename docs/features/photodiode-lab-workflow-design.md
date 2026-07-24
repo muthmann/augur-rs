@@ -165,22 +165,18 @@ device plugin.
   controls, progress published as a table dataset. Host-OS step timing is
   ±ms; if a protocol ever needs µs-exact steps, the step table moves into
   the firmware as a new command (later ADR).
-- **Plugin → plugin control (general):** today the only channel is the
-  persistent context bus, and it is delivered per frame — unusable without a
-  camera. The architecture's intended pattern (ADR 006 in augur-plugins) is
-  *ownership*, not puppeteering: a future experiment plugin links
-  `stage-a-io` and owns the command port itself (modulation plugin disabled
-  while the experiment is armed). A host-routed `set_setting` request API
-  (plugin asks host to set another plugin's setting) is feasible and
-  frame-independent; the design — single-writer arbitration, "manual wins",
-  and a mandatory "driven by" badge — is written up in **ADR 027**
-  (proposed).
-- **Plugin → host application control (recording, filenames):** deliberately
-  impossible today (fail-closed `ExecutionContext`, ADR 026). The design for
-  an explicit, allowlisted host-command queue mirroring `HostActionRequest`
-  in reverse — a closed verb set (`StartRecording { name }` /
-  `StopRecording`), per-plugin consent, sanitised filenames confined to the
-  data directory, and visible execution — is in **ADR 028** (proposed).
+- **Plugin → plugin control (general):** ABI v6 implements the worker-owned,
+  frame-independent semantic service plane described by **ADR 027**. Device
+  plugins remain the sole hardware owners; an experiment plugin sends typed
+  domain requests, holds owner-issued leases, and reads bounded revisioned
+  snapshots. The host never proxies generic UI settings, and control continues
+  during camera-less intervals.
+- **Plugin → host application control (recording, filenames):** ABI v6 also
+  implements the closed, manifest-allowlisted recording queue in **ADR 028**.
+  Relative create-new paths are confined below the configured recording
+  directory, execution is live-only and visible, and start/final/partial
+  receipts name the actual RAW artifact. Replay and offline analysis remain
+  fail-closed.
 
 ## Suggested order (updated 2026-07-17, approved items marked ★)
 

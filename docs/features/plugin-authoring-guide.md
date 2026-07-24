@@ -43,6 +43,11 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 - `PluginDiscontinuity`
 - `PluginStateKind`
 - `PluginCapabilities`
+- `PluginRuntimeRole`
+- `PluginControlContext`
+- `PluginServiceRequest` / `PluginServiceReply`
+- `PluginControlSnapshot`
+- `HostCommandRequest` / `HostCommandReply`
 - `SettingsSchema` / `StatusEntry`
 - `HostViewRegistry`
 - `GlobalSettings`
@@ -52,6 +57,29 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 - `CTX_GLOBAL_SETTINGS`
 
 Domain-specific payloads live in companion crates rather than in `augur-plugin-api`. Plugins that share structured data with downstream consumers define their types in `augur-plugin-types` or their own companion crate.
+
+## Frame-Independent Control (ABI v6)
+
+Declare a stable manifest `id` before participating in control routing. The
+live worker invokes `process_control` at a bounded cadence even without camera
+frames. Use `PluginControlContext::request_service` for atomic, target-defined
+semantic operations; implement `handle_service_request` in the device-owner
+plugin and publish revisioned state through `control_snapshots`.
+
+Do not use generic remote setting mutation for hardware protocols. A device
+plugin remains the sole owner of its connection and validates complete domain
+commands itself. Deduplicate or resume workflows using request IDs and target
+snapshots.
+
+The host calls `set_runtime_role` before applying copied settings. Hardware
+effects are permitted only for `PluginRuntimeRole::LiveWorker` when
+`ExecutionContext::hardware_effects_allowed()` is true. `UiMirror` and
+`OfflineAnalysis` must stay inert.
+
+Recording commands additionally require the corresponding manifest
+`host_commands` entry. Recording paths are relative to the host-configured
+output directory; absolute paths and traversal are rejected. See
+[Plugin Service Control Plane](./plugin-service-control-plane.md).
 
 ## Host Views
 

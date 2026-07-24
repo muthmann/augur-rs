@@ -142,6 +142,9 @@ Replay seeks and source replacements clear retained plugin history and reset
 runtime plugins before the new upstream source publishes frames. This keeps the
 frame window deque monotonic for timestamp-range lookups and prevents
 pre-seek/post-seek frames from being double counted by accumulating plugins.
+The history additionally drops the older timeline on its own when an upstream
+source is replaced or a frame window jumps backwards, so the deque stays
+searchable even if a host-side boundary is missed.
 
 ## Allocation And Ownership Map
 

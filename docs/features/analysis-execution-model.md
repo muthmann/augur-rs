@@ -130,6 +130,12 @@ retained-history eviction. Replay seeks and source replacements clear
 `PluginEventHistory` before new frames are analyzed, preventing pre-seek and
 post-seek windows from sharing one monotonic history deque.
 
+`PluginEventHistory` also enforces that ordering itself, so a session boundary
+that reaches the worker without a discontinuity command cannot interleave two
+timelines: attaching a different upstream source drops the previous source's
+frames, and a frame whose window opens before the newest retained one drops the
+pre-jump history.
+
 ## Hot-Path Rules
 
 Preview accumulation retains raw events only when `raw_events_needed` is set on

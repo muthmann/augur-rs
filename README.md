@@ -21,7 +21,7 @@ AugurRS is a general-purpose workbench for event-based data. It works with any t
 
 For live capture, AugurRS currently ships with a direct hardware driver for the **Prophesee EVK4 / IMX636** — no Metavision or OpenEB required. Support for additional camera backends is planned. The trait-based camera abstraction in `augur-core` makes adding new hardware straightforward.
 
-The **plugin system** turns AugurRS into a programmable analysis surface. Plugins run frame-by-frame alongside the data stream and can do anything from signal processing to detection, tracking, metrics, and custom overlays. The plugin template, authoring docs, and community plugins live in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
+The **plugin system** turns AugurRS into a programmable analysis and laboratory-workflow surface. Plugins can process the event stream or use the worker-owned control plane to coordinate device owners during camera-less intervals. The plugin template, authoring docs, and community plugins live in the companion [**augur-plugins**](https://github.com/muthmann/augur-plugins) repository.
 
 ![Screenshot](assets/example_screenshot_driving_example.png)
 
@@ -108,7 +108,7 @@ Open recorded event files and investigate them with the full workspace:
 
 ### Plugin System
 
-AugurRS ships a generic, FFI-based plugin system. Plugins run frame-by-frame, declare what data they need (decoded frames, raw events, or upstream plugin results), and publish output through host-rendered views.
+AugurRS ships a generic, FFI-based plugin system. Analysis plugins run on decoded frames, raw events, or upstream results and publish through host-rendered views. ABI v6 also provides a worker-owned control tick for semantic device-owner services and narrowly allowlisted recording commands, including camera-less intervals.
 
 Drop a compiled plugin into `~/.augur/plugins/` and the GUI picks it up — no recompilation of the host required.
 
@@ -304,6 +304,7 @@ Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned mac
 | [HDF5 File Support](./docs/features/hdf5-file-support.md) | Native HDF5 + ECF plugin setup for `.h5` / `.hdf5` replay |
 | [Plugin Authoring Guide](./docs/features/plugin-authoring-guide.md) | Write your own plugin: FFI host, phases, context bus, host views |
 | [Dynamic Plugin Loading](./docs/features/dynamic-plugins.md) | Plugin directory layout, manifests, scan/reload workflow |
+| [Plugin Service Control Plane](./docs/features/plugin-service-control-plane.md) | ABI v6 runtime roles, frame-independent semantic services, snapshots, and recording receipts |
 | [GPU Preview Rendering](./docs/features/wgpu-preview-rendering.md) | Dual-backend wgpu/glow preview architecture and benchmark baseline |
 | [Technical Notes](./docs/features/README.md) | SDK internals, built-in tools, and feature details |
 | [Architecture Decisions](./docs/adr/README.md) | ADRs |

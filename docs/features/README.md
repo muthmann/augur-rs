@@ -37,6 +37,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Investigation Dataflow And Memory Model](./investigation-dataflow-and-memory-model.md) — end-to-end ownership, allocation, upstream raw-event source target, 2D/3D render data flow, replay seeking interactions, and plugin boundaries
 - [Investigation Thread And Execution Model](./investigation-thread-and-execution-model.md) — OS thread inventory, channel/atomic map, where calculations vs rendering vs plugins actually run, and hot-path bottlenecks
 - [Analysis Execution Model](./analysis-execution-model.md) — `augur-runtime`, live analysis worker, deterministic offline pipeline, ABI v4 lifecycle, and raw-event hot-path gates
+- [Plugin Service Control Plane](./plugin-service-control-plane.md) — ABI v6 worker-owned semantic peer services, no-frame control ticks, runtime roles, and allowlisted recording receipts
 - [Analysis Runs](./analysis-runs.md) — deterministic range-based runs as the primary analysis workflow: run dialog, runs panel, provenance badge, CLI range flags
 - [Investigation Table Trustworthiness](./investigation-table-trustworthiness.md) — declarative TableV1 provenance/display metadata, summary card, paginated TableWindow, auto-seek on row selection
 - [Clickable 2D Overlays And Failed-Fit Inspection](./investigation-clickable-overlays.md) — marker `source_row`, rejected-fit diamond selection, reason-first inspector, cross-span persistence
