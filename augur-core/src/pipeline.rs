@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
     ops::Range,
     path::{Path, PathBuf},
@@ -45,6 +45,11 @@ const DEFAULT_DISK_WRITER_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_EVENT_RING_CAPACITY_EVENTS: usize = 1_000_000;
 pub const N_BUFFERS: usize = RAW_BUFFER_POOL_CAPACITY;
 const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Upper bound on trigger edges held as pending preview-frame annotations.
+/// Only a CD-driven frame emission or the EOF flush drains them, so a stream
+/// without CD events needs this cap to stay bounded. At 16 B per edge this is
+/// ~1 MB, far more than any single frame window annotates.
+const MAX_PENDING_TRIGGERS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdEvent {
@@ -562,6 +567,18 @@ pub struct PipelineStatsSnapshot {
     pub preview_accumulate_us: u64,
     pub preview_raw_event_copy_us: u64,
     pub preview_frame_send_us: u64,
+    /// Total EVT3 `EXT_TRIGGER` edges decoded (both rising and falling),
+    /// counted at decode time — before frame windowing, best-effort preview
+    /// drops, and the rising-only filter plugins apply. An authoritative
+    /// "did any edge reach the host?" signal for TRIG_IN debugging.
+    pub triggers_total: u64,
+    /// Wall-clock age of the most recently decoded trigger edge, if any.
+    pub last_trigger_age_s: Option<f64>,
+    /// Trigger edges discarded because the pending-annotation buffer hit
+    /// `MAX_PENDING_TRIGGERS`. Nonzero only when CD events are too sparse to
+    /// close preview windows (a dark box, or a trigger-only protocol), where
+    /// the buffer would otherwise grow for the whole session.
+    pub triggers_dropped: u64,
 }
 
 impl PipelineStatsSnapshot {
@@ -613,6 +630,9 @@ struct PipelineStatsInner {
     preview_accumulate_us: u64,
     preview_raw_event_copy_us: u64,
     preview_frame_send_us: u64,
+    triggers_total: u64,
+    triggers_dropped: u64,
+    last_trigger_at: Option<Instant>,
     recent_samples: VecDeque<PipelineStatsSample>,
 }
 
@@ -644,8 +664,22 @@ impl PipelineStatsInner {
             preview_accumulate_us: 0,
             preview_raw_event_copy_us: 0,
             preview_frame_send_us: 0,
+            triggers_total: 0,
+            triggers_dropped: 0,
+            last_trigger_at: None,
             recent_samples: VecDeque::new(),
         }
+    }
+
+    fn record_triggers(&mut self, now: Instant, count: usize) {
+        if count > 0 {
+            self.triggers_total += count as u64;
+            self.last_trigger_at = Some(now);
+        }
+    }
+
+    fn record_dropped_triggers(&mut self, count: usize) {
+        self.triggers_dropped += count as u64;
     }
 
     fn record_packet(&mut self, now: Instant, bytes: u64, events: u64) {
@@ -697,6 +731,11 @@ impl PipelineStatsInner {
             preview_accumulate_us: self.preview_accumulate_us,
             preview_raw_event_copy_us: self.preview_raw_event_copy_us,
             preview_frame_send_us: self.preview_frame_send_us,
+            triggers_total: self.triggers_total,
+            last_trigger_age_s: self
+                .last_trigger_at
+                .map(|at| now.saturating_duration_since(at).as_secs_f64()),
+            triggers_dropped: self.triggers_dropped,
         }
     }
 
@@ -842,6 +881,21 @@ fn reset_preview_frame_accumulators(
     *on_count = 0;
     *off_count = 0;
     *frame_start_ts = None;
+}
+
+/// Caps the pending-annotation buffer at `MAX_PENDING_TRIGGERS`, dropping the
+/// oldest edges first, and returns how many were dropped.
+///
+/// Only a CD-driven frame emission or the EOF flush drains this buffer, so a
+/// stream whose CD events are too sparse to close a window (a dark box, or a
+/// trigger-only protocol) would otherwise grow it for the whole session. The
+/// recent tail is kept because that is what an upcoming frame would annotate.
+fn bound_pending_triggers(pending_triggers: &mut Vec<ExternalTriggerEvent>) -> usize {
+    let excess = pending_triggers.len().saturating_sub(MAX_PENDING_TRIGGERS);
+    if excess > 0 {
+        pending_triggers.drain(..excess);
+    }
+    excess
 }
 
 /// Splits off the pending triggers that belong to a frame ending at
@@ -1578,7 +1632,9 @@ where
                     decoder.take_triggers(&mut pending_triggers);
                     let packet_triggers = &pending_triggers[pending_trigger_watermark..];
                     if let Ok(mut s) = stats_preview.lock() {
-                        s.record_packet(Instant::now(), 0, events.len() as u64);
+                        let now = Instant::now();
+                        s.record_packet(now, 0, events.len() as u64);
+                        s.record_triggers(now, packet_triggers.len());
                         let first = events
                             .first()
                             .map(|event| event.timestamp)
@@ -1595,15 +1651,28 @@ where
                             s.record_event_timestamps(first, last);
                         }
                     }
-                    // A window may open on a trigger edge: trigger-only
-                    // streams (A2-style setups) must still produce frames.
-                    if let Some(first_trigger_ts) = pending_triggers.first().map(|t| t.timestamp_us)
-                    {
-                        let window_open_ts = events
-                            .first()
-                            .map(|event| event.timestamp.min(first_trigger_ts))
-                            .unwrap_or(first_trigger_ts);
-                        frame_start_ts.get_or_insert(window_open_ts);
+                    // Triggers are annotations on the live preview: CD events
+                    // alone open and close frame windows, and edges ride along
+                    // on whichever frame their timestamp falls in (attached in
+                    // `emit_preview_frame` via `split_frame_triggers`). We
+                    // deliberately do NOT open or force-close windows on trigger
+                    // time here — doing so injected empty/partial black frames
+                    // whenever an edge ran ahead of a sparse CD stream, which
+                    // showed up as preview flicker. Exact trigger-only windows
+                    // for A2-style latency protocols come from the replay /
+                    // offline `fetch_range` path, not this live preview.
+                    //
+                    // Because only a CD-driven frame or the EOF flush drains
+                    // this buffer, a stream with no CD events (dark box) would
+                    // otherwise accumulate edges for the whole session. Cap it
+                    // and drop oldest-first: the recent tail is what a frame
+                    // would annotate anyway, and the drop is reported in stats
+                    // rather than being silent.
+                    let dropped = bound_pending_triggers(&mut pending_triggers);
+                    if dropped > 0 {
+                        if let Ok(mut s) = stats_preview.lock() {
+                            s.record_dropped_triggers(dropped);
+                        }
                     }
                     let accumulate_started = Instant::now();
                     let capture_raw_events = raw_events_preview.load(Ordering::Relaxed);
@@ -1664,41 +1733,10 @@ where
                             );
                         }
                     }
-                    // Windows must also close when only triggers advance the
-                    // clock, otherwise trigger-only stretches never emit.
-                    loop {
-                        let Some(last_trigger_ts) = pending_triggers.last().map(|t| t.timestamp_us)
-                        else {
-                            break;
-                        };
-                        let Some(t0) = frame_start_ts
-                            .or_else(|| pending_triggers.first().map(|t| t.timestamp_us))
-                        else {
-                            break;
-                        };
-                        frame_start_ts.get_or_insert(t0);
-                        let acq_us = acq_preview.load(Ordering::Relaxed);
-                        if last_trigger_ts.saturating_sub(t0) < acq_us {
-                            break;
-                        }
-                        emit_preview_frame(
-                            &frame_tx,
-                            &stats_preview,
-                            &event_source_preview,
-                            recording_event_cursor,
-                            &mut frame_buffers,
-                            &mut frame_events,
-                            &mut pending_triggers,
-                            capture_raw_events,
-                            &mut on_count,
-                            &mut off_count,
-                            &mut frame_start_ts,
-                            width,
-                            height,
-                            pixel_count,
-                            t0.saturating_add(acq_us),
-                        );
-                    }
+                    // (Intentionally no trigger-driven window close here — see
+                    // the annotations-only note above. Trailing edges past the
+                    // last CD frame are carried on the next CD frame, or flushed
+                    // at EOF below so they are never silently dropped.)
                     let accumulate_elapsed = accumulate_started.elapsed();
                     if let Ok(mut s) = stats_preview.lock() {
                         s.record_preview_accumulate_time(accumulate_elapsed);
@@ -1803,7 +1841,10 @@ fn prepare_output_writer(
     disk_writer_buffer_bytes: usize,
     metadata: Option<&RecordingMetadata>,
 ) -> Result<BufWriter<File>> {
-    let file = File::create(output_path)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)?;
     let mut writer = BufWriter::with_capacity(disk_writer_buffer_bytes.max(1), file);
     if write_evt3_header {
         write_evt3_header_lines(&mut writer, width, height, metadata)?;
@@ -1846,6 +1887,22 @@ mod tests {
     use super::*;
     use crate::camera::{DeviceInfo, EventCamera};
     use crate::metadata::RecordingMetadata;
+
+    #[test]
+    fn recording_writer_refuses_to_overwrite_existing_file() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("augur-create-new-{nanos}.raw"));
+        std::fs::write(&path, b"keep").expect("collision fixture is written");
+
+        prepare_output_writer(&path, false, 1, 1, 1024, None)
+            .expect_err("existing recording target must not be overwritten");
+        assert_eq!(std::fs::read(&path).expect("fixture remains"), b"keep");
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[derive(Default)]
     struct TimeoutCamera;
@@ -1990,8 +2047,70 @@ mod tests {
             preview_accumulate_us: 0,
             preview_raw_event_copy_us: 0,
             preview_frame_send_us: 0,
+            triggers_total: 0,
+            triggers_dropped: 0,
+            last_trigger_at: None,
             recent_samples: VecDeque::new(),
         }
+    }
+
+    #[test]
+    fn trigger_counter_accumulates_edges_and_records_last_edge_age() {
+        let start = Instant::now();
+        let mut stats = test_stats(start);
+
+        // No edges yet: count is zero and there is no "last edge" age.
+        let snapshot = stats.snapshot_at(start);
+        assert_eq!(snapshot.triggers_total, 0);
+        assert_eq!(snapshot.last_trigger_age_s, None);
+
+        // A zero-count call must not stamp a "last edge" time.
+        stats.record_triggers(start + Duration::from_millis(10), 0);
+        assert_eq!(stats.snapshot_at(start).triggers_total, 0);
+        assert_eq!(stats.snapshot_at(start).last_trigger_age_s, None);
+
+        // Rising + falling edges both count toward the decode-level total.
+        stats.record_triggers(start + Duration::from_millis(100), 2);
+        stats.record_triggers(start + Duration::from_millis(300), 3);
+
+        let snapshot = stats.snapshot_at(start + Duration::from_millis(800));
+        assert_eq!(snapshot.triggers_total, 5);
+        // Age is measured from the most recent edge (300 ms) to now (800 ms).
+        let age = snapshot.last_trigger_age_s.expect("an edge was recorded");
+        assert!((age - 0.5).abs() < 1e-6, "unexpected age: {age}");
+    }
+
+    #[test]
+    fn pending_triggers_stay_bounded_when_no_cd_events_close_a_window() {
+        let mut pending = Vec::new();
+        let mut stats = test_stats(Instant::now());
+
+        // Under the cap nothing is touched: these edges still annotate a frame.
+        for timestamp_us in 0..1_000u64 {
+            pending.push(ExternalTriggerEvent::new(timestamp_us, 0, true));
+        }
+        assert_eq!(bound_pending_triggers(&mut pending), 0);
+        assert_eq!(pending.len(), 1_000);
+
+        // A CD-free stream keeps appending; only the recent tail is kept.
+        for timestamp_us in 1_000..(MAX_PENDING_TRIGGERS as u64 + 5_000) {
+            pending.push(ExternalTriggerEvent::new(timestamp_us, 0, true));
+        }
+        let dropped = bound_pending_triggers(&mut pending);
+        assert_eq!(dropped, 5_000);
+        assert_eq!(pending.len(), MAX_PENDING_TRIGGERS);
+        assert_eq!(
+            pending.first().map(|trigger| trigger.timestamp_us),
+            Some(5_000),
+            "the oldest edges must be the ones dropped"
+        );
+
+        stats.record_dropped_triggers(dropped);
+        assert_eq!(
+            stats.snapshot_at(Instant::now()).triggers_dropped,
+            5_000,
+            "drops must be observable rather than silent"
+        );
     }
 
     #[test]
@@ -3122,13 +3241,13 @@ mod tests {
     }
 
     #[test]
-    fn preview_pipeline_emits_trigger_only_frames_and_flushes_at_eof() {
+    fn preview_pipeline_flushes_trigger_only_edges_at_eof() {
         let mut config = CameraConfig::default();
         config.global.acq_time_ms = 1;
 
-        // No CD events at all: two triggers inside the first window, one
-        // 1.4 ms later. The first frame closes on trigger time alone; the
-        // trailing trigger must be flushed at EOF instead of vanishing.
+        // No CD events at all: triggers do not force frames mid-stream in the
+        // annotations-only preview, but they must never be silently dropped —
+        // the EOF flush emits a single frame carrying every pending edge.
         let packet = words_to_bytes(&[
             (0x8 << 12),         // TIME_HIGH 0
             (0x6 << 12) | 100,   // TIME_LOW 100
@@ -3151,17 +3270,79 @@ mod tests {
         )
         .expect("pipeline must start");
 
-        let first = recv_preview_frame(&controller);
-        assert_eq!(first.window_start_us, 100);
-        assert_eq!(first.window_end_us, 1_100);
-        assert_eq!(first.on_count + first.off_count, 0);
-        assert_eq!(first.external_triggers.len(), 2);
-        assert!(first.external_triggers[0].is_rising());
-        assert!(!first.external_triggers[1].is_rising());
-
+        // A single EOF-flushed frame carries all three edges; there is no
+        // mid-stream trigger-forced frame anymore.
         let flushed = recv_preview_frame(&controller);
-        assert_eq!(flushed.external_triggers.len(), 1);
-        assert_eq!(flushed.external_triggers[0].timestamp_us, 1_500);
+        assert_eq!(flushed.window_start_us, 100);
+        assert_eq!(flushed.on_count + flushed.off_count, 0);
+        assert_eq!(flushed.external_triggers.len(), 3);
+        assert!(flushed.external_triggers[0].is_rising());
+        assert!(!flushed.external_triggers[1].is_rising());
+        assert_eq!(flushed.external_triggers[2].timestamp_us, 1_500);
+
+        assert!(
+            controller
+                .frame_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "no mid-stream trigger-forced frames"
+        );
+
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    // Regression (preview flicker): a trigger sitting more than one acquisition
+    // window ahead of a sparse CD stream must NOT force an extra empty (black)
+    // frame. The edges ride along on the CD-driven frame instead. Previously the
+    // trigger-close loop emitted a black frame per acq step up to the edge,
+    // which showed up as flicker whenever external triggers were enabled.
+    #[test]
+    fn triggers_ride_along_without_forcing_empty_frames() {
+        let mut config = CameraConfig::default();
+        config.global.acq_time_ms = 1; // 1 ms accumulation window
+
+        // One CD event at t=0, then two triggers at t=1500 and t=2500 with no
+        // CD events near them (sparse scene between edges).
+        let packet = words_to_bytes(&[
+            (0x8 << 12),         // TIME_HIGH 0
+            (0x6 << 12),         // TIME_LOW 0
+            8,                   // ADDR_Y
+            (0x2 << 12) | 4,     // CD event t=0
+            (0x6 << 12) | 1_500, // TIME_LOW 1500
+            (0xA << 12) | 1,     // trigger rising t=1500
+            (0x6 << 12) | 2_500, // TIME_LOW 2500
+            (0xA << 12) | 1,     // trigger rising t=2500
+        ]);
+
+        let controller = spawn_pipeline(
+            ScriptedPacketCamera {
+                packets: vec![packet],
+                next_packet: 0,
+                release_after_first: None,
+            },
+            Evt3CorePreviewDecoder::default(),
+            config,
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        // Exactly one frame: it carries the CD content AND both edges as
+        // annotations — no separate black frame.
+        let frame = recv_preview_frame(&controller);
+        assert_eq!(
+            frame.on_count + frame.off_count,
+            1,
+            "frame carries CD content"
+        );
+        assert_eq!(frame.external_triggers.len(), 2, "both edges ride along");
+
+        assert!(
+            controller
+                .frame_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "no empty trigger-forced frame is emitted"
+        );
 
         controller.shutdown().expect("pipeline must shut down");
     }

@@ -1,4 +1,117 @@
+use std::collections::BTreeMap;
+
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+
+/// A semantic, target-defined service request routed by the host between
+/// worker-owned plugin instances.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PluginServiceRequest {
+    pub request_id: u64,
+    #[serde(default)]
+    pub source_plugin_id: String,
+    pub target_plugin_id: String,
+    pub service: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PluginServiceOutcome {
+    Accepted {
+        #[serde(default)]
+        payload: serde_json::Value,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PluginServiceReply {
+    pub request_id: u64,
+    pub source_plugin_id: String,
+    pub target_plugin_id: String,
+    pub service: String,
+    pub outcome: PluginServiceOutcome,
+}
+
+/// Small versioned state published by one plugin for peer monitoring.
+/// High-rate or bulk sample arrays belong in plugin-owned files/datasets,
+/// not in this JSON control plane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PluginControlSnapshot {
+    #[serde(default)]
+    pub plugin_id: String,
+    pub topic: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum HostCommand {
+    StartRecording {
+        run_id: String,
+        base_path: String,
+        #[serde(default)]
+        metadata: BTreeMap<String, String>,
+    },
+    StopRecording,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostCommandRequest {
+    pub request_id: u64,
+    pub command: HostCommand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HostCommandOutcome {
+    RecordingStarted {
+        actual_raw_path: String,
+        started_at: String,
+    },
+    RecordingFinalized {
+        actual_raw_path: String,
+        size: u64,
+        sha256: String,
+        duration_us: u64,
+    },
+    /// The host stopped the pipeline, but at least one finalization step
+    /// failed. The actual path is always reported; size/hash are present when
+    /// the file remained readable so callers can retain or quarantine it.
+    RecordingPartial {
+        actual_raw_path: String,
+        size: Option<u64>,
+        sha256: Option<String>,
+        duration_us: u64,
+        reason: String,
+    },
+    Rejected {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostCommandReply {
+    pub request_id: u64,
+    pub outcome: HostCommandOutcome,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PluginControlInbox {
+    #[serde(default)]
+    pub service_replies: Vec<PluginServiceReply>,
+    #[serde(default)]
+    pub host_replies: Vec<HostCommandReply>,
+    #[serde(default)]
+    pub snapshots: Vec<PluginControlSnapshot>,
+}
 
 pub const CTX_GLOBAL_SETTINGS: &str = "augur.global_settings";
 /// Reserved JSON key inside [`HostActionRequest::params`] that the host uses
@@ -11,6 +124,17 @@ pub const HOST_ACTION_CLUSTER_ROWS_PARAM: &str = "__augur_cluster_rows";
 /// dedupe by monotonic `request_id`.
 pub const CTX_INVESTIGATION_ACTION_REQUESTS: &str = "augur.investigation.action_requests";
 
+/// Active region of interest in sensor pixel coordinates, mirrored from the
+/// host camera config so plugins can restrict analysis to the illuminated
+/// window. A zero `width`/`height` means "use the full sensor".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RoiV1 {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalSettings {
     pub nm_per_pixel: f64,
@@ -18,6 +142,12 @@ pub struct GlobalSettings {
     pub sensor_height: u16,
     pub acq_time_ms: u64,
     pub event_store_budget_bytes: usize,
+    /// Active ROI from the host camera config.
+    #[serde(default)]
+    pub roi: RoiV1,
+    /// Masked (dead/hot) pixels from the host camera config.
+    #[serde(default)]
+    pub masked_pixels: Vec<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

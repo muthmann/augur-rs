@@ -65,11 +65,26 @@ pub enum SettingKind {
         default: String,
     },
     /// Momentary action button. The host sends `set_setting(key, true)` once
-    /// per click; the plugin treats every call as an edge, never as state,
-    /// and `get_setting` should return `false`. This is the frame-independent
-    /// trigger channel — it works with no camera attached, unlike host-view
-    /// actions, which are only delivered inside `process_frame`.
-    Button,
+    /// per click; the plugin treats every call as an edge, never as state.
+    /// This is the frame-independent trigger channel — it works with no camera
+    /// attached, unlike host-view actions, which are only delivered inside
+    /// `process_frame`.
+    ///
+    /// `get_setting` may return `false`, or a monotonic press counter when the
+    /// press must survive the host's settings-snapshot round-trip to a second
+    /// plugin instance (UI mirror → live worker): the receiving instance then
+    /// treats a counter increase as one press edge.
+    ///
+    /// A disabled button renders greyed out and never fires; use it to gate
+    /// actions on missing prerequisites instead of rejecting the press.
+    Button {
+        #[serde(default = "default_button_enabled")]
+        enabled: bool,
+    },
+}
+
+fn default_button_enabled() -> bool {
+    true
 }
 
 /// Which native dialog the host opens for a [`SettingKind::Path`] item.

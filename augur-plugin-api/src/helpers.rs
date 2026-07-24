@@ -4,11 +4,13 @@ use crate::{
     ffi::{
         AnalysisSeverity, ExecutionMode, FfiCdEvent, FfiColorRgba, FfiEventFrame,
         FfiEventStoreHandle, FfiExecutionContext, FfiExternalTriggerEvent, FfiMarkerOverlayItem,
-        FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-        FfiSubpixelMarker, PluginCapabilities, PluginDiscontinuity, PluginInput, PluginStateKind,
+        FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPluginControlContext, FfiPreviewFrame,
+        FfiSlice, FfiString, FfiSubpixelMarker, PluginCapabilities, PluginDiscontinuity,
+        PluginInput, PluginRuntimeRole, PluginStateKind,
     },
     settings::{SettingsSchema, StatusEntry},
-    HostViewRegistry,
+    HostCommandRequest, HostViewRegistry, PluginControlInbox, PluginControlSnapshot,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
 };
 
 /// Owned view of the host-provided execution context.
@@ -38,6 +40,17 @@ impl ExecutionContext {
         self.mode == ExecutionMode::LiveCapture && self.effects_allowed
     }
 
+    pub fn from_ffi(raw: &FfiExecutionContext) -> Self {
+        Self {
+            mode: raw.mode,
+            effects_allowed: raw.effects_allowed != 0,
+            session_id: unsafe { raw.session_id.as_str() }
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
     /// Borrows this context into its FFI representation. The returned value
     /// is only valid while `self` is alive (it borrows `session_id`).
     pub fn as_ffi(&self) -> FfiExecutionContext {
@@ -50,6 +63,46 @@ impl ExecutionContext {
                 .as_deref()
                 .map_or_else(FfiString::empty, FfiString::borrowed),
         }
+    }
+}
+
+/// Safe, call-scoped wrapper for the frame-independent plugin service plane.
+pub struct PluginControlContext<'a> {
+    raw: &'a mut FfiPluginControlContext,
+    inbox: PluginControlInbox,
+}
+
+impl<'a> PluginControlContext<'a> {
+    pub fn new(raw: &'a mut FfiPluginControlContext) -> Self {
+        let inbox =
+            serde_json::from_slice(unsafe { raw.inbox_json.as_slice() }).unwrap_or_default();
+        Self { raw, inbox }
+    }
+
+    pub fn execution(&self) -> ExecutionContext {
+        ExecutionContext::from_ffi(&self.raw.execution)
+    }
+
+    pub fn inbox(&self) -> &PluginControlInbox {
+        &self.inbox
+    }
+
+    pub fn request_service(&mut self, request: &PluginServiceRequest) -> Result<(), String> {
+        self.emit(request, self.raw.emit_service_request)
+    }
+
+    pub fn request_host(&mut self, request: &HostCommandRequest) -> Result<(), String> {
+        self.emit(request, self.raw.emit_host_command)
+    }
+
+    fn emit<T: Serialize>(
+        &mut self,
+        value: &T,
+        callback: unsafe extern "C" fn(*mut std::ffi::c_void, FfiSlice<u8>),
+    ) -> Result<(), String> {
+        let json = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+        unsafe { callback(self.raw.ctx, FfiSlice::from_slice(&json)) };
+        Ok(())
     }
 }
 
@@ -367,6 +420,10 @@ pub trait Plugin: Default {
 
     fn set_enabled(&mut self, enabled: bool);
 
+    /// Informs the instance whether it is a configuration mirror, the
+    /// effectful live worker, or an offline analysis instance.
+    fn set_runtime_role(&mut self, _role: PluginRuntimeRole) {}
+
     fn reset(&mut self);
 
     fn on_discontinuity(&mut self, _reason: PluginDiscontinuity) {
@@ -398,6 +455,35 @@ pub trait Plugin: Default {
         context: &mut HostContext<'_>,
         event_store: &EventStoreHandle<'_>,
     );
+
+    /// Frame-independent service-plane tick. The live worker invokes this at
+    /// a bounded cadence even when no camera frame is available.
+    fn process_control(&mut self, _context: &mut PluginControlContext<'_>) {}
+
+    /// Handle one semantic request on the target plugin's worker-owned
+    /// instance. The default is fail-closed.
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        _execution: &ExecutionContext,
+    ) -> PluginServiceReply {
+        PluginServiceReply {
+            request_id: request.request_id,
+            source_plugin_id: request.source_plugin_id.clone(),
+            target_plugin_id: request.target_plugin_id.clone(),
+            service: request.service.clone(),
+            outcome: PluginServiceOutcome::Rejected {
+                code: "unsupported_service".into(),
+                message: format!("service '{}' is not supported", request.service),
+            },
+        }
+    }
+
+    /// Small versioned status snapshots available to peer plugins on the
+    /// next control tick. Bulk data must use datasets or plugin-owned files.
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        Vec::new()
+    }
 
     fn settings_schema(&self) -> SettingsSchema {
         SettingsSchema::default()

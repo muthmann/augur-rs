@@ -7,9 +7,11 @@ mod settings;
 
 pub use context::{
     GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
-    HostActionScope, HostActionScopePayload, HostDatasetDescriptor, HostDatasetDisplayMetadata,
-    HostDatasetKind, HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind,
-    HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine, Series1dPoint, Series1dV1,
+    HostActionScope, HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply,
+    HostCommandRequest, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
+    HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, Image2dV1, PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome,
+    PluginServiceReply, PluginServiceRequest, RoiV1, Series1dLine, Series1dPoint, Series1dV1,
     TableColumn, TableColumnData, TableColumnDisplayEntry, TableColumnDisplayFormat,
     TableColumnDisplayMetadata, TableColumnValues, TableColumnWidthPriority,
     TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableRowProvenance,
@@ -21,13 +23,15 @@ pub use ffi::{
     AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, ExecutionMode,
     FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiExecutionContext,
     FfiExternalTriggerEvent, FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel,
-    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
-    HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn, PluginDiscontinuity,
-    PluginDiscontinuityFn, PluginEntry, PluginInput, PluginStateKind, PluginStateKindFn,
-    PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    FfiPluginContext, FfiPluginControlContext, FfiPreviewFrame, FfiSlice, FfiString,
+    FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
+    PluginDiscontinuity, PluginDiscontinuityFn, PluginEntry, PluginInput, PluginRuntimeRole,
+    PluginRuntimeRoleFn, PluginStateKind, PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
+    PLUGIN_ENTRY_SYMBOL,
 };
 pub use helpers::{
-    EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin, PluginFrame,
+    EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin, PluginControlContext,
+    PluginFrame,
 };
 pub use settings::{
     PathDialogKind, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
@@ -91,9 +95,12 @@ mod tests {
         },
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
         FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape,
-        FfiPixel, FfiSlice, FfiString, FfiSubpixelMarker, HostViewDatasetGenerationFn,
-        PluginCapabilities, PluginCapabilitiesFn, PluginDiscontinuity, PluginDiscontinuityFn,
-        PluginInput, PluginStateKind, PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
+        FfiPixel, FfiPluginControlContext, FfiSlice, FfiString, FfiSubpixelMarker, HostCommand,
+        HostCommandOutcome, HostCommandReply, HostCommandRequest, HostViewDatasetGenerationFn,
+        PluginCapabilities, PluginCapabilitiesFn, PluginControlInbox, PluginControlSnapshot,
+        PluginDiscontinuity, PluginDiscontinuityFn, PluginInput, PluginRuntimeRole,
+        PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginStateKind,
+        PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
     };
 
     #[test]
@@ -108,7 +115,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiMarkerShape>(), 4);
         assert_eq!(std::mem::size_of::<FfiMarkerOverlayItem>(), 88);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
-        assert_eq!(std::mem::size_of::<PluginVTable>(), 184);
+        assert_eq!(std::mem::size_of::<PluginVTable>(), 216);
+        assert_eq!(std::mem::size_of::<FfiPluginControlContext>(), 72);
         assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
         assert_eq!(
             std::mem::size_of::<EventStoreFrameRangeForTimestampsFn>(),
@@ -123,8 +131,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<crate::FfiExternalTriggerEvent>(), 16);
         assert_eq!(std::mem::align_of::<crate::FfiExternalTriggerEvent>(), 8);
         assert_eq!(std::mem::size_of::<crate::ExecutionMode>(), 4);
+        assert_eq!(std::mem::size_of::<PluginRuntimeRole>(), 4);
         assert_eq!(std::mem::size_of::<crate::FfiExecutionContext>(), 32);
-        assert_eq!(PLUGIN_ABI_VERSION, 5);
+        assert_eq!(PLUGIN_ABI_VERSION, 6);
     }
 
     #[test]
@@ -171,7 +180,7 @@ mod tests {
                         key: "save_snapshot".into(),
                         label: "Save snapshot".into(),
                         tooltip: None,
-                        kind: SettingKind::Button,
+                        kind: SettingKind::Button { enabled: false },
                     },
                 ],
             }],
@@ -184,6 +193,14 @@ mod tests {
     }
 
     #[test]
+    fn button_without_enabled_field_defaults_to_enabled() {
+        // Schemas emitted by plugins built against the pre-`enabled` API.
+        let decoded: SettingKind =
+            serde_json::from_str(r#"{"kind":"button"}"#).expect("legacy button deserializes");
+        assert_eq!(decoded, SettingKind::Button { enabled: true });
+    }
+
+    #[test]
     fn global_settings_round_trip_through_json() {
         let settings = GlobalSettings {
             nm_per_pixel: 65.0,
@@ -191,6 +208,13 @@ mod tests {
             sensor_height: 720,
             acq_time_ms: 50,
             event_store_budget_bytes: 100 * 1024 * 1024,
+            roi: crate::RoiV1 {
+                x: 4,
+                y: 8,
+                width: 640,
+                height: 480,
+            },
+            masked_pixels: vec![(1, 2), (3, 4)],
         };
 
         let json = serde_json::to_vec(&settings).expect("settings must serialize");
@@ -427,6 +451,80 @@ mod tests {
         assert_eq!(
             CTX_INVESTIGATION_ACTION_REQUESTS,
             "augur.investigation.action_requests"
+        );
+    }
+
+    #[test]
+    fn plugin_control_messages_round_trip_through_json() {
+        let inbox = PluginControlInbox {
+            service_replies: vec![PluginServiceReply {
+                request_id: 7,
+                source_plugin_id: "workflow.a1".into(),
+                target_plugin_id: "device.modulation".into(),
+                service: "apply.v1".into(),
+                outcome: PluginServiceOutcome::Accepted {
+                    payload: serde_json::json!({"revision": 3}),
+                },
+            }],
+            host_replies: vec![
+                HostCommandReply {
+                    request_id: 8,
+                    outcome: HostCommandOutcome::RecordingStarted {
+                        actual_raw_path: "/data/run.raw".into(),
+                        started_at: "2026-07-20T12:00:00Z".into(),
+                    },
+                },
+                HostCommandReply {
+                    request_id: 9,
+                    outcome: HostCommandOutcome::RecordingPartial {
+                        actual_raw_path: "/data/run.raw".into(),
+                        size: Some(123),
+                        sha256: None,
+                        duration_us: 42,
+                        reason: "writer failed".into(),
+                    },
+                },
+            ],
+            snapshots: vec![PluginControlSnapshot {
+                plugin_id: "device.modulation".into(),
+                topic: "state.v1".into(),
+                revision: 3,
+                payload: serde_json::json!({"connected": true}),
+            }],
+        };
+        let encoded = serde_json::to_vec(&inbox).expect("control inbox must encode");
+        assert_eq!(
+            serde_json::from_slice::<PluginControlInbox>(&encoded).unwrap(),
+            inbox
+        );
+
+        let request = HostCommandRequest {
+            request_id: 9,
+            command: HostCommand::StartRecording {
+                run_id: "run-9".into(),
+                base_path: "/data/run-9".into(),
+                metadata: [("reference_set".into(), "ref-1".into())]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        let encoded = serde_json::to_vec(&request).expect("host request must encode");
+        assert_eq!(
+            serde_json::from_slice::<HostCommandRequest>(&encoded).unwrap(),
+            request
+        );
+
+        let service = PluginServiceRequest {
+            request_id: 10,
+            source_plugin_id: String::new(),
+            target_plugin_id: "device.modulation".into(),
+            service: "output_off.v1".into(),
+            payload: serde_json::Value::Null,
+        };
+        let encoded = serde_json::to_vec(&service).expect("service request must encode");
+        assert_eq!(
+            serde_json::from_slice::<PluginServiceRequest>(&encoded).unwrap(),
+            service
         );
     }
 

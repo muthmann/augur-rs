@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,6 +12,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use augur_core::{
     analysis::{AnalysisOutput, AnalysisSeverity, AnalysisWarning, Overlay},
@@ -24,11 +27,12 @@ use augur_core::{
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
 };
-use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
+use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy, ExternalTriggerEvent};
 use augur_plugin_api::{
     ExecutionContext, ExecutionMode, FfiCdEvent, GlobalSettings, HostActionRequest,
-    HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostDatasetKind, HostViewKind,
-    Image2dV1, PluginDiscontinuity, PluginInput, Series1dV1, SettingsSchema, TableColumnValues,
+    HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostCommand,
+    HostCommandOutcome, HostCommandReply, HostDatasetKind, HostViewKind, Image2dV1,
+    PluginDiscontinuity, PluginInput, Series1dV1, SettingsSchema, TableColumnValues,
     TableDatasetV1, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
     HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
@@ -36,8 +40,8 @@ use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
     json_value_to_toml, open_directory, AnalysisPassContext, EventHistoryMaterializationCache,
     LiveAnalysisJob, LiveAnalysisResult, LiveAnalysisWorker, LiveHostDatasetSnapshot,
-    LivePluginHostSnapshot, LivePluginState, LivePluginStateSnapshot, OfflineAnalysisConfig,
-    OfflinePluginConfig,
+    LivePluginControlStatus, LivePluginHostSnapshot, LivePluginState, LivePluginStateSnapshot,
+    OfflineAnalysisConfig, OfflinePluginConfig,
 };
 
 use crate::{
@@ -698,13 +702,55 @@ impl Default for ImageJDialogState {
 }
 
 /// Which producer's plugin host-view snapshots the workspace currently shows:
-/// the live worker's approximate preview or a finished analysis run's exact
-/// results. `None` means local synchronous output (paused-scrub recompute) or
-/// no plugin output at all.
+/// the live worker's approximate preview, a finished analysis run's exact
+/// results, or this GUI's own synchronous pass. `None` means no plugin output
+/// at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeSnapshotSource {
     Worker,
     Run(u64),
+    /// The synchronous GUI pass computed the displayed frame (paused replay,
+    /// scrubbing). It reads host views straight from the GUI-side plugin
+    /// mirror, so the worker's concurrent 20 Hz snapshots must not overwrite
+    /// them.
+    Mirror,
+}
+
+#[derive(Debug)]
+struct PluginRecordingSession {
+    source_plugin_id: String,
+    run_id: String,
+    raw_path: PathBuf,
+    /// The `StartRecording` request, already answered with `RecordingStarted`.
+    start_request_id: u64,
+    /// The plugin's own `StopRecording`, if the plugin ended the run. `None`
+    /// when the operator pressed Stop or the pipeline failed — the finalize
+    /// receipt is then delivered under `start_request_id` as a best-effort
+    /// end-of-run notification, since `PluginControlInbox` carries no
+    /// unsolicited host events. The runtime's reply cache is write-once, so
+    /// that fallback cannot displace the cached `RecordingStarted`.
+    stop_request_id: Option<u64>,
+}
+
+impl PluginRecordingSession {
+    fn receipt_request_id(&self) -> u64 {
+        self.stop_request_id.unwrap_or(self.start_request_id)
+    }
+}
+
+#[derive(Debug)]
+struct PluginRecordingFinalizeResult {
+    source_plugin_id: String,
+    reply: HostCommandReply,
+    /// Only a plugin-requested stop that finalized cleanly returns the host to
+    /// live preview. An operator Stop or a pipeline failure must leave the
+    /// device closed.
+    auto_restart_preview: bool,
+}
+
+#[derive(Debug)]
+struct PluginRecordingFinalizeTask {
+    rx: mpsc::Receiver<PluginRecordingFinalizeResult>,
 }
 
 fn format_timestamp_now() -> String {
@@ -747,6 +793,134 @@ fn insert_timestamp_suffix(path: &Path) -> PathBuf {
     parent.join(format!("{stem}_{ts}.{ext}"))
 }
 
+fn recording_started_at_now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| format_timestamp_now())
+}
+
+fn resolve_plugin_recording_path(
+    configured_output: &Path,
+    base_path: &str,
+    run_id: &str,
+    always_timestamp: bool,
+) -> Result<PathBuf, (&'static str, String)> {
+    let relative = if base_path.trim().is_empty() {
+        PathBuf::from(sanitize_file_stem(run_id))
+    } else {
+        PathBuf::from(base_path.trim())
+    };
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err((
+            "path_outside_output_directory",
+            "plugin recording path must be relative and stay below the configured output directory"
+                .into(),
+        ));
+    }
+
+    let relative = ensure_extension(relative, "raw");
+    let configured_dir = configured_output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let data_dir = if configured_dir.is_absolute() {
+        configured_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                (
+                    "output_directory_unavailable",
+                    format!("resolving configured output directory failed: {err}"),
+                )
+            })?
+            .join(configured_dir)
+    };
+    let mut output = data_dir.join(relative);
+    if always_timestamp {
+        output = insert_timestamp_suffix(&output);
+    } else if output.exists() {
+        return Err((
+            "recording_path_exists",
+            format!(
+                "plugin recording target already exists: {}",
+                output.display()
+            ),
+        ));
+    }
+    Ok(output)
+}
+
+fn sha256_file(path: &Path) -> Result<(u64, String), String> {
+    let mut file = fs::File::open(path).map_err(|err| {
+        format!(
+            "opening finalized recording {} failed: {err}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|err| {
+            format!(
+                "hashing finalized recording {} failed: {err}",
+                path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.saturating_add(read as u64);
+    }
+    Ok((size, format!("{:x}", hasher.finalize())))
+}
+
+fn recording_finalize_outcome(
+    path: &Path,
+    duration_us: u64,
+    pipeline_failure: Option<String>,
+) -> HostCommandOutcome {
+    let actual_raw_path = path.display().to_string();
+    match (pipeline_failure, sha256_file(path)) {
+        (None, Ok((size, sha256))) => HostCommandOutcome::RecordingFinalized {
+            actual_raw_path,
+            size,
+            sha256,
+            duration_us,
+        },
+        (failure, hash_result) => {
+            let (size, sha256, hash_failure) = match hash_result {
+                Ok((size, sha256)) => (Some(size), Some(sha256), None),
+                Err(message) => (
+                    fs::metadata(path).ok().map(|metadata| metadata.len()),
+                    None,
+                    Some(message),
+                ),
+            };
+            let reason = [failure, hash_failure]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+            HostCommandOutcome::RecordingPartial {
+                actual_raw_path,
+                size,
+                sha256,
+                duration_us,
+                reason,
+            }
+        }
+    }
+}
+
 pub struct CameraApp {
     config: CameraConfig,
     output_path: String,
@@ -762,6 +936,11 @@ pub struct CameraApp {
     preview_renderer_notice: Option<String>,
     latest_frame: Option<PreviewFrame>,
     pending_preview_frame: Option<PreviewFrame>,
+    /// EXT_TRIGGER edges from preview frames that were drained but never
+    /// processed (drain-to-newest and the process-interval throttle drop whole
+    /// frames). Carried into the next processed frame so plugins that fold on
+    /// the trigger (stage-a-a1) see every edge, not just the survivors'.
+    carried_external_triggers: Vec<ExternalTriggerEvent>,
     last_preview_process_at: Option<Instant>,
     replay_controls: Option<ReplayControls>,
     replay_file_info: Option<ReplayFileInfo>,
@@ -797,7 +976,14 @@ pub struct CameraApp {
     analysis_epoch: Arc<AtomicU64>,
     live_analysis_worker: LiveAnalysisWorker,
     live_analysis_rx: mpsc::Receiver<LiveAnalysisResult>,
+    live_control_execution: ExecutionContext,
+    live_control_status: HashMap<String, LivePluginControlStatus>,
+    plugin_recording_session: Option<PluginRecordingSession>,
+    plugin_recording_finalize_task: Option<PluginRecordingFinalizeTask>,
     live_host_snapshots: Vec<LivePluginHostSnapshot>,
+    /// Highest worker host-view sequence applied from either the analysis or
+    /// control result channel.
+    live_host_snapshot_sequence: u64,
     runtime_snapshot_source: Option<RuntimeSnapshotSource>,
     cached_global_settings: Option<GlobalSettings>,
     cached_global_settings_json: Vec<u8>,
@@ -944,6 +1130,7 @@ impl CameraApp {
             preview_renderer_notice,
             latest_frame: None,
             pending_preview_frame: None,
+            carried_external_triggers: Vec::new(),
             last_preview_process_at: None,
             replay_controls: None,
             replay_file_info: None,
@@ -971,7 +1158,12 @@ impl CameraApp {
             analysis_epoch: Arc::new(AtomicU64::new(1)),
             live_analysis_worker,
             live_analysis_rx,
+            live_control_execution: ExecutionContext::fail_closed(),
+            live_control_status: HashMap::new(),
+            plugin_recording_session: None,
+            plugin_recording_finalize_task: None,
             live_host_snapshots: Vec::new(),
+            live_host_snapshot_sequence: 0,
             runtime_snapshot_source: None,
             cached_global_settings: None,
             cached_global_settings_json: Vec::new(),
@@ -1035,6 +1227,7 @@ impl CameraApp {
         }
         app.sync_config_global_from_runtime();
         app.sync_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
+        app.sync_live_control_execution();
         app.refresh_host_view_registry();
         app
     }
@@ -1087,6 +1280,13 @@ impl CameraApp {
             sensor_height: self.sensor_height,
             acq_time_ms: self.published_acq_time_ms(),
             event_store_budget_bytes: self.event_store.memory_budget_bytes(),
+            roi: augur_plugin_api::RoiV1 {
+                x: self.config.roi.x,
+                y: self.config.roi.y,
+                width: self.config.roi.width,
+                height: self.config.roi.height,
+            },
+            masked_pixels: self.config.pixel_mask.masked_pixels.clone(),
         }
     }
 
@@ -1154,6 +1354,17 @@ impl CameraApp {
                 format!("Live preview \u{00B7} {source}")
             }
             AppMode::Recording => {
+                if let Some(session) = &self.plugin_recording_session {
+                    let target = session
+                        .raw_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| session.run_id.clone());
+                    return format!(
+                        "Recording · {target} · controlled by {}",
+                        session.source_plugin_id
+                    );
+                }
                 let target = PathBuf::from(&self.output_path)
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -1421,6 +1632,11 @@ impl CameraApp {
                 "Approximate live plugin output — result cadence can lag under load. \
                  Run an analysis for exact results."
                     .to_owned(),
+            ),
+            Some(RuntimeSnapshotSource::Mirror) => (
+                "Current frame".to_owned(),
+                crate::theme::Tone::Neutral,
+                "Plugin output computed synchronously for the displayed frame.".to_owned(),
             ),
             None if runtime_plugins_enabled => (
                 "Current frame".to_owned(),
@@ -2268,6 +2484,7 @@ impl CameraApp {
         self.set_replay_speed_internal(&controls, 1.0);
         self.controller = Some(controller);
         self.mode = AppMode::Replaying;
+        self.sync_live_control_execution();
         self.python_stream_name = Some(stream_label.clone());
         self.config = config;
         let global = self.config.global.clone();
@@ -2530,6 +2747,12 @@ impl CameraApp {
         // the next result resurrects pre-reset (possibly cross-source) data.
         let epoch = self.bump_analysis_epoch();
         self.live_analysis_worker.clear_persistent(epoch);
+        // A session boundary is a discontinuity for the worker as well: its
+        // plugins hold state accumulated against the previous source, and its
+        // retained event history still describes that source's timeline.
+        self.live_analysis_worker
+            .discontinuity(epoch, PluginDiscontinuity::SourceChanged);
+        self.clear_runtime_snapshots();
         self.event_store.clear();
         self.analysis_output = AnalysisOutput::default();
         self.analysis_notice = None;
@@ -2551,7 +2774,39 @@ impl CameraApp {
 
     fn clear_runtime_snapshots(&mut self) {
         self.live_host_snapshots.clear();
+        self.live_host_snapshot_sequence = 0;
         self.runtime_snapshot_source = None;
+    }
+
+    fn apply_live_worker_host_snapshots(
+        &mut self,
+        sequence: u64,
+        snapshots: Vec<LivePluginHostSnapshot>,
+    ) {
+        if !is_newer_host_snapshot_sequence(self.live_host_snapshot_sequence, sequence) {
+            return;
+        }
+        let registries_changed = self.runtime_snapshot_source
+            != Some(RuntimeSnapshotSource::Worker)
+            || !live_snapshot_registries_equal(&self.live_host_snapshots, &snapshots);
+        // The worker publishes every 50 ms whether or not anything changed.
+        // Bumping the refresh sequence unconditionally invalidated the GUI's
+        // dataset cache 20x/s, re-serializing and re-parsing every dataset on a
+        // fully idle app. Dataset generations are now content-derived in the
+        // worker, so an unchanged dataset keeps its generation and this
+        // comparison is exact.
+        let datasets_changed = registries_changed
+            || !live_snapshot_generations_equal(&self.live_host_snapshots, &snapshots);
+        self.live_host_snapshot_sequence = sequence;
+        self.live_host_snapshots = snapshots;
+        self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Worker);
+        if registries_changed {
+            self.host_view_registry_dirty = true;
+        }
+        if datasets_changed {
+            self.host_dataset_refresh_seq = self.host_dataset_refresh_seq.wrapping_add(1);
+        }
+        self.refresh_host_view_registry_if_dirty();
     }
 
     fn collect_live_plugin_state_snapshot(&self) -> LivePluginStateSnapshot {
@@ -2651,18 +2906,248 @@ impl CameraApp {
             }
         }
         self.retire_action_requests_up_to(result.action_request_watermark);
-        // Re-resolving the host-view registry clones every descriptor set;
-        // only do it when the worker's registries actually changed.
-        let registries_changed = self.runtime_snapshot_source
-            != Some(RuntimeSnapshotSource::Worker)
-            || !live_snapshot_registries_equal(&self.live_host_snapshots, &result.host_snapshots);
-        self.live_host_snapshots = result.host_snapshots;
-        self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Worker);
-        if registries_changed {
-            self.host_view_registry_dirty = true;
+        self.apply_live_worker_host_snapshots(result.host_snapshot_sequence, result.host_snapshots);
+    }
+
+    fn sync_live_control_execution(&mut self) {
+        let execution = self.plugin_execution_context(true);
+        if execution == self.live_control_execution {
+            return;
         }
-        self.host_dataset_refresh_seq = self.host_dataset_refresh_seq.wrapping_add(1);
-        self.refresh_host_view_registry_if_dirty();
+        self.live_control_execution = execution.clone();
+        self.live_analysis_worker.set_control_execution(execution);
+    }
+
+    fn poll_live_control_results(&mut self) {
+        self.poll_plugin_recording_finalize();
+        while let Ok(result) = self.live_analysis_worker.try_recv_control() {
+            // Host commands are routed regardless of epoch. The worker has
+            // already recorded each one as in-flight, and re-emission is
+            // deduplicated there, so dropping one here would strand the
+            // plugin with no reply and no timeout. `begin_recording` and
+            // `start_preview` both bump the epoch, so a plugin-driven
+            // start/stop cycle reliably lands in that window. The individual
+            // handlers validate host state, so a stale command is rejected
+            // rather than misapplied.
+            for routed in result.host_requests {
+                self.execute_plugin_host_command(routed.source_plugin_id, routed.request);
+            }
+            for warning in result.warnings {
+                eprintln!("plugin control warning: {warning}");
+            }
+            // Snapshots and status describe worker state computed against a
+            // superseded epoch, so they are dropped.
+            if result.epoch < self.current_analysis_epoch() {
+                continue;
+            }
+            // A deliberately selected finished analysis run, or a paused
+            // replay frame computed by the synchronous mirror pass, owns the
+            // workspace until the next live transition clears it.
+            if !matches!(
+                self.runtime_snapshot_source,
+                Some(RuntimeSnapshotSource::Run(_) | RuntimeSnapshotSource::Mirror)
+            ) {
+                self.apply_live_worker_host_snapshots(
+                    result.host_snapshot_sequence,
+                    result.host_snapshots,
+                );
+            }
+            // `result.plugins` is the full set of enabled plugins each tick,
+            // so replacing the map retires entries for plugins that were
+            // disabled or unloaded since the last tick.
+            self.live_control_status = result
+                .plugins
+                .into_iter()
+                .map(|status| (status.plugin_id.clone(), status))
+                .collect();
+        }
+    }
+
+    fn submit_plugin_host_reply(&self, plugin_id: String, reply: HostCommandReply) {
+        self.live_analysis_worker
+            .submit_host_reply(plugin_id, reply);
+    }
+
+    fn reject_plugin_host_command(
+        &self,
+        plugin_id: String,
+        request_id: u64,
+        code: &str,
+        message: impl Into<String>,
+    ) {
+        self.submit_plugin_host_reply(
+            plugin_id,
+            HostCommandReply {
+                request_id,
+                outcome: HostCommandOutcome::Rejected {
+                    code: code.into(),
+                    message: message.into(),
+                },
+            },
+        );
+    }
+
+    fn execute_plugin_host_command(
+        &mut self,
+        source_plugin_id: String,
+        request: augur_plugin_api::HostCommandRequest,
+    ) {
+        if !self.live_control_execution.hardware_effects_allowed() {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request.request_id,
+                "effects_not_allowed",
+                "host recording commands are allowed only during live capture",
+            );
+            return;
+        }
+
+        match request.command {
+            HostCommand::StartRecording {
+                run_id,
+                base_path,
+                metadata,
+            } => {
+                if run_id.trim().is_empty() {
+                    self.reject_plugin_host_command(
+                        source_plugin_id,
+                        request.request_id,
+                        "invalid_run_id",
+                        "run_id must not be empty",
+                    );
+                    return;
+                }
+                if self.plugin_recording_session.is_some()
+                    || self.plugin_recording_finalize_task.is_some()
+                {
+                    self.reject_plugin_host_command(
+                        source_plugin_id,
+                        request.request_id,
+                        "recording_busy",
+                        "a plugin recording is already active or being finalized",
+                    );
+                    return;
+                }
+                let path = match resolve_plugin_recording_path(
+                    Path::new(&self.output_path),
+                    &base_path,
+                    &run_id,
+                    self.always_timestamp,
+                ) {
+                    Ok(path) => path,
+                    Err((code, message)) => {
+                        self.reject_plugin_host_command(
+                            source_plugin_id,
+                            request.request_id,
+                            code,
+                            message,
+                        );
+                        return;
+                    }
+                };
+                let mut recording_metadata = metadata
+                    .into_iter()
+                    .map(|(key, value)| (format!("plugin_{}", sanitize_file_stem(&key)), value))
+                    .collect::<BTreeMap<_, _>>();
+                recording_metadata.insert("plugin_source_id".into(), source_plugin_id.clone());
+                recording_metadata.insert("plugin_run_id".into(), run_id.clone());
+                match self.begin_recording(Some(path.clone()), recording_metadata) {
+                    Ok(actual_path) => {
+                        self.plugin_recording_session = Some(PluginRecordingSession {
+                            source_plugin_id: source_plugin_id.clone(),
+                            run_id,
+                            raw_path: actual_path.clone(),
+                            start_request_id: request.request_id,
+                            stop_request_id: None,
+                        });
+                        self.toast_queue.push(
+                            format!(
+                                "{} started recording {}",
+                                source_plugin_id,
+                                actual_path.display()
+                            ),
+                            crate::toast::ToastTone::Info,
+                        );
+                        self.submit_plugin_host_reply(
+                            source_plugin_id,
+                            HostCommandReply {
+                                request_id: request.request_id,
+                                outcome: HostCommandOutcome::RecordingStarted {
+                                    actual_raw_path: actual_path.display().to_string(),
+                                    started_at: recording_started_at_now(),
+                                },
+                            },
+                        );
+                    }
+                    Err(message) => self.reject_plugin_host_command(
+                        source_plugin_id,
+                        request.request_id,
+                        "recording_start_failed",
+                        message,
+                    ),
+                }
+            }
+            HostCommand::StopRecording => {
+                let Some(session) = self.plugin_recording_session.as_mut() else {
+                    self.reject_plugin_host_command(
+                        source_plugin_id,
+                        request.request_id,
+                        "no_plugin_recording",
+                        "there is no active plugin-initiated recording",
+                    );
+                    return;
+                };
+                if session.source_plugin_id != source_plugin_id {
+                    self.reject_plugin_host_command(
+                        source_plugin_id,
+                        request.request_id,
+                        "recording_owned_by_other_plugin",
+                        "only the plugin that started the recording may stop it",
+                    );
+                    return;
+                }
+                session.stop_request_id = Some(request.request_id);
+                self.stop_pipeline();
+            }
+        }
+    }
+
+    fn poll_plugin_recording_finalize(&mut self) {
+        let result = self
+            .plugin_recording_finalize_task
+            .as_ref()
+            .and_then(|task| task.rx.try_recv().ok());
+        let Some(result) = result else {
+            return;
+        };
+        self.plugin_recording_finalize_task = None;
+        let partial = matches!(
+            &result.reply.outcome,
+            HostCommandOutcome::RecordingPartial { .. }
+        );
+        self.toast_queue.push(
+            if partial {
+                format!(
+                    "{} recording stopped with a partial receipt",
+                    result.source_plugin_id
+                )
+            } else {
+                format!("{} recording finalized", result.source_plugin_id)
+            },
+            if partial {
+                crate::toast::ToastTone::Warn
+            } else {
+                crate::toast::ToastTone::Info
+            },
+        );
+        // A plugin-requested stop returns to live Preview before the receipt is
+        // acknowledged, so workflow plugins can begin the next recording without
+        // an operator click. An operator Stop or a pipeline failure must not
+        // re-open the device the user just closed or that just failed.
+        if result.auto_restart_preview {
+            self.start_preview();
+        }
+        self.submit_plugin_host_reply(result.source_plugin_id, result.reply);
     }
 
     fn reset_runtime_plugins(&mut self) {
@@ -5495,34 +5980,47 @@ impl CameraApp {
     }
 
     fn start_recording(&mut self) {
-        if self.mode == AppMode::Recording || self.replay_open_task.is_some() {
-            return;
-        }
-        if self.mode == AppMode::Previewing {
-            self.stop_pipeline();
-        }
-        match self.start_pipeline_inner(false) {
-            Ok(controller) => {
-                self.sync_pipeline_requirements(&controller);
-                self.controller = Some(controller);
-                self.last_preview_process_at = None;
-                self.mode = AppMode::Recording;
-                self.with_active_viewer_mut(ViewerState::clear_session_state);
-                self.reset_analysis();
-                self.config_dirty = false;
-                self.acq_dirty = false;
-                self.last_error = None;
-                self.camera_status = "Recording in progress.".into();
-                self.toast_queue.push(
-                    format!("Recording started: {}", self.output_path),
-                    crate::toast::ToastTone::Info,
-                );
-            }
+        match self.begin_recording(None, BTreeMap::new()) {
+            Ok(path) => self.toast_queue.push(
+                format!("Recording started: {}", path.display()),
+                crate::toast::ToastTone::Info,
+            ),
             Err(e) => {
                 self.last_error = Some(e.clone());
                 self.toast_queue.push(e, crate::toast::ToastTone::Error);
             }
         }
+    }
+
+    fn begin_recording(
+        &mut self,
+        output_path: Option<PathBuf>,
+        metadata: BTreeMap<String, String>,
+    ) -> Result<PathBuf, String> {
+        if self.mode == AppMode::Recording || self.replay_open_task.is_some() {
+            return Err("recording cannot start while Augur is busy".into());
+        }
+        if self.mode == AppMode::Replaying {
+            return Err("recording cannot start during replay".into());
+        }
+        if self.mode == AppMode::Previewing {
+            self.stop_pipeline();
+        }
+        let actual_path = output_path.unwrap_or(self.validated_output_path()?);
+        let controller =
+            self.start_pipeline_inner_with_recording(false, Some(actual_path.clone()), metadata)?;
+        self.sync_pipeline_requirements(&controller);
+        self.controller = Some(controller);
+        self.last_preview_process_at = None;
+        self.mode = AppMode::Recording;
+        self.sync_live_control_execution();
+        self.with_active_viewer_mut(ViewerState::clear_session_state);
+        self.reset_analysis();
+        self.config_dirty = false;
+        self.acq_dirty = false;
+        self.last_error = None;
+        self.camera_status = "Recording in progress.".into();
+        Ok(actual_path)
     }
 
     fn open_replay_file(&mut self) {
@@ -5654,6 +6152,7 @@ impl CameraApp {
         self.texture = None;
         self.latest_frame = None;
         self.mode = AppMode::Replaying;
+        self.sync_live_control_execution();
         self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.camera_info = Some(replay_info);
         self.config = display_config;
@@ -6078,12 +6577,24 @@ impl CameraApp {
     }
 
     fn start_pipeline_inner(&mut self, preview_only: bool) -> Result<PipelineController, String> {
+        self.start_pipeline_inner_with_recording(preview_only, None, BTreeMap::new())
+    }
+
+    fn start_pipeline_inner_with_recording(
+        &mut self,
+        preview_only: bool,
+        explicit_output_path: Option<PathBuf>,
+        recording_metadata: BTreeMap<String, String>,
+    ) -> Result<PipelineController, String> {
         self.sync_config_global_from_runtime();
 
         let options = if preview_only {
             PipelineOptions::preview_only(self.sensor_width, self.sensor_height)
         } else {
-            let output_path = self.validated_output_path()?;
+            let output_path = match explicit_output_path {
+                Some(path) => path,
+                None => self.validated_output_path()?,
+            };
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
                     format!("failed creating output directory {}: {e}", parent.display())
@@ -6102,10 +6613,10 @@ impl CameraApp {
         let mut options = options;
         options.plugin_event_history = self.plugins_need_retained_event_history();
         if !preview_only {
-            options.metadata = Some(
-                RecordingMetadata::from_context(&camera_info, &self.config)
-                    .with_annotations(RecordingAnnotations::default()),
-            );
+            let mut metadata = RecordingMetadata::from_context(&camera_info, &self.config)
+                .with_annotations(RecordingAnnotations::default());
+            metadata.extra.extend(recording_metadata);
+            options.metadata = Some(metadata);
         }
 
         let controller = spawn_pipeline(
@@ -6595,12 +7106,23 @@ impl CameraApp {
     }
 
     fn stop_pipeline(&mut self) {
+        self.stop_pipeline_with_failure(None);
+    }
+
+    fn stop_pipeline_with_failure(&mut self, mut pipeline_failure: Option<String>) {
         let was_replaying = self.mode == AppMode::Replaying;
+        let plugin_recording = self.plugin_recording_session.take();
+        let recording_duration_us = self
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.stats_snapshot().recording_duration_us)
+            .unwrap_or_default();
         self.disconnect_external_tool();
         if let Some(controller) = self.controller.take() {
             self.event_store.detach_upstream();
             if let Err(e) = controller.shutdown() {
                 let msg = format!("pipeline shutdown failed: {e}");
+                pipeline_failure.get_or_insert_with(|| msg.clone());
                 self.last_error = Some(msg.clone());
                 self.toast_queue.push(msg, crate::toast::ToastTone::Error);
             }
@@ -6625,10 +7147,45 @@ impl CameraApp {
         });
         self.reset_analysis();
         self.mode = AppMode::Idle;
+        self.sync_live_control_execution();
         self.camera_status =
             "Camera idle. Current local settings will be used for the next recording.".into();
         self.toast_queue
             .push("Stopped", crate::toast::ToastTone::Info);
+        if let Some(session) = plugin_recording {
+            self.toast_queue.push(
+                format!("Plugin recording '{}' is being finalized", session.run_id),
+                crate::toast::ToastTone::Warn,
+            );
+            self.start_plugin_recording_finalize(session, recording_duration_us, pipeline_failure);
+        }
+    }
+
+    fn start_plugin_recording_finalize(
+        &mut self,
+        session: PluginRecordingSession,
+        duration_us: u64,
+        pipeline_failure: Option<String>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        // Only a plugin-requested stop of a healthy pipeline hands the host
+        // back to live preview; an operator Stop or a camera failure must
+        // leave the device closed.
+        let auto_restart_preview = session.stop_request_id.is_some() && pipeline_failure.is_none();
+        let request_id = session.receipt_request_id();
+        thread::spawn(move || {
+            let outcome =
+                recording_finalize_outcome(&session.raw_path, duration_us, pipeline_failure);
+            let _ = tx.send(PluginRecordingFinalizeResult {
+                source_plugin_id: session.source_plugin_id,
+                reply: HostCommandReply {
+                    request_id,
+                    outcome,
+                },
+                auto_restart_preview,
+            });
+        });
+        self.plugin_recording_finalize_task = Some(PluginRecordingFinalizeTask { rx });
     }
 
     fn finish_replay(&mut self) {
@@ -6668,7 +7225,7 @@ impl CameraApp {
         if let Some(err) = maybe_error {
             self.last_error = Some(err.clone());
             self.toast_queue.push(err, crate::toast::ToastTone::Error);
-            self.stop_pipeline();
+            self.stop_pipeline_with_failure(self.last_error.clone());
             return;
         }
 
@@ -6853,7 +7410,7 @@ impl CameraApp {
     /// synchronous GUI passes and every replay/offline pass stay effects-free,
     /// so a replayed recording can never re-arm laboratory hardware.
     fn plugin_execution_context(&self, request_effects: bool) -> ExecutionContext {
-        let mode = if self.replay_controls.is_some() {
+        let mode = if self.mode == AppMode::Replaying {
             ExecutionMode::Replay
         } else {
             ExecutionMode::LiveCapture
@@ -6946,12 +7503,22 @@ impl CameraApp {
                 .unwrap_or(0);
             self.retire_action_requests_up_to(watermark);
             self.live_persistent_reseed = true;
+            // Claim the workspace for the mirror. Without this the next worker
+            // control tick (20 Hz) re-asserts `Worker` with its own, unrelated
+            // snapshots and blanks the host views just computed for this frame.
+            self.clear_runtime_snapshots();
+            self.runtime_snapshot_source = Some(RuntimeSnapshotSource::Mirror);
         }
         self.host_dataset_refresh_seq = self.host_dataset_refresh_seq.wrapping_add(1);
     }
 
     fn dispatch_live_analysis(&mut self, frame: &PreviewFrame) {
         self.publish_pending_action_requests();
+        // Live dispatch resumed, so release the mirror's claim on the
+        // workspace and let the worker's next snapshot take over.
+        if self.runtime_snapshot_source == Some(RuntimeSnapshotSource::Mirror) {
+            self.clear_runtime_snapshots();
+        }
         self.analysis_notice = Some(
             "Live plugin output is a preview — start an analysis (Analysis \u{25B8} New \
              Analysis…) for exact results."
@@ -7094,6 +7661,12 @@ impl CameraApp {
         let mut drained_frame = false;
         while let Ok(frame) = frame_rx.try_recv() {
             drained_frame = true;
+            // Trigger edges ride on individual preview frames, but frames are
+            // dropped freely below (drain-to-newest, process throttle). Bank
+            // every drained frame's edges so the next *processed* frame
+            // carries the complete trigger history to the plugins.
+            self.carried_external_triggers
+                .extend_from_slice(&frame.external_triggers);
             self.with_active_viewer_mut(|viewer| viewer.workspace.point_cloud.push_frame(&frame));
             // During a seek sprint, display the first frame that reaches the
             // target. Later frames still feed the 3D history above, but must
@@ -7112,8 +7685,15 @@ impl CameraApp {
         if seek_target_frame.is_some() {
             newest_frame = seek_target_frame;
         }
+        // Bound the bank while frames are being dropped without processing
+        // (e.g. paused replay): oldest edges go first.
+        const MAX_CARRIED_TRIGGERS: usize = 65_536;
+        if self.carried_external_triggers.len() > MAX_CARRIED_TRIGGERS {
+            let excess = self.carried_external_triggers.len() - MAX_CARRIED_TRIGGERS;
+            self.carried_external_triggers.drain(..excess);
+        }
 
-        let Some(frame) = newest_frame else {
+        let Some(mut frame) = newest_frame else {
             return;
         };
         let dispatch_live_analysis = self.should_dispatch_live_analysis();
@@ -7199,6 +7779,17 @@ impl CameraApp {
         }
         if self.mode == AppMode::Replaying && self.replay_pending_fraction.is_some() {
             self.replay_pending_fraction = None;
+        }
+
+        // This frame is the one that actually reaches the plugins: hand it the
+        // banked trigger edges from every dropped frame plus its own, sorted
+        // and deduplicated (its own edges are already in the bank).
+        if !self.carried_external_triggers.is_empty() {
+            let mut triggers = std::mem::take(&mut self.carried_external_triggers);
+            triggers.extend_from_slice(&frame.external_triggers);
+            triggers.sort_unstable_by_key(|t| (t.timestamp_us, t.id, t.level));
+            triggers.dedup();
+            frame.external_triggers = triggers;
         }
 
         let frame_total_started = Instant::now();
@@ -7413,9 +8004,24 @@ impl eframe::App for CameraApp {
         self.poll_python_ingress_requests();
         self.poll_tiff_stack_export_task();
         self.poll_analysis_runs();
+        self.sync_live_control_execution();
+        self.poll_live_control_results();
         self.poll_live_analysis_results();
         self.update_preview_texture(ctx);
         self.poll_pipeline_state();
+        // Plugin-initiated recordings finish asynchronously (worker control
+        // results + the finalize task), and after StopRecording the app may be
+        // Idle with nothing scheduling repaints — without this, the receipts
+        // sit unpolled until the next mouse move and the recording looks hung.
+        if self.plugin_recording_session.is_some() || self.plugin_recording_finalize_task.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.runtime_plugins_enabled() {
+            // Device-owner plugins (Stage-A bench) publish worker status and
+            // datasets on the control tick even with no camera stream; keep a
+            // slow poll alive so their UI stays current in Idle mode.
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.refresh_host_view_registry_if_dirty();
 
         let mode = self.mode;
@@ -8377,6 +8983,10 @@ impl eframe::App for CameraApp {
                                 }
                             }
 
+                            let trigger_stats = self
+                                .controller
+                                .as_ref()
+                                .map(PipelineController::stats_snapshot);
                             ui.add_enabled_ui(!settings_locked, |ui| {
                                 let changed = draw_settings(
                                     ui,
@@ -8386,6 +8996,7 @@ impl eframe::App for CameraApp {
                                     &mut self.mask_file,
                                     self.sensor_width,
                                     self.sensor_height,
+                                    trigger_stats,
                                 );
                                 if changed {
                                     self.config_dirty = true;
@@ -8607,6 +9218,12 @@ impl eframe::App for CameraApp {
                                         else {
                                             continue;
                                         };
+                                        let authoritative_status = self.plugin_manager.records()
+                                            [index]
+                                            .plugin()
+                                            .and_then(|plugin| plugin.id())
+                                            .and_then(|id| self.live_control_status.get(id))
+                                            .map(|status| status.status_entries.clone());
                                         let plugin_enabled = self.plugin_manager.records()[index]
                                             .plugin()
                                             .map(|plugin| plugin.enabled())
@@ -8797,6 +9414,7 @@ impl eframe::App for CameraApp {
                                                     match render_plugin_settings(
                                                         ui,
                                                         plugin,
+                                                        authoritative_status.as_deref(),
                                                         false,
                                                         plugin_name.clone(),
                                                     ) {
@@ -9697,7 +10315,9 @@ impl eframe::App for CameraApp {
         let process_interval = self.active_preview_process_interval();
         self.toast_queue.show(ctx);
 
-        if self.replay_open_task.is_some() || self.python_ingress.is_some() {
+        if self.plugin_recording_finalize_task.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.replay_open_task.is_some() || self.python_ingress.is_some() {
             ctx.request_repaint_after(Duration::from_millis(self.preview_interval_ms));
         } else if stream_active && self.controller.is_some() {
             ctx.request_repaint_after(process_interval);
@@ -10040,6 +10660,28 @@ fn live_snapshot_registries_equal(
         })
 }
 
+/// Compares only dataset identity and generation. The worker derives a
+/// content hash for providers that expose no counter, so equal generations
+/// mean equal payloads and the GUI can keep its decoded cache.
+fn live_snapshot_generations_equal(
+    previous: &[LivePluginHostSnapshot],
+    next: &[LivePluginHostSnapshot],
+) -> bool {
+    previous.len() == next.len()
+        && previous.iter().zip(next.iter()).all(|(left, right)| {
+            left.datasets.len() == right.datasets.len()
+                && left
+                    .datasets
+                    .iter()
+                    .zip(right.datasets.iter())
+                    .all(|(left, right)| left.id == right.id && left.generation == right.generation)
+        })
+}
+
+fn is_newer_host_snapshot_sequence(current: u64, incoming: u64) -> bool {
+    incoming > current
+}
+
 fn sync_retained_event_history_from_upstream(
     event_store: &mut PluginEventHistory,
     source: LiveEventSource,
@@ -10151,7 +10793,7 @@ fn seed_default_params(schema: &SettingsSchema) -> serde_json::Value {
                     serde_json::json!(default.clone())
                 }
                 // Buttons are momentary triggers, not persisted state.
-                SettingKind::Button => continue,
+                SettingKind::Button { .. } => continue,
             };
             map.insert(item.key.clone(), default);
         }
@@ -10337,7 +10979,7 @@ fn render_action_modal_schema(
                         }
                         // Momentary triggers make no sense as captured
                         // parameters of a modal; skip them.
-                        SettingKind::Button => {}
+                        SettingKind::Button { .. } => {}
                     }
                 }
             });
@@ -10348,25 +10990,119 @@ fn render_action_modal_schema(
 mod tests {
     use super::{
         acq_time_us_from_ms, derived_replay_preview_interval_ms, host_view_kind_is_dockable,
-        investigation_split_ratio_bounds, pipeline_stream_active, python_ingress_pipeline_config,
+        investigation_split_ratio_bounds, is_newer_host_snapshot_sequence,
+        live_snapshot_generations_equal, pipeline_stream_active, python_ingress_pipeline_config,
         python_ingress_replay_info, raw_event_focus_volume, raw_event_point_position,
-        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
-        replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
-        replay_step_target_time_us, replay_step_uses_current_controller,
-        replay_time_from_position_sources, roi_is_effectively_full_frame,
-        short_host_view_chip_title, should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
+        recording_finalize_outcome, replay_fraction_from_time, replay_history_has_display_override,
+        replay_history_step_target, replay_pipeline_config, replay_seek_target_reached,
+        replay_snapshot_frame, replay_step_target_time_us, replay_step_uses_current_controller,
+        replay_time_from_position_sources, resolve_plugin_recording_path,
+        roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
+        should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
-        viewport_stream_active, CameraApp, PopupSharedData, RawEventSceneInput,
-        RAW_EVENTS_ON_LAYER_ID,
+        viewport_stream_active, CameraApp, PluginRecordingSession, PopupSharedData,
+        RawEventSceneInput, RAW_EVENTS_ON_LAYER_ID,
     };
     use augur_event_types::{BackpressureBehavior, CursorPolicy};
+    use augur_runtime::{LiveHostDatasetSnapshot, LivePluginHostSnapshot};
     use std::{
         collections::HashSet,
+        fs,
+        path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc,
         },
     };
+
+    fn unique_recording_test_dir() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!("augur-recording-contract-{nanos}"))
+    }
+
+    #[test]
+    fn worker_host_snapshot_sequence_rejects_cross_channel_reordering() {
+        assert!(is_newer_host_snapshot_sequence(0, 1));
+        assert!(is_newer_host_snapshot_sequence(7, 8));
+        assert!(!is_newer_host_snapshot_sequence(8, 8));
+        assert!(!is_newer_host_snapshot_sequence(8, 7));
+    }
+
+    #[test]
+    fn plugin_recording_paths_are_confined_and_never_overwritten() {
+        let root = unique_recording_test_dir();
+        fs::create_dir_all(root.join("runs")).expect("test directory exists");
+        let configured = root.join("manual.raw");
+
+        let path = resolve_plugin_recording_path(&configured, "runs/a1", "run-1", false)
+            .expect("relative child path is accepted");
+        assert_eq!(path, root.join("runs/a1.raw"));
+        fs::write(&path, b"existing").expect("collision fixture is written");
+        let (code, _) = resolve_plugin_recording_path(&configured, "runs/a1", "run-1", false)
+            .expect_err("existing path is rejected");
+        assert_eq!(code, "recording_path_exists");
+
+        let (code, _) = resolve_plugin_recording_path(&configured, "../escape", "run-1", false)
+            .expect_err("traversal is rejected");
+        assert_eq!(code, "path_outside_output_directory");
+        let (code, _) = resolve_plugin_recording_path(&configured, "/tmp/escape", "run-1", false)
+            .expect_err("absolute path is rejected");
+        assert_eq!(code, "path_outside_output_directory");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalized_recording_receipt_uses_sha256_and_actual_size() {
+        let root = unique_recording_test_dir();
+        fs::create_dir_all(&root).expect("test directory exists");
+        let path = root.join("recording.raw");
+        fs::write(&path, b"abc").expect("test recording is written");
+
+        let (size, digest) = sha256_file(&path).expect("hash is computed");
+        assert_eq!(size, 3);
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_pipeline_shutdown_returns_typed_partial_recording_receipt() {
+        let root = unique_recording_test_dir();
+        fs::create_dir_all(&root).expect("test directory exists");
+        let path = root.join("recording.raw");
+        fs::write(&path, b"abc").expect("test recording is written");
+
+        let outcome = recording_finalize_outcome(
+            &path,
+            42,
+            Some("pipeline shutdown failed: writer panic".into()),
+        );
+        match outcome {
+            HostCommandOutcome::RecordingPartial {
+                actual_raw_path,
+                size,
+                sha256,
+                duration_us,
+                reason,
+            } => {
+                assert_eq!(actual_raw_path, path.display().to_string());
+                assert_eq!(size, Some(3));
+                assert!(sha256.is_some());
+                assert_eq!(duration_us, 42);
+                assert!(reason.contains("writer panic"));
+            }
+            other => panic!("expected partial receipt, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     use crate::{
         inspection_3d::{Investigation3dLayer, Investigation3dPoint, Investigation3dScene},
@@ -10382,7 +11118,7 @@ mod tests {
         replay::ReplayFileInfo,
         PACKED_EVENT_RECORD_BYTES,
     };
-    use augur_plugin_api::{FfiCdEvent, HostMarkerShape, HostViewKind};
+    use augur_plugin_api::{FfiCdEvent, HostCommandOutcome, HostMarkerShape, HostViewKind};
 
     fn raw_layer_style(title: &str, color: [u8; 4], size: f32) -> InvestigationLayerStyle {
         InvestigationLayerStyle {
@@ -10392,6 +11128,66 @@ mod tests {
             marker_shape: HostMarkerShape::Point,
             size,
         }
+    }
+
+    fn host_snapshot(datasets: &[(&str, u64)]) -> LivePluginHostSnapshot {
+        LivePluginHostSnapshot {
+            index: 0,
+            name: "workflow".to_owned(),
+            registry: None,
+            datasets: datasets
+                .iter()
+                .map(|(id, generation)| LiveHostDatasetSnapshot {
+                    id: (*id).to_owned(),
+                    generation: *generation,
+                    payload: None,
+                })
+                .collect(),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn unchanged_dataset_generations_do_not_invalidate_the_gui_cache() {
+        // The worker republishes every 50 ms whether or not anything changed,
+        // and derives a content hash for providers exposing no counter, so
+        // equal generations must be recognised as "nothing to re-parse".
+        let previous = vec![host_snapshot(&[("table.a", 7), ("series.b", 991)])];
+        let next = vec![host_snapshot(&[("table.a", 7), ("series.b", 991)])];
+        assert!(live_snapshot_generations_equal(&previous, &next));
+
+        let changed = vec![host_snapshot(&[("table.a", 7), ("series.b", 992)])];
+        assert!(!live_snapshot_generations_equal(&previous, &changed));
+
+        let removed = vec![host_snapshot(&[("table.a", 7)])];
+        assert!(!live_snapshot_generations_equal(&previous, &removed));
+
+        let renamed = vec![host_snapshot(&[("table.a", 7), ("series.c", 991)])];
+        assert!(
+            !live_snapshot_generations_equal(&previous, &renamed),
+            "a dataset swapped for another with the same generation must count as changed"
+        );
+    }
+
+    #[test]
+    fn finalize_receipt_targets_the_stop_request_when_the_plugin_stopped_the_run() {
+        let mut session = PluginRecordingSession {
+            source_plugin_id: "workflow".to_owned(),
+            run_id: "run-1".to_owned(),
+            raw_path: PathBuf::from("/tmp/run-1.raw"),
+            start_request_id: 4,
+            stop_request_id: None,
+        };
+        // Operator Stop or a pipeline failure: the plugin never asked, so the
+        // receipt rides on the start request as an end-of-run notification.
+        assert_eq!(session.receipt_request_id(), 4);
+
+        session.stop_request_id = Some(9);
+        assert_eq!(
+            session.receipt_request_id(),
+            9,
+            "a plugin-requested stop must be answered under its own request id"
+        );
     }
 
     #[test]

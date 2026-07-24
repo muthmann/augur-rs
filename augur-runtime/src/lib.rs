@@ -1,6 +1,6 @@
 use std::{
     cell::UnsafeCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::c_void,
     fs,
     ops::Range,
@@ -33,10 +33,13 @@ use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy};
 use augur_plugin_api::{
     AnalysisSeverity, ExecutionContext, FfiCdEvent, FfiColorRgba, FfiEventFrame,
     FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel,
-    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
-    HostDatasetDescriptor, HostDatasetKind, HostViewRegistry, Image2dV1, PluginCapabilities,
-    PluginDiscontinuity, PluginEntry, PluginInput, PluginStateKind, PluginVTable, Series1dV1,
-    SettingsSchema, StatusEntry, TableDatasetV1, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    FfiPluginContext, FfiPluginControlContext, FfiPreviewFrame, FfiSlice, FfiString,
+    FfiSubpixelMarker, HostCommand, HostCommandReply, HostCommandRequest, HostDatasetDescriptor,
+    HostDatasetKind, HostViewRegistry, Image2dV1, PluginCapabilities, PluginControlInbox,
+    PluginControlSnapshot, PluginDiscontinuity, PluginEntry, PluginInput, PluginRuntimeRole,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginStateKind, PluginVTable,
+    Series1dV1, SettingsSchema, StatusEntry, TableDatasetV1, PLUGIN_ABI_VERSION,
+    PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -45,6 +48,7 @@ use serde_json::Value;
 pub const PLUGIN_UI_CACHE_INTERVAL: Duration = Duration::from_millis(250);
 const MIN_PLAUSIBLE_FUNCTION_POINTER: usize = 4096;
 const DEFAULT_EVENT_HISTORY_BUDGET_BYTES: usize = 100 * 1024 * 1024;
+const CONTROL_TICK_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct LivePluginState {
@@ -118,6 +122,18 @@ struct CachedHostSnapshot {
     payload: Option<Result<HostDatasetSnapshot, String>>,
 }
 
+/// Content-derived generation for providers that expose no counter. Never
+/// returns `0`, which is reserved for "unknown".
+fn content_generation(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    match hasher.finish() {
+        0 => 1,
+        other => other,
+    }
+}
+
 impl HostSnapshotCache {
     /// Drops all cached payloads. Must be called whenever plugin instances
     /// are reconfigured, reloaded, or reset — a fresh instance may reuse
@@ -126,30 +142,54 @@ impl HostSnapshotCache {
         self.entries.clear();
     }
 
-    /// Returns the payload for `key`, calling `fetch` only when the provider
-    /// generation changed (generation `0` always refetches).
+    /// Returns the *effective* generation and payload for `key`.
+    ///
+    /// A provider counter (`generation != 0`) short-circuits the fetch
+    /// entirely. Providers without a counter are still fetched every pass —
+    /// their bytes are the only way to tell whether anything changed — but the
+    /// bytes are hashed into a stable effective generation, so an unchanged
+    /// dataset skips JSON decoding here and, because the generation the GUI
+    /// sees no longer flips to `0`, skips re-parsing downstream as well.
     fn resolve(
         &mut self,
         key: (usize, String),
         generation: u64,
-        fetch: impl FnOnce() -> Option<Result<HostDatasetSnapshot, String>>,
-    ) -> Option<Result<HostDatasetSnapshot, String>> {
-        let reuse = generation != 0
-            && self
-                .entries
-                .get(&key)
-                .is_some_and(|cached| cached.generation == generation);
-        if !reuse {
-            let payload = fetch();
-            self.entries.insert(
-                key.clone(),
-                CachedHostSnapshot {
-                    generation,
-                    payload,
-                },
-            );
+        fetch_bytes: impl FnOnce() -> Result<Option<Vec<u8>>, String>,
+        decode: impl FnOnce(&[u8]) -> Result<HostDatasetSnapshot, String>,
+    ) -> (u64, Option<Result<HostDatasetSnapshot, String>>) {
+        if generation != 0 {
+            if let Some(cached) = self.entries.get(&key) {
+                if cached.generation == generation {
+                    return (generation, cached.payload.clone());
+                }
+            }
         }
-        self.entries[&key].payload.clone()
+
+        let (effective, payload) = match fetch_bytes() {
+            Ok(Some(bytes)) => {
+                let effective = if generation != 0 {
+                    generation
+                } else {
+                    content_generation(&bytes)
+                };
+                if let Some(cached) = self.entries.get(&key) {
+                    if cached.generation == effective {
+                        return (effective, cached.payload.clone());
+                    }
+                }
+                (effective, Some(decode(&bytes)))
+            }
+            Ok(None) => (generation, None),
+            Err(err) => (generation, Some(Err(err))),
+        };
+        self.entries.insert(
+            key,
+            CachedHostSnapshot {
+                generation: effective,
+                payload: payload.clone(),
+            },
+        );
+        (effective, payload)
     }
 }
 
@@ -168,15 +208,52 @@ pub struct LiveAnalysisResult {
     pub output: AnalysisOutput,
     pub context_data: HashMap<String, Vec<u8>>,
     pub persistent_data: HashMap<String, Vec<u8>>,
+    /// Worker-local monotonic order for host-view snapshots. Analysis and
+    /// control results use separate channels, so the GUI must not infer
+    /// freshness from receive order.
+    pub host_snapshot_sequence: u64,
     pub host_snapshots: Vec<LivePluginHostSnapshot>,
     /// Highest host action request id that was visible on the persistent bus
     /// while this job ran. The GUI retires delivered requests up to this id.
     pub action_request_watermark: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RoutedHostCommandRequest {
+    pub source_plugin_id: String,
+    pub request: HostCommandRequest,
+}
+
+#[derive(Debug, Clone)]
+pub struct LivePluginControlStatus {
+    pub plugin_id: String,
+    pub name: String,
+    pub status_entries: Vec<StatusEntry>,
+    pub snapshots: Vec<PluginControlSnapshot>,
+}
+
+/// Frame-independent worker state sent to the GUI. Host requests are
+/// intentionally not executed in `augur-runtime`; the GUI remains the
+/// capability arbiter and returns replies through `submit_host_reply`.
+#[derive(Debug, Clone)]
+pub struct LiveControlResult {
+    pub epoch: u64,
+    pub execution: ExecutionContext,
+    pub plugins: Vec<LivePluginControlStatus>,
+    /// Worker-local monotonic order for `host_snapshots` across both result
+    /// channels.
+    pub host_snapshot_sequence: u64,
+    /// Frame-independent host-view state. Hardware-owning plugins can update
+    /// datasets even when no camera preview frames are being analyzed.
+    pub host_snapshots: Vec<LivePluginHostSnapshot>,
+    pub host_requests: Vec<RoutedHostCommandRequest>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct LiveAnalysisWorker {
     tx: mpsc::Sender<LiveAnalysisCommand>,
+    control_rx: mpsc::Receiver<LiveControlResult>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -188,14 +265,23 @@ impl LiveAnalysisWorker {
     ) -> (Self, mpsc::Receiver<LiveAnalysisResult>) {
         let (tx, rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let join = thread::spawn(move || {
-            run_live_analysis_worker(plugins_dir, memory_budget_bytes, rx, result_tx, worker_stop);
+            run_live_analysis_worker(
+                plugins_dir,
+                memory_budget_bytes,
+                rx,
+                result_tx,
+                control_tx,
+                worker_stop,
+            );
         });
         (
             Self {
                 tx,
+                control_rx,
                 stop,
                 join: Some(join),
             },
@@ -250,10 +336,41 @@ impl LiveAnalysisWorker {
             .tx
             .send(LiveAnalysisCommand::SetMemoryBudget(memory_budget_bytes));
     }
+
+    pub fn set_control_execution(&self, execution: ExecutionContext) {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        if self
+            .tx
+            .send(LiveAnalysisCommand::SetControlExecution {
+                execution,
+                ack: ack_tx,
+            })
+            .is_ok()
+        {
+            let _ = ack_rx.recv();
+        }
+    }
+
+    pub fn submit_host_reply(&self, plugin_id: String, reply: HostCommandReply) {
+        let _ = self
+            .tx
+            .send(LiveAnalysisCommand::HostReply { plugin_id, reply });
+    }
+
+    pub fn try_recv_control(&self) -> Result<LiveControlResult, mpsc::TryRecvError> {
+        self.control_rx.try_recv()
+    }
 }
 
 impl Drop for LiveAnalysisWorker {
     fn drop(&mut self) {
+        // Revoke effects and give plugins one immediate control tick before
+        // destroying worker-owned instances.
+        self.set_control_execution(ExecutionContext::fail_closed());
+        // The flag must be set *before* `Stop` is queued: it is the worker
+        // loop's own guard, so storing it after `join()` would make the
+        // `while !stop.load(..)` check dead and leave shutdown depending
+        // entirely on the `Stop` message being reached.
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.tx.send(LiveAnalysisCommand::Stop);
         if let Some(join) = self.join.take() {
@@ -351,6 +468,14 @@ enum LiveAnalysisCommand {
     },
     Analyze(Box<LiveAnalysisJob>),
     SetMemoryBudget(usize),
+    SetControlExecution {
+        execution: ExecutionContext,
+        ack: mpsc::SyncSender<()>,
+    },
+    HostReply {
+        plugin_id: String,
+        reply: HostCommandReply,
+    },
     Stop,
 }
 
@@ -419,7 +544,16 @@ impl PluginEventHistory {
             return;
         }
 
+        let replaces_other_source = self.upstream.is_some();
         self.detach_upstream();
+        // Frames retained from the previous source describe a different
+        // timeline: their windows carry that session's timestamps (a restarted
+        // camera or a re-opened replay starts over), and their `Upstream`
+        // payloads point at a ring nobody writes to any more. Keeping them
+        // would interleave two timelines in `frames`.
+        if replaces_other_source {
+            self.clear();
+        }
         let owns_cursor = cursor.is_none();
         let cursor = cursor.unwrap_or_else(|| register_plugin_cursor(&source));
         self.upstream = Some(source);
@@ -483,14 +617,12 @@ impl PluginEventHistory {
         };
 
         let byte_len = event_count.saturating_mul(std::mem::size_of::<FfiCdEvent>());
-        self.frames.push_back(PluginEventFrame {
+        self.push_retained_frame(PluginEventFrame {
             data,
             window_start_us: frame.window_start_us,
             window_end_us: frame.window_end_us,
             byte_len,
         });
-        self.memory_usage_bytes = self.memory_usage_bytes.saturating_add(byte_len);
-        self.enforce_memory_budget();
     }
 
     fn push_upstream_batch(&mut self, batch: LiveEventFrameBatch) {
@@ -501,12 +633,32 @@ impl PluginEventHistory {
             .events
             .len()
             .saturating_mul(std::mem::size_of::<FfiCdEvent>());
-        self.frames.push_back(PluginEventFrame {
+        self.push_retained_frame(PluginEventFrame {
             data: PluginEventFrameData::Inline(batch.events.into_boxed_slice()),
             window_start_us: batch.window_start_us,
             window_end_us: batch.window_end_us,
             byte_len,
         });
+    }
+
+    /// Appends a frame, keeping `frames` ordered by window.
+    ///
+    /// The ordering is a hard invariant: `frame_range_for_timestamps` binary
+    /// searches over it and plugins walk the returned index range as a
+    /// timeline. A frame whose window opens before the newest retained one
+    /// belongs to a different timeline — a source switch, a backward seek, or
+    /// a sensor timestamp reset — so the pre-jump history is dropped instead
+    /// of being interleaved with it. Dropping unreachable history silently
+    /// matches how the memory budget evicts frames.
+    fn push_retained_frame(&mut self, frame: PluginEventFrame) {
+        if self.frames.back().is_some_and(|newest| {
+            frame.window_start_us < newest.window_start_us
+                || frame.window_end_us < newest.window_end_us
+        }) {
+            self.clear();
+        }
+        let byte_len = frame.byte_len;
+        self.frames.push_back(frame);
         self.memory_usage_bytes = self.memory_usage_bytes.saturating_add(byte_len);
         self.enforce_memory_budget();
     }
@@ -538,21 +690,15 @@ impl PluginEventHistory {
         }
     }
 
+    /// Retained frames are ordered by window (see `push_retained_frame`), so
+    /// the bounds can be binary searched. This runs on the plugin FFI callback
+    /// path, where a panic would cross an `extern "C"` boundary and abort the
+    /// process: the ordering is established on insertion, never asserted here.
     pub fn frame_range_for_timestamps(
         &self,
         start_timestamp_us: u64,
         end_timestamp_us: u64,
     ) -> Option<(usize, usize)> {
-        debug_assert!(
-            self.frames
-                .iter()
-                .zip(self.frames.iter().skip(1))
-                .all(
-                    |(previous, next)| previous.window_start_us <= next.window_start_us
-                        && previous.window_end_us <= next.window_end_us
-                ),
-            "plugin event history must remain monotonic across range queries"
-        );
         if self.frames.is_empty() || start_timestamp_us > end_timestamp_us {
             return None;
         }
@@ -653,11 +799,19 @@ struct CachedStatusEntries {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
+    /// Stable machine identity used for service routing and capability grants.
+    /// Plugins that participate in the control plane must declare it.
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub version: String,
     pub description: Option<String>,
     pub domain: Option<String>,
     pub library: Option<String>,
+    /// Closed host-command verbs this plugin may emit. Declaration is only
+    /// the first gate; the GUI applies its own persisted user consent.
+    #[serde(default)]
+    pub host_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -799,6 +953,14 @@ impl DynPlugin {
         &self.cached_name
     }
 
+    pub fn id(&self) -> Option<&str> {
+        self.manifest.id.as_deref()
+    }
+
+    pub fn declared_host_commands(&self) -> &[String] {
+        &self.manifest.host_commands
+    }
+
     pub fn description(&self) -> &str {
         &self.cached_description
     }
@@ -852,6 +1014,10 @@ impl DynPlugin {
         }
         self.invalidate_ui_cache();
         self.ui_dirty |= changed;
+    }
+
+    pub fn set_runtime_role(&mut self, role: PluginRuntimeRole) {
+        unsafe { (self.vtable.set_runtime_role)(self.instance, role) };
     }
 
     pub fn reset(&mut self) {
@@ -1051,6 +1217,83 @@ impl DynPlugin {
             );
         }
     }
+
+    fn process_control(
+        &mut self,
+        inbox: &PluginControlInbox,
+        execution: &ExecutionContext,
+    ) -> Result<ControlEmissions, String> {
+        let inbox_json = serde_json::to_vec(inbox)
+            .map_err(|err| format!("serializing control inbox failed: {err}"))?;
+        let mut emissions = ControlEmissions::default();
+        let mut bridge = ControlOutputBridge {
+            emissions: &mut emissions,
+        };
+        let mut context = FfiPluginControlContext {
+            ctx: (&mut bridge as *mut ControlOutputBridge).cast(),
+            inbox_json: FfiSlice::from_slice(&inbox_json),
+            execution: execution.as_ffi(),
+            emit_service_request,
+            emit_host_command,
+        };
+        unsafe { (self.vtable.process_control)(self.instance, &mut context) };
+        Ok(emissions)
+    }
+
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        execution: &ExecutionContext,
+    ) -> Result<PluginServiceReply, String> {
+        let json = serde_json::to_vec(request)
+            .map_err(|err| format!("serializing service request failed: {err}"))?;
+        let mut out_ptr = std::ptr::null();
+        let mut out_len = 0usize;
+        unsafe {
+            (self.vtable.handle_service_request)(
+                self.instance,
+                FfiSlice::from_slice(&json),
+                execution.as_ffi(),
+                &mut out_ptr,
+                &mut out_len,
+            );
+        }
+        let bytes = unsafe { bytes_from_out_ptr(out_ptr, out_len) };
+        serde_json::from_slice(bytes)
+            .map_err(|err| format!("plugin returned invalid service reply: {err}"))
+    }
+
+    fn control_snapshots(&self) -> Result<Vec<PluginControlSnapshot>, String> {
+        self.read_json(self.vtable.control_snapshots)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ControlEmissions {
+    service_requests: Vec<PluginServiceRequest>,
+    host_requests: Vec<HostCommandRequest>,
+}
+
+struct ControlOutputBridge<'a> {
+    emissions: &'a mut ControlEmissions,
+}
+
+unsafe extern "C" fn emit_service_request(ctx: *mut c_void, data: FfiSlice<u8>) {
+    let Some(bridge) = ctx.cast::<ControlOutputBridge>().as_mut() else {
+        return;
+    };
+    if let Ok(request) = serde_json::from_slice(unsafe { data.as_slice() }) {
+        bridge.emissions.service_requests.push(request);
+    }
+}
+
+unsafe extern "C" fn emit_host_command(ctx: *mut c_void, data: FfiSlice<u8>) {
+    let Some(bridge) = ctx.cast::<ControlOutputBridge>().as_mut() else {
+        return;
+    };
+    if let Ok(request) = serde_json::from_slice(unsafe { data.as_slice() }) {
+        bridge.emissions.host_requests.push(request);
+    }
 }
 
 fn validate_plugin_vtable(vtable_ptr: *const PluginVTable) -> Result<PluginVTable, String> {
@@ -1095,6 +1338,7 @@ fn plugin_vtable_looks_plausible(vtable: &PluginVTable) -> bool {
         vtable.description as usize,
         vtable.enabled as usize,
         vtable.set_enabled as usize,
+        vtable.set_runtime_role as usize,
         vtable.reset as usize,
         vtable.on_discontinuity as usize,
         vtable.input_kind as usize,
@@ -1103,6 +1347,9 @@ fn plugin_vtable_looks_plausible(vtable: &PluginVTable) -> bool {
         vtable.num_dependencies as usize,
         vtable.dependency as usize,
         vtable.process_frame as usize,
+        vtable.process_control as usize,
+        vtable.handle_service_request as usize,
+        vtable.control_snapshots as usize,
         vtable.settings_schema as usize,
         vtable.get_setting as usize,
         vtable.set_setting as usize,
@@ -1203,13 +1450,19 @@ impl ManagedPlugin {
 pub struct PluginManager {
     plugins_dir: PathBuf,
     records: Vec<ManagedPlugin>,
+    runtime_role: PluginRuntimeRole,
 }
 
 impl PluginManager {
     pub fn new(plugins_dir: PathBuf) -> Self {
+        Self::with_runtime_role(plugins_dir, PluginRuntimeRole::UiMirror)
+    }
+
+    pub fn with_runtime_role(plugins_dir: PathBuf, runtime_role: PluginRuntimeRole) -> Self {
         Self {
             plugins_dir,
             records: Vec::new(),
+            runtime_role,
         }
     }
 
@@ -1242,7 +1495,29 @@ impl PluginManager {
             if !path.is_dir() {
                 continue;
             }
-            records.push(load_record(path));
+            records.push(load_record(path, self.runtime_role));
+        }
+
+        let mut id_counts = HashMap::new();
+        for id in records
+            .iter()
+            .filter_map(|record| record.plugin.as_ref().and_then(DynPlugin::id))
+        {
+            *id_counts.entry(id.to_owned()).or_insert(0_usize) += 1;
+        }
+        for record in &mut records {
+            let duplicate_id = record
+                .plugin
+                .as_ref()
+                .and_then(DynPlugin::id)
+                .filter(|id| id_counts.get(*id).copied().unwrap_or_default() > 1)
+                .map(str::to_owned);
+            if let Some(id) = duplicate_id {
+                record.plugin = None;
+                record.load_error = Some(format!(
+                    "duplicate stable plugin id `{id}`; every control-plane participant must have a unique manifest id"
+                ));
+            }
         }
         records.sort_by_key(|record| record.name().to_ascii_lowercase());
         self.records = records;
@@ -1253,7 +1528,7 @@ impl PluginManager {
         let Some(record) = self.records.get_mut(index) else {
             return Err(format!("plugin index {index} is out of range"));
         };
-        let refreshed = load_record(record.spec.entry_dir.clone());
+        let refreshed = load_record(record.spec.entry_dir.clone(), self.runtime_role);
         let result = match &refreshed.load_error {
             Some(err) => Err(err.clone()),
             None => Ok(()),
@@ -1268,126 +1543,444 @@ impl PluginManager {
     }
 }
 
+/// Upper bound on retained request/reply dedupe entries, per map. Reached only
+/// by a plugin issuing requests continuously for hours; eviction is
+/// oldest-first, so a replayed *recent* request is still deduped.
+const MAX_RETAINED_CONTROL_REQUESTS: usize = 1024;
+
+#[derive(Default)]
+struct ControlPlaneState {
+    execution: ExecutionContext,
+    service_replies: HashMap<String, Vec<PluginServiceReply>>,
+    host_replies: HashMap<String, Vec<HostCommandReply>>,
+    service_cache: HashMap<(String, u64), (PluginServiceRequest, PluginServiceReply)>,
+    host_requests: HashMap<(String, u64), (HostCommandRequest, Option<HostCommandReply>)>,
+    /// Insertion order for `service_cache` / `host_requests`, used to evict
+    /// oldest-first once `MAX_RETAINED_CONTROL_REQUESTS` is exceeded.
+    service_cache_order: VecDeque<(String, u64)>,
+    host_requests_order: VecDeque<(String, u64)>,
+}
+
+impl ControlPlaneState {
+    /// Drops every request/reply record while keeping `execution`.
+    ///
+    /// Must be called whenever plugin instances are recreated (reload) or
+    /// reset (discontinuity): the dedupe maps are keyed by the plugin's own
+    /// `request_id` counter, which restarts at 1 in a fresh instance. Without
+    /// this, a recycled id either collides with a stale entry and is rejected
+    /// as `request_id_conflict`, or — worse — matches one byte-for-byte and is
+    /// answered from `service_cache` while the target plugin is never invoked,
+    /// so a repeated `output_off.v1` reports `Accepted` without touching the
+    /// device.
+    fn reset_requests(&mut self) {
+        self.service_replies.clear();
+        self.host_replies.clear();
+        self.service_cache.clear();
+        self.host_requests.clear();
+        self.service_cache_order.clear();
+        self.host_requests_order.clear();
+    }
+
+    /// Retires settled dedupe entries while preserving requests still awaiting
+    /// a host reply. Used at a discontinuity, where plugin instances survive
+    /// (so an in-flight request is still owned by someone) but may restart
+    /// their own request-id counters.
+    fn forget_answered_requests(&mut self) {
+        self.service_cache.clear();
+        self.service_cache_order.clear();
+        self.host_requests.retain(|_, (_, reply)| reply.is_none());
+        self.host_requests_order
+            .retain(|key| self.host_requests.contains_key(key));
+    }
+
+    fn cache_service_reply(
+        &mut self,
+        key: (String, u64),
+        request: PluginServiceRequest,
+        reply: PluginServiceReply,
+    ) {
+        if self
+            .service_cache
+            .insert(key.clone(), (request, reply))
+            .is_none()
+        {
+            self.service_cache_order.push_back(key);
+        }
+        while self.service_cache_order.len() > MAX_RETAINED_CONTROL_REQUESTS {
+            if let Some(oldest) = self.service_cache_order.pop_front() {
+                self.service_cache.remove(&oldest);
+            }
+        }
+    }
+
+    fn record_host_request(&mut self, key: (String, u64), request: HostCommandRequest) {
+        if self
+            .host_requests
+            .insert(key.clone(), (request, None))
+            .is_none()
+        {
+            self.host_requests_order.push_back(key);
+        }
+        if self.host_requests_order.len() <= MAX_RETAINED_CONTROL_REQUESTS {
+            return;
+        }
+        // Evict oldest-first, but never a request still awaiting its host
+        // reply — dropping that would strand the plugin with no reply and no
+        // timeout. In-flight requests are naturally few (each awaits a host
+        // round-trip), so this always makes progress in practice.
+        let mut excess = self.host_requests_order.len() - MAX_RETAINED_CONTROL_REQUESTS;
+        let mut retained = VecDeque::with_capacity(self.host_requests_order.len());
+        while let Some(key) = self.host_requests_order.pop_front() {
+            let answered = matches!(self.host_requests.get(&key), Some((_, Some(_))));
+            if excess > 0 && answered {
+                self.host_requests.remove(&key);
+                excess -= 1;
+            } else {
+                retained.push_back(key);
+            }
+        }
+        self.host_requests_order = retained;
+    }
+
+    /// Fills an in-flight request's reply slot, ignoring later replies for the
+    /// same id. Write-once matters because a plugin recording is finalized
+    /// under its *start* request id when the operator (not the plugin) stopped
+    /// it; overwriting would make a duplicate start emission replay
+    /// `RecordingFinalized` instead of `RecordingStarted`.
+    fn resolve_host_request(&mut self, plugin_id: String, reply: HostCommandReply) {
+        let key = (plugin_id.clone(), reply.request_id);
+        let Some((_, cached_reply)) = self.host_requests.get_mut(&key) else {
+            return;
+        };
+        if cached_reply.is_none() {
+            *cached_reply = Some(reply.clone());
+        }
+        self.host_replies.entry(plugin_id).or_default().push(reply);
+    }
+
+    /// Drops reply inboxes addressed to plugins that no longer exist or are
+    /// disabled. Only enabled, id-bearing plugins drain their own inbox, so
+    /// without this a disabled plugin's queue is retained for the whole
+    /// process lifetime.
+    fn prune_inboxes(&mut self, manager: &PluginManager) {
+        let live: HashSet<&str> = manager
+            .records()
+            .iter()
+            .filter_map(|record| record.plugin())
+            .filter(|plugin| plugin.enabled())
+            .filter_map(|plugin| plugin.id())
+            .collect();
+        self.service_replies
+            .retain(|plugin_id, _| live.contains(plugin_id.as_str()));
+        self.host_replies
+            .retain(|plugin_id, _| live.contains(plugin_id.as_str()));
+    }
+}
+
+fn host_command_verb(command: &HostCommand) -> &'static str {
+    match command {
+        HostCommand::StartRecording { .. } => "start_recording",
+        HostCommand::StopRecording => "stop_recording",
+    }
+}
+
+fn rejected_service_reply(
+    request: &PluginServiceRequest,
+    code: &str,
+    message: String,
+) -> PluginServiceReply {
+    PluginServiceReply {
+        request_id: request.request_id,
+        source_plugin_id: request.source_plugin_id.clone(),
+        target_plugin_id: request.target_plugin_id.clone(),
+        service: request.service.clone(),
+        outcome: PluginServiceOutcome::Rejected {
+            code: code.into(),
+            message,
+        },
+    }
+}
+
+fn collect_control_snapshots(
+    manager: &PluginManager,
+    warnings: &mut Vec<String>,
+) -> Vec<PluginControlSnapshot> {
+    let mut snapshots = Vec::new();
+    for record in manager.records() {
+        let Some(plugin) = record.plugin() else {
+            continue;
+        };
+        if !plugin.enabled() {
+            continue;
+        }
+        let Some(plugin_id) = plugin.id() else {
+            continue;
+        };
+        match plugin.control_snapshots() {
+            Ok(mut published) => {
+                for snapshot in &mut published {
+                    snapshot.plugin_id = plugin_id.to_owned();
+                }
+                snapshots.extend(published);
+            }
+            Err(err) => warnings.push(format!(
+                "reading control snapshots from {plugin_id} failed: {err}"
+            )),
+        }
+    }
+    snapshots
+}
+
+fn tick_control_plane(
+    manager: &mut PluginManager,
+    state: &mut ControlPlaneState,
+    host_snapshot_cache: &mut HostSnapshotCache,
+    host_snapshot_sequence: &mut u64,
+) -> LiveControlResult {
+    let mut warnings = Vec::new();
+    let snapshots = collect_control_snapshots(manager, &mut warnings);
+    let mut service_requests = Vec::new();
+    let mut routed_host_requests = Vec::new();
+
+    for record in manager.records_mut() {
+        let Some(plugin) = record.plugin_mut() else {
+            continue;
+        };
+        if !plugin.enabled() {
+            continue;
+        }
+        let Some(plugin_id) = plugin.id().map(str::to_owned) else {
+            continue;
+        };
+        let inbox = PluginControlInbox {
+            service_replies: state.service_replies.remove(&plugin_id).unwrap_or_default(),
+            host_replies: state.host_replies.remove(&plugin_id).unwrap_or_default(),
+            snapshots: snapshots.clone(),
+        };
+        match plugin.process_control(&inbox, &state.execution) {
+            Ok(mut emissions) => {
+                for request in &mut emissions.service_requests {
+                    request.source_plugin_id = plugin_id.clone();
+                }
+                service_requests.extend(emissions.service_requests);
+                for request in emissions.host_requests {
+                    let verb = host_command_verb(&request.command);
+                    if !plugin
+                        .declared_host_commands()
+                        .iter()
+                        .any(|declared| declared == verb)
+                    {
+                        state
+                            .host_replies
+                            .entry(plugin_id.clone())
+                            .or_default()
+                            .push(HostCommandReply {
+                                request_id: request.request_id,
+                                outcome: augur_plugin_api::HostCommandOutcome::Rejected {
+                                    code: "undeclared_host_command".into(),
+                                    message: format!(
+                                        "plugin manifest does not declare host command '{verb}'"
+                                    ),
+                                },
+                            });
+                        continue;
+                    }
+                    let key = (plugin_id.clone(), request.request_id);
+                    if let Some((previous, reply)) = state.host_requests.get(&key) {
+                        if previous != &request {
+                            state
+                                .host_replies
+                                .entry(plugin_id.clone())
+                                .or_default()
+                                .push(HostCommandReply {
+                                    request_id: request.request_id,
+                                    outcome: augur_plugin_api::HostCommandOutcome::Rejected {
+                                        code: "request_id_conflict".into(),
+                                        message:
+                                            "request id was reused for a different host command"
+                                                .into(),
+                                    },
+                                });
+                        } else if let Some(reply) = reply.clone() {
+                            state
+                                .host_replies
+                                .entry(plugin_id.clone())
+                                .or_default()
+                                .push(reply);
+                        }
+                        continue;
+                    }
+                    state.record_host_request(key, request.clone());
+                    routed_host_requests.push(RoutedHostCommandRequest {
+                        source_plugin_id: plugin_id.clone(),
+                        request,
+                    });
+                }
+            }
+            Err(err) => warnings.push(format!("control tick for {plugin_id} failed: {err}")),
+        }
+    }
+
+    for request in service_requests {
+        let key = (request.source_plugin_id.clone(), request.request_id);
+        let reply = if let Some((previous, reply)) = state.service_cache.get(&key) {
+            if previous == &request {
+                reply.clone()
+            } else {
+                rejected_service_reply(
+                    &request,
+                    "request_id_conflict",
+                    "request id was reused for a different service request".into(),
+                )
+            }
+        } else {
+            let target = manager
+                .records_mut()
+                .iter_mut()
+                .filter_map(ManagedPlugin::plugin_mut)
+                .find(|plugin| {
+                    plugin.enabled() && plugin.id() == Some(request.target_plugin_id.as_str())
+                });
+            let reply = match target {
+                Some(target) => target
+                    .handle_service_request(&request, &state.execution)
+                    .unwrap_or_else(|err| rejected_service_reply(&request, "target_error", err)),
+                None => rejected_service_reply(
+                    &request,
+                    "target_unavailable",
+                    format!(
+                        "target plugin '{}' is not enabled",
+                        request.target_plugin_id
+                    ),
+                ),
+            };
+            // Identities are host-owned even when a target returns malformed
+            // or spoofed envelope fields.
+            let reply = PluginServiceReply {
+                request_id: request.request_id,
+                source_plugin_id: request.source_plugin_id.clone(),
+                target_plugin_id: request.target_plugin_id.clone(),
+                service: request.service.clone(),
+                outcome: reply.outcome,
+            };
+            state.cache_service_reply(key, request.clone(), reply.clone());
+            reply
+        };
+        state
+            .service_replies
+            .entry(request.source_plugin_id.clone())
+            .or_default()
+            .push(reply);
+    }
+    state.prune_inboxes(manager);
+
+    let snapshots = collect_control_snapshots(manager, &mut warnings);
+    let plugins = manager
+        .records()
+        .iter()
+        .filter_map(|record| {
+            let plugin = record.plugin()?;
+            let plugin_id = plugin.id()?.to_owned();
+            if !plugin.enabled() {
+                return None;
+            }
+            let status_entries = plugin.status_entries().unwrap_or_else(|err| {
+                warnings.push(format!("reading status from {plugin_id} failed: {err}"));
+                Vec::new()
+            });
+            Some(LivePluginControlStatus {
+                snapshots: snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.plugin_id == plugin_id)
+                    .cloned()
+                    .collect(),
+                plugin_id,
+                name: plugin.name().to_owned(),
+                status_entries,
+            })
+        })
+        .collect();
+
+    let (host_snapshot_sequence, host_snapshots) =
+        collect_sequenced_live_host_snapshots(manager, host_snapshot_cache, host_snapshot_sequence);
+    LiveControlResult {
+        epoch: 0,
+        execution: state.execution.clone(),
+        plugins,
+        host_snapshot_sequence,
+        host_snapshots,
+        host_requests: routed_host_requests,
+        warnings,
+    }
+}
+
 fn run_live_analysis_worker(
     plugins_dir: PathBuf,
     memory_budget_bytes: usize,
     rx: mpsc::Receiver<LiveAnalysisCommand>,
     result_tx: mpsc::Sender<LiveAnalysisResult>,
+    control_tx: mpsc::Sender<LiveControlResult>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut manager = PluginManager::new(plugins_dir);
-    let mut load_warning = manager.scan_and_load().err();
-    let mut event_store = PluginEventHistory::default();
-    event_store.set_memory_budget(memory_budget_bytes);
-    let mut persistent_data = HashMap::new();
-    let mut host_snapshot_cache = HostSnapshotCache::default();
-    let mut active_epoch = 0u64;
+    let mut state = WorkerState::new(plugins_dir, memory_budget_bytes);
+    let mut last_control_tick = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        let Ok(command) = rx.recv() else {
-            break;
+        let command = match rx.recv_timeout(CONTROL_TICK_INTERVAL) {
+            Ok(command) => Some(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        match command {
-            LiveAnalysisCommand::Stop => break,
-            LiveAnalysisCommand::SetMemoryBudget(bytes) => {
-                event_store.set_memory_budget(bytes);
+        let Some(command) = command else {
+            if !state.publish_control(&control_tx) {
+                break;
             }
-            LiveAnalysisCommand::Configure {
-                epoch,
-                snapshot,
-                reason,
-            } => {
-                active_epoch = active_epoch.max(epoch);
-                apply_live_plugin_snapshot(&mut manager, &snapshot);
-                notify_plugins_of_discontinuity(&mut manager, reason);
-                host_snapshot_cache.clear();
-                event_store.clear();
-            }
-            LiveAnalysisCommand::Reload {
-                epoch,
-                snapshot,
-                reason,
-            } => {
-                active_epoch = active_epoch.max(epoch);
-                load_warning = manager.scan_and_load().err();
-                apply_live_plugin_snapshot(&mut manager, &snapshot);
-                notify_plugins_of_discontinuity(&mut manager, reason);
-                host_snapshot_cache.clear();
-                event_store.clear();
-            }
-            LiveAnalysisCommand::Discontinuity { epoch, reason } => {
-                active_epoch = active_epoch.max(epoch);
-                event_store.clear();
-                notify_plugins_of_discontinuity(&mut manager, reason);
-                host_snapshot_cache.clear();
-            }
-            LiveAnalysisCommand::ClearPersistent { epoch } => {
-                active_epoch = active_epoch.max(epoch);
-                persistent_data.clear();
-            }
-            LiveAnalysisCommand::Analyze(mut job) => {
-                while let Ok(next) = rx.try_recv() {
-                    match next {
-                        LiveAnalysisCommand::Stop => return,
-                        LiveAnalysisCommand::SetMemoryBudget(bytes) => {
-                            event_store.set_memory_budget(bytes);
-                        }
-                        LiveAnalysisCommand::Configure {
-                            epoch,
-                            snapshot,
-                            reason,
-                        } => {
-                            active_epoch = active_epoch.max(epoch);
-                            apply_live_plugin_snapshot(&mut manager, &snapshot);
-                            notify_plugins_of_discontinuity(&mut manager, reason);
-                            host_snapshot_cache.clear();
-                            event_store.clear();
-                        }
-                        LiveAnalysisCommand::Reload {
-                            epoch,
-                            snapshot,
-                            reason,
-                        } => {
-                            active_epoch = active_epoch.max(epoch);
-                            load_warning = manager.scan_and_load().err();
-                            apply_live_plugin_snapshot(&mut manager, &snapshot);
-                            notify_plugins_of_discontinuity(&mut manager, reason);
-                            host_snapshot_cache.clear();
-                            event_store.clear();
-                        }
-                        LiveAnalysisCommand::Discontinuity { epoch, reason } => {
-                            active_epoch = active_epoch.max(epoch);
-                            event_store.clear();
-                            notify_plugins_of_discontinuity(&mut manager, reason);
-                            host_snapshot_cache.clear();
-                        }
-                        LiveAnalysisCommand::ClearPersistent { epoch } => {
-                            active_epoch = active_epoch.max(epoch);
-                            persistent_data.clear();
-                            // The pending job's merged seed/updates predate
-                            // the clear and must not resurrect old values.
-                            job.persistent_seed = None;
-                            job.persistent_updates.clear();
-                        }
-                        LiveAnalysisCommand::Analyze(next_job) => {
-                            job.coalesce_with(*next_job);
-                        }
+            last_control_tick = Instant::now();
+            continue;
+        };
+        let mut job = match state.handle_command(command, &control_tx, &mut last_control_tick) {
+            WorkerStep::Handled { .. } => None,
+            WorkerStep::Stop => break,
+            WorkerStep::Analyze(job) => Some(job),
+        };
+        if let Some(job) = job.as_mut() {
+            // Drain the queue so a burst of frames collapses into one analysis
+            // pass, and so control commands queued behind them are not delayed
+            // by a full frame period.
+            let mut stopped = false;
+            while let Ok(next) = rx.try_recv() {
+                match state.handle_command(next, &control_tx, &mut last_control_tick) {
+                    WorkerStep::Handled {
+                        persistent_cleared: true,
+                    } => {
+                        // The pending job's merged seed/updates predate the
+                        // clear and must not resurrect old values.
+                        job.persistent_seed = None;
+                        job.persistent_updates.clear();
                     }
+                    WorkerStep::Handled { .. } => {}
+                    WorkerStep::Stop => {
+                        stopped = true;
+                        break;
+                    }
+                    WorkerStep::Analyze(next_job) => job.coalesce_with(*next_job),
                 }
-
-                if job.epoch < active_epoch {
-                    continue;
-                }
-                active_epoch = active_epoch.max(job.epoch);
-                job.apply_persistent_changes(&mut persistent_data);
+            }
+            if stopped {
+                break;
+            }
+            if job.epoch >= state.active_epoch {
+                state.active_epoch = state.active_epoch.max(job.epoch);
+                job.apply_persistent_changes(&mut state.persistent_data);
                 let mut result = process_live_analysis_job(
-                    &mut manager,
-                    &mut event_store,
-                    &mut persistent_data,
-                    &mut host_snapshot_cache,
-                    &job,
+                    &mut state.manager,
+                    &mut state.event_store,
+                    &mut state.persistent_data,
+                    &mut state.host_snapshot_cache,
+                    &mut state.host_snapshot_sequence,
+                    job,
                 );
-                if let Some(warning) = load_warning.take() {
+                if let Some(warning) = state.load_warning.take() {
                     result.output.warnings.push(AnalysisWarning {
                         source: "plugin-runtime".into(),
                         severity: CoreSeverity::Warning,
@@ -1399,8 +1992,164 @@ fn run_live_analysis_worker(
                 }
             }
         }
+        // A continuously populated analysis queue must not starve hardware
+        // datasets or service/control progress. Publish after a command once
+        // the same deadline used by the idle recv timeout has elapsed.
+        if last_control_tick.elapsed() >= CONTROL_TICK_INTERVAL {
+            if !state.publish_control(&control_tx) {
+                break;
+            }
+            last_control_tick = Instant::now();
+        }
     }
-    event_store.detach_upstream();
+    // Revoke effects and give plugins one last control tick before the
+    // worker-owned instances are dropped.
+    state.control.execution = ExecutionContext::fail_closed();
+    let _ = tick_control_plane(
+        &mut state.manager,
+        &mut state.control,
+        &mut state.host_snapshot_cache,
+        &mut state.host_snapshot_sequence,
+    );
+    state.event_store.detach_upstream();
+}
+
+/// Mutable state owned by the live-analysis worker thread.
+struct WorkerState {
+    manager: PluginManager,
+    event_store: PluginEventHistory,
+    persistent_data: HashMap<String, Vec<u8>>,
+    host_snapshot_cache: HostSnapshotCache,
+    host_snapshot_sequence: u64,
+    active_epoch: u64,
+    control: ControlPlaneState,
+    load_warning: Option<String>,
+}
+
+/// What the worker loop must do once a command has been handled.
+enum WorkerStep {
+    /// Fully handled. `persistent_cleared` tells a job waiting behind this
+    /// command to drop its now-stale persistent seed and updates.
+    Handled {
+        persistent_cleared: bool,
+    },
+    Stop,
+    Analyze(Box<LiveAnalysisJob>),
+}
+
+impl WorkerState {
+    fn new(plugins_dir: PathBuf, memory_budget_bytes: usize) -> Self {
+        let mut manager =
+            PluginManager::with_runtime_role(plugins_dir, PluginRuntimeRole::LiveWorker);
+        let load_warning = manager.scan_and_load().err();
+        let mut event_store = PluginEventHistory::default();
+        event_store.set_memory_budget(memory_budget_bytes);
+        Self {
+            manager,
+            event_store,
+            persistent_data: HashMap::new(),
+            host_snapshot_cache: HostSnapshotCache::default(),
+            host_snapshot_sequence: 0,
+            active_epoch: 0,
+            control: ControlPlaneState::default(),
+            load_warning,
+        }
+    }
+
+    fn publish_control(&mut self, tx: &mpsc::Sender<LiveControlResult>) -> bool {
+        let mut result = tick_control_plane(
+            &mut self.manager,
+            &mut self.control,
+            &mut self.host_snapshot_cache,
+            &mut self.host_snapshot_sequence,
+        );
+        result.epoch = self.active_epoch;
+        tx.send(result).is_ok()
+    }
+
+    /// Handles one command. Shared by the idle `recv_timeout` path and the
+    /// drain that runs ahead of a pending analysis job — the two used to carry
+    /// byte-identical copies of every arm.
+    fn handle_command(
+        &mut self,
+        command: LiveAnalysisCommand,
+        control_tx: &mpsc::Sender<LiveControlResult>,
+        last_control_tick: &mut Instant,
+    ) -> WorkerStep {
+        let handled = WorkerStep::Handled {
+            persistent_cleared: false,
+        };
+        match command {
+            LiveAnalysisCommand::Stop => WorkerStep::Stop,
+            LiveAnalysisCommand::Analyze(job) => WorkerStep::Analyze(job),
+            LiveAnalysisCommand::SetMemoryBudget(bytes) => {
+                self.event_store.set_memory_budget(bytes);
+                handled
+            }
+            LiveAnalysisCommand::SetControlExecution { execution, ack } => {
+                self.control.execution = execution;
+                if !self.publish_control(control_tx) {
+                    return WorkerStep::Stop;
+                }
+                *last_control_tick = Instant::now();
+                let _ = ack.send(());
+                handled
+            }
+            LiveAnalysisCommand::HostReply { plugin_id, reply } => {
+                self.control.resolve_host_request(plugin_id, reply);
+                handled
+            }
+            LiveAnalysisCommand::Configure {
+                epoch,
+                snapshot,
+                reason,
+            } => {
+                self.active_epoch = self.active_epoch.max(epoch);
+                apply_live_plugin_snapshot(&mut self.manager, &snapshot);
+                notify_plugins_of_discontinuity(&mut self.manager, reason);
+                // Settings changes keep the same plugin instances, so in-flight
+                // requests stay valid and must not be dropped.
+                self.host_snapshot_cache.clear();
+                self.event_store.clear();
+                handled
+            }
+            LiveAnalysisCommand::Reload {
+                epoch,
+                snapshot,
+                reason,
+            } => {
+                self.active_epoch = self.active_epoch.max(epoch);
+                self.load_warning = self.manager.scan_and_load().err();
+                apply_live_plugin_snapshot(&mut self.manager, &snapshot);
+                notify_plugins_of_discontinuity(&mut self.manager, reason);
+                self.host_snapshot_cache.clear();
+                self.event_store.clear();
+                // Instances were destroyed and recreated, so their request-id
+                // counters restart at 1. Every dedupe entry is keyed by those
+                // counters and would now alias a different request.
+                self.control.reset_requests();
+                handled
+            }
+            LiveAnalysisCommand::Discontinuity { epoch, reason } => {
+                self.active_epoch = self.active_epoch.max(epoch);
+                notify_plugins_of_discontinuity(&mut self.manager, reason);
+                self.host_snapshot_cache.clear();
+                self.event_store.clear();
+                // Instances survive a discontinuity but may reset their own
+                // counters, so retire settled entries. In-flight requests are
+                // kept — dropping one would strand the plugin awaiting it.
+                self.control.forget_answered_requests();
+                handled
+            }
+            LiveAnalysisCommand::ClearPersistent { epoch } => {
+                self.active_epoch = self.active_epoch.max(epoch);
+                self.persistent_data.clear();
+                WorkerStep::Handled {
+                    persistent_cleared: true,
+                }
+            }
+        }
+    }
 }
 
 fn process_live_analysis_job(
@@ -1408,6 +2157,7 @@ fn process_live_analysis_job(
     event_store: &mut PluginEventHistory,
     persistent_data: &mut HashMap<String, Vec<u8>>,
     host_snapshot_cache: &mut HostSnapshotCache,
+    host_snapshot_sequence: &mut u64,
     job: &LiveAnalysisJob,
 ) -> LiveAnalysisResult {
     let mut output = AnalysisOutput::default();
@@ -1487,12 +2237,15 @@ fn process_live_analysis_job(
         }
     }
 
+    let (host_snapshot_sequence, host_snapshots) =
+        collect_sequenced_live_host_snapshots(manager, host_snapshot_cache, host_snapshot_sequence);
     LiveAnalysisResult {
         epoch: job.epoch,
         output,
         context_data,
         persistent_data: persistent_data.clone(),
-        host_snapshots: collect_live_host_snapshots(manager, host_snapshot_cache),
+        host_snapshot_sequence,
+        host_snapshots,
         action_request_watermark: job.action_request_watermark,
     }
 }
@@ -1546,17 +2299,12 @@ fn collect_live_host_snapshots(
                         .datasets
                         .iter()
                         .map(|descriptor| {
-                            let generation = plugin.host_view_dataset_generation(&descriptor.id);
-                            let payload =
-                                cache.resolve((index, descriptor.id.clone()), generation, || {
-                                    match plugin.host_view_dataset(&descriptor.id) {
-                                        Ok(Some(bytes)) => {
-                                            Some(decode_dataset_snapshot(descriptor, &bytes))
-                                        }
-                                        Ok(None) => None,
-                                        Err(err) => Some(Err(err)),
-                                    }
-                                });
+                            let (generation, payload) = cache.resolve(
+                                (index, descriptor.id.clone()),
+                                plugin.host_view_dataset_generation(&descriptor.id),
+                                || plugin.host_view_dataset(&descriptor.id),
+                                |bytes| decode_dataset_snapshot(descriptor, bytes),
+                            );
                             LiveHostDatasetSnapshot {
                                 id: descriptor.id.clone(),
                                 generation,
@@ -1582,6 +2330,15 @@ fn collect_live_host_snapshots(
             }
         })
         .collect()
+}
+
+fn collect_sequenced_live_host_snapshots(
+    manager: &PluginManager,
+    cache: &mut HostSnapshotCache,
+    sequence: &mut u64,
+) -> (u64, Vec<LivePluginHostSnapshot>) {
+    *sequence = sequence.wrapping_add(1).max(1);
+    (*sequence, collect_live_host_snapshots(manager, cache))
 }
 
 struct OutputBridge<'a> {
@@ -1939,7 +2696,7 @@ unsafe fn bytes_from_out_ptr<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     }
 }
 
-fn load_record(entry_dir: PathBuf) -> ManagedPlugin {
+fn load_record(entry_dir: PathBuf, runtime_role: PluginRuntimeRole) -> ManagedPlugin {
     let display_name = entry_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -1965,11 +2722,16 @@ fn load_record(entry_dir: PathBuf) -> ManagedPlugin {
         display_name,
     };
     match DynPlugin::load(&spec) {
-        Ok(plugin) => ManagedPlugin {
-            spec,
-            plugin: Some(plugin),
-            load_error: None,
-        },
+        Ok(mut plugin) => {
+            // Role assignment precedes enablement/settings mirroring, so a
+            // GUI or offline instance can keep `set_setting` effect-free.
+            plugin.set_runtime_role(runtime_role);
+            ManagedPlugin {
+                spec,
+                plugin: Some(plugin),
+                load_error: None,
+            }
+        }
         Err(err) => ManagedPlugin {
             spec,
             plugin: None,
@@ -1982,8 +2744,32 @@ fn read_manifest(entry_dir: &Path) -> Result<PluginManifest, String> {
     let manifest_path = entry_dir.join("plugin.toml");
     let text = fs::read_to_string(&manifest_path)
         .map_err(|err| format!("reading {} failed: {err}", manifest_path.display()))?;
-    toml::from_str(&text)
-        .map_err(|err| format!("parsing {} failed: {err}", manifest_path.display()))
+    let manifest: PluginManifest = toml::from_str(&text)
+        .map_err(|err| format!("parsing {} failed: {err}", manifest_path.display()))?;
+    if let Some(id) = manifest.id.as_deref() {
+        validate_plugin_id(id).map_err(|err| format!("{}: {err}", manifest_path.display()))?;
+    }
+    Ok(manifest)
+}
+
+fn validate_plugin_id(id: &str) -> Result<(), String> {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return Err("plugin id must not be empty".into());
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "plugin id `{id}` must start with a lowercase ASCII letter or digit"
+        ));
+    }
+    if !chars
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-' | '_'))
+    {
+        return Err(format!(
+            "plugin id `{id}` may contain only lowercase ASCII letters, digits, `.`, `-`, and `_`"
+        ));
+    }
+    Ok(())
 }
 
 fn find_library_file(entry_dir: &Path, manifest: &PluginManifest) -> Result<PathBuf, String> {
@@ -2372,6 +3158,84 @@ mod tests {
     }
 
     #[test]
+    fn manifest_accepts_stable_control_plane_identity_and_host_capabilities() {
+        let plugins_dir = unique_temp_dir("manifest-control-id");
+        fs::create_dir_all(&plugins_dir).expect("test plugin directory is created");
+        fs::write(
+            plugins_dir.join("plugin.toml"),
+            r#"
+id = "stage-a.modulation"
+name = "Stage-A Modulation"
+version = "1.0.0"
+host_commands = ["start_recording", "stop_recording"]
+"#,
+        )
+        .expect("manifest is written");
+
+        let manifest = read_manifest(&plugins_dir).expect("manifest is valid");
+        assert_eq!(manifest.id.as_deref(), Some("stage-a.modulation"));
+        assert_eq!(
+            manifest.host_commands,
+            ["start_recording", "stop_recording"]
+        );
+
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn manifest_rejects_ambiguous_control_plane_identity() {
+        let plugins_dir = unique_temp_dir("manifest-invalid-id");
+        fs::create_dir_all(&plugins_dir).expect("test plugin directory is created");
+        fs::write(
+            plugins_dir.join("plugin.toml"),
+            "id = \"Stage A\"\nname = \"Stage A\"\nversion = \"1.0.0\"\n",
+        )
+        .expect("manifest is written");
+
+        let error = read_manifest(&plugins_dir).expect_err("invalid id must fail");
+        assert!(error.contains("must start with a lowercase ASCII letter or digit"));
+
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn backward_window_jump_drops_the_pre_jump_timeline() {
+        let mut store = PluginEventHistory::default();
+        store.push_frame(&retained_frame(&[event(100, 1)], 100, 100));
+        store.push_frame(&retained_frame(&[event(200, 2)], 200, 200));
+
+        // A restarted source replays low timestamps without an intervening
+        // clear. Interleaving them would break the ordering the range queries
+        // binary search over.
+        store.push_frame(&retained_frame(&[event(50, 3)], 50, 50));
+
+        assert_eq!(store.frame_count(), 1);
+        assert_eq!(store.frame_window(0), Some((50, 50)));
+        assert_eq!(store.frame_range_for_timestamps(0, 1_000), Some((0, 1)));
+        assert_eq!(
+            store.materialize_frame(0).as_deref(),
+            Some(&[event(50, 3)][..])
+        );
+    }
+
+    #[test]
+    fn attaching_a_different_upstream_drops_the_previous_timeline() {
+        let first = LiveEventSource::default();
+        let second = LiveEventSource::default();
+
+        let mut store = PluginEventHistory::default();
+        store.attach_upstream(first, None);
+        store.push_frame(&retained_frame(&[event(1_000, 1)], 1_000, 1_000));
+        assert_eq!(store.frame_count(), 1);
+
+        store.attach_upstream(second, None);
+
+        assert_eq!(store.frame_count(), 0);
+        assert_eq!(store.memory_usage_bytes(), 0);
+        assert_eq!(store.frame_range_for_timestamps(0, 10_000), None);
+    }
+
+    #[test]
     fn clearing_history_on_backward_seek_prevents_pre_seek_ranges_from_surviving() {
         let mut store = PluginEventHistory::default();
         store.push_frame(&retained_frame(&[event(100, 1)], 100, 100));
@@ -2429,6 +3293,53 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("current epoch job should publish a result");
         assert_eq!(result.epoch, 2);
+
+        drop(worker);
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn live_worker_ticks_control_plane_without_analysis_frames() {
+        let plugins_dir = unique_temp_dir("worker-control-tick");
+        let (worker, _rx) = LiveAnalysisWorker::spawn(plugins_dir.clone(), 1024 * 1024);
+
+        thread::sleep(CONTROL_TICK_INTERVAL.saturating_mul(2));
+        let result = worker
+            .try_recv_control()
+            .expect("periodic control result arrives without an analysis frame");
+        assert_eq!(result.execution, ExecutionContext::fail_closed());
+        assert!(
+            result.host_snapshot_sequence > 0,
+            "frame-independent results carry an ordered host-view snapshot"
+        );
+
+        drop(worker);
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn control_execution_changes_are_acknowledged_before_returning() {
+        let plugins_dir = unique_temp_dir("worker-control-revoke");
+        let (worker, _rx) = LiveAnalysisWorker::spawn(plugins_dir.clone(), 1024 * 1024);
+        let live = ExecutionContext {
+            mode: augur_plugin_api::ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: Some("test".into()),
+        };
+
+        worker.set_control_execution(live.clone());
+        let mut observed = Vec::new();
+        while let Ok(result) = worker.try_recv_control() {
+            observed.push(result.execution);
+        }
+        assert!(observed.contains(&live));
+
+        worker.set_control_execution(ExecutionContext::fail_closed());
+        let mut observed = Vec::new();
+        while let Ok(result) = worker.try_recv_control() {
+            observed.push(result.execution);
+        }
+        assert!(observed.contains(&ExecutionContext::fail_closed()));
 
         drop(worker);
         let _ = fs::remove_dir_all(plugins_dir);
@@ -2551,46 +3462,194 @@ mod tests {
         );
     }
 
+    fn decoded_series() -> Result<HostDatasetSnapshot, String> {
+        Ok(HostDatasetSnapshot::Series1d(Arc::new(
+            augur_plugin_api::Series1dV1::default(),
+        )))
+    }
+
     #[test]
     fn snapshot_cache_skips_refetch_for_unchanged_nonzero_generations() {
         let mut cache = HostSnapshotCache::default();
         let key = (0usize, "table.demo".to_owned());
-        let payload = || {
-            Some(Ok(HostDatasetSnapshot::Series1d(Arc::new(
-                augur_plugin_api::Series1dV1::default(),
-            ))))
-        };
 
         let mut fetches = 0;
-        cache.resolve(key.clone(), 7, || {
-            fetches += 1;
-            payload()
-        });
-        cache.resolve(key.clone(), 7, || {
-            fetches += 1;
-            payload()
-        });
+        let fetch_once = |cache: &mut HostSnapshotCache, generation: u64, fetches: &mut i32| {
+            cache.resolve(
+                key.clone(),
+                generation,
+                || {
+                    *fetches += 1;
+                    Ok(Some(b"{}".to_vec()))
+                },
+                |_| decoded_series(),
+            )
+        };
+
+        fetch_once(&mut cache, 7, &mut fetches);
+        fetch_once(&mut cache, 7, &mut fetches);
         assert_eq!(fetches, 1, "unchanged generation must reuse the payload");
 
-        cache.resolve(key.clone(), 8, || {
-            fetches += 1;
-            payload()
-        });
+        fetch_once(&mut cache, 8, &mut fetches);
         assert_eq!(fetches, 2, "a changed generation must refetch");
+    }
 
-        let mut zero_fetches = 0;
-        let zero_key = (0usize, "table.genless".to_owned());
-        cache.resolve(zero_key.clone(), 0, || {
-            zero_fetches += 1;
-            payload()
-        });
-        cache.resolve(zero_key, 0, || {
-            zero_fetches += 1;
-            payload()
-        });
+    #[test]
+    fn snapshot_cache_derives_a_stable_generation_from_content() {
+        let mut cache = HostSnapshotCache::default();
+        let key = (0usize, "table.genless".to_owned());
+
+        let mut decodes = 0;
+        let resolve = |cache: &mut HostSnapshotCache, bytes: &'static [u8], decodes: &mut i32| {
+            cache.resolve(
+                key.clone(),
+                0,
+                || Ok(Some(bytes.to_vec())),
+                |_| {
+                    *decodes += 1;
+                    decoded_series()
+                },
+            )
+        };
+
+        let (first, _) = resolve(&mut cache, b"{\"a\":1}", &mut decodes);
+        let (second, _) = resolve(&mut cache, b"{\"a\":1}", &mut decodes);
+        assert_ne!(
+            first, 0,
+            "a provider without a counter still reports a nonzero generation"
+        );
         assert_eq!(
-            zero_fetches, 2,
-            "generation 0 means no counter and refetches every pass"
+            first, second,
+            "identical bytes must map to the same generation so consumers can cache"
+        );
+        assert_eq!(decodes, 1, "unchanged bytes must skip the JSON decode");
+
+        let (third, _) = resolve(&mut cache, b"{\"a\":2}", &mut decodes);
+        assert_ne!(second, third, "changed bytes must change the generation");
+        assert_eq!(decodes, 2, "changed bytes must be decoded");
+    }
+
+    #[test]
+    fn reset_requests_lets_a_recycled_request_id_reach_the_target_again() {
+        let mut state = ControlPlaneState::default();
+        let key = ("workflow".to_owned(), 1u64);
+        let request = HostCommandRequest {
+            request_id: 1,
+            command: HostCommand::StopRecording,
+        };
+        state.record_host_request(key.clone(), request.clone());
+        state.resolve_host_request(
+            "workflow".to_owned(),
+            HostCommandReply {
+                request_id: 1,
+                outcome: augur_plugin_api::HostCommandOutcome::Rejected {
+                    code: "no_plugin_recording".into(),
+                    message: String::new(),
+                },
+            },
+        );
+        assert!(state.host_requests.contains_key(&key));
+
+        // A reload recreates the plugin, whose counter restarts at 1.
+        state.reset_requests();
+        assert!(
+            !state.host_requests.contains_key(&key),
+            "a recycled request id must not alias the previous instance's entry"
+        );
+    }
+
+    #[test]
+    fn host_reply_cache_is_write_once() {
+        let mut state = ControlPlaneState::default();
+        let key = ("workflow".to_owned(), 1u64);
+        state.record_host_request(
+            key.clone(),
+            HostCommandRequest {
+                request_id: 1,
+                command: HostCommand::StartRecording {
+                    run_id: "run-1".into(),
+                    base_path: "/tmp".into(),
+                    metadata: Default::default(),
+                },
+            },
+        );
+        let started = HostCommandReply {
+            request_id: 1,
+            outcome: augur_plugin_api::HostCommandOutcome::RecordingStarted {
+                actual_raw_path: "/tmp/run-1.raw".into(),
+                started_at: "2026-07-24T00:00:00Z".into(),
+            },
+        };
+        state.resolve_host_request("workflow".to_owned(), started);
+        // The operator stopped the run, so finalization is delivered under the
+        // *start* id; it must not displace the cached start outcome.
+        state.resolve_host_request(
+            "workflow".to_owned(),
+            HostCommandReply {
+                request_id: 1,
+                outcome: augur_plugin_api::HostCommandOutcome::Rejected {
+                    code: "later".into(),
+                    message: String::new(),
+                },
+            },
+        );
+        let (_, cached) = &state.host_requests[&key];
+        assert!(
+            matches!(
+                cached,
+                Some(HostCommandReply {
+                    outcome: augur_plugin_api::HostCommandOutcome::RecordingStarted { .. },
+                    ..
+                })
+            ),
+            "the first reply wins so a duplicate emission replays the start outcome"
+        );
+        assert_eq!(
+            state.host_replies["workflow"].len(),
+            2,
+            "both replies are still delivered to the plugin inbox"
+        );
+    }
+
+    #[test]
+    fn answered_host_requests_are_evicted_but_in_flight_ones_survive() {
+        let mut state = ControlPlaneState::default();
+        let in_flight = ("workflow".to_owned(), 0u64);
+        state.record_host_request(
+            in_flight.clone(),
+            HostCommandRequest {
+                request_id: 0,
+                command: HostCommand::StopRecording,
+            },
+        );
+        for request_id in 1..=(MAX_RETAINED_CONTROL_REQUESTS as u64 + 64) {
+            let key = ("workflow".to_owned(), request_id);
+            state.record_host_request(
+                key,
+                HostCommandRequest {
+                    request_id,
+                    command: HostCommand::StopRecording,
+                },
+            );
+            state.resolve_host_request(
+                "workflow".to_owned(),
+                HostCommandReply {
+                    request_id,
+                    outcome: augur_plugin_api::HostCommandOutcome::Rejected {
+                        code: "no_plugin_recording".into(),
+                        message: String::new(),
+                    },
+                },
+            );
+        }
+        assert!(
+            state.host_requests.len() <= MAX_RETAINED_CONTROL_REQUESTS + 1,
+            "answered entries must be evicted, got {}",
+            state.host_requests.len()
+        );
+        assert!(
+            state.host_requests.contains_key(&in_flight),
+            "a request still awaiting its reply must never be evicted"
         );
     }
 
@@ -2707,6 +3766,19 @@ mod tests {
     ) {
     }
 
+    unsafe extern "C" fn stub_set_runtime_role(_: *mut c_void, _: PluginRuntimeRole) {}
+
+    unsafe extern "C" fn stub_process_control(_: *mut c_void, _: *mut FfiPluginControlContext) {}
+
+    unsafe extern "C" fn stub_handle_service_request(
+        _: *mut c_void,
+        _: FfiSlice<u8>,
+        _: augur_plugin_api::FfiExecutionContext,
+        _: *mut *const u8,
+        _: *mut usize,
+    ) {
+    }
+
     unsafe extern "C" fn stub_json(_: *const c_void, _: *mut *const u8, _: *mut usize) {}
 
     unsafe extern "C" fn stub_get_setting(
@@ -2745,6 +3817,7 @@ mod tests {
             description: stub_string,
             enabled: stub_enabled,
             set_enabled: stub_set_enabled,
+            set_runtime_role: stub_set_runtime_role,
             reset: stub_reset,
             on_discontinuity: stub_on_discontinuity,
             input_kind: stub_input_kind,
@@ -2753,6 +3826,9 @@ mod tests {
             num_dependencies: stub_num_dependencies,
             dependency: stub_dependency,
             process_frame: stub_process_frame,
+            process_control: stub_process_control,
+            handle_service_request: stub_handle_service_request,
+            control_snapshots: stub_json,
             settings_schema: stub_json,
             get_setting: stub_get_setting,
             set_setting: stub_set_setting,

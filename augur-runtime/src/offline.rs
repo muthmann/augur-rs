@@ -17,7 +17,8 @@ use augur_core::{
 use augur_event_types::{CompactEvent, EventSource, ExternalTriggerEvent, FetchError};
 use augur_plugin_api::{
     ExecutionContext, ExecutionMode, GlobalSettings, HostDatasetKind, Image2dV1, PluginInput,
-    Series1dV1, TableColumnValues, TableDatasetV1, TableSchema, CTX_GLOBAL_SETTINGS,
+    PluginRuntimeRole, Series1dV1, TableColumnValues, TableDatasetV1, TableSchema,
+    CTX_GLOBAL_SETTINGS,
 };
 use image::{ImageFormat, RgbaImage};
 use serde::Deserialize;
@@ -327,8 +328,11 @@ pub fn run_offline_analysis(
         TimestampWindower::new(t_start_us, acq_time_us, last_event_ts_us).count() as u64;
 
     let mut plugin_manager = match options.plugins_dir {
-        Some(path) => PluginManager::new(path),
-        None => PluginManager::new_default(),
+        Some(path) => PluginManager::with_runtime_role(path, PluginRuntimeRole::OfflineAnalysis),
+        None => PluginManager::with_runtime_role(
+            crate::default_plugins_dir(),
+            PluginRuntimeRole::OfflineAnalysis,
+        ),
     };
     plugin_manager.scan_and_load()?;
     apply_offline_plugin_config(&mut plugin_manager, &options.config)?;
@@ -384,6 +388,8 @@ pub fn run_offline_analysis(
                 sensor_height: info.height,
                 acq_time_ms: acq_time_us.div_ceil(1_000),
                 event_store_budget_bytes: event_store.memory_budget_bytes(),
+                roi: Default::default(),
+                masked_pixels: Vec::new(),
             },
         )?;
 

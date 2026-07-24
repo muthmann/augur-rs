@@ -1327,44 +1327,69 @@ pub fn render_line_series_view(
         .data_mut(|data| data.get_temp(cursor_id))
         .unwrap_or_default();
 
-    let inner = Plot::new(format!("{view_id}_series"))
+    // Y-axis mode is remembered per view. Default anchors the range to zero, so
+    // a nearly-constant signal reads as flat instead of egui auto-fitting to its
+    // noise; the operator can opt into local (current-window) auto-scaling.
+    let y_from_zero_id = egui::Id::new(("series_y_from_zero", view_id));
+    let mut y_from_zero: bool = ui
+        .ctx()
+        .data_mut(|data| data.get_temp(y_from_zero_id))
+        .unwrap_or(true);
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut y_from_zero, "Y from 0")
+            .on_hover_text(
+                "Anchor the y-axis to zero so a constant signal looks flat. Uncheck for local \
+                 auto-scaling to the current view's min/max.",
+            )
+            .changed()
+        {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(y_from_zero_id, y_from_zero));
+        }
+    });
+
+    let mut plot = Plot::new(format!("{view_id}_series"))
         .legend(Legend::default())
         .height(280.0)
         .x_axis_label(&dataset.x_label)
         .y_axis_label(&dataset.y_label)
-        .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default())
-        .show(ui, |plot_ui| {
-            for (index, series) in dataset.lines.iter().enumerate() {
-                if series.points.is_empty() {
-                    continue;
-                }
-                let points =
-                    PlotPoints::from_iter(series.points.iter().map(|point| [point.x, point.y]));
-                let name = if series.name.trim().is_empty() {
-                    format!("Series {}", index + 1)
+        .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default());
+    if y_from_zero {
+        plot = plot.include_y(0.0);
+    }
+    let inner = plot.show(ui, |plot_ui| {
+        for (index, series) in dataset.lines.iter().enumerate() {
+            if series.points.is_empty() {
+                continue;
+            }
+            let points =
+                PlotPoints::from_iter(series.points.iter().map(|point| [point.x, point.y]));
+            let name = if series.name.trim().is_empty() {
+                format!("Series {}", index + 1)
+            } else {
+                series.name.clone()
+            };
+            plot_ui.line(Line::new(points).name(name));
+        }
+        if let Some(a) = cursors.a {
+            plot_ui.vline(VLine::new(a).name("A"));
+        }
+        if let Some(b) = cursors.b {
+            plot_ui.vline(VLine::new(b).name("B"));
+        }
+        if plot_ui.response().clicked() {
+            if let Some(coord) = plot_ui.pointer_coordinate() {
+                let shift = plot_ui.ctx().input(|input| input.modifiers.shift);
+                if shift {
+                    cursors.b = Some(coord.x);
                 } else {
-                    series.name.clone()
-                };
-                plot_ui.line(Line::new(points).name(name));
-            }
-            if let Some(a) = cursors.a {
-                plot_ui.vline(VLine::new(a).name("A"));
-            }
-            if let Some(b) = cursors.b {
-                plot_ui.vline(VLine::new(b).name("B"));
-            }
-            if plot_ui.response().clicked() {
-                if let Some(coord) = plot_ui.pointer_coordinate() {
-                    let shift = plot_ui.ctx().input(|input| input.modifiers.shift);
-                    if shift {
-                        cursors.b = Some(coord.x);
-                    } else {
-                        cursors.a = Some(coord.x);
-                    }
+                    cursors.a = Some(coord.x);
                 }
             }
-            plot_ui.plot_bounds()
-        });
+        }
+        plot_ui.plot_bounds()
+    });
     let bounds = inner.inner;
     ui.ctx()
         .data_mut(|data| data.insert_temp(cursor_id, cursors));

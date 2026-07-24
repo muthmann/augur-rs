@@ -270,6 +270,21 @@ pub enum ExecutionMode {
     OfflineAnalysis = 2,
 }
 
+/// Which host-owned instance role a dynamic plugin is serving.
+///
+/// Only `LiveWorker` may receive a control context with effects enabled.
+/// UI mirrors and offline instances use settings as inert requested
+/// configuration and must never open devices or mutate laboratory state.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntimeRole {
+    #[default]
+    UiMirror = 0,
+    LiveWorker = 1,
+    OfflineAnalysis = 2,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FfiExecutionContext {
@@ -328,8 +343,10 @@ pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiSt
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
 pub type PluginStateKindFn = unsafe extern "C" fn(*const c_void) -> PluginStateKind;
 pub type PluginDiscontinuityFn = unsafe extern "C" fn(*mut c_void, PluginDiscontinuity);
+pub type PluginRuntimeRoleFn = unsafe extern "C" fn(*mut c_void, PluginRuntimeRole);
+pub type ControlEmitFn = unsafe extern "C" fn(*mut c_void, FfiSlice<u8>);
 
-pub const PLUGIN_ABI_VERSION: u64 = 5;
+pub const PLUGIN_ABI_VERSION: u64 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -353,6 +370,18 @@ pub struct FfiPluginContext {
     pub execution: FfiExecutionContext,
 }
 
+/// Frame-independent control invocation. `inbox_json` and every callback
+/// context are borrowed for this call only and must not be retained.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiPluginControlContext {
+    pub ctx: *mut c_void,
+    pub inbox_json: FfiSlice<u8>,
+    pub execution: FfiExecutionContext,
+    pub emit_service_request: ControlEmitFn,
+    pub emit_host_command: ControlEmitFn,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PluginVTable {
@@ -370,6 +399,7 @@ pub struct PluginVTable {
     pub description: unsafe extern "C" fn(*const c_void) -> FfiString,
     pub enabled: unsafe extern "C" fn(*const c_void) -> bool,
     pub set_enabled: unsafe extern "C" fn(*mut c_void, bool),
+    pub set_runtime_role: PluginRuntimeRoleFn,
     pub reset: unsafe extern "C" fn(*mut c_void),
     pub on_discontinuity: PluginDiscontinuityFn,
     pub input_kind: unsafe extern "C" fn(*const c_void) -> PluginInput,
@@ -384,6 +414,15 @@ pub struct PluginVTable {
         *mut FfiPluginContext,
         *const FfiEventStoreHandle,
     ),
+    pub process_control: unsafe extern "C" fn(*mut c_void, *mut FfiPluginControlContext),
+    pub handle_service_request: unsafe extern "C" fn(
+        *mut c_void,
+        FfiSlice<u8>,
+        FfiExecutionContext,
+        *mut *const u8,
+        *mut usize,
+    ),
+    pub control_snapshots: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub settings_schema: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub get_setting:
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,

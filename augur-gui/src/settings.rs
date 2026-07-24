@@ -1,7 +1,10 @@
-use augur_core::config::CameraConfig;
+use augur_core::{config::CameraConfig, pipeline::PipelineStatsSnapshot};
 
 pub(crate) const IMX636_DEM_SLOTS: usize = 64;
 
+// A UI aggregator that threads scattered app state into one settings panel;
+// grouping the arguments would only move the plumbing elsewhere.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_settings(
     ui: &mut egui::Ui,
     cfg: &mut CameraConfig,
@@ -10,6 +13,7 @@ pub fn draw_settings(
     mask_file: &mut String,
     sensor_width: u16,
     sensor_height: u16,
+    pipeline_stats: Option<PipelineStatsSnapshot>,
 ) -> bool {
     let mut changed = false;
 
@@ -207,6 +211,39 @@ pub fn draw_settings(
                 )
                 .on_hover_text("Inserts EXT_TRIGGER events into the EVT3 stream when an edge arrives on the EVK4 TRIG_IN pin, timestamped on the camera clock. Cannot change while streaming.")
                 .changed();
+
+            // Live decode-level edge counter. Counts every decoded edge (rising
+            // and falling) before frame windowing and the rising-only filter
+            // plugins apply, so a stuck-at-zero count points upstream (wiring,
+            // TRIG_IN levels, enable-while-streaming) rather than at the plugin.
+            if let Some(stats) = pipeline_stats {
+                ui.separator();
+                if stats.triggers_total == 0 {
+                    ui.small("No trigger edges decoded yet.");
+                } else {
+                    let last = match stats.last_trigger_age_s {
+                        Some(age) if age < 1.0 => "last <1 s ago".to_string(),
+                        Some(age) => format!("last {age:.1} s ago"),
+                        None => "last —".to_string(),
+                    };
+                    ui.small(format!("Edges decoded: {} · {last}", stats.triggers_total));
+                    if stats.triggers_dropped > 0 {
+                        ui.small(
+                            egui::RichText::new(format!(
+                                "{} pending edges dropped",
+                                stats.triggers_dropped
+                            ))
+                            .color(ui.visuals().warn_fg_color),
+                        )
+                        .on_hover_text(
+                            "Trigger edges are attached to preview frames, which only close on CD \
+                             events. With too few CD events to close a window the pending buffer \
+                             filled and the oldest edges were discarded. Recorded RAW data and \
+                             analysis runs are unaffected.",
+                        );
+                    }
+                }
+            }
         },
     );
 

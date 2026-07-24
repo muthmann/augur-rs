@@ -6,6 +6,7 @@ use crate::plugin_loader::DynPlugin;
 pub fn render_plugin_settings(
     ui: &mut egui::Ui,
     plugin: &mut DynPlugin,
+    authoritative_status: Option<&[StatusEntry]>,
     show_header: bool,
     id_source: impl std::hash::Hash,
 ) -> Result<bool, String> {
@@ -55,7 +56,10 @@ pub fn render_plugin_settings(
         }
     }
 
-    let status_entries = plugin.status_entries_cached()?;
+    let status_entries = match authoritative_status {
+        Some(status) => status.to_vec(),
+        None => plugin.status_entries_cached()?,
+    };
     if !status_entries.is_empty() {
         ui.separator();
         for entry in &status_entries {
@@ -260,8 +264,12 @@ fn render_setting_item(
                 return plugin.set_setting_value(&item.key, &json!(path));
             }
         }
-        SettingKind::Button => {
-            let response = ui.push_id(widget_id, |ui| ui.button(&item.label)).inner;
+        SettingKind::Button { enabled } => {
+            let response = ui
+                .push_id(widget_id, |ui| {
+                    ui.add_enabled(*enabled, egui::Button::new(&item.label))
+                })
+                .inner;
             maybe_add_tooltip(&response, item.tooltip.as_deref());
             // Momentary trigger: one `set_setting(key, true)` per click, the
             // frame-independent action channel (works with no camera).
