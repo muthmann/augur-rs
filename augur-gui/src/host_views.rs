@@ -1544,6 +1544,137 @@ pub struct SeriesWindowViewportData {
     pub screenshot: Option<Arc<ColorImage>>,
 }
 
+/// Frame payload shared between the app and one popped-out host-view window.
+///
+/// A deferred viewport runs its UI *after* the parent frame that registered it,
+/// so a request raised inside the window (close, export, freeze, sort, …) lands
+/// in the shared cell once the parent has already published the next frame. The
+/// app therefore keeps one long-lived cell per view and republishes into it;
+/// `carry_pending_requests_from` moves requests that have not been consumed yet
+/// onto the incoming payload so they survive the swap.
+pub trait HostWindowFrameData {
+    /// Copy not-yet-consumed requests from the payload being replaced.
+    fn carry_pending_requests_from(&mut self, previous: &Self);
+
+    /// True while at least one request is waiting for the app to consume it.
+    fn has_pending_requests(&self) -> bool;
+
+    /// Ask the app to close this window (raised when the OS close button or
+    /// the embedded window's ✕ is used).
+    fn request_close(&mut self);
+}
+
+impl HostWindowFrameData for TableWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.export_csv_requested |= previous.export_csv_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.selected_row_requested = previous.selected_row_requested.clone();
+        self.sort_column_requested = previous.sort_column_requested.clone();
+        self.page_size_requested = previous.page_size_requested;
+        self.page_index_requested = previous.page_index_requested;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.export_csv_requested
+            || self.freeze_toggle_requested
+            || self.selected_row_requested.is_some()
+            || self.sort_column_requested.is_some()
+            || self.page_size_requested.is_some()
+            || self.page_index_requested.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for DensityWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.export_csv_requested |= previous.export_csv_requested;
+        self.clear_requested |= previous.clear_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.export_image_requested = previous.export_image_requested;
+        // Render settings are owned by the window, not by the app frame.
+        self.settings = previous.settings;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.export_csv_requested
+            || self.clear_requested
+            || self.freeze_toggle_requested
+            || self.export_image_requested.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for ImageWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.clear_requested |= previous.clear_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.export_image_requested = previous.export_image_requested;
+        self.settings = previous.settings;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.clear_requested
+            || self.freeze_toggle_requested
+            || self.export_image_requested.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for ScatterWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.export_csv_requested |= previous.export_csv_requested;
+        self.clear_requested |= previous.clear_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.export_csv_requested
+            || self.clear_requested
+            || self.freeze_toggle_requested
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for SeriesWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.export_png_requested |= previous.export_png_requested;
+        self.screenshot = previous.screenshot.clone();
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.freeze_toggle_requested
+            || self.export_png_requested
+            || self.screenshot.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
 /// Freeze/resume toggle shown in every host-view window. Returns true when
 /// the user toggled it this frame. While frozen the host pins the dataset
 /// snapshot for inspection/export; plugin acquisition keeps running.

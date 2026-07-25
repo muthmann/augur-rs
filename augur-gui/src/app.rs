@@ -63,8 +63,8 @@ use crate::{
         render_summary_card, render_table_window_viewport, reset_provider_for_dataset,
         resolve_host_view_registry, DensityWindowViewportData, HostDatasetSnapshot,
         HostRegistryContribution, HostViewImageFormat, HostViewProviderKey, HostViewRenderState,
-        HostViewUiActions, ImageWindowViewportData, LinkedTableViewOptions, ResolvedHostAction,
-        ResolvedHostView, ResolvedHostViewRegistry, Scatter2dViewOptions,
+        HostViewUiActions, HostWindowFrameData, ImageWindowViewportData, LinkedTableViewOptions,
+        ResolvedHostAction, ResolvedHostView, ResolvedHostViewRegistry, Scatter2dViewOptions,
         ScatterWindowViewportData, SeriesWindowViewportData, SummaryCardOptions,
         TableCellFormatOptions, TableWindowViewportData,
     },
@@ -110,9 +110,17 @@ pub(crate) const PANEL_ROUNDING: f32 = 6.0;
 const UI_THEME_STORAGE_KEY: &str = "augur_gui.theme_preference";
 const DOCK_HEIGHT_STORAGE_KEY: &str = "augur_gui.dock_height";
 const DOCK_OPEN_STORAGE_KEY: &str = "augur_gui.dock_open";
+const DOCK_TABS_STORAGE_KEY: &str = "augur_gui.dock_tabs";
+const DOCK_ACTIVE_STORAGE_KEY: &str = "augur_gui.dock_active";
+const DOCK_DEFAULTS_SEEDED_STORAGE_KEY: &str = "augur_gui.dock_defaults_seeded";
 const DOCK_DEFAULT_HEIGHT: f32 = 220.0;
 const DOCK_MIN_HEIGHT: f32 = 120.0;
 const DOCK_MAX_SCREEN_FRACTION: f32 = 0.45;
+/// Space reserved on the right of the dock tab strip for its controls
+/// (pop out / maximize / collapse), so tabs can never push them out of view.
+const DOCK_CONTROLS_WIDTH: f32 = 92.0;
+/// Lower bound for the scrollable tab strip on very narrow layouts.
+const DOCK_MIN_TAB_STRIP_WIDTH: f32 = 80.0;
 const REPLAY_FRAME_HISTORY_CAPACITY: usize = 8;
 /// Poll cadence for plugin datasets that update from their own threads
 /// (serial readers, mocks) while no camera/replay stream drives repaints.
@@ -478,6 +486,101 @@ struct HostDatasetCacheEntry {
     /// freezing on their first snapshot.
     effective_generation: u64,
     snapshot: CachedHostDataset,
+}
+
+/// Long-lived payload cells for popped-out host-view windows, keyed by view id.
+///
+/// Deferred viewports render *after* the parent frame that registered them, so
+/// the cell a window writes its requests into must outlive that frame —
+/// otherwise "close", "export", "freeze" and friends are dropped on the floor
+/// (see [`publish_window_frame`]).
+#[derive(Default)]
+struct HostViewWindowChannels {
+    table: HashMap<String, Arc<Mutex<TableWindowViewportData>>>,
+    density: HashMap<String, Arc<Mutex<DensityWindowViewportData>>>,
+    image: HashMap<String, Arc<Mutex<ImageWindowViewportData>>>,
+    scatter: HashMap<String, Arc<Mutex<ScatterWindowViewportData>>>,
+    series: HashMap<String, Arc<Mutex<SeriesWindowViewportData>>>,
+}
+
+impl HostViewWindowChannels {
+    /// Drop cells for views that no longer exist or whose window was closed.
+    fn retain_open(&mut self, is_open: impl Fn(&str) -> bool) {
+        self.table.retain(|id, _| is_open(id));
+        self.density.retain(|id, _| is_open(id));
+        self.image.retain(|id, _| is_open(id));
+        self.scatter.retain(|id, _| is_open(id));
+        self.series.retain(|id, _| is_open(id));
+    }
+}
+
+/// Close out one pass of a deferred host-view window: record an OS close
+/// request and wake the root viewport whenever the window left something for
+/// the app to consume, since only the app services these requests and it may
+/// otherwise sit idle (which is what made pop-out windows unclosable).
+fn finish_host_window_pass<T: HostWindowFrameData>(ctx: &egui::Context, shared: &Arc<Mutex<T>>) {
+    let close_requested = ctx.input(|i| i.viewport().close_requested());
+    let mut has_pending = close_requested;
+    if let Ok(mut data) = shared.lock() {
+        if close_requested {
+            data.request_close();
+        }
+        has_pending |= data.has_pending_requests();
+    }
+    if has_pending {
+        request_root_repaint(ctx);
+    }
+}
+
+/// Largest dock height allowed for a window of this height.
+fn dock_max_height(screen_height: f32) -> f32 {
+    (screen_height * DOCK_MAX_SCREEN_FRACTION).max(DOCK_MIN_HEIGHT)
+}
+
+/// Width granted to the scrollable dock tab strip, always leaving room for the
+/// dock controls so a long tab list can neither hide them nor spill out of the
+/// panel and over the side panels.
+fn dock_tab_strip_width(available_width: f32) -> f32 {
+    (available_width - DOCK_CONTROLS_WIDTH).max(DOCK_MIN_TAB_STRIP_WIDTH)
+}
+
+/// Whether the dock should adopt the default tab set.
+///
+/// This may only happen once. Every analysis parameter change re-resolves the
+/// host-view registry, so seeding on each refresh would resurrect the tabs the
+/// user just closed.
+fn should_seed_default_dock_tabs(seeded: bool, tabs: &[String], active: Option<&str>) -> bool {
+    !seeded && tabs.is_empty() && active.is_none()
+}
+
+/// Confine a panel's contents to the panel itself.
+///
+/// egui hands every panel a screen-wide clip rect, so anything that overflows
+/// the panel keeps painting over its neighbours — a long dock tab strip would
+/// draw straight across the analysis side panel.
+fn clip_to_panel(ui: &mut egui::Ui) {
+    let clip = ui.clip_rect().intersect(ui.max_rect());
+    ui.set_clip_rect(clip);
+}
+
+/// Publish this frame's payload into the view's long-lived cell, preserving any
+/// request the window raised since the last parent frame, and hand back the
+/// cell so the viewport callback can keep writing into it.
+fn publish_window_frame<T: HostWindowFrameData>(
+    channels: &mut HashMap<String, Arc<Mutex<T>>>,
+    view_id: &str,
+    mut next: T,
+) -> Arc<Mutex<T>> {
+    if let Some(existing) = channels.get(view_id) {
+        if let Ok(mut data) = existing.lock() {
+            next.carry_pending_requests_from(&data);
+            *data = next;
+        }
+        return Arc::clone(existing);
+    }
+    let cell = Arc::new(Mutex::new(next));
+    channels.insert(view_id.to_owned(), Arc::clone(&cell));
+    cell
 }
 
 #[derive(Debug, Clone)]
@@ -1022,6 +1125,10 @@ pub struct CameraApp {
     host_view_registry: ResolvedHostViewRegistry,
     host_view_registry_dirty: bool,
     host_view_window_open: HashMap<String, bool>,
+    /// Frame payloads shared with the popped-out host-view windows. Kept alive
+    /// across frames so requests raised inside a deferred viewport survive
+    /// until the app can consume them.
+    host_view_window_channels: HostViewWindowChannels,
     /// Last dataset generation pushed to each open host-view window, so the
     /// deferred viewport can be woken exactly when its data changes.
     host_view_window_seen_generation: HashMap<String, u64>,
@@ -1042,6 +1149,16 @@ pub struct CameraApp {
     dock_open: bool,
     /// Drag-resizable dock height in points.
     dock_height: f32,
+    /// Height to force onto the dock panel for one frame. egui owns the panel
+    /// height once it has been shown, so programmatic resizes (maximize /
+    /// restore) have to be pushed through the panel's height range.
+    dock_height_request: Option<f32>,
+    /// Height to restore when the maximize toggle is switched back off.
+    dock_height_before_maximize: Option<f32>,
+    /// Set once the default tab set has been seeded (or the user has touched
+    /// the dock). Without it every registry refresh would resurrect tabs the
+    /// user closed — and any analysis parameter change refreshes the registry.
+    dock_defaults_seeded: bool,
     /// Owl brand mark texture (loaded once at startup); `None` if the asset
     /// could not be read.
     brand_logo: Option<egui::TextureHandle>,
@@ -1095,6 +1212,27 @@ impl CameraApp {
             .and_then(|s| s.get_string(DOCK_OPEN_STORAGE_KEY))
             .map(|s| s != "false")
             .unwrap_or(true);
+        // Restore the dock tab set so views the user closed stay closed across
+        // restarts. Ids whose provider is absent simply do not render.
+        let dock_tabs: Vec<String> = cc
+            .storage
+            .and_then(|s| s.get_string(DOCK_TABS_STORAGE_KEY))
+            .map(|s| {
+                s.split('\n')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let dock_active = cc
+            .storage
+            .and_then(|s| s.get_string(DOCK_ACTIVE_STORAGE_KEY))
+            .filter(|id| dock_tabs.iter().any(|tab| tab == id));
+        let dock_defaults_seeded = cc
+            .storage
+            .and_then(|s| s.get_string(DOCK_DEFAULTS_SEEDED_STORAGE_KEY))
+            .map(|s| s == "true")
+            .unwrap_or(false);
 
         let mut plugin_manager = PluginManager::new_default();
         let plugin_scan_error = plugin_manager.scan_and_load().err();
@@ -1202,16 +1340,20 @@ impl CameraApp {
             host_view_registry: ResolvedHostViewRegistry::default(),
             host_view_registry_dirty: true,
             host_view_window_open: HashMap::new(),
+            host_view_window_channels: HostViewWindowChannels::default(),
             host_view_window_seen_generation: HashMap::new(),
             host_view_frozen_datasets: HashSet::new(),
             host_views_frozen_all: false,
             host_view_render_state: HashMap::new(),
             host_view_dataset_cache: HashMap::new(),
             host_view_resolution_warnings: Vec::new(),
-            dock_tabs: Vec::new(),
-            dock_active: None,
+            dock_tabs,
+            dock_active,
             dock_open,
             dock_height,
+            dock_height_request: None,
+            dock_height_before_maximize: None,
+            dock_defaults_seeded,
             brand_logo: logo_texture,
             pending_action_requests: Vec::new(),
             next_action_request_id: 1,
@@ -3256,8 +3398,17 @@ impl CameraApp {
         self.ensure_default_dock_tabs();
     }
 
+    /// Seed the dock with the first few window views the very first time a
+    /// registry with dockable views appears. This must happen **once**: every
+    /// analysis parameter change re-resolves the registry, and re-seeding there
+    /// would resurrect tabs the user deliberately closed.
     fn ensure_default_dock_tabs(&mut self) {
-        if !self.dock_tabs.is_empty() || self.dock_active.is_some() {
+        if !should_seed_default_dock_tabs(
+            self.dock_defaults_seeded,
+            &self.dock_tabs,
+            self.dock_active.as_deref(),
+        ) {
+            self.dock_defaults_seeded = true;
             return;
         }
         let default_tabs: Vec<String> = self
@@ -3268,11 +3419,14 @@ impl CameraApp {
             .map(|view| view.descriptor.id.clone())
             .collect();
         if default_tabs.is_empty() {
+            // No dockable views yet (plugins still loading) — try again on the
+            // next refresh rather than burning the one-shot seed.
             return;
         }
         self.dock_tabs = default_tabs;
         self.dock_active = self.dock_tabs.first().cloned();
         self.dock_open = true;
+        self.dock_defaults_seeded = true;
     }
 
     fn load_host_view_dataset_snapshot(&self, dataset_id: &str) -> CachedHostDataset {
@@ -4628,11 +4782,14 @@ impl CameraApp {
         }
         self.dock_active = Some(view_id.to_owned());
         self.dock_open = true;
+        self.dock_defaults_seeded = true;
     }
 
     /// Remove a tab from the dock; if the active tab was closed, fall back
-    /// to the previous tab.
+    /// to the previous tab. Closing is an explicit user choice, so the default
+    /// tab set is never seeded again afterwards.
     fn dock_close_view(&mut self, view_id: &str) {
+        self.dock_defaults_seeded = true;
         let prev_index = self.dock_tabs.iter().position(|id| id == view_id);
         self.dock_tabs.retain(|id| id != view_id);
         if self.dock_active.as_deref() == Some(view_id) {
@@ -4651,28 +4808,38 @@ impl CameraApp {
         self.dock_tabs.iter().any(|id| id == view_id)
     }
 
-    /// Render the bottom multi-view dock — a tab strip plus the active
-    /// tab's body. Only renders when at least one tab exists and the dock
-    /// is not collapsed. Drops tabs whose host view has disappeared.
-    fn render_host_view_dock(&mut self, ctx: &egui::Context) {
-        // Drop stale tabs whose view IDs no longer resolve.
-        self.dock_tabs.retain(|id| {
-            self.host_view_registry
-                .view(id)
-                .map(|view| host_view_kind_is_dockable(&view.descriptor.kind))
-                .unwrap_or(false)
-        });
-        if let Some(active) = &self.dock_active {
-            if !self.dock_tabs.iter().any(|id| id == active) {
-                self.dock_active = self.dock_tabs.first().cloned();
-            }
-        } else {
-            self.dock_active = self.dock_tabs.first().cloned();
-        }
+    /// Whether a docked view id currently resolves to a dockable host view.
+    fn dock_tab_is_renderable(&self, view_id: &str) -> bool {
+        self.host_view_registry
+            .view(view_id)
+            .is_some_and(|view| host_view_kind_is_dockable(&view.descriptor.kind))
+    }
 
-        if self.dock_tabs.is_empty() {
+    /// Render the bottom multi-view dock — a tab strip plus the active
+    /// tab's body. Only renders while at least one tab resolves to a live host
+    /// view and the dock is not collapsed.
+    fn render_host_view_dock(&mut self, ctx: &egui::Context) {
+        // `dock_tabs` records what the user wants docked, so tabs are never
+        // dropped here: an epoch bump or a plugin reload empties the registry
+        // for a few frames, and pruning would silently retire those views for
+        // good (defaults are seeded only once). Unresolved ids simply do not
+        // render until their provider is back.
+        let visible_tabs: Vec<String> = self
+            .dock_tabs
+            .iter()
+            .filter(|id| self.dock_tab_is_renderable(id))
+            .cloned()
+            .collect();
+        if visible_tabs.is_empty() {
             return;
         }
+        // Same for the active tab: keep the user's choice, but fall back to a
+        // renderable tab while that view is away.
+        let active_tab: Option<String> = self
+            .dock_active
+            .clone()
+            .filter(|id| self.dock_tab_is_renderable(id))
+            .or_else(|| visible_tabs.first().cloned());
 
         if !self.dock_open {
             // Collapsed: render a thin strip with tab names so the user can
@@ -4680,6 +4847,7 @@ impl CameraApp {
             egui::TopBottomPanel::bottom("host_view_dock_collapsed")
                 .resizable(false)
                 .show(ctx, |ui| {
+                    clip_to_panel(ui);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
                         if ui
@@ -4690,8 +4858,7 @@ impl CameraApp {
                             self.dock_open = true;
                         }
                         ui.label(egui::RichText::new("Dock collapsed").size(11.0));
-                        let names: Vec<String> = self
-                            .dock_tabs
+                        let names: Vec<String> = visible_tabs
                             .iter()
                             .filter_map(|id| {
                                 self.host_view_registry
@@ -4715,46 +4882,52 @@ impl CameraApp {
             return;
         }
 
-        let dock_max_height =
-            (ctx.screen_rect().height() * DOCK_MAX_SCREEN_FRACTION).max(DOCK_MIN_HEIGHT);
+        let dock_max_height = dock_max_height(ctx.screen_rect().height());
         let dock_height = self.dock_height.clamp(DOCK_MIN_HEIGHT, dock_max_height);
         let mut new_height = None;
-        let panel_response = egui::TopBottomPanel::bottom("host_view_dock")
+        let mut panel = egui::TopBottomPanel::bottom("host_view_dock")
             .resizable(true)
             .min_height(DOCK_MIN_HEIGHT)
-            .default_height(dock_height)
-            .show(ctx, |ui| {
-                new_height = Some(ui.available_size().y + 0.0);
-                // Resizer handle: centered 28×2 px bar at the top edge.
-                let palette = crate::theme::palette_for_visuals(ui.visuals());
-                let handle_rect = egui::Rect::from_center_size(
-                    egui::pos2(
-                        ui.available_rect_before_wrap().center().x,
-                        ui.cursor().top() + 3.0,
-                    ),
-                    egui::vec2(28.0, 2.0),
-                );
-                ui.painter()
-                    .rect_filled(handle_rect, 1.0, palette.line_strong);
-                ui.add_space(4.0);
-                self.render_dock_tab_strip(ui);
-                ui.separator();
-                let active_view: Option<ResolvedHostView> = self
-                    .dock_active
-                    .as_ref()
-                    .and_then(|id| self.host_view_registry.view(id).cloned());
-                if let Some(view) = active_view {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.render_host_view_content(ctx, ui, &view);
-                        });
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.weak("No active dock tab.");
+            .default_height(dock_height);
+        if let Some(requested) = self.dock_height_request.take() {
+            // egui keeps the panel height in its own `PanelState` once the
+            // panel has been shown, so `default_height` no longer bites and a
+            // programmatic resize has to go through the height range.
+            let forced = requested.clamp(DOCK_MIN_HEIGHT, dock_max_height);
+            panel = panel.height_range(forced..=forced);
+        }
+        let panel_response = panel.show(ctx, |ui| {
+            clip_to_panel(ui);
+            new_height = Some(ui.available_size().y + 0.0);
+            // Resizer handle: centered 28×2 px bar at the top edge.
+            let palette = crate::theme::palette_for_visuals(ui.visuals());
+            let handle_rect = egui::Rect::from_center_size(
+                egui::pos2(
+                    ui.available_rect_before_wrap().center().x,
+                    ui.cursor().top() + 3.0,
+                ),
+                egui::vec2(28.0, 2.0),
+            );
+            ui.painter()
+                .rect_filled(handle_rect, 1.0, palette.line_strong);
+            ui.add_space(4.0);
+            self.render_dock_tab_strip(ui, &visible_tabs, active_tab.as_deref());
+            ui.separator();
+            let active_view: Option<ResolvedHostView> = active_tab
+                .as_ref()
+                .and_then(|id| self.host_view_registry.view(id).cloned());
+            if let Some(view) = active_view {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_host_view_content(ctx, ui, &view);
                     });
-                }
-            });
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.weak("No active dock tab.");
+                });
+            }
+        });
         if let Some(height) = new_height {
             // Track the user-resized height between frames.
             let _ = panel_response;
@@ -4765,99 +4938,44 @@ impl CameraApp {
     /// Tab strip atop the host-view dock. Each tab carries an icon, kind
     /// tag, title, and close button. A "collapse" affordance on the right
     /// hides the dock body so the central viewport can reclaim the space.
-    fn render_dock_tab_strip(&mut self, ui: &mut egui::Ui) {
+    fn render_dock_tab_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        visible_tabs: &[String],
+        active: Option<&str>,
+    ) {
         let palette = crate::theme::palette_for_visuals(ui.visuals());
-        let active = self.dock_active.clone();
         let mut activate: Option<String> = None;
         let mut close: Option<String> = None;
         let mut popout: Option<String> = None;
         let mut collapse_dock = false;
         let mut maximize_dock = false;
 
+        let is_maximized = self.dock_is_maximized(ui.ctx());
+
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
-            for id in &self.dock_tabs {
-                let Some(view) = self.host_view_registry.view(id) else {
-                    continue;
-                };
-                let tab_id = &view.descriptor.id;
-                let tab_title = &view.descriptor.title;
-                let tab_kind = &view.descriptor.kind;
-                let tab_dataset_id = &view.descriptor.dataset_id;
-                let tab_plugin_tag = self.provider_plugin_tag(view.provider);
-                let is_active = active.as_deref() == Some(tab_id.as_str());
-                let label_color = if is_active {
-                    palette.fg_0
-                } else {
-                    palette.fg_2
-                };
-                let bg = if is_active {
-                    palette.bg_1
-                } else {
-                    palette.bg_2
-                };
-                let tab_frame = egui::Frame::none()
-                    .fill(bg)
-                    .rounding(egui::Rounding {
-                        nw: crate::theme::radius::R_2,
-                        ne: crate::theme::radius::R_2,
-                        sw: 0.0,
-                        se: 0.0,
-                    })
-                    .inner_margin(egui::Margin::symmetric(
-                        crate::theme::sp::SP_2,
-                        crate::theme::sp::SP_1,
-                    ));
-                let tab_rect = tab_frame
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
-                            let icon = host_view_kind_icon(tab_kind);
-                            let kind_tag = host_view_kind_tag(tab_kind);
-                            let label = format!("{icon}  {}", tab_title);
-                            let tooltip = format!("{} \u{00B7} {}", kind_tag, tab_dataset_id);
-                            crate::theme::chip(ui, kind_tag, crate::theme::Tone::Neutral);
-                            let response = ui
-                                .add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&label).color(label_color),
-                                    )
-                                    .sense(egui::Sense::click()),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .on_hover_text(&tooltip);
-                            if response.clicked() {
-                                activate = Some(tab_id.clone());
-                            }
-                            if let Some(plugin) = tab_plugin_tag {
-                                ui.label(
-                                    egui::RichText::new(format!("\u{00B7} {plugin}"))
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(palette.fg_3),
-                                );
-                            }
-                            if ui
-                                .small_button(egui_phosphor::regular::X)
-                                .on_hover_text("Close tab")
-                                .clicked()
-                            {
-                                close = Some(tab_id.clone());
-                            }
-                        });
-                    })
-                    .response
-                    .rect;
-                // Active tab accent: 2px bottom ink line.
-                if is_active {
-                    let accent_rect = egui::Rect::from_min_size(
-                        egui::pos2(tab_rect.left(), tab_rect.bottom() - 2.0),
-                        egui::vec2(tab_rect.width(), 2.0),
-                    );
-                    ui.painter().rect_filled(accent_rect, 0.0, palette.ink);
-                }
-            }
-            ui.add_space(crate::theme::sp::SP_2);
+            // The dock controls are reserved first: a long tab strip used to
+            // push them out of the panel (and egui clips panels to the whole
+            // screen, so the overflow painted over the side panels).
+            let tabs_width = dock_tab_strip_width(ui.available_width());
+            egui::ScrollArea::horizontal()
+                .id_source("host_view_dock_tab_strip")
+                .max_width(tabs_width)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+                        self.render_dock_tabs(
+                            ui,
+                            &palette,
+                            visible_tabs,
+                            active,
+                            &mut activate,
+                            &mut close,
+                        );
+                    });
+                });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button(egui_phosphor::regular::CARET_DOWN)
@@ -4866,20 +4984,29 @@ impl CameraApp {
                 {
                     collapse_dock = true;
                 }
+                let maximize_icon = if is_maximized {
+                    egui_phosphor::regular::ARROWS_IN
+                } else {
+                    egui_phosphor::regular::ARROWS_OUT
+                };
                 if ui
-                    .small_button(egui_phosphor::regular::ARROWS_OUT)
-                    .on_hover_text("Maximize host-view dock")
+                    .small_button(maximize_icon)
+                    .on_hover_text(if is_maximized {
+                        "Restore host-view dock height"
+                    } else {
+                        "Maximize host-view dock"
+                    })
                     .clicked()
                 {
                     maximize_dock = true;
                 }
-                if let Some(active_id) = &active {
+                if let Some(active_id) = active {
                     if ui
                         .small_button(egui_phosphor::regular::ARROW_SQUARE_OUT)
                         .on_hover_text("Pop out active tab to OS window")
                         .clicked()
                     {
-                        popout = Some(active_id.clone());
+                        popout = Some(active_id.to_owned());
                     }
                 }
             });
@@ -4887,6 +5014,7 @@ impl CameraApp {
 
         if let Some(id) = activate {
             self.dock_active = Some(id);
+            self.dock_defaults_seeded = true;
         }
         if let Some(id) = close {
             self.dock_close_view(&id);
@@ -4899,8 +5027,118 @@ impl CameraApp {
             self.dock_open = false;
         }
         if maximize_dock {
-            self.dock_height =
-                (ui.ctx().screen_rect().height() * DOCK_MAX_SCREEN_FRACTION).max(DOCK_MIN_HEIGHT);
+            self.toggle_dock_maximized(ui.ctx());
+        }
+    }
+
+    /// True while the dock fills its maximum share of the window.
+    fn dock_is_maximized(&self, ctx: &egui::Context) -> bool {
+        self.dock_height >= dock_max_height(ctx.screen_rect().height()) - 1.0
+    }
+
+    /// Maximize the dock, or restore the height it had before maximizing.
+    fn toggle_dock_maximized(&mut self, ctx: &egui::Context) {
+        let max = dock_max_height(ctx.screen_rect().height());
+        if self.dock_is_maximized(ctx) {
+            let restored = self
+                .dock_height_before_maximize
+                .take()
+                .unwrap_or(DOCK_DEFAULT_HEIGHT);
+            self.dock_height_request = Some(restored);
+        } else {
+            self.dock_height_before_maximize = Some(self.dock_height);
+            self.dock_height_request = Some(max);
+        }
+    }
+
+    /// The tabs themselves, laid out left to right inside the scrollable strip.
+    fn render_dock_tabs(
+        &self,
+        ui: &mut egui::Ui,
+        palette: &crate::theme::Palette,
+        visible_tabs: &[String],
+        active: Option<&str>,
+        activate: &mut Option<String>,
+        close: &mut Option<String>,
+    ) {
+        for id in visible_tabs {
+            let Some(view) = self.host_view_registry.view(id) else {
+                continue;
+            };
+            let tab_id = &view.descriptor.id;
+            let tab_title = &view.descriptor.title;
+            let tab_kind = &view.descriptor.kind;
+            let tab_dataset_id = &view.descriptor.dataset_id;
+            let tab_plugin_tag = self.provider_plugin_tag(view.provider);
+            let is_active = active == Some(tab_id.as_str());
+            let label_color = if is_active {
+                palette.fg_0
+            } else {
+                palette.fg_2
+            };
+            let bg = if is_active {
+                palette.bg_1
+            } else {
+                palette.bg_2
+            };
+            let tab_frame = egui::Frame::none()
+                .fill(bg)
+                .rounding(egui::Rounding {
+                    nw: crate::theme::radius::R_2,
+                    ne: crate::theme::radius::R_2,
+                    sw: 0.0,
+                    se: 0.0,
+                })
+                .inner_margin(egui::Margin::symmetric(
+                    crate::theme::sp::SP_2,
+                    crate::theme::sp::SP_1,
+                ));
+            let tab_rect = tab_frame
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+                        let icon = host_view_kind_icon(tab_kind);
+                        let kind_tag = host_view_kind_tag(tab_kind);
+                        let label = format!("{icon}  {}", tab_title);
+                        let tooltip = format!("{} \u{00B7} {}", kind_tag, tab_dataset_id);
+                        crate::theme::chip(ui, kind_tag, crate::theme::Tone::Neutral);
+                        let response = ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(&label).color(label_color))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(&tooltip);
+                        if response.clicked() {
+                            *activate = Some(tab_id.clone());
+                        }
+                        if let Some(plugin) = tab_plugin_tag {
+                            ui.label(
+                                egui::RichText::new(format!("\u{00B7} {plugin}"))
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(palette.fg_3),
+                            );
+                        }
+                        if ui
+                            .small_button(egui_phosphor::regular::X)
+                            .on_hover_text("Close tab")
+                            .clicked()
+                        {
+                            *close = Some(tab_id.clone());
+                        }
+                    });
+                })
+                .response
+                .rect;
+            // Active tab accent: 2px bottom ink line.
+            if is_active {
+                let accent_rect = egui::Rect::from_min_size(
+                    egui::pos2(tab_rect.left(), tab_rect.bottom() - 2.0),
+                    egui::vec2(tab_rect.width(), 2.0),
+                );
+                ui.painter().rect_filled(accent_rect, 0.0, palette.ink);
+            }
         }
     }
 
@@ -5034,6 +5272,12 @@ impl CameraApp {
     }
 
     fn render_host_view_windows(&mut self, ctx: &egui::Context) {
+        // Closed windows keep no payload: their cells hold dataset snapshots
+        // and textures that would otherwise stay resident.
+        let open_windows = &self.host_view_window_open;
+        self.host_view_window_channels
+            .retain_open(|view_id| open_windows.get(view_id).copied().unwrap_or(false));
+
         let views: Vec<ResolvedHostView> =
             self.host_view_registry.window_views().cloned().collect();
         for view in views {
@@ -5124,7 +5368,7 @@ impl CameraApp {
                                 viewer.investigation.hovered_row.clone(),
                             )
                         });
-                    let shared = Arc::new(Mutex::new(TableWindowViewportData {
+                    let frame_data = TableWindowViewportData {
                         dataset_id: view.descriptor.dataset_id.clone(),
                         generation,
                         schema: Arc::new(schema.clone()),
@@ -5147,7 +5391,12 @@ impl CameraApp {
                             .map(|info| info.first_timestamp_us),
                         frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
                         freeze_toggle_requested: false,
-                    }));
+                    };
+                    let shared = publish_window_frame(
+                        &mut self.host_view_window_channels.table,
+                        &view.descriptor.id,
+                        frame_data,
+                    );
                     let shared_for_viewport = Arc::clone(&shared);
                     let window_title = title.clone();
                     let viewport_visuals = ctx.style().visuals.clone();
@@ -5163,11 +5412,7 @@ impl CameraApp {
                                     egui::CentralPanel::default().show(ctx, |ui| {
                                         render_table_window_viewport(ui, &shared_for_viewport);
                                     });
-                                    if ctx.input(|i| i.viewport().close_requested()) {
-                                        if let Ok(mut data) = shared_for_viewport.lock() {
-                                            data.close_requested = true;
-                                        }
-                                    }
+                                    finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
                                 egui::viewport::ViewportClass::Embedded => {
                                     let mut open = true;
@@ -5307,7 +5552,7 @@ impl CameraApp {
                         )
                     };
 
-                    let shared = Arc::new(Mutex::new(DensityWindowViewportData {
+                    let frame_data = DensityWindowViewportData {
                         texture,
                         total_rows,
                         rendered_width: rendered_size[0],
@@ -5321,7 +5566,12 @@ impl CameraApp {
                         clear_requested: false,
                         frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
                         freeze_toggle_requested: false,
-                    }));
+                    };
+                    let shared = publish_window_frame(
+                        &mut self.host_view_window_channels.density,
+                        &view.descriptor.id,
+                        frame_data,
+                    );
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
@@ -5342,11 +5592,7 @@ impl CameraApp {
                                             &shared_for_viewport,
                                         );
                                     });
-                                    if ctx.input(|i| i.viewport().close_requested()) {
-                                        if let Ok(mut data) = shared_for_viewport.lock() {
-                                            data.close_requested = true;
-                                        }
-                                    }
+                                    finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
                                 egui::viewport::ViewportClass::Embedded => {
                                     let mut open = true;
@@ -5427,7 +5673,7 @@ impl CameraApp {
                         }) => (None, Some(err.clone())),
                         _ => (None, None),
                     };
-                    let shared = Arc::new(Mutex::new(ScatterWindowViewportData {
+                    let frame_data = ScatterWindowViewportData {
                         schema: schema.clone(),
                         dataset: table_arc,
                         x_column: x_column.clone(),
@@ -5439,7 +5685,12 @@ impl CameraApp {
                         clear_requested: false,
                         frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
                         freeze_toggle_requested: false,
-                    }));
+                    };
+                    let shared = publish_window_frame(
+                        &mut self.host_view_window_channels.scatter,
+                        &view.descriptor.id,
+                        frame_data,
+                    );
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
@@ -5460,11 +5711,7 @@ impl CameraApp {
                                             &shared_for_viewport,
                                         );
                                     });
-                                    if ctx.input(|i| i.viewport().close_requested()) {
-                                        if let Ok(mut data) = shared_for_viewport.lock() {
-                                            data.close_requested = true;
-                                        }
-                                    }
+                                    finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
                                 egui::viewport::ViewportClass::Embedded => {
                                     let mut open = true;
@@ -5553,7 +5800,7 @@ impl CameraApp {
                         )
                     };
 
-                    let shared = Arc::new(Mutex::new(ImageWindowViewportData {
+                    let frame_data = ImageWindowViewportData {
                         texture,
                         rendered_width: rendered_size[0],
                         rendered_height: rendered_size[1],
@@ -5565,7 +5812,12 @@ impl CameraApp {
                         clear_requested: false,
                         frozen: self.host_view_dataset_frozen(&view.descriptor.dataset_id),
                         freeze_toggle_requested: false,
-                    }));
+                    };
+                    let shared = publish_window_frame(
+                        &mut self.host_view_window_channels.image,
+                        &view.descriptor.id,
+                        frame_data,
+                    );
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
@@ -5586,11 +5838,7 @@ impl CameraApp {
                                             &shared_for_viewport,
                                         );
                                     });
-                                    if ctx.input(|i| i.viewport().close_requested()) {
-                                        if let Ok(mut data) = shared_for_viewport.lock() {
-                                            data.close_requested = true;
-                                        }
-                                    }
+                                    finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
                                 egui::viewport::ViewportClass::Embedded => {
                                     let mut open = true;
@@ -5663,7 +5911,7 @@ impl CameraApp {
                         }) => (None, Some(err.clone())),
                         _ => (None, None),
                     };
-                    let shared = Arc::new(Mutex::new(SeriesWindowViewportData {
+                    let frame_data = SeriesWindowViewportData {
                         dataset: series_arc,
                         empty_message: dataset.descriptor.empty_message.clone(),
                         error_message,
@@ -5672,7 +5920,12 @@ impl CameraApp {
                         freeze_toggle_requested: false,
                         export_png_requested: false,
                         screenshot: None,
-                    }));
+                    };
+                    let shared = publish_window_frame(
+                        &mut self.host_view_window_channels.series,
+                        &view.descriptor.id,
+                        frame_data,
+                    );
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
@@ -5708,11 +5961,7 @@ impl CameraApp {
                                             data.screenshot = Some(image);
                                         }
                                     }
-                                    if ctx.input(|i| i.viewport().close_requested()) {
-                                        if let Ok(mut data) = shared_for_viewport.lock() {
-                                            data.close_requested = true;
-                                        }
-                                    }
+                                    finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
                                 egui::viewport::ViewportClass::Embedded => {
                                     let mut open = true;
@@ -10337,6 +10586,15 @@ impl eframe::App for CameraApp {
         }
         storage.set_string(DOCK_HEIGHT_STORAGE_KEY, format!("{:.0}", self.dock_height));
         storage.set_string(DOCK_OPEN_STORAGE_KEY, self.dock_open.to_string());
+        storage.set_string(DOCK_TABS_STORAGE_KEY, self.dock_tabs.join("\n"));
+        storage.set_string(
+            DOCK_ACTIVE_STORAGE_KEY,
+            self.dock_active.clone().unwrap_or_default(),
+        );
+        storage.set_string(
+            DOCK_DEFAULTS_SEEDED_STORAGE_KEY,
+            self.dock_defaults_seeded.to_string(),
+        );
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -11001,17 +11259,21 @@ mod tests {
         should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
         viewport_stream_active, CameraApp, PluginRecordingSession, PopupSharedData,
-        RawEventSceneInput, RAW_EVENTS_ON_LAYER_ID,
+        RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
     };
+    use super::{
+        clip_to_panel, dock_tab_strip_width, publish_window_frame, should_seed_default_dock_tabs,
+    };
+    use crate::host_views::{HostWindowFrameData, SeriesWindowViewportData};
     use augur_event_types::{BackpressureBehavior, CursorPolicy};
     use augur_runtime::{LiveHostDatasetSnapshot, LivePluginHostSnapshot};
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs,
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc,
+            Arc, Mutex,
         },
     };
 
@@ -11207,6 +11469,109 @@ mod tests {
                 y_column: "y".into(),
             },
         ));
+    }
+
+    #[test]
+    fn default_dock_tabs_are_seeded_exactly_once() {
+        // First registry with dockable views: seed the dock.
+        assert!(should_seed_default_dock_tabs(false, &[], None));
+        // The user closed every tab. Any analysis parameter change re-resolves
+        // the registry, and that must not bring the closed views back.
+        assert!(!should_seed_default_dock_tabs(true, &[], None));
+        // Restored/populated dock: nothing to seed.
+        let tabs = vec!["view.a".to_owned()];
+        assert!(!should_seed_default_dock_tabs(false, &tabs, Some("view.a")));
+    }
+
+    #[test]
+    fn dock_panel_contents_stay_inside_the_dock() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 860.0));
+        let ctx = egui::Context::default();
+        let mut observed = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::SidePanel::left("settings")
+                    .exact_width(224.0)
+                    .show(ctx, |_| {});
+                egui::SidePanel::right("analysis")
+                    .exact_width(360.0)
+                    .show(ctx, |_| {});
+                egui::TopBottomPanel::bottom("host_view_dock").show(ctx, |ui| {
+                    let inherited = ui.clip_rect();
+                    clip_to_panel(ui);
+                    observed = Some((inherited, ui.clip_rect(), ui.max_rect()));
+                });
+            },
+        );
+
+        let (inherited, clipped, panel) = observed.expect("the dock panel ran");
+        // egui hands every panel a screen-wide clip rect: without clipping, a
+        // tab strip wider than the dock paints over the analysis side panel.
+        assert!(
+            inherited.right() >= screen.right() - 0.5,
+            "expected the inherited panel clip rect to span the screen, got {inherited:?}"
+        );
+        assert!(
+            clipped.right() <= panel.right() + 0.5,
+            "dock contents must be clipped to the dock ({clipped:?} vs {panel:?})"
+        );
+        assert!(
+            clipped.right() <= screen.right() - 360.0 + 0.5,
+            "dock contents must stop at the analysis side panel, got {clipped:?}"
+        );
+    }
+
+    #[test]
+    fn dock_tab_strip_always_leaves_room_for_the_dock_controls() {
+        let wide = dock_tab_strip_width(900.0);
+        assert!(
+            wide + DOCK_CONTROLS_WIDTH <= 900.0,
+            "tabs must not claim the space reserved for the dock controls"
+        );
+        // Very narrow docks fall back to the minimum strip width rather than a
+        // negative width; the strip scrolls instead of overflowing the panel.
+        assert_eq!(dock_tab_strip_width(0.0), DOCK_MIN_TAB_STRIP_WIDTH);
+    }
+
+    #[test]
+    fn window_channel_keeps_requests_raised_after_the_parent_frame() {
+        let mut channels: HashMap<String, Arc<Mutex<SeriesWindowViewportData>>> = HashMap::new();
+        let cell = publish_window_frame(
+            &mut channels,
+            "view.series",
+            SeriesWindowViewportData::default(),
+        );
+
+        // A deferred viewport renders *after* the frame that published its
+        // payload, so this is when the window's close button lands.
+        cell.lock().unwrap().request_close();
+
+        let next = publish_window_frame(
+            &mut channels,
+            "view.series",
+            SeriesWindowViewportData {
+                empty_message: "no data".to_owned(),
+                ..SeriesWindowViewportData::default()
+            },
+        );
+        assert!(
+            Arc::ptr_eq(&cell, &next),
+            "the window must keep writing into one long-lived cell"
+        );
+        let data = next.lock().unwrap();
+        assert!(
+            data.close_requested,
+            "a close raised by the window must survive the next published frame"
+        );
+        assert!(data.has_pending_requests());
+        assert_eq!(
+            data.empty_message, "no data",
+            "frame inputs must still be refreshed"
+        );
     }
 
     #[test]
