@@ -82,6 +82,28 @@ Exports stay generic:
 - CSV export for table-backed views
 - PNG/TIFF export for rendered image/density views
 
+## Dock And Pop-Out Window Contract
+
+Dockable views are shown either as tabs in the bottom host-view dock or as popped-out OS windows.
+Three host-side rules keep that surface predictable:
+
+- **The dock never claims space it does not own.** egui gives every panel a screen-wide clip rect,
+  so the dock clips its own contents (`clip_to_panel`) and scrolls its tab strip horizontally with
+  the control cluster (pop out / maximize / collapse) reserved on the right. Without this a long tab
+  strip paints across the analysis side panel.
+- **`dock_tabs` is user intent, not derived state.** Default tabs are seeded exactly once, since
+  every analysis parameter change re-resolves the registry and re-seeding would resurrect views the
+  user closed. Ids that do not currently resolve (plugin reload, epoch bump) are skipped while
+  rendering instead of being pruned, so a momentarily empty registry cannot retire a tab for good.
+- **Window requests travel through a long-lived cell.** A deferred viewport renders *after* the
+  parent frame that registered it, so each popped-out view keeps one `Arc<Mutex<…ViewportData>>`
+  (`HostViewWindowChannels`) that outlives a frame. The app republishes frame inputs into that cell
+  and `HostWindowFrameData::carry_pending_requests_from` preserves requests the window raised in the
+  meantime — close, freeze, CSV/PNG export, sorting, paging. A per-frame cell drops those requests
+  on the floor, which is what made pop-out windows impossible to close. The window also wakes the
+  root viewport (`request_root_repaint`) whenever a request is pending, because only the app
+  services them.
+
 ## Reconstruction Direction
 
 Reconstruction is modeled as a generic host-view composition. A runtime plugin publishes a table dataset, and the host renders it through table, scatter, and density views.

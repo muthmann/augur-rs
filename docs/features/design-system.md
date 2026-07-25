@@ -179,6 +179,13 @@ of the central viewport:
   losing its tabs).
 - `dock_height: f32` — drag-resizable height in points (clamped to
   `[160, 800]`, default 280).
+- `dock_height_request: Option<f32>` — one-frame height override. egui
+  owns the panel height through its `PanelState` once the panel has been
+  shown, so maximize/restore has to push the new height through the
+  panel's height range.
+- `dock_defaults_seeded: bool` — the default tab set is seeded once. Any
+  analysis parameter change re-resolves the host-view registry, and
+  re-seeding there would reopen views the user closed.
 
 ### `app.rs` — dock helpers
 
@@ -202,9 +209,15 @@ that function already handles every kind (table, density, image,
 scatter, line series), the dock works for every host-view kind a plugin
 can publish without any per-kind rewrites.
 
-Stale tab IDs are pruned every frame against
-`host_view_registry.views()`; if the active tab disappears, the first
-remaining tab takes its place.
+Tab IDs are *not* pruned: `dock_tabs` records what the user wants
+docked, and the registry can be empty for a few frames (epoch bump,
+plugin reload). Each frame the dock renders only the ids that currently
+resolve to a dockable view, falls back to the first renderable tab while
+the active view is away, and mounts nothing at all when none resolve.
+
+The panel also clips its contents to itself (`clip_to_panel`) — egui
+hands panels a screen-wide clip rect, so anything that overflows would
+otherwise paint over the side panels.
 
 ### `app.rs` — `render_dock_tab_strip`
 
@@ -218,11 +231,17 @@ corners, with:
   `density`, …),
 - an `X` close button.
 
+The tabs live in a horizontal `ScrollArea` whose width always leaves
+`DOCK_CONTROLS_WIDTH` for the action cluster, so more tabs than fit
+scroll instead of pushing the controls out of the panel.
+
 A right-aligned action cluster carries:
 
 - `ARROW_SQUARE_OUT` to pop the active tab out into its existing
   deferred-viewport OS window (this clears the tab from the dock and
   flips the corresponding `host_view_window_open` entry to `true`).
+- `ARROWS_OUT` / `ARROWS_IN` to maximize the dock and restore the height
+  it had before.
 - `CARET_DOWN` to collapse the dock body.
 
 ### `app.rs` — view-chip behaviour
