@@ -6091,6 +6091,11 @@ impl CameraApp {
         controller
             .raw_events_needed
             .store(self.raw_events_required(), Ordering::Relaxed);
+        // The absolute setting values are only rendered inside the settings
+        // panel, so a collapsed panel costs no USB control transfers.
+        controller
+            .sensor_monitoring_needed
+            .store(self.settings_panel_open, Ordering::Relaxed);
     }
 
     fn sync_active_pipeline_requirements(&self) {
@@ -9236,6 +9241,10 @@ impl eframe::App for CameraApp {
                                 .controller
                                 .as_ref()
                                 .map(PipelineController::stats_snapshot);
+                            let sensor_monitoring = self
+                                .controller
+                                .as_ref()
+                                .and_then(PipelineController::sensor_monitoring);
                             ui.add_enabled_ui(!settings_locked, |ui| {
                                 let changed = draw_settings(
                                     ui,
@@ -9246,6 +9255,7 @@ impl eframe::App for CameraApp {
                                     self.sensor_width,
                                     self.sensor_height,
                                     trigger_stats,
+                                    sensor_monitoring.as_ref(),
                                 );
                                 if changed {
                                     self.config_dirty = true;

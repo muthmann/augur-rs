@@ -41,3 +41,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 026: External-Trigger Delivery And Plugin Execution Context (ABI v5)](./026-external-triggers-and-execution-context.md)
 - [ADR 027: Worker-Owned Semantic Plugin Services](./027-plugin-setting-requests.md)
 - [ADR 028: Allowlisted Plugin to Host Recording Commands](./028-plugin-host-command-queue.md)
+- [ADR 029: Sensor Monitoring Readback For Absolute Setting Values](./029-sensor-monitoring-readback.md)

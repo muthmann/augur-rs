@@ -22,7 +22,7 @@ use crossbeam_channel::{
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
-    camera::{PacketStreamCamera, PacketStreamReader},
+    camera::{EventCamera, PacketStreamCamera, PacketStreamReader, SensorMonitoring},
     config::CameraConfig,
     evt3_timestamps::{Evt3TimestampUnwrapper, SecondaryTimestampMapper},
     metadata::{RecordingMetadata, RecordingSidecar},
@@ -50,6 +50,12 @@ const CURRENT_RATE_WINDOW: Duration = Duration::from_secs(1);
 /// without CD events needs this cap to stay bounded. At 16 B per edge this is
 /// ~1 MB, far more than any single frame window annotates.
 const MAX_PENDING_TRIGGERS: usize = 65_536;
+/// How often the control thread re-reads the sensor monitoring block while a
+/// consumer asks for it. Each poll is a handful of USB control transfers, and
+/// the values it reports (dead time, illumination, die temperature) drift far
+/// slower than this, so 500 ms keeps the panel live without adding traffic
+/// that matters next to streaming.
+const SENSOR_MONITORING_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdEvent {
@@ -599,6 +605,95 @@ impl PipelineStatsSnapshot {
 
     pub fn preview_frame_send_avg_ms(self) -> f64 {
         avg_stage_ms(self.preview_frame_send_us, self.preview_frames_emitted)
+    }
+}
+
+/// Most recent sensor monitoring readback, with enough context for a UI to say
+/// how fresh it is and why a field is missing.
+#[derive(Debug, Clone, Default)]
+pub struct SensorMonitoringSnapshot {
+    pub values: SensorMonitoring,
+    /// Wall-clock age of the reading.
+    pub age_s: f64,
+    /// Error from the most recent poll, if it failed. `values` then still holds
+    /// the last successful reading.
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+struct SensorMonitoringState {
+    values: SensorMonitoring,
+    at: Instant,
+    error: Option<String>,
+}
+
+impl SensorMonitoringState {
+    fn snapshot_at(&self, now: Instant) -> SensorMonitoringSnapshot {
+        SensorMonitoringSnapshot {
+            values: self.values,
+            age_s: now.saturating_duration_since(self.at).as_secs_f64(),
+            error: self.error.clone(),
+        }
+    }
+}
+
+/// Re-reads the sensor monitoring block when a consumer is asking for it and
+/// the previous reading has aged out. Runs on the camera-control thread, which
+/// is the only thread allowed to touch the control endpoint.
+fn poll_sensor_monitoring(
+    camera: &mut dyn EventCamera,
+    needed: &AtomicBool,
+    state: &Mutex<Option<SensorMonitoringState>>,
+    last_poll: &mut Option<Instant>,
+) {
+    if !needed.load(Ordering::Relaxed) {
+        // Drop the stale reading so a reopened panel never shows values from
+        // before it was closed as if they were current.
+        if last_poll.take().is_some() {
+            if let Ok(mut slot) = state.lock() {
+                *slot = None;
+            }
+        }
+        return;
+    }
+
+    let now = Instant::now();
+    if matches!(*last_poll, Some(at) if now.saturating_duration_since(at) < SENSOR_MONITORING_INTERVAL)
+    {
+        return;
+    }
+    *last_poll = Some(now);
+
+    let result = camera.read_monitoring();
+    if let Ok(mut slot) = state.lock() {
+        match result {
+            // A source that reports nothing has no monitoring block. Publishing
+            // an all-`None` snapshot would tell a consumer "live values are
+            // available, they are just all missing", so publish nothing.
+            Ok(values) if values.is_empty() => *slot = None,
+            Ok(values) => {
+                *slot = Some(SensorMonitoringState {
+                    values,
+                    at: Instant::now(),
+                    error: None,
+                })
+            }
+            Err(err) => {
+                let message = err.to_string();
+                match slot.as_mut() {
+                    // Keep the last good values visible, but mark them stale by
+                    // leaving `at` alone so the age keeps growing.
+                    Some(existing) => existing.error = Some(message),
+                    None => {
+                        *slot = Some(SensorMonitoringState {
+                            values: SensorMonitoring::default(),
+                            at: Instant::now(),
+                            error: Some(message),
+                        })
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1276,11 +1371,16 @@ pub struct PipelineController {
     pub settings_tx: Sender<CameraConfig>,
     pub acq_time_us: Arc<AtomicU64>,
     pub raw_events_needed: Arc<AtomicBool>,
+    /// Demand flag for the sensor monitoring readback. The control thread only
+    /// spends USB control transfers on it while this is set, so a consumer
+    /// (e.g. an open settings panel) has to ask.
+    pub sensor_monitoring_needed: Arc<AtomicBool>,
     pub event_source: LiveEventSource,
     pub plugin_event_cursor: Option<CursorId>,
     error_rx: Receiver<String>,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStatsInner>>,
+    sensor_monitoring: Arc<Mutex<Option<SensorMonitoringState>>>,
     recording_sidecar: Option<RecordingSidecarState>,
     threads: Vec<thread::JoinHandle<()>>,
 }
@@ -1297,6 +1397,19 @@ impl PipelineController {
             .lock()
             .map(|mut s| s.snapshot())
             .unwrap_or_else(|_| PipelineStatsSnapshot::default())
+    }
+
+    /// Latest sensor monitoring readback, or `None` until the first successful
+    /// poll after [`Self::sensor_monitoring_needed`] was set. Always `None` for
+    /// sources whose camera runs inline on the stream thread — polling there
+    /// would pause packet reads and cost recorded events.
+    pub fn sensor_monitoring(&self) -> Option<SensorMonitoringSnapshot> {
+        let now = Instant::now();
+        self.sensor_monitoring
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|state| state.snapshot_at(now))
     }
 
     pub fn request_stop(&self) {
@@ -1423,6 +1536,8 @@ where
             .saturating_mul(1_000),
     ));
     let raw_events_needed = Arc::new(AtomicBool::new(false));
+    let sensor_monitoring_needed = Arc::new(AtomicBool::new(false));
+    let sensor_monitoring = Arc::new(Mutex::new(None::<SensorMonitoringState>));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(PipelineStatsInner::new()));
     let event_source = LiveEventSource::with_capacity(event_ring_capacity_events);
@@ -1467,6 +1582,8 @@ where
             // recording.
             let stop_control = Arc::clone(&stop);
             let error_control = error_tx.clone();
+            let monitoring_needed = Arc::clone(&sensor_monitoring_needed);
+            let monitoring_state = Arc::clone(&sensor_monitoring);
             let control_thread = thread::spawn(move || {
                 if let Err(e) = camera.configure(&initial_config) {
                     report_pipeline_error(
@@ -1486,6 +1603,7 @@ where
                     );
                     return;
                 }
+                let mut last_monitoring_poll = None;
                 loop {
                     match settings_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(cfg) => {
@@ -1493,11 +1611,20 @@ where
                                 let _ = error_control
                                     .try_send(format!("control: runtime reconfigure failed: {e}"));
                             }
+                            // New bias codes are live now; re-read on the next
+                            // tick instead of showing the pre-apply values.
+                            last_monitoring_poll = None;
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             if stop_control.load(Ordering::Relaxed) {
                                 break;
                             }
+                            poll_sensor_monitoring(
+                                &mut camera,
+                                &monitoring_needed,
+                                &monitoring_state,
+                                &mut last_monitoring_poll,
+                            );
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -1805,11 +1932,13 @@ where
         settings_tx,
         acq_time_us,
         raw_events_needed,
+        sensor_monitoring_needed,
         event_source,
         plugin_event_cursor,
         error_rx,
         stop,
         stats,
+        sensor_monitoring,
         recording_sidecar,
         threads,
     })
@@ -2910,6 +3039,241 @@ mod tests {
         );
 
         controller.shutdown().expect("pipeline must shut down");
+    }
+
+    /// Camera whose monitoring readback is scripted per call, so a test can
+    /// drive the success, empty, and failure paths in order.
+    struct ScriptedMonitoringCamera {
+        /// A reading, or the message the readback should fail with. `CameraError`
+        /// is not `Clone`, so the script stores the message instead.
+        readings: Vec<std::result::Result<SensorMonitoring, String>>,
+        calls: usize,
+    }
+
+    impl ScriptedMonitoringCamera {
+        fn new(readings: Vec<std::result::Result<SensorMonitoring, String>>) -> Self {
+            Self { readings, calls: 0 }
+        }
+    }
+
+    impl EventCamera for ScriptedMonitoringCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+
+        fn read_monitoring(&mut self) -> Result<SensorMonitoring> {
+            let reading = self.readings.get(self.calls).cloned();
+            self.calls += 1;
+            match reading {
+                Some(Ok(values)) => Ok(values),
+                Some(Err(message)) => Err(CameraError::Transport(message)),
+                None => Ok(SensorMonitoring::default()),
+            }
+        }
+    }
+
+    fn dead_time_reading(us: f32) -> SensorMonitoring {
+        SensorMonitoring {
+            pixel_dead_time_us: Some(us),
+            ..SensorMonitoring::default()
+        }
+    }
+
+    #[test]
+    fn monitoring_poll_is_skipped_until_a_consumer_asks() {
+        let mut camera = ScriptedMonitoringCamera::new(vec![Ok(dead_time_reading(6.0))]);
+        let needed = AtomicBool::new(false);
+        let state = Mutex::new(None);
+        let mut last_poll = None;
+
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+
+        assert_eq!(camera.calls, 0, "an unasked-for readback must cost nothing");
+        assert!(state.lock().expect("state lock").is_none());
+    }
+
+    #[test]
+    fn monitoring_poll_publishes_and_then_rate_limits() {
+        let mut camera = ScriptedMonitoringCamera::new(vec![
+            Ok(dead_time_reading(6.0)),
+            Ok(dead_time_reading(9.0)),
+        ]);
+        let needed = AtomicBool::new(true);
+        let state = Mutex::new(None);
+        let mut last_poll = None;
+
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        // Immediately again: inside the interval, so it must not touch the bus.
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+
+        assert_eq!(camera.calls, 1, "polls inside the interval must be skipped");
+        let published = state
+            .lock()
+            .expect("state lock")
+            .as_ref()
+            .expect("a reading must be published")
+            .snapshot_at(Instant::now());
+        assert_eq!(published.values.pixel_dead_time_us, Some(6.0));
+        assert!(published.error.is_none());
+    }
+
+    #[test]
+    fn monitoring_poll_drops_the_reading_once_nobody_asks() {
+        let mut camera = ScriptedMonitoringCamera::new(vec![Ok(dead_time_reading(6.0))]);
+        let needed = AtomicBool::new(true);
+        let state = Mutex::new(None);
+        let mut last_poll = None;
+
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        assert!(state.lock().expect("state lock").is_some());
+
+        needed.store(false, Ordering::Relaxed);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+
+        assert!(
+            state.lock().expect("state lock").is_none(),
+            "a closed consumer must not keep a reading that is no longer refreshed",
+        );
+        assert!(last_poll.is_none());
+    }
+
+    #[test]
+    fn monitoring_poll_publishes_nothing_for_a_source_without_monitoring() {
+        let mut camera = ScriptedMonitoringCamera::new(vec![Ok(SensorMonitoring::default())]);
+        let needed = AtomicBool::new(true);
+        let state = Mutex::new(None);
+        let mut last_poll = None;
+
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+
+        assert_eq!(camera.calls, 1);
+        assert!(
+            state.lock().expect("state lock").is_none(),
+            "an all-None reading must not look like available live values",
+        );
+    }
+
+    #[test]
+    fn monitoring_poll_keeps_the_last_good_values_when_a_read_fails() {
+        let mut camera = ScriptedMonitoringCamera::new(vec![
+            Ok(dead_time_reading(6.0)),
+            Err("register read timed out".into()),
+        ]);
+        let needed = AtomicBool::new(true);
+        let state = Mutex::new(None);
+        let mut last_poll = None;
+
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        let first_at = state
+            .lock()
+            .expect("state lock")
+            .as_ref()
+            .expect("first reading")
+            .at;
+
+        // Force the interval open so the second, failing poll runs.
+        last_poll = None;
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+
+        let guard = state.lock().expect("state lock");
+        let stored = guard.as_ref().expect("state must survive a failed read");
+        assert_eq!(
+            stored.values.pixel_dead_time_us,
+            Some(6.0),
+            "a failed read must not erase the last successful values",
+        );
+        assert_eq!(
+            stored.at, first_at,
+            "the timestamp must stay put so the reading visibly ages",
+        );
+        assert!(stored
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("register read timed out")));
+    }
+
+    #[test]
+    fn split_camera_publishes_monitoring_only_while_requested() {
+        let controller = spawn_pipeline(
+            MonitoringStreamCamera,
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+
+        // Nothing asked yet: the control thread must not publish anything.
+        thread::sleep(Duration::from_millis(150));
+        assert!(controller.sensor_monitoring().is_none());
+
+        controller
+            .sensor_monitoring_needed
+            .store(true, Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            if let Some(snapshot) = controller.sensor_monitoring() {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control thread never published a monitoring reading",
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(snapshot.values.pixel_dead_time_us, Some(6.0));
+
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    /// Split-capable camera that reports a fixed dead time, for the
+    /// control-thread wiring test.
+    struct MonitoringStreamCamera;
+
+    impl EventCamera for MonitoringStreamCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+
+        fn read_monitoring(&mut self) -> Result<SensorMonitoring> {
+            Ok(dead_time_reading(6.0))
+        }
+    }
+
+    impl PacketStreamCamera for MonitoringStreamCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("split camera reads via reader".into()))
+        }
+
+        fn split_stream_reader(&mut self) -> Option<Box<dyn crate::camera::PacketStreamReader>> {
+            Some(Box::new(CountingStreamReader {
+                reads: Arc::new(AtomicU64::new(0)),
+            }))
+        }
     }
 
     /// Camera whose second packet only completes after the test requests

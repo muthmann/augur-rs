@@ -135,7 +135,7 @@ fn main() -> Result<()> {
 
 fn status(config_path: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(config_path.as_deref())?;
-    let camera = Evk4Camera::open_imx636().context("failed opening EVK4")?;
+    let mut camera = Evk4Camera::open_imx636().context("failed opening EVK4")?;
     let info = camera.device_info();
 
     println!(
@@ -160,7 +160,52 @@ fn status(config_path: Option<PathBuf>) -> Result<()> {
         cfg.digital_filter.stc_enabled, cfg.digital_filter.trail_enabled
     );
 
+    print_sensor_readback(&mut camera);
+
     Ok(())
+}
+
+/// Absolute counterparts to the abstract settings, read straight off the
+/// sensor. `status` deliberately does not apply the config file, so the bias
+/// codes below are whatever the device currently holds — after a fresh open
+/// that is the factory trim.
+fn print_sensor_readback(camera: &mut impl EventCamera) {
+    let monitoring = match camera.read_monitoring() {
+        Ok(monitoring) => monitoring,
+        Err(err) => {
+            println!("sensor readback: unavailable ({err})");
+            return;
+        }
+    };
+
+    println!("sensor readback (live device state, config not applied):");
+    match monitoring.pixel_dead_time_us {
+        Some(us) => println!("  refractory period: {us:.2} us"),
+        None => println!("  refractory period: no measurement"),
+    }
+    match monitoring.illumination_lux {
+        Some(lux) => println!("  illumination: {lux:.1} lux"),
+        None => println!("  illumination: no measurement"),
+    }
+    match monitoring.temperature_c {
+        Some(c) => println!("  die temperature: {c:.1} C"),
+        None => println!("  die temperature: no measurement"),
+    }
+    if let Some(biases) = monitoring.biases {
+        println!(
+            "  bias codes (abs/factory): diff_on={}/{} diff_off={}/{} fo={}/{} hpf={}/{} refr={}/{}",
+            biases.current.diff_on,
+            biases.factory_default.diff_on,
+            biases.current.diff_off,
+            biases.factory_default.diff_off,
+            biases.current.fo,
+            biases.factory_default.fo,
+            biases.current.hpf,
+            biases.factory_default.hpf,
+            biases.current.refr,
+            biases.factory_default.refr,
+        );
+    }
 }
 
 fn record(

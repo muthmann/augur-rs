@@ -1,6 +1,7 @@
 use std::{collections::HashSet, fs, thread, time::Duration};
 
 use augur_core::{
+    camera::{BiasCodes, BiasReadback, SensorMonitoring},
     config::{BiasConfig, DigitalFilterConfig, ExternalTriggerConfig, PixelMaskConfig, RoiConfig},
     CameraError, Result,
 };
@@ -15,11 +16,17 @@ const REG_SENSOR_MODE: u32 = 0xF128;
 
 const REG_ROI_CTRL: u32 = 0x0004;
 const REG_LIFO_CTRL: u32 = 0x000C;
+const REG_LIFO_STATUS: u32 = 0x0010;
+const REG_REFRACTORY_CTRL: u32 = 0x0020;
 const REG_ROI_WIN_CTRL: u32 = 0x0034;
 const REG_ROI_WIN_START_ADDR: u32 = 0x0038;
 const REG_ROI_WIN_END_ADDR: u32 = 0x003C;
 const REG_IPH_MIRR_CTRL: u32 = 0x0074;
 const REG_DIG_PAD2_CTRL: u32 = 0x0044;
+const REG_ADC_CONTROL: u32 = 0x004C;
+const REG_ADC_STATUS: u32 = 0x0050;
+const REG_ADC_MISC_CTRL: u32 = 0x0054;
+const REG_TEMP_CTRL: u32 = 0x005C;
 
 const REG_BIAS_FO: u32 = 0x1004;
 const REG_BIAS_HPF: u32 = 0x100C;
@@ -42,14 +49,50 @@ const REG_EDF_RESERVED_7004: u32 = 0x7004;
 
 const BIAS_CONF: u32 = 0x11A1_0000;
 
-#[derive(Debug, Clone, Copy)]
-struct BiasDefaults {
-    fo: u8,
-    hpf: u8,
-    diff_on: u8,
-    diff_off: u8,
-    refr: u8,
-}
+// Sensor monitoring block: the fields behind Metavision's `I_Monitoring`
+// facility, which is the only place the IMX636 reports an abstract setting
+// back as an absolute physical quantity. Field offsets come from OpenEB's
+// `Imx636RegisterMap`, the conversions from `TzImx636`.
+
+/// `refractory_ctrl.refr_counter` — 28-bit dead-time measurement.
+const REFR_COUNTER_MASK: u32 = (1 << 28) - 1;
+/// `refractory_ctrl.refr_valid` — the counter holds a completed measurement.
+const REFR_VALID: u32 = 1 << 28;
+/// `refractory_ctrl.refr_cnt_en` — run the dead-time counter.
+const REFR_CNT_EN: u32 = 1 << 30;
+/// `refractory_ctrl.refr_en` — power up the refractory monitor.
+const REFR_EN: u32 = 1 << 31;
+/// The refractory counter ticks on both edges of the 100 MHz sensor clock.
+const REFRACTORY_TICKS_PER_US: f32 = 200.0;
+
+/// `lifo_status.lifo_ton`, masked as OpenEB's `get_illumination` masks it. The
+/// register map declares 29 bits; the two dropped bits only matter far below
+/// 0.01 lux, so matching the reference implementation keeps the calibration
+/// constants below meaningful.
+const LIFO_TON_MASK: u32 = (1 << 27) - 1;
+/// `lifo_status.lifo_ton_valid`.
+const LIFO_TON_VALID: u32 = 1 << 29;
+
+/// `adc_control.adc_en`, `.adc_clk_en`, `.adc_start`.
+const ADC_EN: u32 = 1 << 0;
+const ADC_CLK_EN: u32 = 1 << 1;
+const ADC_START: u32 = 1 << 2;
+/// `adc_status.adc_dac_dyn` — 10-bit conversion result.
+const ADC_DAC_DYN_MASK: u32 = (1 << 10) - 1;
+/// `adc_status.adc_done_dyn`.
+const ADC_DONE_DYN: u32 = 1 << 11;
+/// `adc_misc_ctrl.adc_buf_cal_en`, `.adc_temp`.
+const ADC_BUF_CAL_EN: u32 = 1 << 1;
+const ADC_TEMP: u32 = 1 << 12;
+/// `temp_ctrl.temp_buf_cal_en`, `.temp_buf_en`.
+const TEMP_BUF_CAL_EN: u32 = 1 << 0;
+const TEMP_BUF_EN: u32 = 1 << 1;
+
+/// Polling budgets for the three monitoring readbacks. Each iteration is one
+/// USB control transfer, so these stay as tight as OpenEB's.
+const REFRACTORY_READ_RETRIES: u8 = 10;
+const LIFO_READ_RETRIES: u8 = 10;
+const TEMPERATURE_READ_RETRIES: u8 = 5;
 
 #[derive(Debug, Clone, Copy)]
 struct StcThresholdParam {
@@ -87,7 +130,11 @@ impl RegOp {
 pub struct Imx636 {
     device_id: u32,
     compatible: Vec<String>,
-    bias_defaults: Option<BiasDefaults>,
+    bias_defaults: Option<BiasCodes>,
+    /// Whether the temperature ADC has been brought up. The init is deferred
+    /// to the first temperature read so a session that never opens the
+    /// settings panel pays nothing for it.
+    temperature_adc_ready: bool,
 }
 
 impl Default for Imx636 {
@@ -102,6 +149,7 @@ impl Imx636 {
             device_id,
             compatible,
             bias_defaults: None,
+            temperature_adc_ready: false,
         }
     }
 
@@ -119,21 +167,29 @@ impl Imx636 {
         Ok(chip_id == 0xA040_1806 && (mode & 0x3) == 0)
     }
 
-    fn load_bias_defaults(&mut self, transport: &mut Transport) -> Result<BiasDefaults> {
+    /// Factory-trimmed bias codes, cached from the first read. `init` runs this
+    /// before any bias write, so the cached codes are the ones the configured
+    /// offsets are relative to.
+    fn load_bias_defaults(&mut self, transport: &mut Transport) -> Result<BiasCodes> {
         if let Some(defaults) = self.bias_defaults {
             return Ok(defaults);
         }
 
+        let defaults = self.read_bias_codes(transport)?;
+        self.bias_defaults = Some(defaults);
+        Ok(defaults)
+    }
+
+    /// Absolute 8-bit codes currently sitting in the five bias registers.
+    fn read_bias_codes(&self, transport: &mut Transport) -> Result<BiasCodes> {
         let mut tz = Treuzell::new(transport);
-        let defaults = BiasDefaults {
+        Ok(BiasCodes {
             fo: (tz.read_reg32(self.device_id, REG_BIAS_FO)? & 0xFF) as u8,
             hpf: (tz.read_reg32(self.device_id, REG_BIAS_HPF)? & 0xFF) as u8,
             diff_on: (tz.read_reg32(self.device_id, REG_BIAS_DIFF_ON)? & 0xFF) as u8,
             diff_off: (tz.read_reg32(self.device_id, REG_BIAS_DIFF_OFF)? & 0xFF) as u8,
             refr: (tz.read_reg32(self.device_id, REG_BIAS_REFR)? & 0xFF) as u8,
-        };
-        self.bias_defaults = Some(defaults);
-        Ok(defaults)
+        })
     }
 
     fn apply_sequence(&self, transport: &mut Transport, sequence: &[RegOp]) -> Result<()> {
@@ -300,6 +356,86 @@ impl Imx636 {
         let ms =
             ((threshold_us as f32 / 1000.0).round() as usize).clamp(1, STC_THRESHOLD_PARAMS.len());
         STC_THRESHOLD_PARAMS[ms - 1]
+    }
+
+    /// Measured pixel dead time (refractory period) in µs — the absolute
+    /// counterpart to the `refr` bias offset.
+    ///
+    /// Mirrors OpenEB's `TzImx636::get_pixel_dead_time`. The enable bits stay
+    /// set after the read, as they do in OpenEB: the monitor needs them on to
+    /// produce a value, and re-arming it on every poll would only add USB
+    /// traffic. `refractory_ctrl` (0x0020) is a monitoring register, distinct
+    /// from the `bias_refr` DAC at 0x1020, so this does not alter the pixel
+    /// configuration.
+    fn read_pixel_dead_time_us(&self, transport: &mut Transport) -> Result<Option<f32>> {
+        let enable = REFR_EN | REFR_CNT_EN;
+        self.write_masked(transport, REG_REFRACTORY_CTRL, enable, enable)?;
+
+        let mut tz = Treuzell::new(transport);
+        for _ in 0..REFRACTORY_READ_RETRIES {
+            // One read per attempt: taking `refr_valid` and `refr_counter`
+            // from the same word rules out the counter updating between two
+            // separate reads.
+            let reg = tz.read_reg32(self.device_id, REG_REFRACTORY_CTRL)?;
+            if reg & REFR_VALID != 0 {
+                let counter = reg & REFR_COUNTER_MASK;
+                return Ok(Some(counter as f32 / REFRACTORY_TICKS_PER_US));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Scene illumination in lux, from the LIFO integration counter.
+    ///
+    /// Mirrors OpenEB's `TzImx636::get_illumination`. `init` already enables
+    /// the LIFO and its counter, so no arming is needed here.
+    fn read_illumination_lux(&self, transport: &mut Transport) -> Result<Option<f32>> {
+        let mut tz = Treuzell::new(transport);
+        for _ in 0..LIFO_READ_RETRIES {
+            let reg = tz.read_reg32(self.device_id, REG_LIFO_STATUS)?;
+            if reg & LIFO_TON_VALID == 0 {
+                continue;
+            }
+            let counter = reg & LIFO_TON_MASK;
+            if counter == 0 || counter == LIFO_TON_MASK {
+                // An empty or saturated integration window carries no value
+                // the logarithmic conversion could turn into a lux figure.
+                return Ok(None);
+            }
+            let integration_us = counter as f32 / 100.0;
+            return Ok(Some(10_f32.powf(3.5 - (integration_us * 0.37).log10())));
+        }
+        Ok(None)
+    }
+
+    /// Sensor die temperature in °C, from the on-chip ADC.
+    ///
+    /// Mirrors OpenEB's `TzImx636::get_temperature`, including the ADC bring-up
+    /// that OpenEB performs during device init.
+    fn read_temperature_c(&mut self, transport: &mut Transport) -> Result<Option<f32>> {
+        if !self.temperature_adc_ready {
+            self.apply_sequence(transport, IMX636_TEMPERATURE_ADC_INIT)?;
+            self.temperature_adc_ready = true;
+        }
+        self.apply_sequence(transport, IMX636_TEMPERATURE_ADC_START)?;
+
+        let mut reading = None;
+        {
+            let mut tz = Treuzell::new(transport);
+            for _ in 0..TEMPERATURE_READ_RETRIES {
+                let reg = tz.read_reg32(self.device_id, REG_ADC_STATUS)?;
+                if reg & ADC_DONE_DYN != 0 {
+                    let code = (reg & ADC_DAC_DYN_MASK) as f32;
+                    reading = Some(0.190 * code - 56.0);
+                    break;
+                }
+            }
+        }
+
+        // Gate the ADC clock again even when the conversion never completed,
+        // so a failed read cannot leave the converter running.
+        self.write_masked(transport, REG_ADC_CONTROL, 0, ADC_CLK_EN)?;
+        Ok(reading)
     }
 }
 
@@ -543,6 +679,19 @@ impl PseeSensor for Imx636 {
     fn stop_streaming(&mut self, transport: &mut Transport) -> Result<()> {
         self.apply_sequence(transport, ISSD_STOP)
     }
+
+    fn read_monitoring(&mut self, transport: &mut Transport) -> Result<SensorMonitoring> {
+        let factory_default = self.load_bias_defaults(transport)?;
+        Ok(SensorMonitoring {
+            pixel_dead_time_us: self.read_pixel_dead_time_us(transport)?,
+            illumination_lux: self.read_illumination_lux(transport)?,
+            temperature_c: self.read_temperature_c(transport)?,
+            biases: Some(BiasReadback {
+                current: self.read_bias_codes(transport)?,
+                factory_default,
+            }),
+        })
+    }
 }
 
 fn check_range(name: &str, value: i32, min: i32, max: i32) -> Result<()> {
@@ -636,6 +785,26 @@ const ISSD_INIT: &[RegOp] = &[
     RegOp::write(0x00009004, 0x00000000),
     RegOp::delay_us(1000),
     RegOp::write(0x00009000, 0x00000200),
+];
+
+/// Temperature ADC and buffer bring-up, from OpenEB's
+/// `TzImx636::temperature_init`. Runs once before the first temperature read.
+const IMX636_TEMPERATURE_ADC_INIT: &[RegOp] = &[
+    RegOp::write_field(REG_ADC_CONTROL, ADC_EN, ADC_EN),
+    RegOp::write_field(REG_ADC_CONTROL, ADC_CLK_EN, ADC_CLK_EN),
+    RegOp::write_field(REG_ADC_MISC_CTRL, ADC_BUF_CAL_EN, ADC_BUF_CAL_EN),
+    RegOp::delay_us(100),
+    RegOp::write_field(REG_TEMP_CTRL, TEMP_BUF_EN, TEMP_BUF_EN),
+    RegOp::write_field(REG_TEMP_CTRL, TEMP_BUF_CAL_EN, TEMP_BUF_CAL_EN),
+    RegOp::delay_us(100),
+    RegOp::write_field(REG_ADC_CONTROL, 0, ADC_CLK_EN),
+];
+
+/// Ungate the ADC clock, select the temperature channel, start one conversion.
+const IMX636_TEMPERATURE_ADC_START: &[RegOp] = &[
+    RegOp::write_field(REG_ADC_CONTROL, ADC_CLK_EN, ADC_CLK_EN),
+    RegOp::write_field(REG_ADC_MISC_CTRL, ADC_TEMP, ADC_TEMP),
+    RegOp::write_field(REG_ADC_CONTROL, ADC_START, ADC_START),
 ];
 
 const IMX636_EXTERNAL_TRIGGER_ENABLE_CH0: &[RegOp] = &[
@@ -1232,6 +1401,40 @@ mod tests {
             sequence,
             [RegOp::write_field(REG_EDF_RESERVED_7004, 0, 0x0400)]
         );
+    }
+
+    #[test]
+    fn refractory_fields_do_not_overlap_and_cover_the_counter() {
+        // A misplaced bit here would silently turn a valid-flag bit into part
+        // of the counter and skew every dead-time reading.
+        assert_eq!(REFR_COUNTER_MASK, 0x0FFF_FFFF);
+        assert_eq!(
+            REFR_COUNTER_MASK & (REFR_VALID | REFR_CNT_EN | REFR_EN),
+            0,
+            "control and status bits must sit outside the counter",
+        );
+        assert_eq!(
+            (REFR_VALID | REFR_CNT_EN | REFR_EN).count_ones(),
+            3,
+            "the three control/status bits must be distinct",
+        );
+    }
+
+    #[test]
+    fn refractory_counter_converts_to_microseconds() {
+        // 200 counts per µs: one full microsecond, and the 6.35 µs a default
+        // refr bias produces on a typical unit.
+        assert_eq!(200.0 / REFRACTORY_TICKS_PER_US, 1.0);
+        assert_eq!(1270.0 / REFRACTORY_TICKS_PER_US, 6.35);
+    }
+
+    #[test]
+    fn temperature_code_converts_to_celsius() {
+        let celsius = |code: u32| 0.190 * code as f32 - 56.0;
+        assert!((celsius(512) - 41.28).abs() < 0.01);
+        // The ADC result is 10 bits; anything wider would be a field-mask bug.
+        assert_eq!(ADC_DAC_DYN_MASK, 0x3FF);
+        assert_eq!(ADC_DAC_DYN_MASK & ADC_DONE_DYN, 0);
     }
 
     #[test]

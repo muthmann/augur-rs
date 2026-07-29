@@ -1,6 +1,19 @@
-use augur_core::{config::CameraConfig, pipeline::PipelineStatsSnapshot};
+use augur_core::{
+    camera::BiasReadback,
+    config::CameraConfig,
+    pipeline::{PipelineStatsSnapshot, SensorMonitoringSnapshot},
+};
 
 pub(crate) const IMX636_DEM_SLOTS: usize = 64;
+
+/// Beyond this age a monitoring reading is called out as stale rather than
+/// shown as if it were current. The control thread refreshes every 500 ms, so
+/// anything past this means polling has stalled.
+const MONITORING_STALE_AFTER_S: f64 = 2.0;
+
+const BIAS_CODE_TOOLTIP: &str = "Absolute 8-bit bias code programmed on the sensor, next to this unit's factory-trimmed default (the code for offset 0). The IMX636 publishes no conversion from this bias to a physical unit, so the code is the absolute value the sensor actually works with.";
+
+const DEAD_TIME_TOOLTIP: &str = "Refractory period measured by the sensor's own dead-time monitor — the absolute value this refr offset produces, i.e. the minimum time between two events from one pixel. Read live from the camera, not computed from the slider.";
 
 // A UI aggregator that threads scattered app state into one settings panel;
 // grouping the arguments would only move the plumbing elsewhere.
@@ -14,8 +27,16 @@ pub fn draw_settings(
     sensor_width: u16,
     sensor_height: u16,
     pipeline_stats: Option<PipelineStatsSnapshot>,
+    sensor_monitoring: Option<&SensorMonitoringSnapshot>,
 ) -> bool {
     let mut changed = false;
+
+    // Absolute values sit next to the offsets that produced them, so a reading
+    // that has stopped refreshing must not keep sitting there as if it were
+    // current. The Sensor Readout section below explains why it went missing.
+    let fresh_monitoring =
+        sensor_monitoring.filter(|snapshot| snapshot.age_s <= MONITORING_STALE_AFTER_S);
+    let bias_codes = fresh_monitoring.and_then(|snapshot| snapshot.values.biases);
 
     const BIAS_SLIDER_COUNT: usize = 5;
     let bias_count = format!("{BIAS_SLIDER_COUNT} / {BIAS_SLIDER_COUNT}");
@@ -27,38 +48,89 @@ pub fn draw_settings(
         Some(&bias_count),
         |ui| {
             ui.weak("Analog pixel tuning. Values are relative offsets from factory defaults.");
+            if bias_codes.is_none() {
+                ui.small(match sensor_monitoring {
+                    None => {
+                        "Absolute codes and the measured dead time appear while the camera runs."
+                    }
+                    Some(_) => {
+                        "Sensor readback stalled — absolute values hidden until it recovers."
+                    }
+                });
+            }
 
             crate::theme::field_label(ui, "diff_on", None);
             changed |= ui
                 .add(egui::Slider::new(&mut cfg.biases.diff_on, -85..=140))
                 .on_hover_text("ON contrast threshold. Lower = more sensitive to brightness increases (more ON events, more noise). Higher = requires larger brightness change.")
                 .changed();
+            bias_code_readout(ui, bias_codes, |readback| {
+                (readback.current.diff_on, readback.factory_default.diff_on)
+            });
 
             crate::theme::field_label(ui, "diff_off", None);
             changed |= ui
                 .add(egui::Slider::new(&mut cfg.biases.diff_off, -35..=190))
                 .on_hover_text("OFF contrast threshold. Lower = more sensitive to brightness decreases (more OFF events, more noise). Higher = requires larger dimming change.")
                 .changed();
+            bias_code_readout(ui, bias_codes, |readback| {
+                (readback.current.diff_off, readback.factory_default.diff_off)
+            });
 
             crate::theme::field_label(ui, "fo", None);
             changed |= ui
                 .add(egui::Slider::new(&mut cfg.biases.fo, -35..=55))
                 .on_hover_text("Pixel low-pass filter cutoff. Lower = filters more high-frequency flicker (e.g. fluorescent lights) but increases latency. Higher = faster response but admits more flicker noise.")
                 .changed();
+            bias_code_readout(ui, bias_codes, |readback| {
+                (readback.current.fo, readback.factory_default.fo)
+            });
 
             crate::theme::field_label(ui, "hpf", None);
             changed |= ui
                 .add(egui::Slider::new(&mut cfg.biases.hpf, 0..=120))
                 .on_hover_text("Pixel high-pass filter cutoff. Lower = responds to slower illumination changes. Higher = only responds to fast transients, filtering out slow changes.")
                 .changed();
+            bias_code_readout(ui, bias_codes, |readback| {
+                (readback.current.hpf, readback.factory_default.hpf)
+            });
 
             crate::theme::field_label(ui, "refr", None);
             changed |= ui
                 .add(egui::Slider::new(&mut cfg.biases.refr, -20..=235))
                 .on_hover_text("Refractory period. Higher = shorter dead time, allowing faster event rates. Lower = longer dead time, suppresses hot pixel noise but may miss rapid changes.")
                 .changed();
+            bias_code_readout(ui, bias_codes, |readback| {
+                (readback.current.refr, readback.factory_default.refr)
+            });
+            // The one abstract bias the sensor can report back in a physical
+            // unit, so it belongs directly under its slider.
+            if let Some(dead_time_us) =
+                fresh_monitoring.and_then(|snapshot| snapshot.values.pixel_dead_time_us)
+            {
+                readout_line(
+                    ui,
+                    format!("dead time  {}", format_measurement(dead_time_us, "µs")),
+                )
+                .on_hover_text(DEAD_TIME_TOOLTIP);
+            }
         },
     );
+
+    if let Some(snapshot) = sensor_monitoring {
+        ui.separator();
+        crate::theme::collapse(
+            ui,
+            "settings_sensor_readout",
+            "Sensor Readout",
+            false,
+            None,
+            |ui| {
+                ui.weak("Live values measured on the sensor itself, not derived from the settings above.");
+                draw_sensor_readout(ui, snapshot);
+            },
+        );
+    }
 
     ui.separator();
     crate::theme::collapse(ui, "settings_roi", "ROI", false, None, |ui| {
@@ -288,4 +360,106 @@ pub fn draw_settings(
     );
 
     changed
+}
+
+/// Muted monospace line used for the absolute readouts under a slider.
+fn readout_line(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
+    ui.label(
+        egui::RichText::new(text.into())
+            .monospace()
+            .size(11.0)
+            .color(palette.fg_3),
+    )
+}
+
+/// The absolute bias code programmed on the sensor plus this unit's factory
+/// default, drawn under the slider holding the relative offset.
+fn bias_code_readout(
+    ui: &mut egui::Ui,
+    readback: Option<BiasReadback>,
+    pick: impl FnOnce(&BiasReadback) -> (u8, u8),
+) {
+    let Some(readback) = readback else {
+        return;
+    };
+    let (code, factory_default) = pick(&readback);
+    readout_line(ui, format!("abs {code}  ·  factory {factory_default}"))
+        .on_hover_text(BIAS_CODE_TOOLTIP);
+}
+
+/// Sensor-measured quantities that are not settings themselves but describe the
+/// conditions a bias setting was chosen under.
+fn draw_sensor_readout(ui: &mut egui::Ui, snapshot: &SensorMonitoringSnapshot) {
+    let values = &snapshot.values;
+    let mut any_reading = false;
+
+    if let Some(dead_time_us) = values.pixel_dead_time_us {
+        readout_line(
+            ui,
+            format!("dead time     {}", format_measurement(dead_time_us, "µs")),
+        )
+        .on_hover_text(DEAD_TIME_TOOLTIP);
+        any_reading = true;
+    }
+    if let Some(lux) = values.illumination_lux {
+        readout_line(ui, format!("illumination  {}", format_measurement(lux, "lux")))
+            .on_hover_text("Scene illumination integrated by the sensor's LIFO block. Worth recording next to a bias setting, since the usable bias range depends on the light level.");
+        any_reading = true;
+    }
+    if let Some(temperature_c) = values.temperature_c {
+        readout_line(ui, format!("die temp      {temperature_c:.1} °C"))
+            .on_hover_text("Sensor die temperature from the on-chip ADC. Analog bias behaviour drifts with temperature, so this belongs in the log of a bias sweep.");
+        any_reading = true;
+    }
+    if !any_reading {
+        ui.small("No measurement available right now.");
+    }
+
+    if snapshot.age_s > MONITORING_STALE_AFTER_S {
+        ui.small(
+            egui::RichText::new(format!("last update {:.0} s ago", snapshot.age_s))
+                .color(ui.visuals().warn_fg_color),
+        )
+        .on_hover_text(
+            "Readings normally refresh twice per second. A growing age means the camera control \
+             thread is no longer completing the readback.",
+        );
+    }
+    if let Some(error) = &snapshot.error {
+        ui.small(egui::RichText::new(error).color(ui.visuals().warn_fg_color))
+            .on_hover_text(
+                "The most recent readback failed. Any values above are the last successful reading.",
+            );
+    }
+}
+
+/// Three significant digits, so a value that jitters in its last decimal does
+/// not make the panel look unstable.
+fn format_measurement(value: f32, unit: &str) -> String {
+    if value >= 100.0 {
+        format!("{value:.0} {unit}")
+    } else if value >= 10.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.2} {unit}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measurement_precision_shrinks_with_magnitude() {
+        assert_eq!(format_measurement(6.3456, "µs"), "6.35 µs");
+        assert_eq!(format_measurement(42.4242, "µs"), "42.4 µs");
+        assert_eq!(format_measurement(1234.7, "lux"), "1235 lux");
+    }
+
+    #[test]
+    fn measurement_keeps_two_decimals_below_ten() {
+        assert_eq!(format_measurement(0.0, "lux"), "0.00 lux");
+        assert_eq!(format_measurement(9.999, "µs"), "10.00 µs");
+    }
 }

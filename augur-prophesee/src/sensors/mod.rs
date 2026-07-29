@@ -1,6 +1,6 @@
 mod imx636;
 
-use augur_core::{config::*, Result};
+use augur_core::{camera::SensorMonitoring, config::*, Result};
 
 pub use imx636::Imx636;
 
@@ -33,4 +33,10 @@ pub trait PseeSensor: Send {
     }
     fn start_streaming(&mut self, transport: &mut Transport) -> Result<()>;
     fn stop_streaming(&mut self, transport: &mut Transport) -> Result<()>;
+
+    /// Reads absolute values for settings the config only expresses as
+    /// relative offsets. Sensors without a monitoring block report nothing.
+    fn read_monitoring(&mut self, _transport: &mut Transport) -> Result<SensorMonitoring> {
+        Ok(SensorMonitoring::default())
+    }
 }
