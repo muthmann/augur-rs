@@ -1,7 +1,7 @@
 use std::{collections::HashSet, fs, thread, time::Duration};
 
 use augur_core::{
-    camera::{BiasCodes, BiasReadback, SensorMonitoring},
+    camera::{BiasCodes, BiasReadback, SensorMonitoring, SensorMonitoringSelection},
     config::{BiasConfig, DigitalFilterConfig, ExternalTriggerConfig, PixelMaskConfig, RoiConfig},
     CameraError, Result,
 };
@@ -681,15 +681,42 @@ impl PseeSensor for Imx636 {
     }
 
     fn read_monitoring(&mut self, transport: &mut Transport) -> Result<SensorMonitoring> {
-        let factory_default = self.load_bias_defaults(transport)?;
-        Ok(SensorMonitoring {
-            pixel_dead_time_us: self.read_pixel_dead_time_us(transport)?,
-            illumination_lux: self.read_illumination_lux(transport)?,
-            temperature_c: self.read_temperature_c(transport)?,
-            biases: Some(BiasReadback {
+        self.read_monitoring_selected(transport, SensorMonitoringSelection::ALL)
+    }
+
+    fn read_monitoring_selected(
+        &mut self,
+        transport: &mut Transport,
+        selection: SensorMonitoringSelection,
+    ) -> Result<SensorMonitoring> {
+        if selection.is_empty() {
+            return Ok(SensorMonitoring::default());
+        }
+        let biases = if selection.biases {
+            Some(BiasReadback {
                 current: self.read_bias_codes(transport)?,
-                factory_default,
-            }),
+                factory_default: self.load_bias_defaults(transport)?,
+            })
+        } else {
+            None
+        };
+        Ok(SensorMonitoring {
+            pixel_dead_time_us: selection
+                .pixel_dead_time
+                .then(|| self.read_pixel_dead_time_us(transport))
+                .transpose()?
+                .flatten(),
+            illumination_lux: selection
+                .illumination
+                .then(|| self.read_illumination_lux(transport))
+                .transpose()?
+                .flatten(),
+            temperature_c: selection
+                .temperature
+                .then(|| self.read_temperature_c(transport))
+                .transpose()?
+                .flatten(),
+            biases,
         })
     }
 }

@@ -265,9 +265,22 @@ fn record(
         }
     }
 
+    let final_stats = controller.stats_snapshot();
     controller.shutdown().context("pipeline shutdown failed")?;
     if let Some(err) = fatal_error {
         anyhow::bail!("pipeline failed: {err}");
+    }
+    if final_stats.recording_may_have_gaps() {
+        eprintln!(
+            "WARNING: the recording path stalled {} time(s) (longest {:.1} ms, total {:.1} ms). \
+             The camera FIFO overflows while the host cannot accept data, so this file may \
+             contain event gaps.",
+            final_stats.raw_pool_starvation_events,
+            final_stats.raw_pool_starvation_max_us as f64 / 1_000.0,
+            final_stats.raw_pool_starvation_us as f64 / 1_000.0,
+        );
+    } else {
+        println!("Recording path never stalled; no host-side event loss.");
     }
     println!("Stopped.");
     Ok(())

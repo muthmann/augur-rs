@@ -42,3 +42,5 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 027: Worker-Owned Semantic Plugin Services](./027-plugin-setting-requests.md)
 - [ADR 028: Allowlisted Plugin to Host Recording Commands](./028-plugin-host-command-queue.md)
 - [ADR 029: Sensor Monitoring Readback For Absolute Setting Values](./029-sensor-monitoring-readback.md)
+- [ADR 030: Reader-Owned Transfer Buffers And Recording Completeness Accounting](./030-recording-completeness-accounting.md)
+- [ADR 031: Optional Sensor-Telemetry Companion Recording](./031-sensor-telemetry-companion-recording.md)

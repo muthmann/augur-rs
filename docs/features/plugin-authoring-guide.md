@@ -60,11 +60,11 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 
 ### Sensor measurements (`HostContext::sensor_monitoring`)
 
-`HostContext::sensor_monitoring()` returns the absolute values the sensor
-measured for the current capture: refractory period (µs), illumination (lux),
-die temperature (°C), and the absolute bias codes with their per-unit factory
-defaults. The camera configuration only carries relative bias offsets, so these
-cannot be derived plugin-side.
+`HostContext::sensor_monitoring()` returns the absolute values reported by the
+sensor monitor for the current capture: estimated refractory period (µs),
+illumination (lux), die temperature (°C), and the absolute bias codes with their
+per-unit factory defaults. The camera configuration only carries relative bias
+offsets, so these cannot be derived plugin-side.
 
 ```rust
 if let Some(monitoring) = context.sensor_monitoring() {
@@ -81,6 +81,14 @@ between a live preview and an offline re-run of the same recording, which
 breaks the guarantee that analysis runs are reproducible (ADR 025). Use it for
 logging, provenance, and sanity checks on capture conditions.
 
+These are sensor-monitor conversion outputs, not traceably calibrated
+instruments. Public IMX636/OpenEB material does not specify uncertainty,
+spectral response, field of view, or monitor bandwidth. In particular, use the
+lux value to annotate broad operating conditions, not as a replacement for a
+synchronized photodiode in fast or quantitative optical experiments. The full
+trust model and recommended persistence cadence are documented in
+`docs/features/absolute-setting-values.md`.
+
 Each field is independently `Option`: `None` means the sensor cannot report that
 quantity. Among the biases only `refr` has a physical unit; the other four are
 exposed as absolute codes because no vendor-documented conversion exists
@@ -88,6 +96,9 @@ exposed as absolute codes because no vendor-documented conversion exists
 
 `age_s` is how long before this frame the host actually read the sensor. The
 host polls at a few hertz, so a reading is never simultaneous with its frame.
+The same cached sample may appear on multiple frames and the payload currently
+has no sample ID or error field; enforce an age limit and do not count each
+payload as a new acquisition.
 
 Domain-specific payloads live in companion crates rather than in `augur-plugin-api`. Plugins that share structured data with downstream consumers define their types in `augur-plugin-types` or their own companion crate.
 

@@ -15,7 +15,7 @@ across units and impossible to report in a thesis in physical units.
 
 Research against the Metavision SDK documentation and the OpenEB HAL found
 exactly one settings-related absolute readback for this sensor:
-`I_Monitoring::get_pixel_dead_time()`, which measures the refractory period in
+`I_Monitoring::get_pixel_dead_time()`, which estimates the refractory period in
 µs from the `refractory_ctrl` register. The same monitoring block also reports
 illumination in lux and die temperature in °C. For `diff_on`, `diff_off`, `fo`
 and `hpf` there is **no** vendor-documented conversion to a physical unit and no
@@ -38,8 +38,9 @@ when nothing is displaying it.
 - **`augur-core::camera` owns the vocabulary.** `SensorMonitoring` carries
   `Option` fields for pixel dead time (µs), illumination (lux), temperature (°C)
   and a `BiasReadback` (`current` and `factory_default` `BiasCodes`). `None`
-  means "this sensor cannot report it" — the host never substitutes a computed
-  estimate for a missing measurement.
+  means the monitor supplied no value; the current model does not distinguish
+  unsupported from temporarily invalid fields. The host never substitutes a
+  computed guess for a missing monitor value.
 - **`EventCamera::read_monitoring()` is an optional trait method** defaulting to
   an empty reading, mirrored by `PseeSensor::read_monitoring` for per-sensor
   implementations. Replay, decoded imports and ingress sources inherit the
@@ -53,8 +54,9 @@ when nothing is displaying it.
   `PipelineController::sensor_monitoring_needed` gates the poll, which runs from
   the control thread's existing 50 ms idle tick at most every 500 ms. The GUI
   sets the flag when the settings panel is open or runtime plugins are enabled,
-  following the `raw_events_needed` precedent. A successful reconfigure resets
-  the interval so post-apply codes appear immediately.
+  following the `raw_events_needed` precedent. Any reconfiguration attempt
+  resets the interval; after a successful apply this makes the post-apply codes
+  appear immediately, while a failed apply still causes an immediate re-read.
 - **Sources whose camera runs inline on the stream thread get no monitoring at
   all.** Polling there would pause packet reads and cost recorded events, which
   ranks below any display concern.
@@ -68,18 +70,22 @@ when nothing is displaying it.
   it and an offline re-run of the same recording does not.
 - **Freshness is part of the contract.** `SensorMonitoringSnapshot` carries an
   age and the last error. Values shown beside a slider are withdrawn once the
-  reading passes 2 s; a failed poll keeps the last good values but does not
+  reading passes 2 s; the separate Sensor Readout keeps the last values with an
+  age/error warning. Plugins receive the age but not the error and must enforce
+  their own age limit. A failed poll keeps the last good values but does not
   refresh the timestamp, so the age keeps growing. Clearing the demand flag
   discards the reading.
 
 ## Consequences
 
-- The GUI shows the measured refractory period in µs beside the `refr` offset,
+- The GUI shows the sensor-estimated refractory period in µs beside the `refr` offset,
   and the absolute bias code beside each of the five biases. `augur status`
   prints the same values for lab logging.
 - Illumination and die temperature become available. They are not settings, so
   they live in their own Sensor Readout section rather than among the biases —
-  their value is as recorded context for a bias sweep.
+  their value is as operating context for a bias sweep. Public vendor material
+  provides the conversions but no accuracy, uncertainty or bandwidth, so they
+  are telemetry rather than calibrated substitutes for external instruments.
 - The plugin ABI is untouched: `augur-plugin-api` gains companion types and a
   `HostContext` accessor, but no vtable entry and no `PLUGIN_ABI_VERSION` bump,
   so already-built plugins keep loading.
@@ -90,6 +96,12 @@ when nothing is displaying it.
 - The IMX636 temperature ADC is now brought up (lazily, on first read), which
   OpenEB does during device init. The dead-time monitor's enable bits stay set
   after a read, as they do in OpenEB.
+- Monitoring is never embedded in EVT3 and is never frame-synchronous. ADR 031
+  adds an opt-in low-rate companion CSV with host-monotonic poll brackets and
+  RAW payload byte offsets while retaining the different-clock distinction.
+- Current plugin transport repeats the cached snapshot on each processed frame
+  and has no sample ID or acquisition timestamp beyond `age_s`; it is suitable
+  for optional context, not yet a lossless monitoring-series schema.
 - Should Prophesee publish a bias-to-physical mapping, or the datasheet become
   available, the remaining four biases can be filled in behind the same
   `Option` fields without touching the transport, pipeline or UI structure.

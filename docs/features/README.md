@@ -16,6 +16,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 ## Index
 
 - [AugurRS SDK Overview](./augur-sdk.md) — shared backend, runtime guarantees, IMX636-specific behavior, recording details
+- [Recording Completeness](./recording-completeness.md) — gap-free capture path, reader-owned transfer buffers, stop-time drain, stall accounting in the GUI/CLI/sidecar, and live-analysis coverage
 - [Performance Safeguards](./performance-safeguards.md) — capture-path fail-fast setup, stop-time drain behavior, preview throttling, and UI-side load shedding
 - [Performance Overhaul](./performance-overhaul.md) — split pipeline telemetry, direct `Color32` preview rendering, async decoded replay opening, and generation-aware host caching
 - [WGPU Preview Rendering](./wgpu-preview-rendering.md) — dual-backend startup, shader-driven preview textures, shared overlay painting, and preview perf telemetry
@@ -28,7 +29,8 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Rich Recording Metadata](./rich-recording-metadata.md) — self-describing EVT3 headers, metadata sidecars, and replay provenance
 - [Replay](./raw-replay.md) — `.raw` plus decoded-event replay, seekable transport controls, persisted EOF state
 - [External Triggers & Execution Context](./external-triggers.md) — EVK4 TRIG_IN enable, EXT_TRIGGER delivery to plugins through live/replay/offline paths, and the fail-closed plugin execution context (ABI v5)
-- [Absolute Setting Values](./absolute-setting-values.md) — measured refractory period in µs beside the `refr` offset, absolute bias codes with per-unit factory defaults, illumination/die-temperature readout, and which settings have no documented physical unit
+- [Absolute Setting Values](./absolute-setting-values.md) — sensor-reported refractory period, illumination, die temperature and bias codes, including calculation provenance, reliability limits, recommended logging cadence, and measurement interactions
+- [Sensor Telemetry Companion Recording](./sensor-telemetry-recording.md) — opt-in CSV persistence, selective 1.5/0.2-Hz register polling, RAW-byteoffset time correlation, and direct Capture controls
 - [Python Event Ingress](./python-event-ingress.md) — loopback `evt3.augur` connector support for publishing NumPy event arrays into the existing Augur preview pipeline
 - [Theme-Aware GUI Status Colors](./theme-aware-gui-status-colors.md) — theme-adaptive warning/error labels plus contrast-safe success/info colors
 - [Design System](./design-system.md) — workbench palette, spacing/radius tokens, magenta/cyan polarity preview, condensed status footer, and the `theme::visuals` builder used by every panel

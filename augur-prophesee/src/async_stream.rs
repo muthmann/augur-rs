@@ -7,13 +7,22 @@
 //! fills the next buffer while the pipeline processes the previous one and
 //! there is no host-side dead time between reads.
 //!
+//! Buffer ownership: the reader owns both the transfer buffers and a pool of
+//! spares. A completed transfer is re-armed with a spare *immediately*, and its
+//! filled buffer is queued for delivery. Re-arming therefore never waits for
+//! the pipeline to hand a buffer back, which matters because the pipeline can
+//! stall (slow disk) for far longer than the device FIFO survives. While the
+//! pipeline has no free buffer it calls [`AsyncBulkStreamReader::service`],
+//! which keeps reaping and re-arming so the endpoint stays fed.
+//!
 //! Threading model: all submission, reaping, and event handling happen on the
 //! thread that owns the reader (the pipeline's stream thread). libusb may
 //! invoke the completion callback from another thread that happens to be
 //! pumping events for the same context (the control thread's synchronous
 //! transfers do this), so the completion queue is mutex-protected. Ordering
 //! is preserved because bulk IN URBs on one endpoint complete in submission
-//! order and libusb fires callbacks in completion order.
+//! order, libusb fires callbacks in completion order, and a re-armed transfer
+//! always goes to the tail of the endpoint's queue.
 
 use std::{
     collections::VecDeque,
@@ -36,6 +45,12 @@ const TRANSFER_BUF_SIZE: usize = 65_536;
 const TRANSFER_TIMEOUT_MS: u32 = 100;
 const EVENT_POLL_STEP: Duration = Duration::from_millis(10);
 const DROP_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+
+type StreamBuffer = Box<[u8; TRANSFER_BUF_SIZE]>;
+
+fn new_stream_buffer() -> StreamBuffer {
+    Box::new([0_u8; TRANSFER_BUF_SIZE])
+}
 
 struct CompletionQueue {
     completed: Mutex<VecDeque<usize>>,
@@ -76,7 +91,10 @@ extern "system" fn stream_transfer_done(transfer: *mut ffi::libusb_transfer) {
 
 struct TransferSlot {
     transfer: *mut ffi::libusb_transfer,
-    buffer: Option<Box<[u8; TRANSFER_BUF_SIZE]>>,
+    /// `None` while the slot's buffer is queued for delivery and no spare was
+    /// available to take its place; such a slot is re-armed as soon as a
+    /// buffer is recycled.
+    buffer: Option<StreamBuffer>,
     tag: Option<Box<CallbackTag>>,
     in_flight: bool,
 }
@@ -88,6 +106,14 @@ pub struct AsyncBulkStreamReader {
     transport: Transport,
     queue: Option<Box<CompletionQueue>>,
     slots: Vec<TransferSlot>,
+    /// Buffers available to re-arm a reaped transfer.
+    spare: Vec<StreamBuffer>,
+    /// Received payloads awaiting delivery, in completion order.
+    ready: VecDeque<(StreamBuffer, usize)>,
+    /// Sticky transport failure. Reported only once every already-received
+    /// packet has been delivered, so a failing device never costs data the
+    /// host already holds.
+    fatal: Option<String>,
 }
 
 // Safety: the reader is used from one thread at a time (`read_packet` takes
@@ -98,6 +124,7 @@ unsafe impl Send for AsyncBulkStreamReader {}
 
 impl AsyncBulkStreamReader {
     pub fn new(transport: Transport, queued_transfers: usize) -> Result<Self> {
+        let queued_transfers = queued_transfers.max(1);
         let queue = Box::new(CompletionQueue {
             completed: Mutex::new(VecDeque::with_capacity(queued_transfers)),
         });
@@ -105,9 +132,14 @@ impl AsyncBulkStreamReader {
             transport,
             queue: Some(queue),
             slots: Vec::with_capacity(queued_transfers),
+            // One spare per transfer: a full round of completions can be
+            // re-armed without the pipeline handing anything back.
+            spare: (0..queued_transfers).map(|_| new_stream_buffer()).collect(),
+            ready: VecDeque::with_capacity(queued_transfers * 2),
+            fatal: None,
         };
 
-        for index in 0..queued_transfers.max(1) {
+        for index in 0..queued_transfers {
             // Safety: libusb_alloc_transfer returns an owned transfer or null.
             let transfer = unsafe { ffi::libusb_alloc_transfer(0) };
             if transfer.is_null() {
@@ -117,7 +149,7 @@ impl AsyncBulkStreamReader {
             }
             reader.slots.push(TransferSlot {
                 transfer,
-                buffer: Some(Box::new([0_u8; TRANSFER_BUF_SIZE])),
+                buffer: Some(new_stream_buffer()),
                 tag: Some(Box::new(CallbackTag {
                     queue: reader
                         .queue
@@ -138,10 +170,11 @@ impl AsyncBulkStreamReader {
         let endpoint = self.transport.stream_endpoint();
         let slot = &mut self.slots[index];
         debug_assert!(!slot.in_flight, "transfer resubmitted while in flight");
-        let buffer = slot
-            .buffer
-            .as_mut()
-            .expect("transfer buffer is present unless leaked on drop");
+        let Some(buffer) = slot.buffer.as_mut() else {
+            // The slot's buffer is queued for delivery and no spare was free.
+            // `rearm_idle_slots` picks it up once one is recycled.
+            return Ok(());
+        };
         let tag = slot
             .tag
             .as_ref()
@@ -190,42 +223,112 @@ impl AsyncBulkStreamReader {
         Ok(())
     }
 
-    fn consume(&mut self, index: usize, out: &mut [u8]) -> Result<usize> {
-        self.slots[index].in_flight = false;
-        // Safety: the transfer is reaped (callback fired), so libusb no
-        // longer touches it and its fields are stable.
-        let (status, actual_length) = unsafe {
-            let transfer = &*self.slots[index].transfer;
-            (transfer.status, transfer.actual_length.max(0) as usize)
-        };
+    /// Collects every completion the kernel already reported: queues the
+    /// received bytes for delivery and puts the transfer back on the endpoint.
+    ///
+    /// Never blocks and never waits for a downstream buffer, so it is safe to
+    /// call while the pipeline is stalled.
+    fn reap(&mut self) {
+        while let Some(index) = self.pop_completed() {
+            self.slots[index].in_flight = false;
+            // Safety: the transfer is reaped (callback fired), so libusb no
+            // longer touches it and its fields are stable.
+            let (status, actual_length) = unsafe {
+                let transfer = &*self.slots[index].transfer;
+                (transfer.status, transfer.actual_length.max(0) as usize)
+            };
 
-        match status {
-            LIBUSB_TRANSFER_COMPLETED | LIBUSB_TRANSFER_TIMED_OUT => {
-                let len = actual_length.min(out.len());
-                if len > 0 {
-                    let buffer = self.slots[index]
-                        .buffer
-                        .as_ref()
-                        .expect("reaped transfer still owns its buffer");
-                    out[..len].copy_from_slice(&buffer[..len]);
+            match status {
+                // A timed-out or cancelled bulk IN transfer still returns the
+                // bytes the device already sent; discarding them would punch a
+                // hole in the recording.
+                LIBUSB_TRANSFER_COMPLETED
+                | LIBUSB_TRANSFER_TIMED_OUT
+                | LIBUSB_TRANSFER_CANCELLED => {
+                    if actual_length > 0 {
+                        let replacement = self.spare.pop();
+                        let filled = match replacement {
+                            Some(replacement) => self.slots[index].buffer.replace(replacement),
+                            None => self.slots[index].buffer.take(),
+                        };
+                        if let Some(filled) = filled {
+                            self.ready.push_back((filled, actual_length));
+                        }
+                    }
                 }
-                self.submit(index)?;
-                if len == 0 {
-                    return Err(CameraError::Timeout("USB stream read timed out".into()));
+                LIBUSB_TRANSFER_STALL => {
+                    self.set_fatal("stream endpoint stalled");
+                    continue;
                 }
-                Ok(len)
+                LIBUSB_TRANSFER_NO_DEVICE => {
+                    self.set_fatal("USB device disconnected");
+                    continue;
+                }
+                other => {
+                    self.set_fatal(&format!("stream transfer failed with status {other}"));
+                    continue;
+                }
             }
-            LIBUSB_TRANSFER_CANCELLED => {
-                Err(CameraError::Timeout("stream transfer cancelled".into()))
+
+            if status == LIBUSB_TRANSFER_CANCELLED {
+                // Cancellation only happens while tearing the reader down; do
+                // not put the transfer back on the endpoint.
+                continue;
             }
-            LIBUSB_TRANSFER_STALL => Err(CameraError::Transport("stream endpoint stalled".into())),
-            LIBUSB_TRANSFER_NO_DEVICE => {
-                Err(CameraError::Transport("USB device disconnected".into()))
+            if let Err(err) = self.submit(index) {
+                self.set_fatal(&err.to_string());
             }
-            other => Err(CameraError::Transport(format!(
-                "stream transfer failed with status {other}"
-            ))),
         }
+    }
+
+    fn set_fatal(&mut self, message: &str) {
+        if self.fatal.is_none() {
+            self.fatal = Some(message.to_owned());
+        }
+    }
+
+    /// Returns a delivered buffer to the spare pool and re-arms any transfer
+    /// that had to give its buffer up.
+    fn recycle(&mut self, buffer: StreamBuffer) {
+        self.spare.push(buffer);
+        self.rearm_idle_slots();
+    }
+
+    fn rearm_idle_slots(&mut self) {
+        for index in 0..self.slots.len() {
+            if self.spare.is_empty() {
+                break;
+            }
+            let slot = &mut self.slots[index];
+            if slot.in_flight || slot.buffer.is_some() {
+                continue;
+            }
+            slot.buffer = self.spare.pop();
+            if let Err(err) = self.submit(index) {
+                self.set_fatal(&err.to_string());
+            }
+        }
+    }
+
+    /// Moves the oldest received payload into `out`, if one is queued.
+    fn deliver(&mut self, out: &mut [u8]) -> Option<Result<usize>> {
+        let (buffer, len) = self.ready.pop_front()?;
+        if len > out.len() {
+            // Truncating here would silently drop recorded events. The caller's
+            // buffer is sized to `TRANSFER_BUF_SIZE`, so this is a wiring bug.
+            let capacity = out.len();
+            self.recycle(buffer);
+            return Some(Err(CameraError::Transport(format!(
+                "stream packet of {len} bytes does not fit the {capacity}-byte pipeline buffer"
+            ))));
+        }
+        out[..len].copy_from_slice(&buffer[..len]);
+        self.recycle(buffer);
+        Some(Ok(len))
+    }
+
+    fn take_fatal(&mut self) -> Option<CameraError> {
+        self.fatal.take().map(CameraError::Transport)
     }
 }
 
@@ -233,13 +336,39 @@ impl PacketStreamReader for AsyncBulkStreamReader {
     fn read_packet(&mut self, out: &mut [u8]) -> Result<usize> {
         let deadline = Instant::now() + self.transport.stream_timeout();
         loop {
-            if let Some(index) = self.pop_completed() {
-                return self.consume(index, out);
+            self.reap();
+            if let Some(result) = self.deliver(out) {
+                return result;
+            }
+            // Only surface a transport failure once nothing received is left.
+            if let Some(err) = self.take_fatal() {
+                return Err(err);
             }
             if Instant::now() >= deadline {
                 return Err(CameraError::Timeout("USB stream read timed out".into()));
             }
             self.pump_events(EVENT_POLL_STEP)?;
+        }
+    }
+
+    fn service(&mut self, budget: Duration) {
+        // Errors are recorded and reported by the next `read_packet`; there is
+        // nothing useful to do with them here, and the point of this call is to
+        // keep the endpoint fed.
+        if let Err(err) = self.pump_events(budget.min(EVENT_POLL_STEP)) {
+            self.set_fatal(&err.to_string());
+        }
+        self.reap();
+    }
+
+    fn take_buffered_packet(&mut self, out: &mut [u8]) -> Result<usize> {
+        // Non-blocking: collect what the kernel already finished, then hand
+        // over one queued payload.
+        let _ = self.pump_events(Duration::ZERO);
+        self.reap();
+        match self.deliver(out) {
+            Some(result) => result,
+            None => Ok(0),
         }
     }
 }

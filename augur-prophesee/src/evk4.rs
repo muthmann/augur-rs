@@ -1,5 +1,8 @@
 use augur_core::{
-    camera::{DeviceInfo, EventCamera, PacketStreamCamera, PacketStreamReader, SensorMonitoring},
+    camera::{
+        DeviceInfo, EventCamera, PacketStreamCamera, PacketStreamReader, SensorMonitoring,
+        SensorMonitoringSelection,
+    },
     config::CameraConfig,
     CameraError, Result,
 };
@@ -172,6 +175,14 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
 
     fn read_monitoring(&mut self) -> Result<SensorMonitoring> {
         self.sensor.read_monitoring(&mut self.transport)
+    }
+
+    fn read_monitoring_selected(
+        &mut self,
+        selection: SensorMonitoringSelection,
+    ) -> Result<SensorMonitoring> {
+        self.sensor
+            .read_monitoring_selected(&mut self.transport, selection)
     }
 }
 

@@ -1,6 +1,10 @@
 mod imx636;
 
-use augur_core::{camera::SensorMonitoring, config::*, Result};
+use augur_core::{
+    camera::{SensorMonitoring, SensorMonitoringSelection},
+    config::*,
+    Result,
+};
 
 pub use imx636::Imx636;
 
@@ -38,5 +42,13 @@ pub trait PseeSensor: Send {
     /// relative offsets. Sensors without a monitoring block report nothing.
     fn read_monitoring(&mut self, _transport: &mut Transport) -> Result<SensorMonitoring> {
         Ok(SensorMonitoring::default())
+    }
+
+    fn read_monitoring_selected(
+        &mut self,
+        transport: &mut Transport,
+        _selection: SensorMonitoringSelection,
+    ) -> Result<SensorMonitoring> {
+        self.read_monitoring(transport)
     }
 }

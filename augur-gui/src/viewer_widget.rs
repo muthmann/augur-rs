@@ -147,6 +147,10 @@ pub(crate) struct ViewerOutput {
     pub(crate) popup_toggled: bool,
     pub(crate) return_from_external: bool,
     pub(crate) mask_hotpixels_clicked: bool,
+    pub(crate) probe_camera: bool,
+    pub(crate) open_replay: bool,
+    pub(crate) start_preview: bool,
+    pub(crate) start_recording: bool,
     pub(crate) replay_toggle_pause: bool,
     pub(crate) replay_restart: bool,
     pub(crate) replay_stop: bool,
@@ -169,6 +173,10 @@ impl ViewerOutput {
         self.popup_toggled
             || self.return_from_external
             || self.mask_hotpixels_clicked
+            || self.probe_camera
+            || self.open_replay
+            || self.start_preview
+            || self.start_recording
             || self.replay_toggle_pause
             || self.replay_restart
             || self.replay_stop
@@ -202,6 +210,10 @@ impl ViewerOutput {
         self.popup_toggled |= other.popup_toggled;
         self.return_from_external |= other.return_from_external;
         self.mask_hotpixels_clicked |= other.mask_hotpixels_clicked;
+        self.probe_camera |= other.probe_camera;
+        self.open_replay |= other.open_replay;
+        self.start_preview |= other.start_preview;
+        self.start_recording |= other.start_recording;
         self.replay_toggle_pause |= other.replay_toggle_pause;
         self.replay_restart |= other.replay_restart;
         self.replay_stop |= other.replay_stop;
@@ -517,7 +529,12 @@ pub(crate) fn draw_viewer_canvas(
         ));
     } else {
         state.workspace.hover_sensor = None;
-        draw_empty_preview_placeholder(ui, max_image_height, input.mode);
+        output.merge(draw_empty_preview_placeholder(
+            ui,
+            max_image_height,
+            input.mode,
+            input.camera_info.is_some(),
+        ));
     }
     output
 }
@@ -797,6 +814,22 @@ fn draw_status_footer(
                                 stats.preview_accumulate_avg_ms(),
                                 stats.preview_frame_send_avg_ms(),
                             ));
+                            // Recording integrity: preview drops are expected
+                            // and harmless, but a stalled recording path means
+                            // the camera FIFO overflowed and events are gone.
+                            if stats.recording_may_have_gaps() {
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    format!(
+                                        "Recording path stalled {}\u{00D7} (longest {:.1} ms, total {:.1} ms) \u{2014} the recording may have event gaps.",
+                                        stats.raw_pool_starvation_events,
+                                        stats.raw_pool_starvation_max_us as f64 / 1_000.0,
+                                        stats.raw_pool_starvation_us as f64 / 1_000.0,
+                                    ),
+                                );
+                            } else {
+                                ui.small("Recording path: no stalls, no host-side event loss.");
+                            }
                         }
 
                         if let Some(frame_summary) = preview_frame_status_summary(input.frame) {
@@ -1248,8 +1281,64 @@ fn toolbar_icon(symbol: &str) -> egui::RichText {
     egui::RichText::new(symbol).size(18.0)
 }
 
-fn draw_empty_preview_placeholder(ui: &mut egui::Ui, max_image_height: f32, mode: AppMode) {
-    draw_text_placeholder(ui, max_image_height, empty_preview_message(mode));
+fn draw_empty_preview_placeholder(
+    ui: &mut egui::Ui,
+    max_image_height: f32,
+    mode: AppMode,
+    camera_detected: bool,
+) -> ViewerOutput {
+    let mut output = ViewerOutput::default();
+    if mode != AppMode::Idle {
+        draw_text_placeholder(
+            ui,
+            max_image_height,
+            empty_preview_message(mode, camera_detected),
+        );
+        return output;
+    }
+
+    let available = egui::vec2(ui.available_width(), max_image_height);
+    ui.allocate_ui_with_layout(
+        available,
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.add_space((available.y - 150.0).max(24.0) * 0.5);
+            ui.heading(if camera_detected {
+                "Camera detected"
+            } else {
+                "No camera detected"
+            });
+            ui.add_space(6.0);
+            ui.label(if camera_detected {
+                "Start a live preview or begin recording."
+            } else {
+                "Probe the camera here, or open an existing recording."
+            });
+            ui.add_space(14.0);
+            ui.horizontal_centered(|ui| {
+                if camera_detected {
+                    if ui
+                        .add(crate::theme::primary_button("Start Preview"))
+                        .clicked()
+                    {
+                        output.start_preview = true;
+                    }
+                    if ui.button("Record").clicked() {
+                        output.start_recording = true;
+                    }
+                } else if ui
+                    .add(crate::theme::primary_button("Probe Camera"))
+                    .clicked()
+                {
+                    output.probe_camera = true;
+                }
+                if ui.button("Open Replay…").clicked() {
+                    output.open_replay = true;
+                }
+            });
+        },
+    );
+    output
 }
 
 #[derive(Default)]
@@ -2555,9 +2644,12 @@ fn preview_heading(mode: AppMode) -> &'static str {
     }
 }
 
-fn empty_preview_message(mode: AppMode) -> &'static str {
+fn empty_preview_message(mode: AppMode, camera_detected: bool) -> &'static str {
     match mode {
-        AppMode::Idle => "No camera probed. Click Probe Camera to connect, or open a replay file.",
+        AppMode::Idle if camera_detected => {
+            "Camera detected. Start Preview or Record, or open a replay file."
+        }
+        AppMode::Idle => "No camera detected. Probe the camera, or open a replay file.",
         AppMode::Replaying => {
             "No replay frame yet. Use the timeline or wait for playback to decode the next frame."
         }

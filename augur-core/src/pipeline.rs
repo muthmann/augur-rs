@@ -22,7 +22,10 @@ use crossbeam_channel::{
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
-    camera::{EventCamera, PacketStreamCamera, PacketStreamReader, SensorMonitoring},
+    camera::{
+        EventCamera, PacketStreamCamera, PacketStreamReader, SensorMonitoring,
+        SensorMonitoringSelection,
+    },
     config::CameraConfig,
     evt3_timestamps::{Evt3TimestampUnwrapper, SecondaryTimestampMapper},
     metadata::{RecordingMetadata, RecordingSidecar},
@@ -56,6 +59,26 @@ const MAX_PENDING_TRIGGERS: usize = 65_536;
 /// slower than this, so 500 ms keeps the panel live without adding traffic
 /// that matters next to streaming.
 const SENSOR_MONITORING_INTERVAL: Duration = Duration::from_millis(500);
+const SENSOR_TELEMETRY_QUEUE_CAPACITY: usize = 64;
+/// How long the stream loop waits for a free raw buffer before rechecking the
+/// stop flag and the control queue.
+const POOL_WAIT_WINDOW: Duration = Duration::from_millis(10);
+/// Slice the stream loop parks on the buffer pool between transport service
+/// calls while the pool is empty.
+const POOL_WAIT_SERVICE_SLICE: Duration = Duration::from_millis(1);
+/// How long the post-stop drain waits for a raw buffer to move data the reader
+/// already received into. Generous on purpose: this runs once per recording and
+/// the alternative is losing the recording's tail.
+const STOP_DRAIN_POOL_WAIT: Duration = Duration::from_millis(200);
+/// Hard bounds on the post-stop drain. The camera is not guaranteed to have
+/// stopped streaming yet (the control thread stops it on its own tick), so a
+/// reader that keeps re-arming its transfers can keep producing packets. The
+/// drain exists to flush what the host already held, not to keep recording, so
+/// it must terminate on its own.
+const STOP_DRAIN_DEADLINE: Duration = Duration::from_millis(500);
+/// Packet cap for the same reason. Comfortably above any reader's in-flight
+/// plus buffered transfer count (EVK4: 8 queued + 8 spare).
+const STOP_DRAIN_MAX_PACKETS: u64 = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdEvent {
@@ -521,7 +544,26 @@ pub struct PipelineOptions {
     pub disk_writer_buffer_bytes: usize,
     pub event_ring_capacity_events: usize,
     pub plugin_event_history: bool,
+    pub sensor_telemetry: Option<SensorTelemetryOptions>,
     pub metadata: Option<RecordingMetadata>,
+}
+
+/// Optional companion recording for physical sensor monitoring values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensorTelemetryOptions {
+    pub illumination_interval: Duration,
+    pub slow_interval: Duration,
+}
+
+impl Default for SensorTelemetryOptions {
+    fn default() -> Self {
+        Self {
+            // 1.5 Hz.
+            illumination_interval: Duration::from_nanos(666_666_667),
+            // 0.2 Hz.
+            slow_interval: Duration::from_secs(5),
+        }
+    }
 }
 
 impl PipelineOptions {
@@ -534,6 +576,7 @@ impl PipelineOptions {
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
             event_ring_capacity_events: DEFAULT_EVENT_RING_CAPACITY_EVENTS,
             plugin_event_history: false,
+            sensor_telemetry: None,
             metadata: None,
         }
     }
@@ -547,9 +590,19 @@ impl PipelineOptions {
             disk_writer_buffer_bytes: DEFAULT_DISK_WRITER_BUFFER_BYTES,
             event_ring_capacity_events: DEFAULT_EVENT_RING_CAPACITY_EVENTS,
             plugin_event_history: false,
+            sensor_telemetry: None,
             metadata: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SensorTelemetrySnapshot {
+    pub output_path: Option<PathBuf>,
+    pub samples_written: u64,
+    pub samples_dropped: u64,
+    pub read_errors: u64,
+    pub write_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -585,9 +638,28 @@ pub struct PipelineStatsSnapshot {
     /// close preview windows (a dark box, or a trigger-only protocol), where
     /// the buffer would otherwise grow for the whole session.
     pub triggers_dropped: u64,
+    /// How often the stream reader found the raw-buffer pool empty, i.e. the
+    /// recording path could not accept the next packet.
+    pub raw_pool_starvation_events: u64,
+    /// Total time the stream reader spent waiting for a free raw buffer.
+    pub raw_pool_starvation_us: u64,
+    /// Longest single wait for a free raw buffer. This is the headline
+    /// recording-integrity number: the transport only buffers a bounded amount
+    /// of data, so a long stall means the camera FIFO overflowed and those
+    /// events are unrecoverable.
+    pub raw_pool_starvation_max_us: u64,
+    /// Packets recovered from the reader after the stream loop stopped, i.e.
+    /// data the device had already handed to the host at stop time.
+    pub stop_drain_packets: u64,
 }
 
 impl PipelineStatsSnapshot {
+    /// Whether the recording path ever failed to accept data. Any nonzero
+    /// value means the recording may have a gap.
+    pub fn recording_may_have_gaps(&self) -> bool {
+        self.raw_pool_starvation_events > 0
+    }
+
     pub fn preview_decode_avg_ms(self) -> f64 {
         avg_stage_ms(self.preview_decode_us, self.preview_packets_processed)
     }
@@ -627,6 +699,164 @@ struct SensorMonitoringState {
     error: Option<String>,
 }
 
+fn merge_monitoring_values(target: &mut SensorMonitoring, update: SensorMonitoring) {
+    if update.pixel_dead_time_us.is_some() {
+        target.pixel_dead_time_us = update.pixel_dead_time_us;
+    }
+    if update.illumination_lux.is_some() {
+        target.illumination_lux = update.illumination_lux;
+    }
+    if update.temperature_c.is_some() {
+        target.temperature_c = update.temperature_c;
+    }
+    if update.biases.is_some() {
+        target.biases = update.biases;
+    }
+}
+
+#[derive(Debug)]
+struct SensorTelemetrySchedule {
+    options: SensorTelemetryOptions,
+    next_illumination: Instant,
+    next_slow: Instant,
+    include_biases: bool,
+    next_sample_id: u64,
+}
+
+impl SensorTelemetrySchedule {
+    fn new(options: SensorTelemetryOptions, now: Instant) -> Self {
+        Self {
+            options,
+            next_illumination: now,
+            next_slow: now,
+            include_biases: true,
+            next_sample_id: 0,
+        }
+    }
+
+    fn force_bias_readback(&mut self) {
+        self.include_biases = true;
+    }
+
+    fn due(&mut self, now: Instant) -> Option<(u64, &'static str, SensorMonitoringSelection)> {
+        let illumination_due = now >= self.next_illumination;
+        let slow_due = now >= self.next_slow;
+        if !illumination_due && !slow_due && !self.include_biases {
+            return None;
+        }
+
+        let mut selection = SensorMonitoringSelection::NONE;
+        let poll_kind = match (illumination_due, slow_due, self.include_biases) {
+            (true, true, true) => "illumination+slow+biases",
+            (true, true, false) => "illumination+slow",
+            (true, false, true) => "illumination+biases",
+            (false, true, true) => "slow+biases",
+            (true, false, false) => "illumination",
+            (false, true, false) => "slow",
+            (false, false, true) => "biases",
+            (false, false, false) => unreachable!(),
+        };
+        if illumination_due {
+            selection = selection.union(SensorMonitoringSelection::ILLUMINATION);
+            self.next_illumination = now + self.options.illumination_interval;
+        }
+        if slow_due {
+            selection = selection.union(SensorMonitoringSelection::SLOW_TELEMETRY);
+            self.next_slow = now + self.options.slow_interval;
+        }
+        if self.include_biases {
+            selection.biases = true;
+            self.include_biases = false;
+        }
+
+        let sample_id = self.next_sample_id;
+        self.next_sample_id = self.next_sample_id.saturating_add(1);
+        Some((sample_id, poll_kind, selection))
+    }
+}
+
+#[derive(Debug)]
+struct SensorTelemetrySample {
+    sample_id: u64,
+    poll_kind: &'static str,
+    host_elapsed_start_us: u64,
+    host_elapsed_end_us: u64,
+    raw_data_offset_before_bytes: u64,
+    raw_data_offset_after_bytes: u64,
+    values: SensorMonitoring,
+    status: &'static str,
+    error: Option<String>,
+}
+
+fn csv_optional_f32(value: Option<f32>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn write_sensor_telemetry_sample(
+    writer: &mut impl Write,
+    sample: &SensorTelemetrySample,
+) -> std::io::Result<()> {
+    let values = sample.values;
+    let biases = values.biases;
+    writeln!(
+        writer,
+        "1,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        sample.sample_id,
+        sample.poll_kind,
+        sample.host_elapsed_start_us,
+        sample.host_elapsed_end_us,
+        sample.raw_data_offset_before_bytes,
+        sample.raw_data_offset_after_bytes,
+        csv_optional_f32(values.illumination_lux),
+        csv_optional_f32(values.temperature_c),
+        csv_optional_f32(values.pixel_dead_time_us),
+        biases
+            .map(|value| value.current.diff_on)
+            .map_or_else(String::new, |v| v.to_string()),
+        biases
+            .map(|value| value.current.diff_off)
+            .map_or_else(String::new, |v| v.to_string()),
+        biases
+            .map(|value| value.current.fo)
+            .map_or_else(String::new, |v| v.to_string()),
+        biases
+            .map(|value| value.current.hpf)
+            .map_or_else(String::new, |v| v.to_string()),
+        biases
+            .map(|value| value.current.refr)
+            .map_or_else(String::new, |v| v.to_string()),
+        sample.status,
+        csv_escape(sample.error.as_deref().unwrap_or_default()),
+    )
+}
+
+fn prepare_sensor_telemetry_writer(path: &Path) -> Result<BufWriter<File>> {
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "schema_version,sample_id,poll_kind,host_elapsed_start_us,host_elapsed_end_us,\
+raw_data_offset_before_bytes,raw_data_offset_after_bytes,illumination_lux,temperature_c,\
+pixel_dead_time_us,bias_diff_on_code,bias_diff_off_code,bias_fo_code,bias_hpf_code,\
+bias_refr_code,status,error"
+    )?;
+    Ok(writer)
+}
+
+pub fn sensor_telemetry_path(raw_path: &Path) -> Option<PathBuf> {
+    let stem = raw_path.file_stem()?.to_string_lossy();
+    let parent = raw_path.parent().unwrap_or_else(|| Path::new("."));
+    Some(parent.join(format!("{stem}.sensor-monitoring.csv")))
+}
+
 impl SensorMonitoringState {
     fn snapshot_at(&self, now: Instant) -> SensorMonitoringSnapshot {
         SensorMonitoringSnapshot {
@@ -664,7 +894,7 @@ fn poll_sensor_monitoring(
     }
     *last_poll = Some(now);
 
-    let result = camera.read_monitoring();
+    let result = camera.read_monitoring_selected(SensorMonitoringSelection::ALL);
     if let Ok(mut slot) = state.lock() {
         match result {
             // A source that reports nothing has no monitoring block. Publishing
@@ -693,6 +923,94 @@ fn poll_sensor_monitoring(
                     }
                 }
             }
+        }
+    }
+}
+
+fn poll_sensor_telemetry(
+    camera: &mut dyn EventCamera,
+    schedule: &mut SensorTelemetrySchedule,
+    stats: &Mutex<PipelineStatsInner>,
+    monitoring_state: &Mutex<Option<SensorMonitoringState>>,
+    sample_tx: &Sender<SensorTelemetrySample>,
+    telemetry_state: &Mutex<SensorTelemetrySnapshot>,
+) {
+    let now = Instant::now();
+    let Some((sample_id, poll_kind, selection)) = schedule.due(now) else {
+        return;
+    };
+    let (host_elapsed_start_us, raw_data_offset_before_bytes) = stats
+        .lock()
+        .map(|stats| stats.recording_anchor(now))
+        .unwrap_or_default();
+
+    let result = camera.read_monitoring_selected(selection);
+    let completed = Instant::now();
+    let (host_elapsed_end_us, raw_data_offset_after_bytes) = stats
+        .lock()
+        .map(|stats| stats.recording_anchor(completed))
+        .unwrap_or_default();
+
+    let (values, status, error) = match result {
+        Ok(values) if values.is_empty() => (
+            values,
+            "unsupported",
+            Some("no requested monitoring value available".to_owned()),
+        ),
+        Ok(values) => {
+            if let Ok(mut slot) = monitoring_state.lock() {
+                match slot.as_mut() {
+                    Some(existing) => {
+                        merge_monitoring_values(&mut existing.values, values);
+                        existing.at = completed;
+                        existing.error = None;
+                    }
+                    None => {
+                        *slot = Some(SensorMonitoringState {
+                            values,
+                            at: completed,
+                            error: None,
+                        });
+                    }
+                }
+            }
+            (values, "valid", None)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            if let Ok(mut state) = telemetry_state.lock() {
+                state.read_errors = state.read_errors.saturating_add(1);
+            }
+            if let Ok(mut slot) = monitoring_state.lock() {
+                match slot.as_mut() {
+                    Some(existing) => existing.error = Some(message.clone()),
+                    None => {
+                        *slot = Some(SensorMonitoringState {
+                            values: SensorMonitoring::default(),
+                            at: completed,
+                            error: Some(message.clone()),
+                        });
+                    }
+                }
+            }
+            (SensorMonitoring::default(), "error", Some(message))
+        }
+    };
+
+    let sample = SensorTelemetrySample {
+        sample_id,
+        poll_kind,
+        host_elapsed_start_us,
+        host_elapsed_end_us,
+        raw_data_offset_before_bytes,
+        raw_data_offset_after_bytes,
+        values,
+        status,
+        error,
+    };
+    if sample_tx.try_send(sample).is_err() {
+        if let Ok(mut state) = telemetry_state.lock() {
+            state.samples_dropped = state.samples_dropped.saturating_add(1);
         }
     }
 }
@@ -728,6 +1046,10 @@ struct PipelineStatsInner {
     triggers_total: u64,
     triggers_dropped: u64,
     last_trigger_at: Option<Instant>,
+    raw_pool_starvation_events: u64,
+    raw_pool_starvation_us: u64,
+    raw_pool_starvation_max_us: u64,
+    stop_drain_packets: u64,
     recent_samples: VecDeque<PipelineStatsSample>,
 }
 
@@ -762,6 +1084,10 @@ impl PipelineStatsInner {
             triggers_total: 0,
             triggers_dropped: 0,
             last_trigger_at: None,
+            raw_pool_starvation_events: 0,
+            raw_pool_starvation_us: 0,
+            raw_pool_starvation_max_us: 0,
+            stop_drain_packets: 0,
             recent_samples: VecDeque::new(),
         }
     }
@@ -786,6 +1112,13 @@ impl PipelineStatsInner {
             events,
         });
         self.prune_recent(now);
+    }
+
+    fn recording_anchor(&self, now: Instant) -> (u64, u64) {
+        (
+            now.saturating_duration_since(self.started).as_micros() as u64,
+            self.bytes_total,
+        )
     }
 
     fn snapshot(&mut self) -> PipelineStatsSnapshot {
@@ -831,6 +1164,10 @@ impl PipelineStatsInner {
                 .last_trigger_at
                 .map(|at| now.saturating_duration_since(at).as_secs_f64()),
             triggers_dropped: self.triggers_dropped,
+            raw_pool_starvation_events: self.raw_pool_starvation_events,
+            raw_pool_starvation_us: self.raw_pool_starvation_us,
+            raw_pool_starvation_max_us: self.raw_pool_starvation_max_us,
+            stop_drain_packets: self.stop_drain_packets,
         }
     }
 
@@ -865,6 +1202,19 @@ impl PipelineStatsInner {
 
     fn record_disk_queue_depth(&mut self, queue_depth: usize) {
         self.disk_queue_high_water = self.disk_queue_high_water.max(queue_depth);
+    }
+
+    /// Records that the stream reader had to wait for a free raw buffer, i.e.
+    /// the recording path could not accept data for `wait`.
+    fn record_raw_pool_starvation(&mut self, wait: Duration) {
+        let wait_us = wait.as_micros() as u64;
+        self.raw_pool_starvation_events = self.raw_pool_starvation_events.saturating_add(1);
+        self.raw_pool_starvation_us = self.raw_pool_starvation_us.saturating_add(wait_us);
+        self.raw_pool_starvation_max_us = self.raw_pool_starvation_max_us.max(wait_us);
+    }
+
+    fn record_stop_drain_packet(&mut self) {
+        self.stop_drain_packets = self.stop_drain_packets.saturating_add(1);
     }
 
     fn record_disk_send_wait(&mut self, wait: Duration) {
@@ -1176,6 +1526,12 @@ trait StreamWorker: Send {
     fn start(&mut self) -> std::result::Result<(), String>;
     fn poll_control(&mut self, error_tx: &Sender<String>);
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize>;
+    /// Keeps the transport serviced while the loop has no buffer to read into.
+    /// See [`PacketStreamReader::service`].
+    fn service(&mut self, budget: Duration);
+    /// Drains data the reader already received once the loop has stopped.
+    /// See [`PacketStreamReader::take_buffered_packet`].
+    fn take_buffered_packet(&mut self, buf: &mut [u8]) -> Result<usize>;
     fn finish(&mut self) -> std::result::Result<(), String>;
 }
 
@@ -1207,6 +1563,14 @@ impl<C: PacketStreamCamera> StreamWorker for InlineCameraWorker<C> {
         self.camera.read_packet(buf)
     }
 
+    // Inline cameras read synchronously: nothing is queued in the transport
+    // that could go stale while the pipeline waits for a buffer.
+    fn service(&mut self, _budget: Duration) {}
+
+    fn take_buffered_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
     fn finish(&mut self) -> std::result::Result<(), String> {
         self.camera
             .stop_streaming()
@@ -1229,8 +1593,101 @@ impl StreamWorker for SplitStreamWorker {
         self.reader.read_packet(buf)
     }
 
+    fn service(&mut self, budget: Duration) {
+        self.reader.service(budget);
+    }
+
+    fn take_buffered_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.reader.take_buffered_packet(buf)
+    }
+
     fn finish(&mut self) -> std::result::Result<(), String> {
         Ok(())
+    }
+}
+
+enum RawBufferWait {
+    Buffer(UsbBuffer),
+    Timeout,
+    Disconnected,
+}
+
+/// Takes a free raw buffer, keeping the transport serviced while none is
+/// available.
+///
+/// The buffer pool is the pipeline's backpressure: while it is empty the
+/// recording path cannot accept data. Blocking here without servicing the
+/// transport would let its queued transfers go stale, so the device endpoint
+/// runs dry and the camera FIFO overflows — turning a short downstream hiccup
+/// into a much longer, unrecoverable gap. Every wait is recorded, because a
+/// recording that hit this path may be incomplete.
+fn acquire_raw_buffer(
+    worker: &mut dyn StreamWorker,
+    stop: &AtomicBool,
+    stats: &Mutex<PipelineStatsInner>,
+    pool_rx: &Receiver<UsbBuffer>,
+) -> RawBufferWait {
+    match pool_rx.try_recv() {
+        Ok(buf) => return RawBufferWait::Buffer(buf),
+        Err(TryRecvError::Disconnected) => return RawBufferWait::Disconnected,
+        Err(TryRecvError::Empty) => {}
+    }
+
+    let started = Instant::now();
+    let outcome = loop {
+        // Zero budget: reap and re-arm whatever the transport already
+        // completed without blocking, then park on the pool for a slice.
+        worker.service(Duration::ZERO);
+        match pool_rx.recv_timeout(POOL_WAIT_SERVICE_SLICE) {
+            Ok(buf) => break RawBufferWait::Buffer(buf),
+            Err(RecvTimeoutError::Disconnected) => break RawBufferWait::Disconnected,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if stop.load(Ordering::Relaxed) || started.elapsed() >= POOL_WAIT_WINDOW {
+            break RawBufferWait::Timeout;
+        }
+    };
+    if let Ok(mut s) = stats.lock() {
+        s.record_raw_pool_starvation(started.elapsed());
+    }
+    outcome
+}
+
+/// Moves packets the reader already received into the recording after the
+/// stream loop stopped.
+///
+/// The transport keeps several transfers in flight, so at stop time the host
+/// usually already holds data the device sent. Tearing the reader down without
+/// draining it truncates the tail of every recording.
+fn drain_reader_after_stop(
+    worker: &mut dyn StreamWorker,
+    stats: &Mutex<PipelineStatsInner>,
+    pool_rx: &Receiver<UsbBuffer>,
+    pool_return_tx: &Sender<UsbBuffer>,
+    disk_tx: &Sender<DiskChunk>,
+) {
+    let deadline = Instant::now() + STOP_DRAIN_DEADLINE;
+    let mut drained = 0_u64;
+    while drained < STOP_DRAIN_MAX_PACKETS && Instant::now() < deadline {
+        let Ok(mut buf) = pool_rx.recv_timeout(STOP_DRAIN_POOL_WAIT) else {
+            return;
+        };
+        let taken = worker.take_buffered_packet(&mut buf[..]);
+        match taken {
+            Ok(len) if len > 0 => {
+                if disk_tx.send(DiskChunk { buf, len }).is_err() {
+                    return;
+                }
+                drained += 1;
+                if let Ok(mut s) = stats.lock() {
+                    s.record_stop_drain_packet();
+                }
+            }
+            _ => {
+                let _ = pool_return_tx.send(buf);
+                return;
+            }
+        }
     }
 }
 
@@ -1250,10 +1707,10 @@ fn run_stream_loop(
     while !stop.load(Ordering::Relaxed) {
         worker.poll_control(error_tx);
 
-        let mut buf = match pool_rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(b) => b,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+        let mut buf = match acquire_raw_buffer(worker, stop, stats, pool_rx) {
+            RawBufferWait::Buffer(buf) => buf,
+            RawBufferWait::Timeout => continue,
+            RawBufferWait::Disconnected => break,
         };
 
         let len = match worker.read_packet(&mut buf[..]) {
@@ -1364,6 +1821,10 @@ fn run_stream_loop(
             let _ = pool_return_tx.send(buf);
         }
     }
+
+    if let Some(disk_tx) = disk_tx {
+        drain_reader_after_stop(worker, stats, pool_rx, pool_return_tx, disk_tx);
+    }
 }
 
 pub struct PipelineController {
@@ -1381,8 +1842,10 @@ pub struct PipelineController {
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<PipelineStatsInner>>,
     sensor_monitoring: Arc<Mutex<Option<SensorMonitoringState>>>,
+    sensor_telemetry: Arc<Mutex<SensorTelemetrySnapshot>>,
     recording_sidecar: Option<RecordingSidecarState>,
     threads: Vec<thread::JoinHandle<()>>,
+    sensor_telemetry_thread: Option<thread::JoinHandle<()>>,
 }
 
 struct RecordingSidecarState {
@@ -1412,6 +1875,13 @@ impl PipelineController {
             .map(|state| state.snapshot_at(now))
     }
 
+    pub fn sensor_telemetry(&self) -> SensorTelemetrySnapshot {
+        self.sensor_telemetry
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default()
+    }
+
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -1432,17 +1902,48 @@ impl PipelineController {
                 had_panic = true;
             }
         }
+        if let Some(handle) = self.sensor_telemetry_thread.take() {
+            if handle.join().is_err() {
+                had_panic = true;
+            }
+        }
         if had_panic {
             return Err(CameraError::Other(
                 "one or more pipeline threads panicked".into(),
             ));
         }
         let stats_snapshot = self.stats_snapshot();
+        let sensor_telemetry_snapshot = self.sensor_telemetry();
         if let Some(recording_sidecar) = &mut self.recording_sidecar {
             recording_sidecar.metadata.update_timing(
                 stats_snapshot.recording_duration_us,
                 stats_snapshot.events_total,
             );
+            recording_sidecar.metadata.update_integrity(
+                stats_snapshot.raw_pool_starvation_events,
+                stats_snapshot.raw_pool_starvation_max_us,
+                stats_snapshot.raw_pool_starvation_us,
+            );
+            if sensor_telemetry_snapshot.output_path.is_some() {
+                recording_sidecar.metadata.extra.insert(
+                    "sensor_monitoring_samples_written".into(),
+                    sensor_telemetry_snapshot.samples_written.to_string(),
+                );
+                recording_sidecar.metadata.extra.insert(
+                    "sensor_monitoring_samples_dropped".into(),
+                    sensor_telemetry_snapshot.samples_dropped.to_string(),
+                );
+                recording_sidecar.metadata.extra.insert(
+                    "sensor_monitoring_read_errors".into(),
+                    sensor_telemetry_snapshot.read_errors.to_string(),
+                );
+                if let Some(error) = sensor_telemetry_snapshot.write_error {
+                    recording_sidecar
+                        .metadata
+                        .extra
+                        .insert("sensor_monitoring_write_error".into(), error);
+                }
+            }
             RecordingSidecar::new(
                 recording_sidecar.config.clone(),
                 recording_sidecar.metadata.clone(),
@@ -1473,22 +1974,47 @@ where
         disk_writer_buffer_bytes,
         event_ring_capacity_events,
         plugin_event_history,
+        sensor_telemetry,
         metadata,
     } = options;
     let recording = output_path.is_some();
     let mut recording_sidecar = None;
-    let recording_metadata = metadata.unwrap_or_default();
-
-    if let Some(ref output_path) = output_path {
-        if let Some(config_path) = recording_config_path(output_path) {
-            RecordingSidecar::new(initial_config.clone(), recording_metadata.clone())
-                .save_to_path(&config_path)?;
-            recording_sidecar = Some(RecordingSidecarState {
-                path: config_path,
-                config: initial_config.clone(),
-                metadata: recording_metadata.clone(),
-            });
-        }
+    if sensor_telemetry.is_some() && output_path.is_none() {
+        return Err(CameraError::Config(
+            "sensor telemetry requires a raw recording output path".into(),
+        ));
+    }
+    if sensor_telemetry.is_some_and(|options| {
+        options.illumination_interval.is_zero() || options.slow_interval.is_zero()
+    }) {
+        return Err(CameraError::Config(
+            "sensor telemetry intervals must be greater than zero".into(),
+        ));
+    }
+    let sensor_telemetry_path = sensor_telemetry
+        .and(output_path.as_deref())
+        .and_then(sensor_telemetry_path);
+    let mut recording_metadata = metadata.unwrap_or_default();
+    if let (Some(options), Some(path)) = (sensor_telemetry, sensor_telemetry_path.as_ref()) {
+        recording_metadata.extra.insert(
+            "sensor_monitoring_file".into(),
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        recording_metadata.extra.insert(
+            "sensor_monitoring_clock".into(),
+            "host_monotonic_with_raw_data_offset_bracket".into(),
+        );
+        recording_metadata.extra.insert(
+            "sensor_monitoring_illumination_hz".into(),
+            format!("{:.6}", 1.0 / options.illumination_interval.as_secs_f64()),
+        );
+        recording_metadata.extra.insert(
+            "sensor_monitoring_slow_hz".into(),
+            format!("{:.6}", 1.0 / options.slow_interval.as_secs_f64()),
+        );
     }
 
     let disk_writer = if let Some(ref output_path) = output_path {
@@ -1503,6 +2029,41 @@ where
     } else {
         None
     };
+    let sensor_telemetry_writer = match sensor_telemetry_path.as_deref() {
+        Some(path) => match prepare_sensor_telemetry_writer(path) {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                drop(disk_writer);
+                if let Some(raw_path) = output_path.as_deref() {
+                    let _ = std::fs::remove_file(raw_path);
+                }
+                return Err(err);
+            }
+        },
+        None => None,
+    };
+
+    if let Some(ref output_path) = output_path {
+        if let Some(config_path) = recording_config_path(output_path) {
+            if let Err(err) =
+                RecordingSidecar::new(initial_config.clone(), recording_metadata.clone())
+                    .save_to_path(&config_path)
+            {
+                drop(disk_writer);
+                drop(sensor_telemetry_writer);
+                let _ = std::fs::remove_file(output_path);
+                if let Some(path) = sensor_telemetry_path.as_deref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(err);
+            }
+            recording_sidecar = Some(RecordingSidecarState {
+                path: config_path,
+                config: initial_config.clone(),
+                metadata: recording_metadata.clone(),
+            });
+        }
+    }
 
     let (pool_tx, pool_rx) = bounded::<UsbBuffer>(RAW_BUFFER_POOL_CAPACITY);
     for _ in 0..RAW_BUFFER_POOL_CAPACITY {
@@ -1527,6 +2088,10 @@ where
     let (frame_tx, frame_rx) = bounded::<PreviewFrame>(PREVIEW_FRAME_QUEUE_CAPACITY);
     let (settings_tx, settings_rx) = bounded::<CameraConfig>(8);
     let (error_tx, error_rx) = bounded::<String>(32);
+    let (sensor_telemetry_tx, sensor_telemetry_rx) = sensor_telemetry_writer
+        .as_ref()
+        .map(|_| bounded::<SensorTelemetrySample>(SENSOR_TELEMETRY_QUEUE_CAPACITY))
+        .unzip();
 
     let acq_time_us = Arc::new(AtomicU64::new(
         initial_config
@@ -1538,6 +2103,10 @@ where
     let raw_events_needed = Arc::new(AtomicBool::new(false));
     let sensor_monitoring_needed = Arc::new(AtomicBool::new(false));
     let sensor_monitoring = Arc::new(Mutex::new(None::<SensorMonitoringState>));
+    let sensor_telemetry_state = Arc::new(Mutex::new(SensorTelemetrySnapshot {
+        output_path: sensor_telemetry_path.clone(),
+        ..SensorTelemetrySnapshot::default()
+    }));
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(PipelineStatsInner::new()));
     let event_source = LiveEventSource::with_capacity(event_ring_capacity_events);
@@ -1571,9 +2140,52 @@ where
     let stats_preview = Arc::clone(&stats);
 
     let mut threads = Vec::new();
-
     let mut camera = camera;
-    let mut worker: Box<dyn StreamWorker> = match camera.split_stream_reader() {
+    let stream_reader = camera.split_stream_reader();
+    if sensor_telemetry.is_some() && stream_reader.is_none() {
+        drop(disk_writer);
+        drop(sensor_telemetry_writer);
+        if let Some(path) = output_path.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = sensor_telemetry_path.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(sidecar) = recording_sidecar.as_ref() {
+            let _ = std::fs::remove_file(&sidecar.path);
+        }
+        return Err(CameraError::Config(
+            "sensor telemetry requires a camera with an independent control thread".into(),
+        ));
+    }
+    let sensor_telemetry_thread =
+        sensor_telemetry_writer
+            .zip(sensor_telemetry_rx)
+            .map(|(mut writer, sample_rx)| {
+                let telemetry_state = Arc::clone(&sensor_telemetry_state);
+                thread::spawn(move || {
+                    while let Ok(sample) = sample_rx.recv() {
+                        if let Err(err) = write_sensor_telemetry_sample(&mut writer, &sample) {
+                            if let Ok(mut state) = telemetry_state.lock() {
+                                state.write_error =
+                                    Some(format!("failed writing sensor telemetry: {err}"));
+                            }
+                            return;
+                        }
+                        if let Ok(mut state) = telemetry_state.lock() {
+                            state.samples_written = state.samples_written.saturating_add(1);
+                        }
+                    }
+                    if let Err(err) = writer.flush() {
+                        if let Ok(mut state) = telemetry_state.lock() {
+                            state.write_error =
+                                Some(format!("failed flushing sensor telemetry: {err}"));
+                        }
+                    }
+                })
+            });
+
+    let mut worker: Box<dyn StreamWorker> = match stream_reader {
         Some(reader) => {
             // Camera control (initial configure, start/stop streaming, and
             // runtime reconfiguration) runs on a dedicated thread: control
@@ -1584,6 +2196,11 @@ where
             let error_control = error_tx.clone();
             let monitoring_needed = Arc::clone(&sensor_monitoring_needed);
             let monitoring_state = Arc::clone(&sensor_monitoring);
+            let telemetry_stats = Arc::clone(&stats);
+            let telemetry_state = Arc::clone(&sensor_telemetry_state);
+            let telemetry_sample_tx = sensor_telemetry_tx;
+            let mut telemetry_schedule = sensor_telemetry
+                .map(|options| SensorTelemetrySchedule::new(options, Instant::now()));
             let control_thread = thread::spawn(move || {
                 if let Err(e) = camera.configure(&initial_config) {
                     report_pipeline_error(
@@ -1607,24 +2224,45 @@ where
                 loop {
                     match settings_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(cfg) => {
-                            if let Err(e) = camera.configure(&cfg) {
-                                let _ = error_control
-                                    .try_send(format!("control: runtime reconfigure failed: {e}"));
-                            }
-                            // New bias codes are live now; re-read on the next
-                            // tick instead of showing the pre-apply values.
                             last_monitoring_poll = None;
+                            match camera.configure(&cfg) {
+                                Ok(()) => {
+                                    // New bias codes are live now; include them
+                                    // in the next telemetry poll.
+                                    if let Some(schedule) = telemetry_schedule.as_mut() {
+                                        schedule.force_bias_readback();
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = error_control.try_send(format!(
+                                        "control: runtime reconfigure failed: {e}"
+                                    ));
+                                }
+                            }
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             if stop_control.load(Ordering::Relaxed) {
                                 break;
                             }
-                            poll_sensor_monitoring(
-                                &mut camera,
-                                &monitoring_needed,
-                                &monitoring_state,
-                                &mut last_monitoring_poll,
-                            );
+                            if let (Some(schedule), Some(sample_tx)) =
+                                (telemetry_schedule.as_mut(), telemetry_sample_tx.as_ref())
+                            {
+                                poll_sensor_telemetry(
+                                    &mut camera,
+                                    schedule,
+                                    &telemetry_stats,
+                                    &monitoring_state,
+                                    sample_tx,
+                                    &telemetry_state,
+                                );
+                            } else {
+                                poll_sensor_monitoring(
+                                    &mut camera,
+                                    &monitoring_needed,
+                                    &monitoring_state,
+                                    &mut last_monitoring_poll,
+                                );
+                            }
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -1939,8 +2577,10 @@ where
         stop,
         stats,
         sensor_monitoring,
+        sensor_telemetry: sensor_telemetry_state,
         recording_sidecar,
         threads,
+        sensor_telemetry_thread,
     })
 }
 
@@ -2018,6 +2658,79 @@ mod tests {
     use crate::metadata::RecordingMetadata;
 
     #[test]
+    fn sensor_telemetry_companion_path_keeps_the_raw_stem() {
+        assert_eq!(
+            sensor_telemetry_path(Path::new("/tmp/experiment.v2.raw")),
+            Some(PathBuf::from("/tmp/experiment.v2.sensor-monitoring.csv"))
+        );
+    }
+
+    #[test]
+    fn sensor_telemetry_schedule_uses_field_specific_rates_without_catch_up() {
+        let started = Instant::now();
+        let mut schedule = SensorTelemetrySchedule::new(
+            SensorTelemetryOptions {
+                illumination_interval: Duration::from_millis(667),
+                slow_interval: Duration::from_secs(5),
+            },
+            started,
+        );
+
+        let (_, _, initial) = schedule.due(started).expect("initial sample");
+        assert!(initial.illumination);
+        assert!(initial.temperature);
+        assert!(initial.pixel_dead_time);
+        assert!(initial.biases);
+        assert!(schedule.due(started + Duration::from_millis(666)).is_none());
+
+        let (_, kind, fast) = schedule
+            .due(started + Duration::from_millis(667))
+            .expect("illumination sample");
+        assert_eq!(kind, "illumination");
+        assert_eq!(fast, SensorMonitoringSelection::ILLUMINATION);
+
+        let (_, kind, delayed) = schedule
+            .due(started + Duration::from_secs(10))
+            .expect("one delayed combined sample");
+        assert_eq!(kind, "illumination+slow");
+        assert!(delayed.illumination);
+        assert!(delayed.temperature);
+        assert!(delayed.pixel_dead_time);
+        assert!(
+            schedule.due(started + Duration::from_secs(10)).is_none(),
+            "a delayed poll must not trigger a catch-up burst"
+        );
+    }
+
+    #[test]
+    fn sensor_telemetry_csv_exposes_poll_and_raw_offset_brackets() {
+        let mut csv = Vec::new();
+        write_sensor_telemetry_sample(
+            &mut csv,
+            &SensorTelemetrySample {
+                sample_id: 4,
+                poll_kind: "illumination",
+                host_elapsed_start_us: 1_000,
+                host_elapsed_end_us: 1_025,
+                raw_data_offset_before_bytes: 65_536,
+                raw_data_offset_after_bytes: 131_072,
+                values: SensorMonitoring {
+                    illumination_lux: Some(12.5),
+                    ..SensorMonitoring::default()
+                },
+                status: "valid",
+                error: None,
+            },
+        )
+        .expect("sample serializes");
+        let csv = String::from_utf8(csv).expect("CSV is UTF-8");
+        assert_eq!(
+            csv,
+            "1,4,illumination,1000,1025,65536,131072,12.5,,,,,,,,valid,\n"
+        );
+    }
+
+    #[test]
     fn recording_writer_refuses_to_overwrite_existing_file() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -2058,6 +2771,36 @@ mod tests {
         fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
             Err(CameraError::Timeout("idle test camera".into()))
         }
+    }
+
+    #[test]
+    fn telemetry_rejects_inline_camera_without_leaving_output_files() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let raw_path = std::env::temp_dir().join(format!("augur-telemetry-inline-{nanos}.raw"));
+        let telemetry_path = sensor_telemetry_path(&raw_path).expect("companion path");
+        let config_path = recording_config_path(&raw_path).expect("config path");
+        let mut options = PipelineOptions::new(&raw_path);
+        options.sensor_telemetry = Some(SensorTelemetryOptions::default());
+
+        let error = match spawn_pipeline(
+            TimeoutCamera,
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            options,
+        ) {
+            Ok(controller) => {
+                let _ = controller.shutdown();
+                panic!("inline camera cannot safely record control telemetry");
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("independent control thread"));
+        assert!(!raw_path.exists());
+        assert!(!telemetry_path.exists());
+        assert!(!config_path.exists());
     }
 
     struct ScriptedPacketCamera {
@@ -2159,6 +2902,10 @@ mod tests {
     fn test_stats(start: Instant) -> PipelineStatsInner {
         PipelineStatsInner {
             started: start,
+            raw_pool_starvation_events: 0,
+            raw_pool_starvation_us: 0,
+            raw_pool_starvation_max_us: 0,
+            stop_drain_packets: 0,
             bytes_total: 0,
             events_total: 0,
             first_timestamp_us: None,
@@ -3276,12 +4023,117 @@ mod tests {
         }
     }
 
+    struct SelectiveTelemetryCamera {
+        selections: Arc<Mutex<Vec<SensorMonitoringSelection>>>,
+    }
+
+    impl EventCamera for SelectiveTelemetryCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+
+        fn read_monitoring_selected(
+            &mut self,
+            selection: SensorMonitoringSelection,
+        ) -> Result<SensorMonitoring> {
+            self.selections.lock().expect("selections").push(selection);
+            Ok(SensorMonitoring {
+                pixel_dead_time_us: selection.pixel_dead_time.then_some(6.25),
+                illumination_lux: selection.illumination.then_some(42.0),
+                temperature_c: selection.temperature.then_some(31.5),
+                biases: None,
+            })
+        }
+    }
+
+    impl PacketStreamCamera for SelectiveTelemetryCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("split camera reads via reader".into()))
+        }
+
+        fn split_stream_reader(&mut self) -> Option<Box<dyn crate::camera::PacketStreamReader>> {
+            Some(Box::new(CountingStreamReader {
+                reads: Arc::new(AtomicU64::new(0)),
+            }))
+        }
+    }
+
+    #[test]
+    fn telemetry_pipeline_records_selected_samples_and_finalizes_sidecar() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock is valid")
+            .as_nanos();
+        let raw_path = std::env::temp_dir().join(format!("augur-telemetry-{nanos}.raw"));
+        let telemetry_path = sensor_telemetry_path(&raw_path).expect("companion path");
+        let config_path = recording_config_path(&raw_path).expect("config path");
+        let selections = Arc::new(Mutex::new(Vec::new()));
+        let mut options = PipelineOptions::new(&raw_path);
+        options.sensor_telemetry = Some(SensorTelemetryOptions {
+            illumination_interval: Duration::from_millis(20),
+            slow_interval: Duration::from_millis(60),
+        });
+
+        let controller = spawn_pipeline(
+            SelectiveTelemetryCamera {
+                selections: Arc::clone(&selections),
+            },
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            options,
+        )
+        .expect("telemetry pipeline starts");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.sensor_telemetry().samples_written < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "telemetry samples were not written"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        controller.shutdown().expect("pipeline shuts down");
+
+        let selections = selections.lock().expect("selections");
+        assert!(selections
+            .iter()
+            .any(|selection| selection.illumination && selection.temperature));
+        assert!(selections
+            .iter()
+            .any(|selection| selection.illumination && !selection.temperature));
+        let csv = std::fs::read_to_string(&telemetry_path).expect("telemetry CSV");
+        assert!(csv.lines().count() >= 4);
+        assert!(csv.contains(",42,31.5,6.25,"));
+        let sidecar = std::fs::read_to_string(&config_path).expect("recording sidecar");
+        assert!(sidecar.contains("sensor_monitoring_samples_written"));
+        assert!(sidecar.contains("host_monotonic_with_raw_data_offset_bracket"));
+
+        let _ = std::fs::remove_file(raw_path);
+        let _ = std::fs::remove_file(telemetry_path);
+        let _ = std::fs::remove_file(config_path);
+    }
+
     /// Camera whose second packet only completes after the test requests
     /// stop, like a USB bulk transfer that lands just as shutdown begins.
     struct StopGatedTailCamera {
         sent_first: bool,
         tail_sent: bool,
         stop_requested: Arc<AtomicBool>,
+        /// Set once the camera is blocked inside the tail read, so the test can
+        /// request the stop while that read is genuinely in flight instead of
+        /// racing the stream thread's stop-flag check.
+        in_tail_read: Arc<AtomicBool>,
     }
 
     impl EventCamera for StopGatedTailCamera {
@@ -3312,6 +4164,7 @@ mod tests {
             if self.tail_sent {
                 return Err(CameraError::Eof);
             }
+            self.in_tail_read.store(true, Ordering::Relaxed);
             let waited = Instant::now();
             while !self.stop_requested.load(Ordering::Relaxed) {
                 if waited.elapsed() > Duration::from_secs(10) {
@@ -3338,6 +4191,7 @@ mod tests {
             .as_nanos();
         let output_path = std::env::temp_dir().join(format!("augur-tail-loss-{nanos}.raw"));
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let in_tail_read = Arc::new(AtomicBool::new(false));
 
         let mut options = PipelineOptions::new(&output_path);
         options.write_evt3_header = false;
@@ -3346,6 +4200,7 @@ mod tests {
                 sent_first: false,
                 tail_sent: false,
                 stop_requested: Arc::clone(&stop_requested),
+                in_tail_read: Arc::clone(&in_tail_read),
             },
             Evt3CorePreviewDecoder::default(),
             CameraConfig::default(),
@@ -3354,12 +4209,15 @@ mod tests {
         .expect("pipeline must start");
 
         // Wait until the first packet has been accepted by the USB reader and
-        // the camera is blocked inside the gated second read.
+        // the camera is blocked inside the gated second read. Observing the
+        // read itself (not just the first packet's byte count) keeps the stop
+        // request from racing the stream thread's stop-flag check.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while controller.stats_snapshot().bytes_total < 4 {
-            assert!(Instant::now() < deadline, "first packet never arrived");
+        while !in_tail_read.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "tail read never started");
             thread::sleep(Duration::from_millis(1));
         }
+        assert!(controller.stats_snapshot().bytes_total >= 4);
 
         controller.request_stop();
         stop_requested.store(true, Ordering::Relaxed);
@@ -3373,6 +4231,189 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7, 8],
             "every packet accepted by the USB reader must reach the recording",
         );
+    }
+
+    /// Stream reader that delivers one packet, then holds the rest as data it
+    /// already received but has not handed over — exactly the state the async
+    /// multi-URB reader is in when a recording is stopped with transfers
+    /// completed in its queue.
+    struct BufferedTailReader {
+        delivered_first: bool,
+        buffered: VecDeque<Vec<u8>>,
+    }
+
+    impl crate::camera::PacketStreamReader for BufferedTailReader {
+        fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if !self.delivered_first {
+                self.delivered_first = true;
+                buf[..4].copy_from_slice(&[1, 2, 3, 4]);
+                return Ok(4);
+            }
+            // No *new* data arrives; the tail only exists in the reader's own
+            // completed-transfer queue.
+            thread::sleep(Duration::from_millis(1));
+            Err(CameraError::Timeout("no new packet".into()))
+        }
+
+        fn take_buffered_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+            match self.buffered.pop_front() {
+                Some(packet) => {
+                    buf[..packet.len()].copy_from_slice(&packet);
+                    Ok(packet.len())
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    struct BufferedTailCamera {
+        reader: Option<Box<dyn crate::camera::PacketStreamReader>>,
+    }
+
+    impl EventCamera for BufferedTailCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+    }
+
+    impl PacketStreamCamera for BufferedTailCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("split camera reads via reader".into()))
+        }
+
+        fn split_stream_reader(&mut self) -> Option<Box<dyn crate::camera::PacketStreamReader>> {
+            self.reader.take()
+        }
+    }
+
+    #[test]
+    fn packets_already_received_by_the_reader_reach_the_recording_after_stop() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock must be sane")
+            .as_nanos();
+        let output_path = std::env::temp_dir().join(format!("augur-reader-tail-{nanos}.raw"));
+
+        let mut options = PipelineOptions::new(&output_path);
+        options.write_evt3_header = false;
+        let controller = spawn_pipeline(
+            BufferedTailCamera {
+                reader: Some(Box::new(BufferedTailReader {
+                    delivered_first: false,
+                    buffered: VecDeque::from(vec![vec![5, 6, 7, 8], vec![9, 10, 11, 12]]),
+                })),
+            },
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            options,
+        )
+        .expect("pipeline must start");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.stats_snapshot().bytes_total < 4 {
+            assert!(Instant::now() < deadline, "first packet never arrived");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        controller.request_stop();
+        controller.shutdown().expect("pipeline must shut down");
+
+        let written = std::fs::read(&output_path).expect("recording file must exist");
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(output_path.with_extension("toml"));
+        assert_eq!(
+            written,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "data the device already delivered to the host must not be dropped at stop",
+        );
+    }
+
+    struct ServiceCountingWorker {
+        services: u64,
+    }
+
+    impl StreamWorker for ServiceCountingWorker {
+        fn start(&mut self) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn poll_control(&mut self, _error_tx: &Sender<String>) {}
+
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("unused".into()))
+        }
+
+        fn service(&mut self, _budget: Duration) {
+            self.services += 1;
+        }
+
+        fn take_buffered_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn finish(&mut self) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn empty_buffer_pool_keeps_the_transport_serviced_and_is_recorded() {
+        // Keep the sender alive: a disconnected pool is a different path.
+        let (_pool_tx, pool_rx) = bounded::<UsbBuffer>(4);
+        let stop = AtomicBool::new(false);
+        let stats = Mutex::new(PipelineStatsInner::new());
+        let mut worker = ServiceCountingWorker { services: 0 };
+
+        let outcome = acquire_raw_buffer(&mut worker, &stop, &stats, &pool_rx);
+
+        assert!(matches!(outcome, RawBufferWait::Timeout));
+        assert!(
+            worker.services > 0,
+            "queued transfers must keep being serviced while the pipeline cannot accept data",
+        );
+        let snapshot = stats.lock().expect("stats").snapshot();
+        assert_eq!(snapshot.raw_pool_starvation_events, 1);
+        assert!(
+            snapshot.raw_pool_starvation_max_us > 0,
+            "the stall duration must be measurable",
+        );
+        assert!(
+            snapshot.recording_may_have_gaps(),
+            "a stalled recording path must be reported as a possible gap",
+        );
+    }
+
+    #[test]
+    fn an_available_raw_buffer_is_taken_without_reporting_a_stall() {
+        let (pool_tx, pool_rx) = bounded::<UsbBuffer>(4);
+        pool_tx
+            .send(Box::new([0_u8; BUF_SIZE]))
+            .expect("pool must accept the buffer");
+        let stop = AtomicBool::new(false);
+        let stats = Mutex::new(PipelineStatsInner::new());
+        let mut worker = ServiceCountingWorker { services: 0 };
+
+        let outcome = acquire_raw_buffer(&mut worker, &stop, &stats, &pool_rx);
+
+        assert!(matches!(outcome, RawBufferWait::Buffer(_)));
+        assert_eq!(worker.services, 0);
+        assert!(!stats
+            .lock()
+            .expect("stats")
+            .snapshot()
+            .recording_may_have_gaps());
     }
 
     #[test]

@@ -21,8 +21,9 @@ use augur_core::{
     config::{CameraConfig, GlobalSettingsConfig},
     metadata::{RecordingAnnotations, RecordingMetadata},
     pipeline::{
-        spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, LiveEventSource, PipelineController,
-        PipelineOptions, PipelineStatsSnapshot, PreviewFrame,
+        sensor_telemetry_path, spawn_pipeline, CdEvent, Evt3CorePreviewDecoder, LiveEventSource,
+        PipelineController, PipelineOptions, PipelineStatsSnapshot, PreviewFrame,
+        SensorTelemetryOptions,
     },
     replay::{align_relative_evt3_word_offset, RawFileCamera, ReplayControls, ReplayFileInfo},
     DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
@@ -227,6 +228,23 @@ fn live_worker_active_for_state(
             && !replay_paused
             && !replay_finished
             && !replay_pause_after_seek_frame)
+}
+
+/// Describes how much of the live stream actually reached the plugins.
+///
+/// Live series are built one accumulation window at a time, so a dispatch
+/// ratio below 100 % means the series has that many missing samples. Saying so
+/// in numbers is the only way a researcher can tell a complete measurement
+/// from a sparsely sampled one.
+fn live_analysis_coverage_text(dispatched: u64, seen: u64) -> String {
+    if seen == 0 || dispatched >= seen {
+        return String::new();
+    }
+    let percent = dispatched as f64 / seen as f64 * 100.0;
+    format!(
+        " covering {dispatched} of {seen} accumulation windows ({percent:.0} %), so live series \
+         have gaps"
+    )
 }
 
 fn should_dispatch_live_analysis_for_state(
@@ -1057,6 +1075,13 @@ pub struct CameraApp {
     /// frames). Carried into the next processed frame so plugins that fold on
     /// the trigger (stage-a-a1) see every edge, not just the survivors'.
     carried_external_triggers: Vec<ExternalTriggerEvent>,
+    /// How many accumulation windows the preview pipeline delivered, and how
+    /// many of those actually reached the plugins. Live analysis is
+    /// best-effort by design (ADR 025): drain-to-newest and the process
+    /// throttle skip whole windows. Counting both makes the resulting gaps in
+    /// live plugin series an explicit number instead of an invisible one.
+    live_analysis_windows_seen: u64,
+    live_analysis_windows_dispatched: u64,
     last_preview_process_at: Option<Instant>,
     replay_controls: Option<ReplayControls>,
     replay_file_info: Option<ReplayFileInfo>,
@@ -1118,6 +1143,7 @@ pub struct CameraApp {
     theme_preference: UiThemePreference,
     popup_open: bool,
     lock_settings_while_recording: bool,
+    record_sensor_telemetry: bool,
     settings_panel_open: bool,
     analysis_panel_open: bool,
     plugins_window_open: bool,
@@ -1282,6 +1308,8 @@ impl CameraApp {
             latest_frame: None,
             pending_preview_frame: None,
             carried_external_triggers: Vec::new(),
+            live_analysis_windows_seen: 0,
+            live_analysis_windows_dispatched: 0,
             last_preview_process_at: None,
             replay_controls: None,
             replay_file_info: None,
@@ -1333,6 +1361,7 @@ impl CameraApp {
             theme_preference,
             popup_open: false,
             lock_settings_while_recording: true,
+            record_sensor_telemetry: false,
             settings_panel_open: true,
             analysis_panel_open: true,
             plugins_window_open: false,
@@ -2450,6 +2479,18 @@ impl CameraApp {
         if output.mask_hotpixels_clicked {
             self.copy_detected_hotpixels_to_mask();
         }
+        if output.probe_camera {
+            self.probe_camera();
+        }
+        if output.open_replay {
+            self.open_replay_file();
+        }
+        if output.start_preview {
+            self.start_preview();
+        }
+        if output.start_recording {
+            self.start_recording();
+        }
         if output.replay_toggle_pause {
             self.set_replay_paused(!self.replay_paused);
         }
@@ -2658,6 +2699,9 @@ impl CameraApp {
         }
         self.set_replay_paused_internal(&controls, false);
         self.set_replay_speed_internal(&controls, 1.0);
+        // Coverage is a per-session statement about this stream's live series.
+        self.live_analysis_windows_seen = 0;
+        self.live_analysis_windows_dispatched = 0;
         self.controller = Some(controller);
         self.mode = AppMode::Replaying;
         self.sync_live_control_execution();
@@ -6216,6 +6260,123 @@ impl CameraApp {
         Ok(path)
     }
 
+    fn choose_output_path(&mut self) {
+        let default_name = format!("output_{}.raw", format_timestamp_now());
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("RAW", &["raw"])
+            .save_file()
+        {
+            self.output_path = path.display().to_string();
+        }
+    }
+
+    fn draw_capture_controls(&mut self, ui: &mut egui::Ui, mode: AppMode) {
+        crate::theme::card_frame(ui).show(ui, |ui| {
+            crate::theme::section_subhead(ui, "Capture");
+            ui.small(&self.camera_status);
+            ui.add_space(crate::theme::sp::SP_2);
+
+            ui.horizontal_wrapped(|ui| match mode {
+                AppMode::Idle if self.camera_info.is_none() => {
+                    if ui
+                        .add(crate::theme::primary_button("Probe Camera"))
+                        .clicked()
+                    {
+                        self.probe_camera();
+                    }
+                }
+                AppMode::Idle => {
+                    if ui
+                        .add(crate::theme::primary_button("Start Preview"))
+                        .clicked()
+                    {
+                        self.start_preview();
+                    }
+                    if ui.button("Record").clicked() {
+                        self.start_recording();
+                    }
+                }
+                AppMode::Previewing => {
+                    if ui.add(crate::theme::primary_button("Record")).clicked() {
+                        self.start_recording();
+                    }
+                    if ui.button("Stop Preview").clicked() {
+                        self.stop_pipeline();
+                    }
+                }
+                AppMode::Recording => {
+                    if ui
+                        .add(crate::theme::primary_button("Stop Recording"))
+                        .clicked()
+                    {
+                        self.stop_pipeline();
+                    }
+                }
+                AppMode::Replaying => {
+                    ui.weak("Replay mode");
+                }
+            });
+
+            if matches!(mode, AppMode::Previewing | AppMode::Recording)
+                && (self.config_dirty || self.acq_dirty)
+            {
+                let enabled = !self.settings_are_locked();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Apply Settings"))
+                    .clicked()
+                {
+                    self.apply_runtime_changes();
+                }
+            }
+
+            if mode != AppMode::Replaying {
+                ui.separator();
+                ui.label("Recording file");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        mode != AppMode::Recording,
+                        egui::TextEdit::singleline(&mut self.output_path).desired_width(130.0),
+                    );
+                    if ui
+                        .add_enabled(mode != AppMode::Recording, egui::Button::new("…"))
+                        .on_hover_text("Choose recording file")
+                        .clicked()
+                    {
+                        self.choose_output_path();
+                    }
+                });
+                ui.add_enabled_ui(mode != AppMode::Recording, |ui| {
+                    ui.checkbox(
+                        &mut self.record_sensor_telemetry,
+                        "Record sensor monitoring",
+                    );
+                });
+                if self.record_sensor_telemetry {
+                    let companion = sensor_telemetry_path(Path::new(self.output_path.trim()))
+                        .and_then(|path| path.file_name().map(|name| name.to_owned()))
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "<recording>.sensor-monitoring.csv".into());
+                    ui.small(format!(
+                        "{companion}\nLux 1.5 Hz · temperature/dead time 0.2 Hz"
+                    ));
+                    if let Some(controller) = self.controller.as_ref() {
+                        let telemetry = controller.sensor_telemetry();
+                        if telemetry.output_path.is_some() {
+                            ui.small(format!(
+                                "{} samples written · {} dropped",
+                                telemetry.samples_written, telemetry.samples_dropped
+                            ));
+                            if let Some(error) = telemetry.write_error {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     fn probe_camera(&mut self) {
         match Evk4Camera::open_imx636() {
             Ok(camera) => {
@@ -6250,6 +6411,9 @@ impl CameraApp {
         match self.start_pipeline_inner(true) {
             Ok(controller) => {
                 self.sync_pipeline_requirements(&controller);
+                // Coverage is a per-session statement about this stream's live series.
+                self.live_analysis_windows_seen = 0;
+                self.live_analysis_windows_dispatched = 0;
                 self.controller = Some(controller);
                 self.last_preview_process_at = None;
                 self.mode = AppMode::Previewing;
@@ -6300,6 +6464,9 @@ impl CameraApp {
         let controller =
             self.start_pipeline_inner_with_recording(false, Some(actual_path.clone()), metadata)?;
         self.sync_pipeline_requirements(&controller);
+        // Coverage is a per-session statement about this stream's live series.
+        self.live_analysis_windows_seen = 0;
+        self.live_analysis_windows_dispatched = 0;
         self.controller = Some(controller);
         self.last_preview_process_at = None;
         self.mode = AppMode::Recording;
@@ -6436,6 +6603,9 @@ impl CameraApp {
         self.set_replay_paused_internal(&controls, false);
         self.set_replay_speed_internal(&controls, 1.0);
         self.sync_pipeline_requirements(&controller);
+        // Coverage is a per-session statement about this stream's live series.
+        self.live_analysis_windows_seen = 0;
+        self.live_analysis_windows_dispatched = 0;
         self.controller = Some(controller);
         self.last_preview_process_at = None;
         self.pending_preview_frame = None;
@@ -6894,6 +7064,9 @@ impl CameraApp {
             opts.sensor_width = self.sensor_width;
             opts.sensor_height = self.sensor_height;
             opts.disk_writer_buffer_bytes = mib_to_bytes(self.disk_writer_buffer_mib);
+            if self.record_sensor_telemetry {
+                opts.sensor_telemetry = Some(SensorTelemetryOptions::default());
+            }
             opts
         };
 
@@ -7337,6 +7510,9 @@ impl CameraApp {
         };
         self.set_replay_speed_internal(&controls, seek_speed);
         self.sync_pipeline_requirements(&controller);
+        // Coverage is a per-session statement about this stream's live series.
+        self.live_analysis_windows_seen = 0;
+        self.live_analysis_windows_dispatched = 0;
         self.controller = Some(controller);
         if let Some(controller) = &self.controller {
             sync_acq_time_atomic(&controller.acq_time_us, self.acq_time_ms);
@@ -7809,11 +7985,16 @@ impl CameraApp {
         if self.runtime_snapshot_source == Some(RuntimeSnapshotSource::Mirror) {
             self.clear_runtime_snapshots();
         }
-        self.analysis_notice = Some(
-            "Live plugin output is a preview — start an analysis (Analysis \u{25B8} New \
-             Analysis…) for exact results."
-                .into(),
-        );
+        self.live_analysis_windows_dispatched =
+            self.live_analysis_windows_dispatched.saturating_add(1);
+        self.analysis_notice = Some(format!(
+            "Live plugin output is a preview{} — start an analysis (Analysis \u{25B8} New \
+             Analysis…) for exact, gap-free results.",
+            live_analysis_coverage_text(
+                self.live_analysis_windows_dispatched,
+                self.live_analysis_windows_seen,
+            )
+        ));
         let epoch = self.current_analysis_epoch();
         let global_settings_json = self.cached_global_settings_json();
         let sensor_monitoring_json = self.sensor_monitoring_json();
@@ -7953,6 +8134,7 @@ impl CameraApp {
         let mut drained_frame = false;
         while let Ok(frame) = frame_rx.try_recv() {
             drained_frame = true;
+            self.live_analysis_windows_seen = self.live_analysis_windows_seen.saturating_add(1);
             // Trigger edges ride on individual preview frames, but frames are
             // dropped freely below (drain-to-newest, process throttle). Bank
             // every drained frame's edges so the next *processed* frame
@@ -8540,7 +8722,8 @@ impl eframe::App for CameraApp {
                     }
                     if ui
                         .add_enabled(
-                            mode == AppMode::Idle || mode == AppMode::Previewing,
+                            (mode == AppMode::Idle || mode == AppMode::Previewing)
+                                && self.camera_info.is_some(),
                             egui::Button::new("Record").shortcut_text("\u{2318}R"),
                         )
                         .clicked()
@@ -9243,6 +9426,8 @@ impl eframe::App for CameraApp {
                     ) {
                         self.settings_panel_open = false;
                     }
+                    self.draw_capture_controls(ui, mode);
+                    ui.add_space(crate::theme::sp::SP_2);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -9304,15 +9489,21 @@ impl eframe::App for CameraApp {
                     // Panel footer — only when not replaying.
                     if mode != AppMode::Replaying {
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(crate::theme::primary_button("Apply Settings"))
-                                .on_hover_text("Apply current settings to the camera")
-                                .clicked()
-                            {
-                                self.apply_runtime_changes();
-                            }
-                        });
+                        if matches!(mode, AppMode::Previewing | AppMode::Recording) {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !settings_locked
+                                            && (self.config_dirty || self.acq_dirty),
+                                        crate::theme::primary_button("Apply Settings"),
+                                    )
+                                    .on_hover_text("Apply current settings to the camera")
+                                    .clicked()
+                                {
+                                    self.apply_runtime_changes();
+                                }
+                            });
+                        }
                         ui.horizontal(|ui| {
                             ui.checkbox(
                                 &mut self.lock_settings_while_recording,
@@ -9919,14 +10110,30 @@ impl eframe::App for CameraApp {
         }
         self.handle_investigation_shortcuts(ctx, &investigation_scene_3d);
 
-        // ⌘[ / ⌘] panel toggle shortcuts
+        // Global camera and panel shortcuts shown by the menus.
         if !ctx.wants_keyboard_input() {
-            let (toggle_settings, toggle_analysis) = ctx.input_mut(|input| {
-                (
-                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::OpenBracket),
-                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::CloseBracket),
-                )
-            });
+            let (start_preview, start_recording, stop_capture, toggle_settings, toggle_analysis) =
+                ctx.input_mut(|input| {
+                    (
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::R),
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::Period),
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::OpenBracket),
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::CloseBracket),
+                    )
+                });
+            if start_preview && mode == AppMode::Idle && self.camera_info.is_some() {
+                self.start_preview();
+            }
+            if start_recording
+                && matches!(mode, AppMode::Idle | AppMode::Previewing)
+                && self.camera_info.is_some()
+            {
+                self.start_recording();
+            }
+            if stop_capture && mode != AppMode::Idle {
+                self.stop_pipeline();
+            }
             if toggle_settings {
                 self.settings_panel_open = !self.settings_panel_open;
             }
@@ -11297,14 +11504,14 @@ mod tests {
     use super::{
         acq_time_us_from_ms, derived_replay_preview_interval_ms, host_view_kind_is_dockable,
         investigation_split_ratio_bounds, is_newer_host_snapshot_sequence,
-        live_snapshot_generations_equal, pipeline_stream_active, python_ingress_pipeline_config,
-        python_ingress_replay_info, raw_event_focus_volume, raw_event_point_position,
-        recording_finalize_outcome, replay_fraction_from_time, replay_history_has_display_override,
-        replay_history_step_target, replay_pipeline_config, replay_seek_target_reached,
-        replay_snapshot_frame, replay_step_target_time_us, replay_step_uses_current_controller,
-        replay_time_from_position_sources, resolve_plugin_recording_path,
-        roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
-        should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
+        live_analysis_coverage_text, live_snapshot_generations_equal, pipeline_stream_active,
+        python_ingress_pipeline_config, python_ingress_replay_info, raw_event_focus_volume,
+        raw_event_point_position, recording_finalize_outcome, replay_fraction_from_time,
+        replay_history_has_display_override, replay_history_step_target, replay_pipeline_config,
+        replay_seek_target_reached, replay_snapshot_frame, replay_step_target_time_us,
+        replay_step_uses_current_controller, replay_time_from_position_sources,
+        resolve_plugin_recording_path, roi_is_effectively_full_frame, sha256_file,
+        short_host_view_chip_title, should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
         viewport_stream_active, CameraApp, PluginRecordingSession, PopupSharedData,
         RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
@@ -11331,6 +11538,20 @@ mod tests {
             .expect("system clock is valid")
             .as_nanos();
         std::env::temp_dir().join(format!("augur-recording-contract-{nanos}"))
+    }
+
+    #[test]
+    fn live_analysis_coverage_reports_skipped_windows() {
+        // Full coverage says nothing: the notice already calls live output a
+        // preview, and a "100 %" claim would be noise.
+        assert_eq!(live_analysis_coverage_text(0, 0), "");
+        assert_eq!(live_analysis_coverage_text(4, 4), "");
+        // Anything less must be quantified, because the missing windows are
+        // exactly the missing samples in the plugin's live series.
+        let text = live_analysis_coverage_text(1, 16);
+        assert!(text.contains("1 of 16"), "unexpected coverage text: {text}");
+        assert!(text.contains("6 %"), "unexpected coverage text: {text}");
+        assert!(text.contains("gaps"), "unexpected coverage text: {text}");
     }
 
     #[test]

@@ -61,6 +61,74 @@ impl SensorMonitoring {
     }
 }
 
+/// Selects which monitoring blocks a camera should physically read.
+///
+/// Keeping this separate from [`SensorMonitoring`] lets low-rate recorders
+/// avoid waking unrelated ADC/register blocks merely to discard their values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SensorMonitoringSelection {
+    pub pixel_dead_time: bool,
+    pub illumination: bool,
+    pub temperature: bool,
+    pub biases: bool,
+}
+
+impl SensorMonitoringSelection {
+    pub const ALL: Self = Self {
+        pixel_dead_time: true,
+        illumination: true,
+        temperature: true,
+        biases: true,
+    };
+
+    pub const ILLUMINATION: Self = Self {
+        illumination: true,
+        ..Self::NONE
+    };
+
+    pub const SLOW_TELEMETRY: Self = Self {
+        pixel_dead_time: true,
+        temperature: true,
+        ..Self::NONE
+    };
+
+    pub const NONE: Self = Self {
+        pixel_dead_time: false,
+        illumination: false,
+        temperature: false,
+        biases: false,
+    };
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            pixel_dead_time: self.pixel_dead_time || other.pixel_dead_time,
+            illumination: self.illumination || other.illumination,
+            temperature: self.temperature || other.temperature,
+            biases: self.biases || other.biases,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+
+    fn filter(self, mut values: SensorMonitoring) -> SensorMonitoring {
+        if !self.pixel_dead_time {
+            values.pixel_dead_time_us = None;
+        }
+        if !self.illumination {
+            values.illumination_lux = None;
+        }
+        if !self.temperature {
+            values.temperature_c = None;
+        }
+        if !self.biases {
+            values.biases = None;
+        }
+        values
+    }
+}
+
 pub trait EventCamera: Send {
     fn configure(&mut self, config: &CameraConfig) -> Result<()>;
     fn start_streaming(&mut self) -> Result<()>;
@@ -77,6 +145,17 @@ pub trait EventCamera: Send {
     fn read_monitoring(&mut self) -> Result<SensorMonitoring> {
         Ok(SensorMonitoring::default())
     }
+
+    /// Reads only the requested monitoring blocks when the hardware supports
+    /// selective access. The default preserves compatibility with camera
+    /// implementations that can only perform one monolithic read.
+    fn read_monitoring_selected(
+        &mut self,
+        selection: SensorMonitoringSelection,
+    ) -> Result<SensorMonitoring> {
+        self.read_monitoring()
+            .map(|values| selection.filter(values))
+    }
 }
 
 /// Stream-only packet reader split off a `PacketStreamCamera`, so the
@@ -84,6 +163,31 @@ pub trait EventCamera: Send {
 /// control (configure, start/stop) runs elsewhere.
 pub trait PacketStreamReader: Send {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize>;
+
+    /// Services the transport without delivering a packet.
+    ///
+    /// Readers that keep transfers queued in the kernel must be able to reap
+    /// completions and re-arm them even while the pipeline has no free buffer
+    /// to receive data into. Without this the transfer queue drains during a
+    /// downstream stall, the device endpoint runs dry, and the camera FIFO
+    /// overflows — a hard, unrecoverable gap in the recording that is far
+    /// longer than the stall itself.
+    ///
+    /// Implementations must return within roughly `budget` and must never
+    /// discard received data. The default is a no-op, which is correct for
+    /// readers that hold no queued transfers.
+    fn service(&mut self, _budget: std::time::Duration) {}
+
+    /// Moves one packet the reader already received, but has not delivered,
+    /// into `out`.
+    ///
+    /// Called after the stream loop stops so data the device already handed to
+    /// the host still reaches the recording instead of being dropped with the
+    /// reader. Returns `Ok(0)` when nothing is buffered. The default reports
+    /// no buffered data.
+    fn take_buffered_packet(&mut self, _out: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 pub trait PacketStreamCamera: EventCamera {
