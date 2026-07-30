@@ -114,6 +114,11 @@ pub struct PluginControlInbox {
 }
 
 pub const CTX_GLOBAL_SETTINGS: &str = "augur.global_settings";
+
+/// Per-frame context bus key carrying [`SensorMonitoringV1`]. Host-written and
+/// read-only for plugins. Absent whenever the host is not streaming from a
+/// camera that can measure these values — see the type's docs.
+pub const CTX_SENSOR_MONITORING: &str = "augur.sensor_monitoring";
 /// Reserved JSON key inside [`HostActionRequest::params`] that the host uses
 /// to attach raw table-row snapshots for cluster-scoped actions.
 pub const HOST_ACTION_CLUSTER_ROWS_PARAM: &str = "__augur_cluster_rows";
@@ -148,6 +153,63 @@ pub struct GlobalSettings {
     /// Masked (dead/hot) pixels from the host camera config.
     #[serde(default)]
     pub masked_pixels: Vec<(u16, u16)>,
+}
+
+/// Absolute 8-bit bias codes as programmed on the sensor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SensorBiasCodesV1 {
+    pub diff_on: u8,
+    pub diff_off: u8,
+    pub fo: u8,
+    pub hpf: u8,
+    pub refr: u8,
+}
+
+/// Programmed bias codes together with the per-unit factory trim the
+/// configured offsets are relative to. `current - factory_default` is the
+/// offset shown in the host settings panel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SensorBiasReadbackV1 {
+    pub current: SensorBiasCodesV1,
+    pub factory_default: SensorBiasCodesV1,
+}
+
+/// Absolute, sensor-measured counterparts to the abstract camera settings.
+///
+/// The host camera configuration expresses biases as relative offsets around a
+/// per-unit factory trim, so a plugin cannot derive physical values from it.
+/// This is the sensor's own report.
+///
+/// **Availability:** present only while the host streams from a camera with a
+/// monitoring block (currently the EVK4/IMX636). Replay, decoded imports and
+/// deterministic offline analysis runs never carry it, because there is no
+/// device to ask — a plugin that needs these values must treat them as
+/// optional and must not change its results depending on their presence, or
+/// live and offline runs over the same data will disagree.
+///
+/// A `None` field means the sensor cannot report that quantity. Only `refr`
+/// has a physical unit among the biases; the other four are exposed as their
+/// absolute code in `bias_codes`, because no vendor-documented conversion to
+/// a physical unit exists.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+pub struct SensorMonitoringV1 {
+    /// Measured pixel dead time (refractory period) in microseconds.
+    #[serde(default)]
+    pub pixel_dead_time_us: Option<f32>,
+    /// Scene illumination in lux, integrated by the sensor.
+    #[serde(default)]
+    pub illumination_lux: Option<f32>,
+    /// Sensor die temperature in degrees Celsius.
+    #[serde(default)]
+    pub temperature_c: Option<f32>,
+    /// Absolute bias codes plus the factory defaults they offset from.
+    #[serde(default)]
+    pub bias_codes: Option<SensorBiasReadbackV1>,
+    /// Seconds since the host actually read these values from the sensor. The
+    /// host polls at a few hertz, so a reading is normally well under a second
+    /// old but is never simultaneous with the frame it arrives on.
+    #[serde(default)]
+    pub age_s: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

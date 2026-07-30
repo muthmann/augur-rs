@@ -32,9 +32,9 @@ use augur_plugin_api::{
     ExecutionContext, ExecutionMode, FfiCdEvent, GlobalSettings, HostActionRequest,
     HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostCommand,
     HostCommandOutcome, HostCommandReply, HostDatasetKind, HostViewKind, Image2dV1,
-    PluginDiscontinuity, PluginInput, Series1dV1, SettingsSchema, TableColumnValues,
-    TableDatasetV1, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
-    HOST_ACTION_CLUSTER_ROWS_PARAM,
+    PluginDiscontinuity, PluginInput, SensorBiasCodesV1, SensorBiasReadbackV1, SensorMonitoringV1,
+    Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1, CTX_GLOBAL_SETTINGS,
+    CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
@@ -354,6 +354,19 @@ fn raw_event_focus_volume(
             roi.x_min, roi.x_max, roi.y_min, roi.y_max
         ),
         color: [255, 221, 116, 220],
+    }
+}
+
+/// Maps the core camera bias codes onto the plugin-facing companion type. The
+/// two are deliberately separate: `augur-core` is the camera SDK, and plugins
+/// compile against `augur-plugin-api` alone.
+fn bias_codes_v1(codes: &augur_core::camera::BiasCodes) -> SensorBiasCodesV1 {
+    SensorBiasCodesV1 {
+        diff_on: codes.diff_on,
+        diff_off: codes.diff_off,
+        fo: codes.fo,
+        hpf: codes.hpf,
+        refr: codes.refr,
     }
 }
 
@@ -1439,6 +1452,27 @@ impl CameraApp {
             self.cached_global_settings = Some(global_settings);
         }
         Some(self.cached_global_settings_json.clone())
+    }
+
+    /// Serializes the latest sensor readback for the plugin context bus.
+    ///
+    /// Not cached like the global settings: every reading is a distinct
+    /// measurement, and a plugin logging illumination or die temperature needs
+    /// the changes, not a deduplicated value.
+    fn sensor_monitoring_json(&self) -> Option<Vec<u8>> {
+        let snapshot = self.controller.as_ref()?.sensor_monitoring()?;
+        let biases = snapshot.values.biases.map(|readback| SensorBiasReadbackV1 {
+            current: bias_codes_v1(&readback.current),
+            factory_default: bias_codes_v1(&readback.factory_default),
+        });
+        serde_json::to_vec(&SensorMonitoringV1 {
+            pixel_dead_time_us: snapshot.values.pixel_dead_time_us,
+            illumination_lux: snapshot.values.illumination_lux,
+            temperature_c: snapshot.values.temperature_c,
+            bias_codes: biases,
+            age_s: snapshot.age_s,
+        })
+        .ok()
     }
 
     fn effective_preview_interval_ms(&self) -> u64 {
@@ -6091,11 +6125,13 @@ impl CameraApp {
         controller
             .raw_events_needed
             .store(self.raw_events_required(), Ordering::Relaxed);
-        // The absolute setting values are only rendered inside the settings
-        // panel, so a collapsed panel costs no USB control transfers.
-        controller
-            .sensor_monitoring_needed
-            .store(self.settings_panel_open, Ordering::Relaxed);
+        // Poll while something can consume the values: the settings panel
+        // renders them, and live plugins receive them on the context bus. A
+        // collapsed panel with no live plugins costs no USB control transfers.
+        controller.sensor_monitoring_needed.store(
+            self.settings_panel_open || self.runtime_plugins_enabled(),
+            Ordering::Relaxed,
+        );
     }
 
     fn sync_active_pipeline_requirements(&self) {
@@ -7780,6 +7816,7 @@ impl CameraApp {
         );
         let epoch = self.current_analysis_epoch();
         let global_settings_json = self.cached_global_settings_json();
+        let sensor_monitoring_json = self.sensor_monitoring_json();
         // The worker's persistent map stays authoritative between jobs so
         // plugin-published values are never rolled back by a stale echo.
         // A full snapshot is sent only when the GUI owned the bus.
@@ -7800,6 +7837,7 @@ impl CameraApp {
             frame: frame.clone(),
             execution: self.plugin_execution_context(true),
             global_settings_json,
+            sensor_monitoring_json,
             persistent_seed,
             persistent_updates,
             action_request_watermark,

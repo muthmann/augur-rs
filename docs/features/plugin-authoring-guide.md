@@ -51,10 +51,43 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 - `SettingsSchema` / `StatusEntry`
 - `HostViewRegistry`
 - `GlobalSettings`
+- `SensorMonitoringV1` / `SensorBiasReadbackV1` / `SensorBiasCodesV1`
 - `TableDatasetV1`
 - `Image2dV1`
 - `Series1dV1`
 - `CTX_GLOBAL_SETTINGS`
+- `CTX_SENSOR_MONITORING`
+
+### Sensor measurements (`HostContext::sensor_monitoring`)
+
+`HostContext::sensor_monitoring()` returns the absolute values the sensor
+measured for the current capture: refractory period (µs), illumination (lux),
+die temperature (°C), and the absolute bias codes with their per-unit factory
+defaults. The camera configuration only carries relative bias offsets, so these
+cannot be derived plugin-side.
+
+```rust
+if let Some(monitoring) = context.sensor_monitoring() {
+    if let Some(lux) = monitoring.illumination_lux {
+        // log the light level this measurement was taken under
+    }
+}
+```
+
+**It is optional context, never an input to results.** The value is `None` on
+replay, decoded imports, and deterministic offline analysis runs — there is no
+device to ask. A plugin whose output changes with its presence would disagree
+between a live preview and an offline re-run of the same recording, which
+breaks the guarantee that analysis runs are reproducible (ADR 025). Use it for
+logging, provenance, and sanity checks on capture conditions.
+
+Each field is independently `Option`: `None` means the sensor cannot report that
+quantity. Among the biases only `refr` has a physical unit; the other four are
+exposed as absolute codes because no vendor-documented conversion exists
+(`docs/features/absolute-setting-values.md`).
+
+`age_s` is how long before this frame the host actually read the sensor. The
+host polls at a few hertz, so a reading is never simultaneous with its frame.
 
 Domain-specific payloads live in companion crates rather than in `augur-plugin-api`. Plugins that share structured data with downstream consumers define their types in `augur-plugin-types` or their own companion crate.
 

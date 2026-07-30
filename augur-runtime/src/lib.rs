@@ -38,8 +38,8 @@ use augur_plugin_api::{
     HostDatasetKind, HostViewRegistry, Image2dV1, PluginCapabilities, PluginControlInbox,
     PluginControlSnapshot, PluginDiscontinuity, PluginEntry, PluginInput, PluginRuntimeRole,
     PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginStateKind, PluginVTable,
-    Series1dV1, SettingsSchema, StatusEntry, TableDatasetV1, PLUGIN_ABI_VERSION,
-    PLUGIN_ENTRY_SYMBOL,
+    Series1dV1, SettingsSchema, StatusEntry, TableDatasetV1, CTX_SENSOR_MONITORING,
+    PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
 };
 use libloading::Library;
 use serde::Deserialize;
@@ -388,6 +388,10 @@ pub struct LiveAnalysisJob {
     /// sets `LiveCapture` + effects for the active live-capture worker only.
     pub execution: ExecutionContext,
     pub global_settings_json: Option<Vec<u8>>,
+    /// Serialized `SensorMonitoringV1` for this frame, when the host is
+    /// streaming from a camera that can measure it. `None` on replay and any
+    /// source without a monitoring block.
+    pub sensor_monitoring_json: Option<Vec<u8>>,
     /// Full replacement snapshot of the persistent context bus. The GUI sends
     /// one when it owned the bus since the last live job (startup and
     /// paused-scrub → live transitions); otherwise the worker's own map stays
@@ -411,6 +415,7 @@ impl LiveAnalysisJob {
             frame,
             execution,
             global_settings_json,
+            sensor_monitoring_json,
             persistent_seed,
             persistent_updates,
             action_request_watermark,
@@ -419,6 +424,7 @@ impl LiveAnalysisJob {
         self.frame = frame;
         self.execution = execution;
         self.global_settings_json = global_settings_json;
+        self.sensor_monitoring_json = sensor_monitoring_json;
         if persistent_seed.is_some() {
             // A newer full snapshot already contains every older update.
             self.persistent_seed = persistent_seed;
@@ -2165,6 +2171,9 @@ fn process_live_analysis_job(
     if let Some(json) = &job.global_settings_json {
         context_data.insert("augur.global_settings".to_owned(), json.clone());
     }
+    if let Some(json) = &job.sensor_monitoring_json {
+        context_data.insert(CTX_SENSOR_MONITORING.to_owned(), json.clone());
+    }
 
     let retained_history_needed = manager.records().iter().any(|record| {
         record
@@ -3271,6 +3280,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::new(),
             action_request_watermark: 0,
@@ -3285,6 +3295,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::new(),
             action_request_watermark: 0,
@@ -3362,6 +3373,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: Some(seed),
             persistent_updates: HashMap::new(),
             action_request_watermark: 0,
@@ -3380,6 +3392,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::new(),
             action_request_watermark: 0,
@@ -3397,12 +3410,57 @@ host_commands = ["start_recording", "stop_recording"]
     }
 
     #[test]
+    fn coalesced_jobs_take_the_newest_sensor_monitoring_reading() {
+        let mut job = LiveAnalysisJob {
+            epoch: 1,
+            frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
+            global_settings_json: None,
+            sensor_monitoring_json: Some(b"older-reading".to_vec()),
+            persistent_seed: None,
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
+        };
+        job.coalesce_with(LiveAnalysisJob {
+            epoch: 2,
+            frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
+            global_settings_json: None,
+            sensor_monitoring_json: Some(b"newer-reading".to_vec()),
+            persistent_seed: None,
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
+        });
+
+        assert_eq!(
+            job.sensor_monitoring_json.as_deref(),
+            Some(b"newer-reading".as_slice()),
+            "a coalesced job must carry the freshest measurement, not the one it superseded",
+        );
+
+        // A host that stopped reporting (panel closed, camera gone) must clear
+        // the value rather than pin the last reading onto every later frame.
+        job.coalesce_with(LiveAnalysisJob {
+            epoch: 3,
+            frame: empty_preview_frame(),
+            execution: ExecutionContext::fail_closed(),
+            global_settings_json: None,
+            sensor_monitoring_json: None,
+            persistent_seed: None,
+            persistent_updates: HashMap::new(),
+            action_request_watermark: 0,
+        });
+        assert_eq!(job.sensor_monitoring_json, None);
+    }
+
+    #[test]
     fn coalesced_jobs_keep_superseded_persistent_updates() {
         let mut job = LiveAnalysisJob {
             epoch: 1,
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::from([("host.queue".to_owned(), Some(b"first".to_vec()))]),
             action_request_watermark: 3,
@@ -3412,6 +3470,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: None,
             persistent_updates: HashMap::from([("host.other".to_owned(), None)]),
             action_request_watermark: 2,
@@ -3439,6 +3498,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: Some(HashMap::from([("stale".to_owned(), b"a".to_vec())])),
             persistent_updates: HashMap::from([("stale.update".to_owned(), Some(b"b".to_vec()))]),
             action_request_watermark: 0,
@@ -3448,6 +3508,7 @@ host_commands = ["start_recording", "stop_recording"]
             frame: empty_preview_frame(),
             execution: ExecutionContext::fail_closed(),
             global_settings_json: None,
+            sensor_monitoring_json: None,
             persistent_seed: Some(HashMap::from([("fresh".to_owned(), b"c".to_vec())])),
             persistent_updates: HashMap::new(),
             action_request_watermark: 0,

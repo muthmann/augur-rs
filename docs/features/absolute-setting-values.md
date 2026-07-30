@@ -24,6 +24,9 @@ control, the absolute value it actually produced.
   so the readings are discoverable before the hardware is plugged in.
 - **`augur status`** prints the same readback (refractory period, illumination,
   die temperature, bias codes) for logging outside the GUI.
+- **Plugins** read the same values through
+  `HostContext::sensor_monitoring() -> Option<SensorMonitoringV1>`, delivered on
+  the per-frame context bus under `CTX_SENSOR_MONITORING`.
 
 ## What has an absolute unit, and what does not
 
@@ -69,6 +72,32 @@ have no counterpart here.
 4. **The GUI asks only when it can show it.** `sync_pipeline_requirements`
    stores `settings_panel_open` into the demand flag, following the existing
    `raw_events_needed` pattern. A collapsed panel costs zero control transfers.
+
+## Plugin access
+
+`HostContext::sensor_monitoring()` returns `Option<SensorMonitoringV1>` for the
+current frame. The host serializes the snapshot into the per-frame context bus
+under `CTX_SENSOR_MONITORING` (`"augur.sensor_monitoring"`), the same mechanism
+`GlobalSettings` uses — **no vtable or ABI change**, so existing plugins keep
+working without a rebuild.
+
+Design notes:
+
+- **Context bus, not the frame ABI.** A typed frame field would have been
+  `None` in exactly the deterministic offline path that ADR 025 makes the
+  primary analysis workflow, and would have forced every plugin to be rebuilt
+  for a value most do not use.
+- **Optional context, never an input to results.** Live capture has it, replay
+  and offline runs do not. A plugin whose results depend on it would disagree
+  between a live preview and an offline re-run of the same recording. The type
+  documentation and the authoring guide both say so explicitly.
+- **The poll is demand-driven from either consumer.** The GUI sets
+  `sensor_monitoring_needed` when the settings panel is open **or** runtime
+  plugins are enabled, so a plugin gets readings with the panel collapsed.
+- **Not deduplicated.** Unlike `GlobalSettings`, every reading is serialized
+  fresh: a plugin logging illumination or die temperature needs the changes.
+- **`age_s` travels with the value**, because the host polls at a few hertz and
+  a reading is never simultaneous with the frame it arrives on.
 
 ## Guarantees and limitations
 

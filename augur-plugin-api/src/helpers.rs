@@ -10,7 +10,8 @@ use crate::{
     },
     settings::{SettingsSchema, StatusEntry},
     HostCommandRequest, HostViewRegistry, PluginControlInbox, PluginControlSnapshot,
-    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, SensorMonitoringV1,
+    CTX_SENSOR_MONITORING,
 };
 
 /// Owned view of the host-provided execution context.
@@ -331,6 +332,18 @@ impl<'a> HostContext<'a> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
         }
+    }
+
+    /// Absolute values measured by the sensor for this frame's capture.
+    ///
+    /// `None` whenever the host has nothing to report — replay, decoded
+    /// imports, offline analysis runs, or a camera without a monitoring block.
+    /// Treat it as optional context (logging, provenance, a sanity check on
+    /// the light level); a plugin whose *results* depend on it would produce
+    /// different answers live than in a deterministic offline re-run of the
+    /// same recording.
+    pub fn sensor_monitoring(&self) -> Option<SensorMonitoringV1> {
+        self.get(CTX_SENSOR_MONITORING).ok().flatten()
     }
 
     pub fn publish_raw(&mut self, key: &str, value: &[u8]) {

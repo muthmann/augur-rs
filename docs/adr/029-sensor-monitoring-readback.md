@@ -52,12 +52,20 @@ when nothing is displaying it.
 - **The camera-control thread polls, behind a demand flag.**
   `PipelineController::sensor_monitoring_needed` gates the poll, which runs from
   the control thread's existing 50 ms idle tick at most every 500 ms. The GUI
-  sets the flag from `settings_panel_open`, following the `raw_events_needed`
-  precedent. A successful reconfigure resets the interval so post-apply codes
-  appear immediately.
+  sets the flag when the settings panel is open or runtime plugins are enabled,
+  following the `raw_events_needed` precedent. A successful reconfigure resets
+  the interval so post-apply codes appear immediately.
 - **Sources whose camera runs inline on the stream thread get no monitoring at
   all.** Polling there would pause packet reads and cost recorded events, which
   ranks below any display concern.
+- **Plugins read it from the per-frame context bus**, not from the frame ABI.
+  `CTX_SENSOR_MONITORING` carries a serialized `SensorMonitoringV1`, and
+  `HostContext::sensor_monitoring()` is the typed accessor. No vtable change,
+  so no plugin rebuild. A typed frame field was rejected: it would be absent in
+  exactly the deterministic offline path ADR 025 makes primary, and would force
+  every plugin to be rebuilt for a value most do not use. The type is documented
+  as optional context that must not influence results, because live capture has
+  it and an offline re-run of the same recording does not.
 - **Freshness is part of the contract.** `SensorMonitoringSnapshot` carries an
   age and the last error. Values shown beside a slider are withdrawn once the
   reading passes 2 s; a failed poll keeps the last good values but does not
@@ -72,8 +80,11 @@ when nothing is displaying it.
 - Illumination and die temperature become available. They are not settings, so
   they live in their own Sensor Readout section rather than among the biases —
   their value is as recorded context for a bias sweep.
-- The plugin ABI is untouched. This is host-side telemetry; no plugin-visible
-  type changes, no vtable change.
+- The plugin ABI is untouched: `augur-plugin-api` gains companion types and a
+  `HostContext` accessor, but no vtable entry and no `PLUGIN_ABI_VERSION` bump,
+  so already-built plugins keep loading.
+- The GUI requests the poll while the settings panel is open **or** runtime
+  plugins are enabled, so a plugin receives readings with the panel collapsed.
 - Adding a new sensor requires no work: the default `read_monitoring` reports
   nothing and the panel degrades to the current behaviour.
 - The IMX636 temperature ADC is now brought up (lazily, on first read), which

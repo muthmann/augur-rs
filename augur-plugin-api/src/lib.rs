@@ -11,12 +11,12 @@ pub use context::{
     HostCommandRequest, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
     HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement,
     HostViewRegistry, Image2dV1, PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, Series1dLine, Series1dPoint, Series1dV1,
-    TableColumn, TableColumnData, TableColumnDisplayEntry, TableColumnDisplayFormat,
-    TableColumnDisplayMetadata, TableColumnValues, TableColumnWidthPriority,
-    TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableRowProvenance,
-    TableSchema, TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
-    HOST_ACTION_CLUSTER_ROWS_PARAM,
+    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasReadbackV1,
+    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
+    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
+    TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
+    TableDatasetV1, TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    CTX_INVESTIGATION_ACTION_REQUESTS, CTX_SENSOR_MONITORING, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 pub use event_store::EventStore;
 pub use ffi::{
@@ -89,6 +89,7 @@ mod tests {
             Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
             TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
             TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+            CTX_SENSOR_MONITORING,
         },
         settings::{
             PathDialogKind, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
@@ -222,6 +223,51 @@ mod tests {
             serde_json::from_slice(&json).expect("settings must deserialize");
         assert_eq!(decoded, settings);
         assert_eq!(CTX_GLOBAL_SETTINGS, "augur.global_settings");
+    }
+
+    #[test]
+    fn sensor_monitoring_round_trips_through_json() {
+        let monitoring = crate::SensorMonitoringV1 {
+            pixel_dead_time_us: Some(6.35),
+            illumination_lux: Some(412.0),
+            temperature_c: Some(41.3),
+            bias_codes: Some(crate::SensorBiasReadbackV1 {
+                current: crate::SensorBiasCodesV1 {
+                    diff_on: 114,
+                    diff_off: 40,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 118,
+                },
+                factory_default: crate::SensorBiasCodesV1 {
+                    diff_on: 102,
+                    diff_off: 40,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 138,
+                },
+            }),
+            age_s: 0.25,
+        };
+
+        let json = serde_json::to_vec(&monitoring).expect("monitoring must serialize");
+        let decoded: crate::SensorMonitoringV1 =
+            serde_json::from_slice(&json).expect("monitoring must deserialize");
+        assert_eq!(decoded, monitoring);
+        assert_eq!(CTX_SENSOR_MONITORING, "augur.sensor_monitoring");
+    }
+
+    #[test]
+    fn sensor_monitoring_tolerates_a_host_that_reports_nothing() {
+        // A sensor without a monitoring block, and older hosts that only wrote
+        // some of the fields, must both decode rather than fail the frame.
+        let decoded: crate::SensorMonitoringV1 =
+            serde_json::from_slice(br#"{"illumination_lux":12.5}"#)
+                .expect("partial monitoring must deserialize");
+        assert_eq!(decoded.illumination_lux, Some(12.5));
+        assert_eq!(decoded.pixel_dead_time_us, None);
+        assert_eq!(decoded.bias_codes, None);
+        assert_eq!(decoded.age_s, 0.0);
     }
 
     #[test]
