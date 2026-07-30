@@ -117,20 +117,29 @@ pub fn draw_settings(
         },
     );
 
-    if let Some(snapshot) = sensor_monitoring {
-        ui.separator();
-        crate::theme::collapse(
-            ui,
-            "settings_sensor_readout",
-            "Sensor Readout",
-            false,
-            None,
-            |ui| {
-                ui.weak("Live values measured on the sensor itself, not derived from the settings above.");
-                draw_sensor_readout(ui, snapshot);
-            },
-        );
-    }
+    ui.separator();
+    // Always present and open by default. Illumination and die temperature are
+    // the conditions a bias setting only makes sense against, so they must be
+    // readable at a glance rather than behind a collapsed section that appears
+    // and disappears with the camera.
+    crate::theme::collapse(
+        ui,
+        "settings_sensor_readout",
+        "Sensor Readout",
+        true,
+        None,
+        |ui| {
+            ui.weak(
+                "Live values measured on the sensor itself, not derived from the settings above.",
+            );
+            match sensor_monitoring {
+                Some(snapshot) => draw_sensor_readout(ui, snapshot),
+                None => {
+                    ui.small("Illumination and die temperature appear while the camera runs.");
+                }
+            }
+        },
+    );
 
     ui.separator();
     crate::theme::collapse(ui, "settings_roi", "ROI", false, None, |ui| {

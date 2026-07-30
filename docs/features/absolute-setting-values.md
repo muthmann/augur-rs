@@ -19,7 +19,9 @@ control, the absolute value it actually produced.
 - **Sensor Readout section** — illumination in lux and die temperature in °C,
   the two remaining monitoring quantities. Neither is a setting; both describe
   the conditions a bias setting was chosen under, which is what makes a bias
-  sweep reproducible.
+  sweep reproducible. The section is always present and open by default: it
+  states what it is waiting for when no camera is running rather than vanishing,
+  so the readings are discoverable before the hardware is plugged in.
 - **`augur status`** prints the same readback (refractory period, illumination,
   die temperature, bias codes) for logging outside the GUI.
 
