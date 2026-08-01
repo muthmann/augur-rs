@@ -4106,12 +4106,17 @@ mod tests {
         controller.shutdown().expect("pipeline shuts down");
 
         let selections = selections.lock().expect("selections");
+        // Every sample polls illumination, and the first one always includes the
+        // slow fields, so this holds no matter how the poller was scheduled.
         assert!(selections
             .iter()
             .any(|selection| selection.illumination && selection.temperature));
-        assert!(selections
-            .iter()
-            .any(|selection| selection.illumination && !selection.temperature));
+        // Deliberately not asserted here: that some sample polls illumination
+        // *without* the slow fields. Under scheduling delay both intervals come
+        // due together and a combined sample is the correct outcome - see
+        // `sensor_telemetry_schedule_uses_field_specific_rates_without_catch_up`,
+        // which pins that split against a synthetic clock instead of a loaded
+        // machine's thread scheduler.
         let csv = std::fs::read_to_string(&telemetry_path).expect("telemetry CSV");
         assert!(csv.lines().count() >= 4);
         assert!(csv.contains(",42,31.5,6.25,"));
