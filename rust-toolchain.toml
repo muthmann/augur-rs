@@ -4,3 +4,4 @@
 # Bump this deliberately, in its own commit, with the lint fallout fixed.
 channel = "1.95.0"
 components = ["clippy", "rustfmt"]
+
