@@ -32,7 +32,7 @@ targets=(aarch64-apple-darwin x86_64-apple-darwin)
 universal_dir="$repo_root/target/universal-apple-darwin/release"
 
 cd "$repo_root"
-mkdir -p "$out_dir"
+out_dir="$(augur_abs_out_dir "$out_dir")"
 
 if [ "$skip_build" -eq 0 ]; then
   for target in "${targets[@]}"; do

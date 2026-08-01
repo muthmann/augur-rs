@@ -26,7 +26,15 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+
+# Resolve the output directory to an absolute path before anything uses it.
+# makensis resolves relative paths against the .nsi file's directory rather than
+# the working directory, so a relative -OutDir would write the installer
+# somewhere nobody is looking - or, more often, fail to open it at all.
 if (-not $OutDir) { $OutDir = Join-Path $repoRoot 'dist' }
+if (-not [System.IO.Path]::IsPathRooted($OutDir)) { $OutDir = Join-Path $repoRoot $OutDir }
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$OutDir = (Resolve-Path $OutDir).Path
 
 function Write-Step($message) { Write-Host "==> $message" -ForegroundColor Cyan }
 
@@ -45,8 +53,6 @@ Write-Step "packaging AugurRS $version"
 
 Push-Location $repoRoot
 try {
-    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-
     if (-not $SkipBuild) {
         Write-Step 'building release binaries'
         cargo build --release --locked --bin augur --bin AugurRS

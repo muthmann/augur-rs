@@ -33,3 +33,14 @@ augur_doc_files() {
 augur_log() {
   printf '\033[1;36m==>\033[0m %s\n' "$*" >&2
 }
+
+# Resolve an output directory to an absolute path, creating it if needed.
+#
+# The build scripts `cd` into the repo root and hand paths to tools that resolve
+# them against their own notion of "here", so a relative `--out` is a quiet way
+# to write artifacts somewhere nobody looks.
+augur_abs_out_dir() {
+  local dir="$1"
+  mkdir -p "$dir"
+  (cd "$dir" && pwd)
+}

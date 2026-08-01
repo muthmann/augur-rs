@@ -34,7 +34,8 @@ release_dir="$repo_root/target/release"
 tools_dir="$repo_root/target/appimage-tools"
 
 cd "$repo_root"
-mkdir -p "$out_dir" "$tools_dir"
+out_dir="$(augur_abs_out_dir "$out_dir")"
+mkdir -p "$tools_dir"
 
 if [ "$skip_build" -eq 0 ]; then
   augur_log "building release binaries"
