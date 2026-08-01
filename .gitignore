@@ -3,6 +3,9 @@
 # Rust build output
 /target/
 
+# Packaging output (resources/packaging/*)
+/dist/
+
 # Local capture/config artifacts
 /output.raw
 /output.toml
