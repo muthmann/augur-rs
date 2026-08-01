@@ -58,6 +58,11 @@ jobs:
       - name: Smoke-test the disk image
         run: bash resources/packaging/macos/verify-dmg.sh dist
 
+      # The bundle swap is the riskiest step in the whole update path: copy it
+      # with the wrong tool and the signature silently stops validating.
+      - name: Verify the in-app update swap
+        run: bash resources/packaging/macos/verify-update-swap.sh dist
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
