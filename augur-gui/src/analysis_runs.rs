@@ -871,7 +871,7 @@ fn range_label(t_start_us: Option<u64>, t_end_us: Option<u64>) -> String {
 }
 
 fn window_label(acq_time_us: u64) -> String {
-    if acq_time_us % 1_000 == 0 {
+    if acq_time_us.is_multiple_of(1_000) {
         format!("{} ms windows", acq_time_us / 1_000)
     } else {
         format!("{acq_time_us} us windows")
