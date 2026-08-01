@@ -23,7 +23,8 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Global Settings Menu and Replay Pacing](./global-settings-menu.md) — top-bar settings controls, hover/reference guidance, persisted `[global]` config, plugin `GlobalSettings`, replay-editable acquisition time, and speed-change replay resets
 - [Replay Timing Model](./replay-timing-model.md) — timestamp-driven replay pacing, auto-derived replay display cadence, and preview-frame load shedding
 - [TIFF Stack Export](./tiff-stack-export.md) — File-menu batch export of replay accumulations to multi-page 16-bit TIFF with time-window and ROI controls
-- [Release Distribution](./release-distribution.md) — cross-platform tagged artifacts, macOS signing/notarization, and cargo-release workflow
+- [Release Distribution](./release-distribution.md) — per-platform installers (DMG, AppImage, NSIS), universal macOS binaries, checksums, and how a tagged release is actually built
+- [In-App Updates](./in-app-updates.md) — `Help ▸ Check for updates…` and `augur update`: throttled background check, mandatory checksum verification, and the per-platform apply mechanics
 - [Local Desktop Install](./local-desktop-install.md) — one-command macOS source install plus current release expectations on Linux and Windows
 - [HDF5 File Support](./hdf5-file-support.md) — native HDF5 build requirements, ECF plugin installation, runtime environment setup
 - [Rich Recording Metadata](./rich-recording-metadata.md) — self-describing EVT3 headers, metadata sidecars, and replay provenance

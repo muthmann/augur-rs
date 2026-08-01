@@ -205,6 +205,35 @@ The disk writer uses a **bounded channel** — recording pauses if the OS falls 
 
 ---
 
+## Install
+
+Prebuilt, checksum-verified builds for every release are on the
+[releases page](https://github.com/muthmann/augur-rs/releases/latest).
+
+| Platform | Download | Install |
+|---|---|---|
+| macOS | `AugurRS-<version>-macos-universal.dmg` | Drag to Applications. On first launch **right-click ▸ Open** — the build is ad-hoc signed rather than notarized, so Gatekeeper asks once. Universal: runs on Apple Silicon and Intel. |
+| Linux | `AugurRS-<version>-linux-x86_64.AppImage` | `chmod +x` and run. No install step, no root. |
+| Windows | `AugurRS-<version>-windows-x86_64-setup.exe` | Run the setup. Installs per user, so no admin rights are needed, and appears in Add/Remove Programs. |
+
+Terminal-only users can take `augur-<version>-<platform>.tar.gz` / `.zip` instead, which carry the
+`augur` CLI and `AugurRS` binaries plus the example config.
+
+Verify any download against the release's `SHA256SUMS`:
+
+```bash
+shasum -a 256 -c SHA256SUMS   # macOS
+sha256sum -c SHA256SUMS       # Linux
+```
+
+**Updates.** AugurRS updates itself: `Help ▸ Check for updates…` in the GUI, or `augur update` on
+the command line. A background check runs at most once a day and can be turned off. Downloads are
+verified before anything is replaced, and updating is refused while a recording or analysis run is
+active — the running version is written into every recording sidecar. See
+[In-App Updates](./docs/features/in-app-updates.md).
+
+---
+
 ## Quick Start
 
 ### Replay Only (No Camera Required)
@@ -276,17 +305,20 @@ captures/
 
 | Platform | Status |
 |---|---|
-| macOS | Primary — hardware-tested |
-| Linux | CI-verified on every push |
-| Windows | CI-verified on every push |
+| macOS | Primary — hardware-tested. Universal arm64 + x86_64 builds. |
+| Linux | Built, tested, and packaged on every push (x86_64) |
+| Windows | Built, tested, and packaged on every push (x86_64) |
 
-Tagged releases ship macOS, Linux, and Windows CLI archives plus an unsigned macOS `AugurRS.dmg`. Optional HDF5 replay remains source-build-only.
+Every platform gets a real installer — see [Install](#install) above and
+[Release Distribution](./docs/features/release-distribution.md). Optional HDF5 replay remains
+source-build-only.
 
-- macOS: the GitHub DMG works, but Gatekeeper can prompt because it is unsigned. A local source
-  build via `./scripts/build-macos-app.sh --install` is the smoothest path if you want a normal
-  app in Applications without repeating terminal launch commands.
-- Linux / Windows: the GitHub releases are runnable after extracting the archive, but they are
-  still archive-style distributions rather than native installers.
+Remaining rough edges:
+
+- macOS downloads are ad-hoc signed rather than notarized, so Gatekeeper prompts on first launch.
+  Getting rid of that needs a paid Apple Developer ID.
+- Linux ships x86_64 only.
+- The plain `.tar.gz` / `.zip` archives cannot self-update; the DMG, AppImage, and setup can.
 
 ---
 
