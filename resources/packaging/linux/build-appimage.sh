@@ -56,6 +56,14 @@ rm -rf "$appdir"
 mkdir -p "$appdir/usr/bin"
 cp "$release_dir/AugurRS" "$release_dir/augur" "$appdir/usr/bin/"
 
+# linuxdeploy matches the icon to the desktop file's `Icon=` key by basename,
+# so the file it is handed has to be named exactly `AugurRS.png`. The committed
+# asset keeps its size in the name, so stage a correctly named copy.
+icon_stage="$repo_root/target/appimage-icon"
+rm -rf "$icon_stage"
+mkdir -p "$icon_stage"
+cp "$repo_root/assets/AugurRS-256.png" "$icon_stage/AugurRS.png"
+
 # GitHub runners have no FUSE, so both linuxdeploy and the appimagetool it
 # invokes have to unpack themselves instead of mounting.
 export APPIMAGE_EXTRACT_AND_RUN=1
@@ -68,7 +76,7 @@ rm -f "$repo_root/$OUTPUT" "$out_dir/$OUTPUT"
   --appdir "$appdir" \
   --executable "$appdir/usr/bin/AugurRS" \
   --desktop-file "$repo_root/resources/packaging/linux/AugurRS.desktop" \
-  --icon-file "$repo_root/assets/AugurRS-256.png" \
+  --icon-file "$icon_stage/AugurRS.png" \
   --output appimage
 
 mv "$repo_root/$OUTPUT" "$out_dir/$OUTPUT"
