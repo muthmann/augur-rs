@@ -55,6 +55,9 @@ jobs:
       - name: Build DMG and CLI archive
         run: bash resources/packaging/macos/build-dmg.sh --out dist
 
+      - name: Smoke-test the disk image
+        run: bash resources/packaging/macos/verify-dmg.sh dist
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -82,6 +85,9 @@ jobs:
       - name: Build AppImage and CLI archive
         run: bash resources/packaging/linux/build-appimage.sh --out dist
 
+      - name: Smoke-test the AppImage
+        run: bash resources/packaging/linux/verify-appimage.sh dist
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -106,6 +112,12 @@ jobs:
       - name: Build installer and portable archive
         shell: pwsh
         run: ./resources/packaging/windows/build-installer.ps1 -OutDir dist
+
+      # Actually installs, runs, and uninstalls. The silent path exercised here
+      # is the same one the in-app updater invokes.
+      - name: Smoke-test the installer
+        shell: pwsh
+        run: ./resources/packaging/windows/verify-installer.ps1 -DistDir dist
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
