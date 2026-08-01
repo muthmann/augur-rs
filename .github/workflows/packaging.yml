@@ -25,8 +25,11 @@ jobs:
   dry-run:
     name: Build installers
     uses: ./.github/workflows/release.yml
+    # A called workflow cannot request more than its caller grants, and
+    # release.yml needs contents:write for the publishing path. Nothing is
+    # published here: `publish: false` skips that step outright.
     permissions:
-      contents: read
+      contents: write
     with:
       tag: ${{ github.head_ref || github.ref_name }}
       publish: false
