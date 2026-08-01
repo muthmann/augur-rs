@@ -68,6 +68,16 @@ enum Command {
         #[command(subcommand)]
         cmd: ConfigCommand,
     },
+    /// Check for a newer release, and install it.
+    #[cfg(feature = "self-update")]
+    Update {
+        /// Report what is available without downloading or installing.
+        #[arg(long)]
+        check_only: bool,
+        /// Install without the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -130,7 +140,80 @@ fn main() -> Result<()> {
             t_end_us,
         } => analyze(input, config, out, plugins_dir, t_start_us, t_end_us),
         Command::Config { cmd } => config_cmd(cmd),
+        #[cfg(feature = "self-update")]
+        Command::Update { check_only, yes } => update(check_only, yes),
     }
+}
+
+/// Check for a newer release and, unless `check_only`, install it.
+///
+/// Prints what it is about to do at every step: this replaces the binary the
+/// caller is running, so nothing here should be a surprise after the fact.
+#[cfg(feature = "self-update")]
+fn update(check_only: bool, assume_yes: bool) -> Result<()> {
+    use std::io::Write as _;
+
+    const CURRENT: &str = env!("CARGO_PKG_VERSION");
+
+    println!("installed: augur {CURRENT}");
+
+    let release = match augur_update::check(CURRENT)? {
+        augur_update::UpdateStatus::UpToDate(version) => {
+            println!("up to date: {version} is the latest release");
+            return Ok(());
+        }
+        augur_update::UpdateStatus::Available(release) => release,
+    };
+
+    println!("available: {} ({})", release.version, release.notes_url);
+
+    if check_only {
+        return Ok(());
+    }
+
+    // Fail before downloading rather than after. An extracted tarball or a
+    // source build has nothing this updater can replace.
+    if let Err(error) = augur_update::install_kind() {
+        anyhow::bail!(
+            "{error}\ndownload it manually: {}",
+            augur_update::releases_url()
+        );
+    }
+
+    if !assume_yes {
+        print!("install {} now? [y/N] ", release.version);
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("cancelled");
+            return Ok(());
+        }
+    }
+
+    println!("downloading {}…", release.asset.name);
+    let mut last_percent = u64::MAX;
+    let download = augur_update::download(&release, |done, total| {
+        if total == 0 {
+            return;
+        }
+        let percent = done * 100 / total;
+        if percent != last_percent {
+            last_percent = percent;
+            print!("\r  {percent:>3}%");
+            let _ = std::io::stdout().flush();
+        }
+    })?;
+    println!("\r  checksum verified");
+
+    match augur_update::apply(&download)? {
+        augur_update::Applied::Relaunched => println!("installed {}", download.version),
+        augur_update::Applied::InstallerRunning => {
+            println!("installer running; it will finish once this process exits");
+        }
+    }
+
+    Ok(())
 }
 
 fn status(config_path: Option<PathBuf>) -> Result<()> {

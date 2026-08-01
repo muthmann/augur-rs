@@ -1209,6 +1209,7 @@ pub struct CameraApp {
     action_modal: Option<ActionModalState>,
     apply_settings_confirm_open: bool,
     toast_queue: crate::toast::ToastQueue,
+    updates: crate::updates::Updates,
 }
 
 #[derive(Debug, Clone)]
@@ -1403,7 +1404,11 @@ impl CameraApp {
             action_modal: None,
             apply_settings_confirm_open: false,
             toast_queue: crate::toast::ToastQueue::default(),
+            updates: crate::updates::Updates::new(),
         };
+        // Runs on a background thread, at most once a day, and only if the user
+        // has not turned it off. Never blocks startup.
+        app.updates.start_automatic_check();
         app.event_store
             .set_memory_budget(mib_to_bytes(global_defaults.event_store_budget_mib));
         if !app.investigation_renderer.is_wgpu() {
@@ -7732,6 +7737,42 @@ impl CameraApp {
         self.apply_runtime_changes_now();
     }
 
+    /// Advance the in-app updater once per frame: drain the background check,
+    /// draw its window, and surface the outcome.
+    fn drive_updates(&mut self, ctx: &egui::Context) {
+        let busy = self.update_blocker();
+        let actions = [self.updates.poll(ctx), self.updates.window(ctx, busy)];
+
+        for action in actions {
+            match action {
+                crate::updates::UpdateAction::None => {}
+                crate::updates::UpdateAction::Toast(message, tone) => {
+                    self.toast_queue.push(message, tone);
+                }
+                // The replacement is already installed and launched, or an
+                // installer is waiting for this process to release its files.
+                crate::updates::UpdateAction::Quit => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Work that must finish before the binary underneath it may be replaced.
+    ///
+    /// The version of AugurRS that produced a dataset is written into its
+    /// sidecar, so swapping binaries mid-acquisition would leave that record
+    /// describing a build that never wrote the file.
+    fn update_blocker(&self) -> Option<&'static str> {
+        if self.mode == AppMode::Recording {
+            return Some("A recording");
+        }
+        if self.analysis_runs.any_running() {
+            return Some("An analysis run");
+        }
+        None
+    }
+
     fn render_apply_settings_confirm(&mut self, ctx: &egui::Context) {
         if !self.apply_settings_confirm_open {
             return;
@@ -9266,6 +9307,29 @@ impl eframe::App for CameraApp {
                         }
                     });
                 }
+
+                // ── Help ──────────────────────────────────────────────────────
+                ui.menu_button("Help", |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("AugurRS {}", env!("CARGO_PKG_VERSION")))
+                            .strong(),
+                    );
+                    ui.separator();
+                    self.updates.menu(ui);
+                    ui.separator();
+                    if ui.button("Documentation").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/muthmann/augur-rs#readme",
+                        ));
+                        ui.close_menu();
+                    }
+                    if ui.button("Report an issue").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/muthmann/augur-rs/issues",
+                        ));
+                        ui.close_menu();
+                    }
+                });
 
                 // ── Right-aligned status area ────────────────────────────────
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -10817,6 +10881,7 @@ impl eframe::App for CameraApp {
             self.replay_pause_after_seek_frame,
         );
         let process_interval = self.active_preview_process_interval();
+        self.drive_updates(ctx);
         self.toast_queue.show(ctx);
 
         if self.plugin_recording_finalize_task.is_some() {

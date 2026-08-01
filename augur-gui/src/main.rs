@@ -19,6 +19,7 @@ mod render_backend;
 mod settings;
 mod theme;
 mod toast;
+mod updates;
 mod viewer_tools;
 mod viewer_widget;
 
