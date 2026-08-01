@@ -209,9 +209,12 @@ impl AsyncBulkStreamReader {
     }
 
     fn pump_events(&self, wait: Duration) -> Result<()> {
+        // `timeval`'s field types differ across platforms - `time_t`/`suseconds_t`
+        // on unix, `c_long` on Windows - so let inference pick them rather than
+        // naming types that only exist on one of the two.
         let tv = libc::timeval {
-            tv_sec: wait.as_secs() as libc::time_t,
-            tv_usec: wait.subsec_micros() as libc::suseconds_t,
+            tv_sec: wait.as_secs() as _,
+            tv_usec: wait.subsec_micros() as _,
         };
         // Safety: the context outlives the reader via the shared transport.
         let rc = unsafe { ffi::libusb_handle_events_timeout(self.transport.raw_context(), &tv) };
