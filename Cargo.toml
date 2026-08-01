@@ -8,6 +8,7 @@ members = [
   "augur-gui",
   "augur-plugin-api",
   "augur-plugin-types",
+  "augur-update",
 ]
 resolver = "2"
 
@@ -21,6 +22,7 @@ authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
 anyhow = "1"
 augur-event-types = { path = "augur-event-types" }
 augur-runtime = { path = "augur-runtime" }
+augur-update = { path = "augur-update" }
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
@@ -46,3 +48,5 @@ image = { version = "0.24.9", default-features = false, features = ["png", "tiff
 tiff = "0.9"
 gethostname = "1"
 time = { version = "=0.3.36", features = ["formatting"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+dirs = "5"
