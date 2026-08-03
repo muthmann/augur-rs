@@ -115,6 +115,15 @@ const DOCK_OPEN_STORAGE_KEY: &str = "augur_gui.dock_open";
 const DOCK_TABS_STORAGE_KEY: &str = "augur_gui.dock_tabs";
 const DOCK_ACTIVE_STORAGE_KEY: &str = "augur_gui.dock_active";
 const DOCK_DEFAULTS_SEEDED_STORAGE_KEY: &str = "augur_gui.dock_defaults_seeded";
+/// Whether recordings write their sensor-monitoring companion CSV.
+///
+/// Persisted, unlike the other recording toggles, because it is a property of
+/// how a bench records rather than of one session. Plugins that treat the
+/// telemetry as run provenance — Stage-A A1 compacts it into the measurement
+/// folder — cannot ask for it and cannot tell "the operator does not want it"
+/// from "the checkbox reset itself overnight". A silent reset costs a whole
+/// survey's bench conditions, and the loss is only discovered afterwards.
+const RECORD_SENSOR_TELEMETRY_STORAGE_KEY: &str = "augur_gui.record_sensor_telemetry";
 const DOCK_DEFAULT_HEIGHT: f32 = 220.0;
 const DOCK_MIN_HEIGHT: f32 = 120.0;
 const DOCK_MAX_SCREEN_FRACTION: f32 = 0.45;
@@ -1260,6 +1269,11 @@ impl CameraApp {
             .and_then(|s| s.get_string(DOCK_OPEN_STORAGE_KEY))
             .map(|s| s != "false")
             .unwrap_or(true);
+        let record_sensor_telemetry = cc
+            .storage
+            .and_then(|s| s.get_string(RECORD_SENSOR_TELEMETRY_STORAGE_KEY))
+            .map(|s| s == "true")
+            .unwrap_or(false);
         // Restore the dock tab set so views the user closed stay closed across
         // restarts. Ids whose provider is absent simply do not render.
         let dock_tabs: Vec<String> = cc
@@ -1372,7 +1386,7 @@ impl CameraApp {
             theme_preference,
             popup_open: false,
             lock_settings_while_recording: true,
-            record_sensor_telemetry: false,
+            record_sensor_telemetry,
             settings_panel_open: true,
             analysis_panel_open: true,
             plugins_window_open: false,
@@ -11161,6 +11175,10 @@ impl eframe::App for CameraApp {
         storage.set_string(
             DOCK_DEFAULTS_SEEDED_STORAGE_KEY,
             self.dock_defaults_seeded.to_string(),
+        );
+        storage.set_string(
+            RECORD_SENSOR_TELEMETRY_STORAGE_KEY,
+            self.record_sensor_telemetry.to_string(),
         );
     }
 
