@@ -13,6 +13,8 @@ uses the new accumulation window, and now auto-derives the replay display cadenc
 ## User-Facing Changes
 
 - The top bar now includes `Settings` between `Camera` and `View`.
+- `Pixel scale (nm/px)…` reads `Pixel scale (nm/px) — uncalibrated…` until its calibration is
+  confirmed, and its submenu carries the `Calibrated for this setup` checkbox.
 - High-level entries such as `Acquisition time…`, `Pixel scale (nm/px)…`, `Sensor geometry…`, and
   `EventStore budget…` open compact inline submenus instead of crowding the top-level menu with
   sliders.
@@ -30,6 +32,7 @@ uses the new accumulation window, and now auto-derives the replay display cadenc
 ```toml
 [global]
 nm_per_pixel = 4860.0
+pixel_scale_calibrated = false
 sensor_width = 1280
 sensor_height = 720
 acq_time_ms = 50
@@ -48,11 +51,21 @@ The GUI synchronizes those values when it:
 - loads replay sidecars
 - restores live state after replay closes
 
+### Loading a config while a pipeline runs
+
+`File ▸ Load Config…` is allowed during Preview, but it only changes what the panel *shows* — it
+never reconfigures the running sensor. When a controller is active the load therefore leaves the
+panel **dirty** rather than clean, and the toast reads
+`Config loaded from <path> — click Apply Settings to send it to the running camera.` in warning
+tone. Without that, the UI would report itself in sync with hardware running different settings
+(ADR 033).
+
 ## Parameter Reference
 
 | Parameter | Guidance |
 |---|---|
 | `nm_per_pixel` | Physical size of one sensor pixel in nanometers. Default: IMX636 sensor pitch `4860` nm (`4.86 µm`). Shared with plugins for coordinate conversion and used by the ruler/scale bar. In optical setups with magnification, replace it with the effective sample-plane calibration. |
+| `pixel_scale_calibrated` | Whether `nm_per_pixel` has been confirmed as the *sample-plane* scale for this setup. Defaults to `false`, including for config files written before the field existed, because the program cannot discover whether optics are in the path. While `false`, the scale bar, ruler and line-profile length note append `(uncal.)`. Ticked from `Settings ▸ Pixel scale (nm/px)… ▸ Calibrated for this setup`. See [Pixel Scale Calibration](./pixel-scale-calibration.md). |
 | `sensor_width`, `sensor_height` | Sensor pixel dimensions. They must match the connected camera, default to IMX636 (`1280x720`), and are used for ROI validation plus plugin coordinate systems. These are idle-time settings because they describe the pipeline shape. |
 | `acq_time_ms` | Duration of each preview frame's accumulation window. Lower values give finer temporal resolution but fewer events per frame; higher values integrate more events for a brighter preview while reducing temporal detail. |
 | `event_store_budget_mib` | Maximum memory for retained decoded-event history. Runtime plugins can access past frames from this buffer, so increase it for longer analysis windows or reduce it to save RAM. |
@@ -69,7 +82,7 @@ Runtime plugins can now read host-owned experiment settings from the normal per-
 
 The published payload includes:
 
-- `nm_per_pixel`
+- `nm_per_pixel` (a plain `f64`; the host's calibration claim is not part of the plugin payload)
 - `sensor_width`
 - `sensor_height`
 - `acq_time_ms`

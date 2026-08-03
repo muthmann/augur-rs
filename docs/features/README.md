@@ -21,6 +21,7 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Performance Overhaul](./performance-overhaul.md) — split pipeline telemetry, direct `Color32` preview rendering, async decoded replay opening, and generation-aware host caching
 - [WGPU Preview Rendering](./wgpu-preview-rendering.md) — dual-backend startup, shader-driven preview textures, shared overlay painting, and preview perf telemetry
 - [Global Settings Menu and Replay Pacing](./global-settings-menu.md) — top-bar settings controls, hover/reference guidance, persisted `[global]` config, plugin `GlobalSettings`, replay-editable acquisition time, and speed-change replay resets
+- [Pixel Scale Calibration](./pixel-scale-calibration.md) — sample-plane scale versus raw sensor pitch, the `pixel_scale_calibrated` claim, and the `(uncal.)` marking on every derived µm readout
 - [Replay Timing Model](./replay-timing-model.md) — timestamp-driven replay pacing, auto-derived replay display cadence, and preview-frame load shedding
 - [TIFF Stack Export](./tiff-stack-export.md) — File-menu batch export of replay accumulations to multi-page 16-bit TIFF with time-window and ROI controls
 - [Release Distribution](./release-distribution.md) — per-platform installers (DMG, AppImage, NSIS), universal macOS binaries, checksums, and how a tagged release is actually built

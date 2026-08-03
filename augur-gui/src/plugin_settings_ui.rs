@@ -1,4 +1,5 @@
 use augur_plugin_api::{SettingItem, SettingKind, StatusEntry};
+use egui::Color32;
 use serde_json::json;
 
 use crate::plugin_loader::DynPlugin;
@@ -193,6 +194,7 @@ fn render_setting_item(
             let response = ui
                 .push_id(widget_id, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        ui.style_mut().wrap = Some(false);
                         for (index, variant) in variants.iter().enumerate() {
                             ui.radio_value(&mut value, index, variant);
                         }
@@ -232,13 +234,31 @@ fn render_setting_item(
             let response = ui
                 .push_id(widget_id, |ui| {
                     ui.horizontal(|ui| {
+                        // Reserve the browse button first so a long path can
+                        // never push it toward the panel edge, then ellipsise
+                        // the path from the front — the tail is the part that
+                        // identifies the file.
+                        let browse_width = crate::theme::button_width(ui, "Browse\u{2026}");
+                        let path_width =
+                            (ui.available_width() - browse_width - ui.spacing().item_spacing.x)
+                                .max(0.0);
                         let shown = if value.is_empty() {
-                            "(not set)"
+                            "(not set)".to_owned()
                         } else {
-                            &value
+                            elide_path_front(&value, path_chars(ui, path_width))
                         };
-                        ui.label(egui::RichText::new(shown).monospace().small());
-                        if ui.button("Browse…").clicked() {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(path_width, ui.spacing().interact_size.y),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let label =
+                                    ui.label(egui::RichText::new(&shown).monospace().small());
+                                if !value.is_empty() && shown != value {
+                                    label.on_hover_text(&value);
+                                }
+                            },
+                        );
+                        if ui.button("Browse\u{2026}").clicked() {
                             let file_dialog = rfd::FileDialog::new();
                             let selection = match dialog {
                                 augur_plugin_api::PathDialogKind::OpenFile => {
@@ -280,6 +300,37 @@ fn render_setting_item(
     }
 
     Ok(false)
+}
+
+/// How many monospace characters fit in `width`, measured against the small
+/// text style the path label actually uses.
+fn path_chars(ui: &egui::Ui, width: f32) -> usize {
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    let advance = ui
+        .fonts(|f| {
+            f.layout_no_wrap(
+                "0".to_owned(),
+                egui::FontId::monospace(size),
+                Color32::WHITE,
+            )
+        })
+        .size()
+        .x
+        .max(1.0);
+    (width / advance).floor().max(0.0) as usize
+}
+
+/// Shorten a path from the front, keeping the file name visible:
+/// `/very/long/prefix/protocols/example.csv` → `…/protocols/example.csv`.
+fn elide_path_front(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if max_chars == 0 || count <= max_chars {
+        return path.to_owned();
+    }
+    // One char of the budget goes to the leading ellipsis.
+    let keep = max_chars.saturating_sub(1);
+    let tail: String = path.chars().skip(count - keep).collect();
+    format!("\u{2026}{tail}")
 }
 
 fn maybe_add_tooltip(response: &egui::Response, tooltip: Option<&str>) {
@@ -363,4 +414,36 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
         points,
         egui::Stroke::new(2.0, stroke_color),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::elide_path_front;
+
+    #[test]
+    fn short_paths_are_left_alone() {
+        assert_eq!(elide_path_front("example.csv", 34), "example.csv");
+        // Exactly at the budget is still untouched.
+        assert_eq!(elide_path_front("0123456789", 10), "0123456789");
+    }
+
+    #[test]
+    fn long_paths_keep_their_tail() {
+        let elided = elide_path_front("/home/lab/augur/plugins/protocols/example.csv", 24);
+        assert!(elided.starts_with('\u{2026}'), "{elided}");
+        assert!(elided.ends_with("example.csv"), "{elided}");
+        assert_eq!(elided.chars().count(), 24);
+    }
+
+    #[test]
+    fn a_zero_budget_falls_back_to_the_full_path_rather_than_an_empty_label() {
+        assert_eq!(elide_path_front("example.csv", 0), "example.csv");
+    }
+
+    #[test]
+    fn multibyte_paths_are_split_on_character_boundaries() {
+        let elided = elide_path_front("/Meßdaten/Röntgen/protokoll_ü.csv", 12);
+        assert_eq!(elided.chars().count(), 12);
+        assert!(elided.ends_with("ll_ü.csv"), "{elided}");
+    }
 }

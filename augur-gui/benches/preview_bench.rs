@@ -9,6 +9,10 @@ mod colormap;
 mod line_profile;
 #[path = "../src/preview.rs"]
 mod preview;
+// `line_profile` refers to its sibling as `super::scale_bar`; mounting it at
+// the bench crate root keeps that path resolvable outside `viewer_tools`.
+#[path = "../src/viewer_tools/scale_bar.rs"]
+mod scale_bar;
 #[path = "../src/theme.rs"]
 mod theme;
 

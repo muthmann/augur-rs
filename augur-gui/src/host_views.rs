@@ -24,6 +24,23 @@ use crate::{
     },
 };
 
+/// Placeholder for a view that has no data yet.
+///
+/// A bare `ui.label` strands the message in the top-left corner of what is
+/// often a very tall empty dock. Centring it in the space the data would have
+/// occupied reads as "nothing here yet" instead of "stray caption".
+pub fn empty_state(ui: &mut egui::Ui, message: &str) {
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
+    let height = ui.available_height().clamp(48.0, 160.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+        |ui| {
+            ui.label(egui::RichText::new(message).size(12.0).color(palette.fg_3));
+        },
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostViewProviderKey {
     Runtime(usize),
@@ -702,7 +719,7 @@ pub fn render_summary_card(
     let mut output = SummaryCardOutput::default();
     let total_rows = dataset.map(TableDatasetV1::row_count).unwrap_or(0);
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         ui.label(format!("Rows: {total_rows}"));
         ui.separator();
         if ui.button("Open full table").clicked() {
@@ -715,7 +732,7 @@ pub fn render_summary_card(
 
     if total_rows == 0 {
         ui.separator();
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return output;
     }
 
@@ -839,7 +856,7 @@ pub fn render_linked_table_view(
     effective_state.clamp_page(filtered_total);
     let (page_start, page_end) = effective_state.visible_slice(filtered_total);
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         if options.allow_export && ui.button("Export CSV").clicked() {
             output.actions.export_csv = true;
         }
@@ -891,7 +908,7 @@ pub fn render_linked_table_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return output;
     };
 
@@ -1021,7 +1038,7 @@ pub fn render_density2d_view(
 ) -> HostViewUiActions {
     let mut actions = HostViewUiActions::default();
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         if ui.button("Export CSV").clicked() {
             actions.export_csv = true;
         }
@@ -1068,7 +1085,7 @@ pub fn render_density2d_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return actions;
     };
 
@@ -1080,7 +1097,7 @@ pub fn render_density2d_view(
                 ui.add(egui::Image::new(texture).fit_to_exact_size(size));
             });
     } else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
     }
 
     ui.separator();
@@ -1115,7 +1132,7 @@ pub fn render_image2d_view(
 ) -> HostViewUiActions {
     let mut actions = HostViewUiActions::default();
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         ui.menu_button("Export Image", |ui| {
             if ui.button("PNG").clicked() {
                 actions.export_image = Some(HostViewImageFormat::Png);
@@ -1155,7 +1172,7 @@ pub fn render_image2d_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return actions;
     };
 
@@ -1167,7 +1184,7 @@ pub fn render_image2d_view(
                 ui.add(egui::Image::new(texture).fit_to_exact_size(size));
             });
     } else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
     }
 
     ui.separator();
@@ -1199,7 +1216,7 @@ pub fn render_scatter2d_view(
 ) -> HostViewUiActions {
     let mut actions = HostViewUiActions::default();
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         if ui.button("Export CSV").clicked() {
             actions.export_csv = true;
         }
@@ -1220,7 +1237,7 @@ pub fn render_scatter2d_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return actions;
     };
 
@@ -1313,11 +1330,11 @@ pub fn render_line_series_view(
     empty_message: &str,
 ) {
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return;
     };
     if dataset.is_empty() {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return;
     }
 
@@ -1792,7 +1809,7 @@ pub fn render_density_window_viewport(
     ) = {
         let mut data = shared.lock().expect("density viewport mutex poisoned");
 
-        ui.horizontal_wrapped(|ui| {
+        crate::theme::wrap_row(ui, |ui| {
             if freeze_toggle_button(ui, data.frozen) {
                 data.freeze_toggle_requested = true;
             }
@@ -1865,7 +1882,7 @@ pub fn render_density_window_viewport(
             });
     } else {
         ui.centered_and_justified(|ui| {
-            ui.label(empty_message);
+            empty_state(ui, &empty_message);
         });
     }
 
@@ -1894,7 +1911,7 @@ pub fn render_image_window_viewport(
     let (texture, rendered_width, rendered_height, settings, empty_message, error_message) = {
         let mut data = shared.lock().expect("image viewport mutex poisoned");
 
-        ui.horizontal_wrapped(|ui| {
+        crate::theme::wrap_row(ui, |ui| {
             if freeze_toggle_button(ui, data.frozen) {
                 data.freeze_toggle_requested = true;
             }
@@ -1958,7 +1975,7 @@ pub fn render_image_window_viewport(
             });
     } else {
         ui.centered_and_justified(|ui| {
-            ui.label(empty_message);
+            empty_state(ui, &empty_message);
         });
     }
 

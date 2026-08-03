@@ -24,6 +24,18 @@ are not all calibrated measurements with known uncertainty.
   The section is always present and open by default: it states what it is
   waiting for when no camera is running rather than vanishing, so the readings
   are discoverable before the hardware is plugged in.
+
+  Presentation: readings are two-column rows (`theme::inspector_row`) with the
+  value right-aligned, rather than the space-padded monospace strings they used
+  to be — values line up whatever their width, and stay lined up if a label or
+  unit changes length. Hovering a row explains what the sensor measured. With
+  no camera running the section is a single line; it no longer spends two grey
+  paragraphs restating that these are live values while showing none.
+- **Viewer diagnostics footer** — illumination and die temperature also appear
+  on the viewer's one-line footer while streaming, so the conditions are
+  readable without opening the settings sidebar. That copy is dropped once the
+  readback is stale or errored; see
+  [`viewer-toolbar-and-status-layout.md`](viewer-toolbar-and-status-layout.md).
 - **`augur status`** prints the same readback (refractory period, illumination,
   die temperature, bias codes) for logging outside the GUI.
 - **Plugins** read the same values through
@@ -290,6 +302,8 @@ Design notes:
 - `augur-prophesee/src/sensors/imx636.rs` — register sequences and conversions
 - `augur-prophesee/src/sensors/mod.rs`, `augur-prophesee/src/evk4.rs` — hooks
 - `augur-gui/src/settings.rs` — per-slider readouts, Sensor Readout section
+- `augur-gui/src/viewer_widget.rs` — `sensor_footer_readings`, the freshness
+  filter behind the footer copy of the readings
 - `augur-gui/src/app.rs` — demand flag in `sync_pipeline_requirements`
 - `augur-cli/src/main.rs` — `augur status` readback block
 

@@ -656,6 +656,118 @@ surfaces:
 - Default dock seeding now chooses only dock-renderable host views, so candidate 3D layer
   descriptors no longer produce an immediate dock mismatch error.
 
+## Pass 7 — wrapping, alignment, and one primary per surface
+
+A screenshot review of the Idle / Split / photodiode-plugin state turned up
+one real layout bug and a set of alignment and duplication problems.
+
+### The vertical-text bug
+
+Pass 6.3 shortened host-view chip labels to stop the Analysis panel "wrapping
+labels into vertical strips". That treated the symptom. The cause is that the
+Analysis panel sets `style.wrap = Some(true)` for its whole subtree, and egui
+lays a `Button`'s label out against the width *left on the current line*: once
+two chips fill a row, the third is offered ~14 px and breaks one character per
+line instead of moving down. Shortening labels only changes how many chips it
+takes to reach that state.
+
+`theme::wrap_row(ui, …)` is the fix — `horizontal_wrapped` with text wrapping
+turned off inside, so every widget reports its natural width and the wrapping
+placer breaks between widgets rather than inside them. Adopted by the host-view
+chip row (`app.rs`), the capture-card action row, the summary/table action rows
+in `host_views.rs`, and the plugin `Enum` radio row.
+
+**Use `theme::wrap_row` for any row of buttons or chips in a narrow panel.**
+Rows of pure prose keep `horizontal_wrapped`, where text wrapping is wanted.
+
+### New `theme.rs` helpers
+
+| Helper | Purpose |
+| --- | --- |
+| `wrap_row` | wrapping row whose widgets wrap as whole units (above) |
+| `button_width` / `button_row_width` | galley-measured width of a default button, or of a row of them |
+| `centered_row` | allocate a row at a given width, so a `top_down(Align::Center)` parent actually centres it |
+| `action_button(primary, text)` | ink fill only when this copy of the action is the primary one |
+
+`centered_row` exists because `Ui::horizontal_centered` centres **vertically**
+— the canvas empty state's `Probe Camera` / `Open Replay…` row was left-aligned
+under a centred heading for exactly that reason. `button_row_width` measures
+from the laid-out galley rather than the previous frame's `min_rect`, so the
+row is centred on its first frame with no visible jump.
+
+`inspector_row` now returns its row `Response`, so callers can hang hover text
+off the whole row.
+
+### One primary per surface
+
+`Probe Camera` was ink-filled twice at once — in the capture card and again in
+the canvas empty state. `App::canvas_cta_visible` mirrors the placeholder's own
+condition, and the capture card passes `!canvas_cta_visible` to
+`theme::action_button`: the canvas CTA owns the emphasis while it is on screen,
+the card takes it back once a pipeline runs.
+
+### Menu bar, panels, and chrome
+
+- The menu bar carried **two** top-level `Analysis` menus — offline runs and
+  live toggles. Merged into one, with the toggles under a `Live analysis`
+  subhead.
+- `1 2D   2 Split   3 3D` beside the viewer title duplicated the `2D | Split |
+  3D` pill cluster in the menu bar. Removed; `pill_cluster` takes a positional
+  `tooltips` slice and teaches the shortcut on the control itself.
+- Dock tabs dropped the kind chip that duplicated the glyph beside it, and show
+  their close button only on the active or hovered tab — in an always-reserved
+  slot, so revealing it never reflows the strip.
+- The recording-file field filled the capture card instead of a fixed 130 px.
+- Plugin `Path` rows reserve the browse button first and ellipsise the path
+  from the front (`…/protocols/example.csv`), keeping the file name readable.
+- Host-view empty messages route through `host_views::empty_state`, centred in
+  the space the data would occupy rather than stranded top-left in a tall dock.
+- The 3D overlay tray gets a second row when the canvas is too narrow, instead
+  of scrolling controls out of sight and clipping a reading mid-token. The
+  stored tray width is now the *unclamped* natural width — clamping it to the
+  canvas made a too-wide tray indistinguishable from one that fits.
+
+### Panel footers are reserved, never appended
+
+A `ScrollArea` with `auto_shrink([false, false])` takes every remaining pixel of
+its parent, so anything written *after* it lands outside the visible region —
+present in the accessibility tree, invisible on screen. The left settings
+panel's `Apply Settings` button and `Lock settings while recording` checkbox
+were unreachable at 1210x768 for exactly this reason.
+
+**Rule:** claim panel chrome that must stay on screen *before* the scroll area,
+with `egui::TopBottomPanel::bottom(...).show_inside(ui, …)`. The scroll area
+then fills what is left instead of what it wants.
+
+With the footer reliably visible, the capture card's duplicate `Apply Settings`
+button was removed — it only existed to work around the missing footer, and two
+of the same action in one panel violates one-primary-per-surface. The footer
+button's tooltip now states *why* it is disabled (locked, or nothing to send)
+instead of leaving a dead control unexplained.
+
+### Read-only means legible, not inert
+
+`ui.add_enabled_ui(false, …)` around a whole section disables its collapsing
+header too, so a panel advertised as a "read-only reference" cannot be opened
+to read. `settings::section` wraps only the section *body*, leaving the header
+live. Replay and locked recordings therefore still expand every settings
+section; only the controls are greyed out.
+
+### Sensor readout
+
+See [`absolute-setting-values.md`](absolute-setting-values.md) and
+[`viewer-toolbar-and-status-layout.md`](viewer-toolbar-and-status-layout.md).
+
+### Verifying
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+All pass; 145 tests green in `augur-gui`.
+
 ## Follow-ups (still open)
 
 - Settings panel collapse counters (`5 / 5`, `0 / 64`) — needs the

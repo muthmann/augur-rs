@@ -70,6 +70,14 @@ impl CameraConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalSettingsConfig {
     pub nm_per_pixel: f64,
+    /// Whether `nm_per_pixel` describes the sample plane of *this* setup.
+    ///
+    /// The default is the bare IMX636 pixel pitch, which is only the true
+    /// sample-plane scale for direct detection. Behind any optics it is off by
+    /// the magnification, so measurements derived from it (scale bar, ruler)
+    /// stay labelled as uncalibrated until someone states otherwise.
+    #[serde(default)]
+    pub pixel_scale_calibrated: bool,
     pub sensor_width: u16,
     pub sensor_height: u16,
     pub acq_time_ms: u64,
@@ -83,6 +91,7 @@ impl Default for GlobalSettingsConfig {
     fn default() -> Self {
         Self {
             nm_per_pixel: 4_860.0,
+            pixel_scale_calibrated: false,
             sensor_width: 1280,
             sensor_height: 720,
             acq_time_ms: 50,
@@ -270,6 +279,7 @@ mod tests {
         let cfg = CameraConfig {
             global: GlobalSettingsConfig {
                 nm_per_pixel: 42.5,
+                pixel_scale_calibrated: true,
                 sensor_width: 640,
                 sensor_height: 480,
                 acq_time_ms: 75,
@@ -316,6 +326,9 @@ mod tests {
         .expect("legacy toml without global must load");
 
         assert_eq!(cfg.global, GlobalSettingsConfig::default());
+        // A config written before calibration provenance existed cannot claim
+        // to be calibrated.
+        assert!(!cfg.global.pixel_scale_calibrated);
         assert_eq!(cfg.external_triggers, ExternalTriggerConfig::default());
     }
 }

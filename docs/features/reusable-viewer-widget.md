@@ -32,7 +32,8 @@ responsive even when focus is in the external window.
 
 - `ViewerState` for viewer-owned mutable state such as view mode, zoom/pan, tools, contrast,
   annotations, scale bar, and auxiliary windows
-- `ViewerInput` for per-frame host data such as texture handles, frames, pipeline stats, replay
+- `ViewerInput` for per-frame host data such as texture handles, frames, pipeline stats,
+  `sensor_monitoring` (the latest sensor readback, surfaced in the diagnostics footer), replay
   status, warnings, and error strings
 - `ViewerOutput` for host actions such as ROI commits, popup toggles, hotpixel masking, replay
   transport commands, and preview-rerender triggers

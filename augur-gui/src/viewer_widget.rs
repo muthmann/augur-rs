@@ -2,7 +2,7 @@ use augur_core::{
     analysis::{AnalysisSeverity, AnalysisWarning, MarkerShape, Overlay},
     camera::DeviceInfo,
     config::{CameraConfig, RoiConfig},
-    pipeline::{PipelineStatsSnapshot, PreviewFrame},
+    pipeline::{PipelineStatsSnapshot, PreviewFrame, SensorMonitoringSnapshot},
 };
 use egui_phosphor::regular as phosphor;
 
@@ -16,8 +16,8 @@ use crate::{
     preview_renderer::PreviewDisplayTexture,
     viewer_tools::{
         compute_scale_bar, AnnotationManager, AnnotationShape, AnnotationShapeKind, ContrastMode,
-        ContrastSettings, HistogramWindow, LineProfileTool, RulerTool, ScaleBarPosition,
-        ScaleBarSettings,
+        ContrastSettings, HistogramWindow, LineProfileTool, PixelScale, RulerTool,
+        ScaleBarPosition, ScaleBarSettings,
     },
 };
 
@@ -324,13 +324,17 @@ impl ViewerState {
         self.contrast_settings.display_max = clamped_max;
     }
 
-    pub(crate) fn show_aux_windows(&mut self, ctx: &egui::Context) -> ViewerAuxChanges {
+    pub(crate) fn show_aux_windows(
+        &mut self,
+        ctx: &egui::Context,
+        pixel_scale: PixelScale,
+    ) -> ViewerAuxChanges {
         let previous_contrast = self.contrast_settings.clone();
         let histogram_was_open = self.histogram_window.open;
         self.histogram_window
             .show(ctx, &mut self.contrast_settings, self.preview_mode);
         let contrast_changed = self.contrast_settings != previous_contrast;
-        self.line_profile_tool.show_window(ctx);
+        self.line_profile_tool.show_window(ctx, pixel_scale);
         ViewerAuxChanges {
             contrast_changed,
             histogram_visibility_changed: self.histogram_window.open != histogram_was_open,
@@ -380,13 +384,14 @@ pub(crate) struct ViewerInput<'a> {
     pub(crate) time_surface_hover_value: Option<u8>,
     pub(crate) overlays: &'a [Overlay],
     pub(crate) camera_info: Option<&'a DeviceInfo>,
-    pub(crate) nm_per_pixel: f64,
+    pub(crate) pixel_scale: PixelScale,
     pub(crate) config: &'a CameraConfig,
     pub(crate) investigation_points_2d: &'a [Investigation2dPoint],
     pub(crate) selected_row: Option<&'a StableRowKey>,
     pub(crate) mode: AppMode,
     pub(crate) settings_locked: bool,
     pub(crate) pipeline_stats: Option<&'a PipelineStatsSnapshot>,
+    pub(crate) sensor_monitoring: Option<&'a SensorMonitoringSnapshot>,
     pub(crate) replay: ViewerReplayState,
     pub(crate) analysis_warnings: &'a [AnalysisWarning],
     pub(crate) analysis_notice: Option<&'a str>,
@@ -471,18 +476,9 @@ pub(crate) fn draw_viewer_top_chrome(
                     .color(palette.fg_2),
                 );
             }
-            // Right-aligned hint row: keep the primary layout shortcuts visible
-            // in the viewer chrome where the prototype teaches them.
-            // Use a nested right-to-left layout filling the remaining width
-            // so the hint truly anchors to the right edge regardless of the
-            // header's measured size.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("1 2D   2 Split   3 3D")
-                        .size(11.0)
-                        .color(palette.fg_3),
-                );
-            });
+            // No layout-shortcut hint here: the 2D / Split / 3D pill cluster in
+            // the menu bar is the control itself and carries the shortcut in
+            // its hover text, so repeating it beside the title was noise.
         },
     );
     ui.separator();
@@ -519,7 +515,7 @@ pub(crate) fn draw_viewer_canvas(
             state,
             PreviewCanvasOptions {
                 scale_bar_settings,
-                nm_per_pixel: input.nm_per_pixel,
+                pixel_scale: input.pixel_scale,
                 settings_locked: input.settings_locked,
                 auto_focus_roi: input.mode == AppMode::Replaying || input.settings_locked,
                 investigation_points: input.investigation_points_2d,
@@ -758,6 +754,7 @@ fn draw_status_footer(
                     ui,
                     input.pipeline_stats,
                     preview_polarity_split(input.frame).as_ref(),
+                    input.sensor_monitoring,
                 );
                 if let Some(hover_summary) = preview_hover_status_text(state, input) {
                     ui.horizontal(|ui| {
@@ -771,13 +768,11 @@ fn draw_status_footer(
                     });
                 }
                 if state.workspace.tool == PreviewTool::Ruler {
-                    if let Some(measurement) =
-                        state.ruler_tool.measurement(input.nm_per_pixel)
-                    {
-                        ui.small(format!(
-                            "{:.1} px  \u{00B7}  {:.2} \u{00B5}m",
-                            measurement.pixel_distance, measurement.micrometers
-                        ));
+                    if let Some(measurement) = state.ruler_tool.measurement(input.pixel_scale) {
+                        let reading = ui.small(measurement.label());
+                        if !measurement.calibrated {
+                            reading.on_hover_text(crate::viewer_tools::UNCALIBRATED_TOOLTIP);
+                        }
                     }
                 }
 
@@ -914,6 +909,7 @@ fn draw_unified_diagnostics_row(
     ui: &mut egui::Ui,
     stats: Option<&augur_core::pipeline::PipelineStatsSnapshot>,
     polarity: Option<&PolaritySplit>,
+    sensor: Option<&augur_core::pipeline::SensorMonitoringSnapshot>,
 ) {
     let palette = crate::theme::palette_for_visuals(ui.visuals());
     let bullet = || {
@@ -992,14 +988,56 @@ fn draw_unified_diagnostics_row(
                     .size(11.0)
                     .color(palette.fg_3),
             );
+            wrote_left = true;
         } else if !wrote_left {
             ui.label(
                 egui::RichText::new("No live pipeline.")
                     .size(11.0)
                     .color(palette.fg_3),
             );
+            wrote_left = true;
+        }
+        // Sensor conditions belong next to the throughput numbers: a bias
+        // setting only means something against the light level and die
+        // temperature it was chosen under, and this is the one place both are
+        // readable without opening the settings sidebar.
+        for reading in sensor_footer_readings(sensor) {
+            if wrote_left {
+                ui.label(bullet());
+            }
+            ui.label(
+                egui::RichText::new(reading)
+                    .monospace()
+                    .size(11.0)
+                    .color(palette.fg_2),
+            )
+            .on_hover_text(
+                "Measured on the sensor itself. Full readout in Camera Settings → Sensor Readout.",
+            );
+            wrote_left = true;
         }
     });
+}
+
+/// Illumination and die temperature for the diagnostics row, dropped entirely
+/// once the readback goes stale — a frozen light level next to live throughput
+/// numbers would read as current when it is not.
+fn sensor_footer_readings(
+    sensor: Option<&augur_core::pipeline::SensorMonitoringSnapshot>,
+) -> Vec<String> {
+    let Some(snapshot) = sensor.filter(|snapshot| {
+        snapshot.age_s <= crate::settings::MONITORING_STALE_AFTER_S && snapshot.error.is_none()
+    }) else {
+        return Vec::new();
+    };
+    let mut readings = Vec::new();
+    if let Some(lux) = snapshot.values.illumination_lux {
+        readings.push(crate::settings::format_measurement(lux, "lux"));
+    }
+    if let Some(temperature_c) = snapshot.values.temperature_c {
+        readings.push(format!("{temperature_c:.1} °C"));
+    }
+    readings
 }
 
 /// Format a `u64` with `,` thousands separators — e.g. `1192227 → 1,192,227`.
@@ -1315,7 +1353,16 @@ fn draw_empty_preview_placeholder(
                 "Probe the camera here, or open an existing recording."
             });
             ui.add_space(14.0);
-            ui.horizontal_centered(|ui| {
+            // `horizontal_centered` centres vertically, not horizontally, which
+            // left this row hanging at the far left under a centred heading.
+            // Measure the row and allocate it at that width instead.
+            let labels: &[&str] = if camera_detected {
+                &["Start Preview", "Record", "Open Replay…"]
+            } else {
+                &["Probe Camera", "Open Replay…"]
+            };
+            let row_width = crate::theme::button_row_width(ui, labels);
+            crate::theme::centered_row(ui, row_width, |ui| {
                 if camera_detected {
                     if ui
                         .add(crate::theme::primary_button("Start Preview"))
@@ -1355,7 +1402,7 @@ struct OverlayPickCandidate {
 
 struct PreviewCanvasOptions<'a> {
     scale_bar_settings: ScaleBarSettings,
-    nm_per_pixel: f64,
+    pixel_scale: PixelScale,
     settings_locked: bool,
     auto_focus_roi: bool,
     investigation_points: &'a [Investigation2dPoint],
@@ -1378,7 +1425,7 @@ fn draw_preview_canvas(
     let annotation_manager = &mut state.annotation_manager;
     let PreviewCanvasOptions {
         scale_bar_settings,
-        nm_per_pixel,
+        pixel_scale,
         settings_locked,
         auto_focus_roi,
         investigation_points,
@@ -1676,7 +1723,7 @@ fn draw_preview_canvas(
     if let (Some(start), Some(end), Some(measurement)) = (
         ruler_tool.start,
         ruler_tool.end,
-        ruler_tool.measurement(nm_per_pixel),
+        ruler_tool.measurement(pixel_scale),
     ) {
         paint_sensor_line_with_shadow(
             &painter,
@@ -1695,10 +1742,7 @@ fn draw_preview_canvas(
             &painter,
             midpoint,
             egui::Align2::CENTER_BOTTOM,
-            &format!(
-                "{:.1} px | {:.2} µm",
-                measurement.pixel_distance, measurement.micrometers
-            ),
+            &measurement.label(),
             egui::FontId::proportional(13.0),
             egui::Color32::WHITE,
         );
@@ -1720,7 +1764,7 @@ fn draw_preview_canvas(
             image_rect,
             viewport,
             &scale_bar_settings,
-            nm_per_pixel,
+            pixel_scale,
         );
     }
 
@@ -2602,11 +2646,11 @@ fn paint_scale_bar(
     image_rect: egui::Rect,
     viewport: PreviewViewport,
     settings: &ScaleBarSettings,
-    nm_per_pixel: f64,
+    pixel_scale: PixelScale,
 ) {
     let pixels_per_sensor_pixel =
         image_rect.width() / viewport.visible_sensor_rect.width().max(1.0);
-    let Some(spec) = compute_scale_bar(nm_per_pixel, pixels_per_sensor_pixel) else {
+    let Some(spec) = compute_scale_bar(pixel_scale.nm_per_pixel, pixels_per_sensor_pixel) else {
         return;
     };
 
@@ -2631,7 +2675,9 @@ fn paint_scale_bar(
         painter,
         egui::pos2(rect.center().x, rect.top() - 4.0),
         egui::Align2::CENTER_BOTTOM,
-        &spec.label,
+        // The bar states its own provenance: an unconfirmed scale is the
+        // sensor pitch, which is the sample-plane scale only without optics.
+        &format!("{}{}", spec.label, pixel_scale.suffix()),
         egui::FontId::proportional(13.0),
         settings.color,
     );
@@ -2910,6 +2956,61 @@ fn format_replay_time(duration_us: u64) -> String {
     let seconds = (total_tenths % 600) / 10;
     let tenths = total_tenths % 10;
     format!("{minutes:02}:{seconds:02}.{tenths}")
+}
+
+#[cfg(test)]
+mod sensor_footer_tests {
+    use super::sensor_footer_readings;
+    use augur_core::{camera::SensorMonitoring, pipeline::SensorMonitoringSnapshot};
+
+    fn snapshot(age_s: f64, error: Option<&str>) -> SensorMonitoringSnapshot {
+        SensorMonitoringSnapshot {
+            values: SensorMonitoring {
+                pixel_dead_time_us: Some(6.35),
+                illumination_lux: Some(1234.7),
+                temperature_c: Some(41.24),
+                biases: None,
+            },
+            age_s,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn fresh_snapshot_yields_illumination_and_die_temperature() {
+        let snapshot = snapshot(0.4, None);
+        assert_eq!(
+            sensor_footer_readings(Some(&snapshot)),
+            vec!["1235 lux".to_owned(), "41.2 °C".to_owned()]
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_is_dropped_rather_than_shown_as_current() {
+        let snapshot = snapshot(crate::settings::MONITORING_STALE_AFTER_S + 0.1, None);
+        assert!(sensor_footer_readings(Some(&snapshot)).is_empty());
+    }
+
+    #[test]
+    fn failed_readback_is_dropped_even_when_fresh() {
+        let snapshot = snapshot(0.1, Some("i2c timeout"));
+        assert!(sensor_footer_readings(Some(&snapshot)).is_empty());
+    }
+
+    #[test]
+    fn absent_snapshot_adds_nothing() {
+        assert!(sensor_footer_readings(None).is_empty());
+    }
+
+    #[test]
+    fn missing_fields_are_skipped_without_placeholders() {
+        let mut snapshot = snapshot(0.1, None);
+        snapshot.values.illumination_lux = None;
+        assert_eq!(
+            sensor_footer_readings(Some(&snapshot)),
+            vec!["41.2 °C".to_owned()]
+        );
+    }
 }
 
 #[cfg(test)]

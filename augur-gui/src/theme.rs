@@ -373,7 +373,7 @@ impl Tone {
 
 /// Render a small monospace pill chip. Use for plugin phase, dirty
 /// indicators, and the layer-count badge in the analysis panel.
-pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) {
+pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response {
     let p = palette_for_visuals(ui.visuals());
     let fg = tone.fg(&p);
     let bg = tone.bg(&p);
@@ -387,7 +387,7 @@ pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) {
         text_galley.size().x + pad_x * 2.0,
         text_galley.size().y + pad_y * 2.0,
     );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let radius = rect.height() * 0.5;
     ui.painter().rect_filled(rect, radius, bg);
     if border != Color32::TRANSPARENT {
@@ -396,12 +396,27 @@ pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) {
     }
     let text_pos = egui::pos2(rect.left() + pad_x, rect.top() + pad_y);
     ui.painter().galley(text_pos, text_galley, fg);
+    response
 }
 
 /// Style a button as the primary action — ink-coloured background, light
 /// text, no shadow. Use sparingly: design says one primary per surface.
 pub fn primary_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(text).color(Color32::WHITE)).fill(Palette::light().ink)
+}
+
+/// A button that takes the primary ink fill only when it really is the
+/// primary action on screen.
+///
+/// Use it where the same action appears twice — the capture card and the
+/// canvas call to action, for instance — so the design's one-primary-per-
+/// surface rule survives the duplication.
+pub fn action_button(primary: bool, text: &str) -> egui::Button<'_> {
+    if primary {
+        primary_button(text)
+    } else {
+        egui::Button::new(text)
+    }
 }
 
 /// Phosphor glyph used by [`panel_header`] for its trailing collapse
@@ -501,7 +516,10 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Respo
 /// Two-column inspector row used in the right Workspace panel: a left
 /// `aug-label` and a right monospace caption value. Mirrors
 /// `.inspector-row` from the design.
-pub fn inspector_row(ui: &mut egui::Ui, label: &str, value: &str) {
+///
+/// Returns the whole-row response, so callers can attach hover text that
+/// explains the value without the user having to find the label exactly.
+pub fn inspector_row(ui: &mut egui::Ui, label: &str, value: &str) -> egui::Response {
     let p = palette_for_visuals(ui.visuals());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).size(12.0).color(p.fg_2).strong());
@@ -513,7 +531,65 @@ pub fn inspector_row(ui: &mut egui::Ui, label: &str, value: &str) {
                     .color(p.fg_2),
             );
         });
-    });
+    })
+    .response
+}
+
+/// A wrapping row whose *widgets* wrap as whole units.
+///
+/// `Ui::horizontal_wrapped` on its own is not enough: egui lays a button's
+/// label out against the width still left on the line, so a nearly full row
+/// squeezes the next button into a few pixels and its text breaks one
+/// character per line instead of the button moving down. Disabling text wrap
+/// inside the row makes each widget report its natural width, which is what
+/// the wrapping placer needs to decide where the row breaks.
+///
+/// Use this for any row of buttons or chips that lives in a narrow panel.
+pub fn wrap_row<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal_wrapped(|ui| {
+        ui.style_mut().wrap = Some(false);
+        add_contents(ui)
+    })
+    .inner
+}
+
+/// Width a default [`egui::Button`] occupies for `text`.
+///
+/// Measured from the laid-out galley plus the style's button padding, so a
+/// row centred with [`centered_row`] lands correctly on its very first frame
+/// rather than jumping once a measured-last-frame width arrives.
+pub fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Button.resolve(ui.style());
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font_id, Color32::WHITE));
+    galley.size().x + ui.spacing().button_padding.x * 2.0
+}
+
+/// Total width of a row of default buttons, including the spacing between
+/// them. Pair with [`centered_row`] to centre a button row.
+pub fn button_row_width(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    let buttons: f32 = labels.iter().map(|label| button_width(ui, label)).sum();
+    let gaps = labels.len().saturating_sub(1) as f32 * ui.spacing().item_spacing.x;
+    buttons + gaps
+}
+
+/// Lay `add_contents` out left-to-right in a row exactly `width` wide.
+///
+/// Inside a `top_down(Align::Center)` parent this is what actually centres a
+/// row: `Ui::horizontal_centered` centres its contents *vertically* and still
+/// starts them at the left edge, which leaves a button row stranded under a
+/// centred heading.
+pub fn centered_row<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let height = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width.min(ui.available_width()), height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add_contents,
+    )
+    .inner
 }
 
 /// Connected pill cluster used by the design's layout toggle. Returns
@@ -521,11 +597,15 @@ pub fn inspector_row(ui: &mut egui::Ui, label: &str, value: &str) {
 /// painted manually so the active segment inherits the cluster's outer
 /// rounding (otherwise an ink-fill on a left/right segment looks like a
 /// sharp rectangle inside a rounded frame).
+///
+/// `tooltips` is positional against `options`; a shorter slice simply leaves
+/// the remaining segments without hover text.
 pub fn pill_cluster(
     ui: &mut egui::Ui,
     options: &[&str],
     selected: usize,
     enabled: &[bool],
+    tooltips: &[&str],
 ) -> Option<usize> {
     let p = palette_for_visuals(ui.visuals());
     let radius = radius::R_2;
@@ -615,6 +695,10 @@ pub fn pill_cluster(
             } else {
                 egui::CursorIcon::NotAllowed
             });
+        let response = match tooltips.get(i) {
+            Some(tooltip) => response.on_hover_text(*tooltip),
+            None => response,
+        };
         if is_enabled && response.clicked() {
             clicked = Some(i);
         }

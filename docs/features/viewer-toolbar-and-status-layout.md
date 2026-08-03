@@ -29,6 +29,15 @@ transport, and diagnostics now live below the image so the data viewport gets fi
 - The 2D footer now shows a one-line summary with preview throughput (□ Mev/s · ↑ MB/s · ◯ elapsed),
   frame ON/OFF balance, hover readout, and ruler measurements. Expanded diagnostics keep pipeline stats, runtime-dirty state,
   analysis warnings, notices, hotpixel masking actions, replay-open progress, and errors.
+- The same footer line carries the live **sensor conditions** — scene illumination and die
+  temperature — because a bias setting only means something against the light level and
+  temperature it was chosen under, and this is the one place both are readable without opening
+  the settings sidebar. `sensor_footer_readings` drops the pair entirely once the readback goes
+  stale (`settings::MONITORING_STALE_AFTER_S`) or the last poll failed: a frozen light level
+  sitting beside live throughput numbers would read as current when it is not. The full readout,
+  including measured dead time, stays in Camera Settings → Sensor Readout.
+- The viewer head no longer prints a `1 2D  2 Split  3 3D` hint. The pill cluster in the menu bar
+  is the control itself and carries each shortcut in its hover text.
 - The 3D canvas now overlays compact `ISO` / `XY` / `XT` / `YT`, reset, fit, and focus controls
   directly on the viewport instead of reserving a tall text toolbar above it.
 - In split mode, point-size, raw-history, and max-point controls also live in that canvas overlay

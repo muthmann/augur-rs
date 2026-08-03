@@ -53,8 +53,8 @@ use crate::{
     export::{export_tiff_stack, ExportEventSource, TiffStackExportParams},
     export_dialog::{ExportDialog, ExportDialogAction},
     external_tools::{
-        ExternalTool, ExternalToolStatus, ImageJBridge, BUNDLED_IMAGEJ_PLUGIN_JAR,
-        BUNDLED_IMAGEJ_PLUGIN_JAR_NAME, DEFAULT_IMAGEJ_BRIDGE_PORT,
+        ExternalTool, ExternalToolStatus, ExternalToolThroughput, ImageJBridge,
+        BUNDLED_IMAGEJ_PLUGIN_JAR, BUNDLED_IMAGEJ_PLUGIN_JAR_NAME, DEFAULT_IMAGEJ_BRIDGE_PORT,
     },
     host_views::{
         decode_dataset_snapshot, export_image_to_path, export_table_csv_to_path,
@@ -95,6 +95,7 @@ use crate::{
     },
     render_backend::ActiveRendererInfo,
     settings::draw_settings,
+    viewer_tools::PixelScale,
     viewer_widget::{
         draw_replay_transport, draw_text_placeholder, draw_viewer, draw_viewer_bottom_chrome,
         draw_viewer_canvas, draw_viewer_top_chrome, replay_speed_matches,
@@ -744,7 +745,7 @@ struct PopupSharedData {
     time_surface_hover_value: Option<u8>,
     overlays: Vec<Overlay>,
     camera_info: Option<DeviceInfo>,
-    nm_per_pixel: f64,
+    pixel_scale: PixelScale,
     config: CameraConfig,
     mode: AppMode,
     settings_locked: bool,
@@ -779,7 +780,7 @@ impl Default for PopupSharedData {
             time_surface_hover_value: None,
             overlays: Vec::new(),
             camera_info: None,
-            nm_per_pixel: 1.0,
+            pixel_scale: PixelScale::default(),
             config: CameraConfig::default(),
             mode: AppMode::Idle,
             settings_locked: false,
@@ -1129,8 +1130,15 @@ pub struct CameraApp {
     cached_global_settings: Option<GlobalSettings>,
     cached_global_settings_json: Vec<u8>,
     nm_per_pixel: f64,
+    /// See [`GlobalSettingsConfig::pixel_scale_calibrated`]: whether anyone has
+    /// confirmed `nm_per_pixel` for this optical setup.
+    pixel_scale_calibrated: bool,
     sensor_width: u16,
     sensor_height: u16,
+    /// Where the running recording is actually being written. Timestamping and
+    /// collision avoidance rename the target, so the configured path in
+    /// `output_path` is a *request*, not the answer.
+    active_recording_path: Option<PathBuf>,
     analysis_output: AnalysisOutput,
     analysis_notice: Option<String>,
     acq_time_ms: u64,
@@ -1348,8 +1356,10 @@ impl CameraApp {
             cached_global_settings: None,
             cached_global_settings_json: Vec::new(),
             nm_per_pixel: global_defaults.nm_per_pixel,
+            pixel_scale_calibrated: global_defaults.pixel_scale_calibrated,
             sensor_width: global_defaults.sensor_width,
             sensor_height: global_defaults.sensor_height,
+            active_recording_path: None,
             analysis_output: AnalysisOutput::default(),
             analysis_notice: None,
             acq_time_ms: global_defaults.acq_time_ms,
@@ -1441,6 +1451,7 @@ impl CameraApp {
     fn sync_config_global_from_runtime(&mut self) {
         self.config.global = GlobalSettingsConfig {
             nm_per_pixel: self.nm_per_pixel,
+            pixel_scale_calibrated: self.pixel_scale_calibrated,
             sensor_width: self.sensor_width,
             sensor_height: self.sensor_height,
             acq_time_ms: self.acq_time_ms,
@@ -1519,6 +1530,7 @@ impl CameraApp {
 
     fn apply_global_config(&mut self, global: &GlobalSettingsConfig) {
         self.nm_per_pixel = global.nm_per_pixel.max(1.0);
+        self.pixel_scale_calibrated = global.pixel_scale_calibrated;
         self.sensor_width = global.sensor_width.max(1);
         self.sensor_height = global.sensor_height.max(1);
         self.acq_time_ms = global.acq_time_ms.max(1);
@@ -1575,11 +1587,7 @@ impl CameraApp {
                         session.source_plugin_id
                     );
                 }
-                let target = PathBuf::from(&self.output_path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "recording".to_owned());
+                let target = recording_target_name(self.active_recording_path.as_deref());
                 format!("Recording \u{00B7} {target}")
             }
             AppMode::Replaying => {
@@ -2018,10 +2026,15 @@ impl CameraApp {
 
         ui.separator();
         let warning_count = self.analysis_output.warnings.len();
+        // A plugin that failed to load is a broken capability, not a Plugin
+        // Manager detail. Leaving it out let this panel say "All clear" while
+        // an ABI mismatch sat one window away.
+        let plugin_failures = self.plugin_load_failures();
         let notice_count = warning_count
             + usize::from(self.last_error.is_some())
             + usize::from(self.analysis_notice.is_some())
-            + self.host_view_resolution_warnings.len();
+            + self.host_view_resolution_warnings.len()
+            + plugin_failures.len();
         let count_text = format!("{notice_count}");
         crate::theme::collapse(
             ui,
@@ -2038,9 +2051,17 @@ impl CameraApp {
                         error,
                     );
                 }
-                if warning_count == 0 && self.last_error.is_none() {
+                for failure in &plugin_failures {
+                    notice_row(
+                        ui,
+                        egui_phosphor::regular::PLUG,
+                        ui.visuals().error_fg_color,
+                        failure,
+                    );
+                }
+                if warning_count == 0 && self.last_error.is_none() && plugin_failures.is_empty() {
                     ui.small("All clear.");
-                } else {
+                } else if warning_count > 0 {
                     use egui_phosphor::regular as ph;
                     for warning in self.analysis_output.warnings.iter().take(8) {
                         let (color, glyph) = match warning.severity {
@@ -2433,7 +2454,7 @@ impl CameraApp {
         data.time_surface_hover_value = popup_time_surface_hover_value;
         data.overlays = self.analysis_output.overlays.clone();
         data.camera_info = self.camera_info.clone();
-        data.nm_per_pixel = self.nm_per_pixel;
+        data.pixel_scale = self.pixel_scale();
         data.config = self.config.clone();
         data.mode = self.mode;
         data.settings_locked = settings_locked;
@@ -2540,6 +2561,13 @@ impl CameraApp {
             .as_ref()
             .map(|tool| tool.status())
             .unwrap_or(ExternalToolStatus::Disconnected)
+    }
+
+    fn external_tool_throughput(&self) -> ExternalToolThroughput {
+        self.external_tool
+            .as_ref()
+            .map(|tool| tool.throughput())
+            .unwrap_or_default()
     }
 
     fn disconnect_external_tool(&mut self) {
@@ -2763,6 +2791,7 @@ impl CameraApp {
         let mut disconnect_requested = false;
         let mut export_plugin_requested = false;
         let external_status = self.external_tool_status();
+        let throughput = self.external_tool_throughput();
         egui::Window::new("Stream to ImageJ")
             .open(&mut open)
             .collapsible(false)
@@ -2794,6 +2823,36 @@ impl CameraApp {
                             .color(status_color),
                     );
                 });
+
+                // "Streaming" alone would let an incomplete series look
+                // gap-free. The bridge drops under back-pressure by design, so
+                // the count of what ImageJ actually received belongs next to
+                // the connection state.
+                if throughput.frames_offered > 0 {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Frames:").size(body_size));
+                        let color = if throughput.has_gaps() {
+                            ui.visuals().warn_fg_color
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        ui.label(
+                            egui::RichText::new(throughput.label())
+                                .size(body_size)
+                                .color(color),
+                        );
+                    });
+                    if throughput.has_gaps() {
+                        ui.label(
+                            egui::RichText::new(
+                                "ImageJ could not keep up, so this preview series has gaps. \
+                                 Export a TIFF stack or run an analysis for a complete series.",
+                            )
+                            .size(small_size)
+                            .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                }
                 ui.add_space(4.0 * scale);
 
                 ui.separator();
@@ -5154,6 +5213,11 @@ impl CameraApp {
             let tab_dataset_id = &view.descriptor.dataset_id;
             let tab_plugin_tag = self.provider_plugin_tag(view.provider);
             let is_active = active == Some(tab_id.as_str());
+            let hover_id = ui.id().with(("dock_tab_hovered", tab_id));
+            let tab_hovered = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(hover_id))
+                .unwrap_or(false);
             let label_color = if is_active {
                 palette.fg_0
             } else {
@@ -5176,44 +5240,57 @@ impl CameraApp {
                     crate::theme::sp::SP_2,
                     crate::theme::sp::SP_1,
                 ));
-            let tab_rect = tab_frame
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
-                        let icon = host_view_kind_icon(tab_kind);
-                        let kind_tag = host_view_kind_tag(tab_kind);
-                        let label = format!("{icon}  {}", tab_title);
-                        let tooltip = format!("{} \u{00B7} {}", kind_tag, tab_dataset_id);
-                        crate::theme::chip(ui, kind_tag, crate::theme::Tone::Neutral);
-                        let response = ui
-                            .add(
-                                egui::Label::new(egui::RichText::new(&label).color(label_color))
-                                    .sense(egui::Sense::click()),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text(&tooltip);
-                        if response.clicked() {
-                            *activate = Some(tab_id.clone());
-                        }
-                        if let Some(plugin) = tab_plugin_tag {
-                            ui.label(
-                                egui::RichText::new(format!("\u{00B7} {plugin}"))
-                                    .monospace()
-                                    .size(10.0)
-                                    .color(palette.fg_3),
-                            );
-                        }
+            let tab_response = tab_frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+                    let icon = host_view_kind_icon(tab_kind);
+                    let kind_tag = host_view_kind_tag(tab_kind);
+                    let label = format!("{icon}  {}", tab_title);
+                    let tooltip = format!("{} \u{00B7} {}", kind_tag, tab_dataset_id);
+                    // No kind chip: the leading glyph already encodes the kind
+                    // and the tag stays in the tooltip. Dropping it keeps tabs
+                    // narrow enough that several fit before the strip scrolls.
+                    let response = ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(&label).color(label_color))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(&tooltip);
+                    if response.clicked() {
+                        *activate = Some(tab_id.clone());
+                    }
+                    if let Some(plugin) = tab_plugin_tag {
+                        ui.label(
+                            egui::RichText::new(format!("\u{00B7} {plugin}"))
+                                .monospace()
+                                .size(10.0)
+                                .color(palette.fg_3),
+                        );
+                    }
+                    // Close affordance only where it is actionable: the active
+                    // tab, or the one the pointer is over. The slot is always
+                    // reserved so revealing it never reflows the strip.
+                    let close_size =
+                        egui::vec2(ui.spacing().icon_width, ui.spacing().interact_size.y);
+                    if is_active || tab_hovered {
                         if ui
-                            .small_button(egui_phosphor::regular::X)
+                            .add_sized(close_size, egui::Button::new(egui_phosphor::regular::X))
                             .on_hover_text("Close tab")
                             .clicked()
                         {
                             *close = Some(tab_id.clone());
                         }
-                    });
-                })
-                .response
-                .rect;
+                    } else {
+                        ui.allocate_space(close_size);
+                    }
+                });
+            });
+            let tab_rect = tab_response.response.rect;
+            // Recorded for the next frame: the close button has to be laid out
+            // before the finished tab rect exists to hit-test against.
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(hover_id, ui.rect_contains_pointer(tab_rect)));
             // Active tab accent: 2px bottom ink line.
             if is_active {
                 let accent_rect = egui::Rect::from_min_size(
@@ -5265,7 +5342,11 @@ impl CameraApp {
             return;
         }
         let palette = crate::theme::palette_for_visuals(ui.visuals());
-        ui.horizontal_wrapped(|ui| {
+        // `wrap_row`, not `horizontal_wrapped`: the analysis panel turns text
+        // wrapping on for its whole subtree, which would make a chip that does
+        // not fit on the current line break its label per character instead of
+        // moving down to the next line.
+        crate::theme::wrap_row(ui, |ui| {
             ui.spacing_mut().item_spacing =
                 egui::vec2(crate::theme::sp::SP_1, crate::theme::sp::SP_1);
             for (id, title, kind) in chips {
@@ -6237,6 +6318,32 @@ impl CameraApp {
         )
     }
 
+    /// Plugins the runtime could not load, phrased for the health summary.
+    ///
+    /// These belong in `Status & warnings`, not only in the Plugin Manager: a
+    /// plugin that never loaded is a capability the session does not have, and
+    /// "All clear" must not be able to hide one.
+    /// The scale every physical readout is derived from, carried together with
+    /// whether it has been confirmed for this setup.
+    fn pixel_scale(&self) -> PixelScale {
+        PixelScale {
+            nm_per_pixel: self.nm_per_pixel,
+            calibrated: self.pixel_scale_calibrated,
+        }
+    }
+
+    fn plugin_load_failures(&self) -> Vec<String> {
+        self.plugin_manager
+            .records()
+            .iter()
+            .filter_map(|record| {
+                record
+                    .load_error()
+                    .map(|error| format!("{} \u{00B7} not loaded: {error}", record.name()))
+            })
+            .collect()
+    }
+
     fn enabled_plugin_names(&self) -> Vec<String> {
         self.plugin_manager
             .records()
@@ -6276,16 +6383,29 @@ impl CameraApp {
         }
     }
 
+    /// True while the central canvas is showing its empty-state call to
+    /// action. That placeholder carries the same buttons as the capture card,
+    /// so the card steps down to secondary styling and the screen keeps a
+    /// single ink-filled primary.
+    fn canvas_cta_visible(&self, mode: AppMode) -> bool {
+        mode == AppMode::Idle
+            && !self.external_tool_status().is_streaming()
+            && !(self.texture.is_some() && self.latest_frame.is_some())
+    }
+
     fn draw_capture_controls(&mut self, ui: &mut egui::Ui, mode: AppMode) {
+        // One primary per surface: yield the ink fill to the canvas CTA while
+        // it is on screen, take it back once the canvas shows a live preview.
+        let is_primary = !self.canvas_cta_visible(mode);
         crate::theme::card_frame(ui).show(ui, |ui| {
             crate::theme::section_subhead(ui, "Capture");
             ui.small(&self.camera_status);
             ui.add_space(crate::theme::sp::SP_2);
 
-            ui.horizontal_wrapped(|ui| match mode {
+            crate::theme::wrap_row(ui, |ui| match mode {
                 AppMode::Idle if self.camera_info.is_none() => {
                     if ui
-                        .add(crate::theme::primary_button("Probe Camera"))
+                        .add(crate::theme::action_button(is_primary, "Probe Camera"))
                         .clicked()
                     {
                         self.probe_camera();
@@ -6293,7 +6413,7 @@ impl CameraApp {
                 }
                 AppMode::Idle => {
                     if ui
-                        .add(crate::theme::primary_button("Start Preview"))
+                        .add(crate::theme::action_button(is_primary, "Start Preview"))
                         .clicked()
                     {
                         self.start_preview();
@@ -6323,25 +6443,24 @@ impl CameraApp {
                 }
             });
 
-            if matches!(mode, AppMode::Previewing | AppMode::Recording)
-                && (self.config_dirty || self.acq_dirty)
-            {
-                let enabled = !self.settings_are_locked();
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Apply Settings"))
-                    .clicked()
-                {
-                    self.apply_runtime_changes();
-                }
-            }
-
+            // No second Apply Settings here: the panel footer owns it and is
+            // now reliably on screen. This copy existed because the footer used
+            // to be pushed out of the window.
             if mode != AppMode::Replaying {
                 ui.separator();
                 ui.label("Recording file");
                 ui.horizontal(|ui| {
+                    // Fill the card instead of a fixed 130 px: the old width
+                    // clipped the path mid-string and left dead space beside
+                    // the browse button.
+                    let browse_width = crate::theme::button_width(ui, "…");
+                    let field_width =
+                        (ui.available_width() - browse_width - ui.spacing().item_spacing.x)
+                            .max(0.0);
                     ui.add_enabled(
                         mode != AppMode::Recording,
-                        egui::TextEdit::singleline(&mut self.output_path).desired_width(130.0),
+                        egui::TextEdit::singleline(&mut self.output_path)
+                            .desired_width(field_width),
                     );
                     if ui
                         .add_enabled(mode != AppMode::Recording, egui::Button::new("…"))
@@ -6351,6 +6470,18 @@ impl CameraApp {
                         self.choose_output_path();
                     }
                 });
+                // While recording, the field above is only the request: the
+                // pipeline writes to the path that survived timestamping and
+                // collision avoidance. Show that one whenever they differ.
+                if let Some(actual) = self.active_recording_path.as_deref() {
+                    if actual != Path::new(self.output_path.trim()) {
+                        ui.small(format!("Writing to {}", actual.display()))
+                            .on_hover_text(
+                                "The configured path was already taken or timestamping is on, \
+                                 so the pipeline writes this file instead.",
+                            );
+                    }
+                }
                 ui.add_enabled_ui(mode != AppMode::Recording, |ui| {
                     ui.checkbox(
                         &mut self.record_sensor_telemetry,
@@ -6358,7 +6489,11 @@ impl CameraApp {
                     );
                 });
                 if self.record_sensor_telemetry {
-                    let companion = sensor_telemetry_path(Path::new(self.output_path.trim()))
+                    let telemetry_base = self
+                        .active_recording_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(self.output_path.trim()));
+                    let companion = sensor_telemetry_path(&telemetry_base)
                         .and_then(|path| path.file_name().map(|name| name.to_owned()))
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "<recording>.sensor-monitoring.csv".into());
@@ -6475,6 +6610,7 @@ impl CameraApp {
         self.controller = Some(controller);
         self.last_preview_process_at = None;
         self.mode = AppMode::Recording;
+        self.active_recording_path = Some(actual_path.clone());
         self.sync_live_control_execution();
         self.with_active_viewer_mut(ViewerState::clear_session_state);
         self.reset_analysis();
@@ -7618,9 +7754,16 @@ impl CameraApp {
         });
         self.reset_analysis();
         self.mode = AppMode::Idle;
+        let finished_recording = self.active_recording_path.take();
         self.sync_live_control_execution();
-        self.camera_status =
-            "Camera idle. Current local settings will be used for the next recording.".into();
+        self.camera_status = match &finished_recording {
+            // Name the file that was actually written — it is often not the
+            // path in the output field.
+            Some(path) => format!("Camera idle. Last recording written to {}.", path.display()),
+            None => {
+                "Camera idle. Current local settings will be used for the next recording.".into()
+            }
+        };
         self.toast_queue
             .push("Stopped", crate::toast::ToastTone::Info);
         if let Some(session) = plugin_recording {
@@ -7824,7 +7967,14 @@ impl CameraApp {
     fn apply_runtime_changes_now(&mut self) {
         self.sync_config_global_from_runtime();
 
+        // Without a pipeline there is no camera to send anything to. Saying so
+        // beats the silent no-op this used to be: the edits are kept and take
+        // effect on the next preview or recording.
         let Some(ctrl) = &self.controller else {
+            let msg = "No camera is running — the edited settings are kept and \
+                       applied when you start Preview or Record."
+                .to_owned();
+            self.toast_queue.push(msg, crate::toast::ToastTone::Info);
             return;
         };
 
@@ -8690,12 +8840,31 @@ impl eframe::App for CameraApp {
                                     let global = self.config.global.clone();
                                     self.apply_global_config(&global);
                                     self.mask_file = mask_file;
-                                    self.config_dirty = false;
-                                    self.acq_dirty = false;
+                                    // Loading a file changes what the panel
+                                    // shows, never what the sensor runs. With a
+                                    // pipeline up, the two have just diverged,
+                                    // so the panel must stay dirty until the
+                                    // user pushes the values across.
+                                    let camera_running = self.controller.is_some();
+                                    self.config_dirty = camera_running;
+                                    self.acq_dirty = camera_running;
                                     self.last_error = None;
+                                    let message = if camera_running {
+                                        format!(
+                                            "Config loaded from {} — click Apply Settings to \
+                                             send it to the running camera.",
+                                            path.display()
+                                        )
+                                    } else {
+                                        format!("Config loaded from {}", path.display())
+                                    };
                                     self.toast_queue.push(
-                                        format!("Config loaded from {}", path.display()),
-                                        crate::toast::ToastTone::Success,
+                                        message,
+                                        if camera_running {
+                                            crate::toast::ToastTone::Warn
+                                        } else {
+                                            crate::toast::ToastTone::Success
+                                        },
                                     );
                                 }
                                 Err(e) => {
@@ -8710,6 +8879,15 @@ impl eframe::App for CameraApp {
                 });
 
                 // ── Analysis ──────────────────────────────────────────────────
+                // Deterministic analysis runs and the live-preview toggles are
+                // two different things, but they are both "analysis" to the
+                // user — one menu, two labelled groups, so the menu bar never
+                // shows the same word twice.
+                let has_runtime_plugins = self
+                    .plugin_manager
+                    .records()
+                    .iter()
+                    .any(|record| record.plugin().is_some());
                 ui.menu_button("Analysis", |ui| {
                     if ui
                         .add_enabled(
@@ -8738,6 +8916,29 @@ impl eframe::App for CameraApp {
                                 egui::RichText::new("An analysis is running…").weak(),
                             ),
                         );
+                    }
+
+                    if self.hotpixel_detection.enabled() || has_runtime_plugins {
+                        ui.separator();
+                        crate::theme::section_subhead(ui, "Live analysis");
+                        let mut hotpixel_enabled = self.hotpixel_detection.enabled();
+                        if ui
+                            .checkbox(&mut hotpixel_enabled, "Hotpixel Detection")
+                            .changed()
+                        {
+                            self.hotpixel_detection.set_enabled(hotpixel_enabled);
+                            analysis_toggle_changed = true;
+                        }
+                        for record in self.plugin_manager.records_mut() {
+                            let Some(plugin) = record.plugin_mut() else {
+                                continue;
+                            };
+                            let mut enabled = plugin.enabled();
+                            if ui.checkbox(&mut enabled, plugin.name()).changed() {
+                                plugin.set_enabled(enabled);
+                                analysis_toggle_changed = true;
+                            }
+                        }
                     }
                 });
 
@@ -8896,7 +9097,12 @@ impl eframe::App for CameraApp {
                         }
                     });
 
-                    ui.menu_button("Pixel scale (nm/px)…", |ui| {
+                    let pixel_scale_label = if self.pixel_scale_calibrated {
+                        "Pixel scale (nm/px)\u{2026}".to_owned()
+                    } else {
+                        "Pixel scale (nm/px) \u{2014} uncalibrated\u{2026}".to_owned()
+                    };
+                    ui.menu_button(pixel_scale_label, |ui| {
                         ui.label("Physical pixel scale")
                             .on_hover_text(PIXEL_SCALE_TOOLTIP);
                         let response = ui
@@ -8908,6 +9114,29 @@ impl eframe::App for CameraApp {
                             .on_hover_text(PIXEL_SCALE_TOOLTIP);
                         if response.changed() {
                             global_settings_changed = true;
+                        }
+                        // Every micrometre this app prints comes from this
+                        // number. The default is the bare sensor pitch, which
+                        // is the sample-plane scale only for direct detection,
+                        // so readouts stay marked until someone states that it
+                        // holds for their setup.
+                        if ui
+                            .checkbox(
+                                &mut self.pixel_scale_calibrated,
+                                "Calibrated for this setup",
+                            )
+                            .on_hover_text(
+                                "Tick this once the value above is the real sample-plane scale \
+                                 (sensor pitch divided by the optical magnification). Until then \
+                                 the scale bar, ruler and line profile mark their micrometre \
+                                 readings as uncalibrated.",
+                            )
+                            .changed()
+                        {
+                            global_settings_changed = true;
+                        }
+                        if !self.pixel_scale_calibrated {
+                            ui.small(crate::viewer_tools::UNCALIBRATED_TOOLTIP);
                         }
                     });
 
@@ -9278,36 +9507,6 @@ impl eframe::App for CameraApp {
                     }
                 });
 
-                // ── Analysis ──────────────────────────────────────────────────
-                let has_runtime_plugins = self
-                    .plugin_manager
-                    .records()
-                    .iter()
-                    .any(|record| record.plugin().is_some());
-                if self.hotpixel_detection.enabled() || has_runtime_plugins {
-                    ui.menu_button("Analysis", |ui| {
-                        let mut hotpixel_enabled = self.hotpixel_detection.enabled();
-                        if ui
-                            .checkbox(&mut hotpixel_enabled, "Hotpixel Detection")
-                            .changed()
-                        {
-                            self.hotpixel_detection.set_enabled(hotpixel_enabled);
-                            analysis_toggle_changed = true;
-                        }
-
-                        for record in self.plugin_manager.records_mut() {
-                            let Some(plugin) = record.plugin_mut() else {
-                                continue;
-                            };
-                            let mut enabled = plugin.enabled();
-                            if ui.checkbox(&mut enabled, plugin.name()).changed() {
-                                plugin.set_enabled(enabled);
-                                analysis_toggle_changed = true;
-                            }
-                        }
-                    });
-                }
-
                 // ── Help ──────────────────────────────────────────────────────
                 ui.menu_button("Help", |ui| {
                     ui.label(
@@ -9374,15 +9573,27 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     let external_status = self.external_tool_status();
                     if !matches!(external_status, ExternalToolStatus::Disconnected) {
+                        let throughput = self.external_tool_throughput();
+                        // A dropped frame downgrades the chip: "Streaming" on
+                        // its own would present an incomplete series as whole.
                         let bridge_tone = match external_status {
+                            ExternalToolStatus::Streaming if throughput.has_gaps() => {
+                                crate::theme::Tone::Warn
+                            }
                             ExternalToolStatus::Streaming => crate::theme::Tone::Success,
                             _ => crate::theme::Tone::Info,
                         };
-                        crate::theme::chip(
-                            ui,
-                            &format!("ImageJ: {}", external_status.label()),
-                            bridge_tone,
-                        );
+                        let bridge_label = if throughput.has_gaps() {
+                            format!(
+                                "ImageJ: {} \u{00B7} {} dropped",
+                                external_status.label(),
+                                throughput.frames_dropped
+                            )
+                        } else {
+                            format!("ImageJ: {}", external_status.label())
+                        };
+                        crate::theme::chip(ui, &bridge_label, bridge_tone)
+                            .on_hover_text(throughput.label());
                         ui.separator();
                     }
                     if let Some(status) = self.python_ingress_status() {
@@ -9410,7 +9621,16 @@ impl eframe::App for CameraApp {
                         self.investigation_renderer.is_wgpu(),
                         self.investigation_renderer.is_wgpu(),
                     ];
-                    if let Some(i) = crate::theme::pill_cluster(ui, &labels, selected, &enabled) {
+                    // The keyboard shortcut is taught here, on the control it
+                    // drives, rather than as a standing hint in the viewer head.
+                    let tooltips = [
+                        "2D preview only  (1)",
+                        "Split 2D + 3D  (2)",
+                        "3D inspection only  (3)",
+                    ];
+                    if let Some(i) =
+                        crate::theme::pill_cluster(ui, &labels, selected, &enabled, &tooltips)
+                    {
                         layout = layouts[i];
                         self.set_active_investigation_layout(ctx, layout);
                     }
@@ -9492,6 +9712,45 @@ impl eframe::App for CameraApp {
                     }
                     self.draw_capture_controls(ui, mode);
                     ui.add_space(crate::theme::sp::SP_2);
+
+                    // The footer is claimed *before* the scroll area, not
+                    // appended after it. `auto_shrink([false, false])` makes the
+                    // scroll area take every remaining pixel, which used to push
+                    // Apply Settings and the recording lock past the bottom of
+                    // the window at 1210x768 — reachable by screen readers,
+                    // invisible to everyone else.
+                    if mode != AppMode::Replaying {
+                        egui::TopBottomPanel::bottom("settings_footer")
+                            .frame(egui::Frame::none())
+                            .show_separator_line(false)
+                            .show_inside(ui, |ui| {
+                                ui.separator();
+                                if matches!(mode, AppMode::Previewing | AppMode::Recording) {
+                                    let dirty = self.config_dirty || self.acq_dirty;
+                                    let apply = ui
+                                        .add_enabled(
+                                            !settings_locked && dirty,
+                                            crate::theme::primary_button("Apply Settings"),
+                                        )
+                                        .on_hover_text(if settings_locked {
+                                            "Settings are locked for this recording"
+                                        } else if dirty {
+                                            "Send the edited settings to the running camera"
+                                        } else {
+                                            "No local edits to send — the camera already \
+                                             runs these settings"
+                                        });
+                                    if apply.clicked() {
+                                        self.apply_runtime_changes();
+                                    }
+                                }
+                                ui.checkbox(
+                                    &mut self.lock_settings_while_recording,
+                                    "Lock settings while recording",
+                                );
+                            });
+                    }
+
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -9532,49 +9791,26 @@ impl eframe::App for CameraApp {
                                 .controller
                                 .as_ref()
                                 .and_then(PipelineController::sensor_monitoring);
-                            ui.add_enabled_ui(!settings_locked, |ui| {
-                                let changed = draw_settings(
-                                    ui,
-                                    &mut self.config,
-                                    &mut self.mask_x,
-                                    &mut self.mask_y,
-                                    &mut self.mask_file,
-                                    self.sensor_width,
-                                    self.sensor_height,
-                                    trigger_stats,
-                                    sensor_monitoring.as_ref(),
-                                );
-                                if changed {
-                                    self.config_dirty = true;
-                                }
-                            });
-                        });
-
-                    // Panel footer — only when not replaying.
-                    if mode != AppMode::Replaying {
-                        ui.separator();
-                        if matches!(mode, AppMode::Previewing | AppMode::Recording) {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        !settings_locked
-                                            && (self.config_dirty || self.acq_dirty),
-                                        crate::theme::primary_button("Apply Settings"),
-                                    )
-                                    .on_hover_text("Apply current settings to the camera")
-                                    .clicked()
-                                {
-                                    self.apply_runtime_changes();
-                                }
-                            });
-                        }
-                        ui.horizontal(|ui| {
-                            ui.checkbox(
-                                &mut self.lock_settings_while_recording,
-                                "Lock settings while recording",
+                            // Locking disables the *controls*, not the sections
+                            // themselves: replay advertises these values as a
+                            // read-only reference, so every section must still
+                            // open (see `settings::section`).
+                            let changed = draw_settings(
+                                ui,
+                                &mut self.config,
+                                &mut self.mask_x,
+                                &mut self.mask_y,
+                                &mut self.mask_file,
+                                self.sensor_width,
+                                self.sensor_height,
+                                trigger_stats,
+                                sensor_monitoring.as_ref(),
+                                settings_locked,
                             );
+                            if changed {
+                                self.config_dirty = true;
+                            }
                         });
-                    }
                 });
         } else {
             egui::SidePanel::left("settings-collapsed")
@@ -10158,6 +10394,10 @@ impl eframe::App for CameraApp {
             .controller
             .as_ref()
             .map(PipelineController::stats_snapshot);
+        let sensor_monitoring = self
+            .controller
+            .as_ref()
+            .and_then(PipelineController::sensor_monitoring);
         let detected_hotpixels = self.latest_detected_hotpixels();
         let mut main_viewer_output: Option<ViewerOutput> = None;
         let mut main_3d_output = None;
@@ -10243,19 +10483,24 @@ impl eframe::App for CameraApp {
                 );
                 let selected_row = self.viewer.investigation.primary_selection().cloned();
                 let replay_state = self.viewer_replay_state();
+                // Copied out before the closure: calling `self.pixel_scale()`
+                // inside it would borrow all of `*self` for as long as
+                // `make_input` lives.
+                let pixel_scale = self.pixel_scale();
                 let make_input = |viewer_id: &'static str| ViewerInput {
                     texture: self.texture.as_ref(),
                     frame: self.latest_frame.as_ref(),
                     time_surface_hover_value: main_time_surface_hover_value,
                     overlays: &self.analysis_output.overlays,
                     camera_info: self.camera_info.as_ref(),
-                    nm_per_pixel: self.nm_per_pixel,
+                    pixel_scale,
                     config: &self.config,
                     investigation_points_2d: &investigation_points_2d,
                     selected_row: selected_row.as_ref(),
                     mode: self.mode,
                     settings_locked,
                     pipeline_stats: pipeline_stats.as_ref(),
+                    sensor_monitoring: sensor_monitoring.as_ref(),
                     replay: replay_state,
                     analysis_warnings: &self.analysis_output.warnings,
                     analysis_notice: self.analysis_notice.as_deref(),
@@ -10423,7 +10668,8 @@ impl eframe::App for CameraApp {
             self.viewer.investigation.hovered_row = output.hovered;
         }
         if !self.popup_open {
-            let aux = self.viewer.show_aux_windows(ctx);
+            let pixel_scale = self.pixel_scale();
+            let aux = self.viewer.show_aux_windows(ctx, pixel_scale);
             self.apply_aux_window_changes(ctx, aux);
         }
         self.show_imagej_dialog(ctx);
@@ -10461,7 +10707,7 @@ impl eframe::App for CameraApp {
                                         time_surface_hover_value,
                                         overlays,
                                         camera_info,
-                                        nm_per_pixel,
+                                        pixel_scale,
                                         config,
                                         mode,
                                         settings_locked,
@@ -10490,13 +10736,14 @@ impl eframe::App for CameraApp {
                                         time_surface_hover_value: *time_surface_hover_value,
                                         overlays,
                                         camera_info: camera_info.as_ref(),
-                                        nm_per_pixel: *nm_per_pixel,
+                                        pixel_scale: *pixel_scale,
                                         config,
                                         investigation_points_2d: investigation_points_2d.as_slice(),
                                         selected_row: selected_row.as_ref(),
                                         mode: *mode,
                                         settings_locked: *settings_locked,
                                         pipeline_stats: pipeline_stats.as_ref(),
+                                        sensor_monitoring: sensor_monitoring.as_ref(),
                                         replay: *replay,
                                         analysis_warnings,
                                         analysis_notice: analysis_notice.as_deref(),
@@ -10616,7 +10863,7 @@ impl eframe::App for CameraApp {
                                         }
                                     };
                                     popup_output.merge(popup_transport_output);
-                                    let aux = viewer.show_aux_windows(ctx);
+                                    let aux = viewer.show_aux_windows(ctx, *pixel_scale);
                                     popup_output.contrast_changed |= aux.contrast_changed;
                                     popup_output.histogram_visibility_changed |=
                                         aux.histogram_visibility_changed;
@@ -10666,7 +10913,7 @@ impl eframe::App for CameraApp {
                                             time_surface_hover_value,
                                             overlays,
                                             camera_info,
-                                            nm_per_pixel,
+                                            pixel_scale,
                                             config,
                                             mode,
                                             settings_locked,
@@ -10695,7 +10942,7 @@ impl eframe::App for CameraApp {
                                             time_surface_hover_value: *time_surface_hover_value,
                                             overlays,
                                             camera_info: camera_info.as_ref(),
-                                            nm_per_pixel: *nm_per_pixel,
+                                            pixel_scale: *pixel_scale,
                                             config,
                                             investigation_points_2d: investigation_points_2d
                                                 .as_slice(),
@@ -10703,6 +10950,7 @@ impl eframe::App for CameraApp {
                                             mode: *mode,
                                             settings_locked: *settings_locked,
                                             pipeline_stats: pipeline_stats.as_ref(),
+                                            sensor_monitoring: sensor_monitoring.as_ref(),
                                             replay: *replay,
                                             analysis_warnings,
                                             analysis_notice: analysis_notice.as_deref(),
@@ -10830,7 +11078,7 @@ impl eframe::App for CameraApp {
                                             }
                                         };
                                         popup_output.merge(popup_transport_output);
-                                        let aux = viewer.show_aux_windows(ctx);
+                                        let aux = viewer.show_aux_windows(ctx, *pixel_scale);
                                         popup_output.contrast_changed |= aux.contrast_changed;
                                         popup_output.histogram_visibility_changed |=
                                             aux.histogram_visibility_changed;
@@ -11339,7 +11587,21 @@ fn sanitize_file_stem(title: &str) -> String {
     }
 }
 
-fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
+/// The file name to show for a running recording.
+///
+/// Derived from the path the pipeline actually opened, never from the
+/// configured request: `validated_output_path` inserts a timestamp and dodges
+/// collisions, so naming the request would point people at a file that does
+/// not exist.
+fn recording_target_name(active_recording_path: Option<&Path>) -> String {
+    active_recording_path
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "recording".to_owned())
+}
+
+pub(crate) fn ensure_extension(mut path: PathBuf, extension: &str) -> PathBuf {
     if path.extension().is_none() {
         path.set_extension(extension);
     }
@@ -11571,12 +11833,13 @@ mod tests {
         investigation_split_ratio_bounds, is_newer_host_snapshot_sequence,
         live_analysis_coverage_text, live_snapshot_generations_equal, pipeline_stream_active,
         python_ingress_pipeline_config, python_ingress_replay_info, raw_event_focus_volume,
-        raw_event_point_position, recording_finalize_outcome, replay_fraction_from_time,
-        replay_history_has_display_override, replay_history_step_target, replay_pipeline_config,
-        replay_seek_target_reached, replay_snapshot_frame, replay_step_target_time_us,
-        replay_step_uses_current_controller, replay_time_from_position_sources,
-        resolve_plugin_recording_path, roi_is_effectively_full_frame, sha256_file,
-        short_host_view_chip_title, should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
+        raw_event_point_position, recording_finalize_outcome, recording_target_name,
+        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
+        replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
+        replay_step_target_time_us, replay_step_uses_current_controller,
+        replay_time_from_position_sources, resolve_plugin_recording_path,
+        roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
+        should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
         viewport_stream_active, CameraApp, PluginRecordingSession, PopupSharedData,
         RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
@@ -11649,6 +11912,18 @@ mod tests {
         assert_eq!(code, "path_outside_output_directory");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recording_status_names_the_resolved_file_not_the_configured_one() {
+        // What `validated_output_path` produced after timestamping, which is
+        // deliberately not what the user typed into the output field.
+        let resolved = PathBuf::from("/data/output_20260801_101500.raw");
+        assert_eq!(
+            recording_target_name(Some(resolved.as_path())),
+            "output_20260801_101500.raw"
+        );
+        assert_eq!(recording_target_name(None), "recording");
     }
 
     #[test]

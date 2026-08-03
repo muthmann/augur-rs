@@ -9,11 +9,30 @@ pub(crate) const IMX636_DEM_SLOTS: usize = 64;
 /// Beyond this age a monitoring reading is called out as stale rather than
 /// shown as if it were current. The control thread refreshes every 500 ms, so
 /// anything past this means polling has stalled.
-const MONITORING_STALE_AFTER_S: f64 = 2.0;
+pub(crate) const MONITORING_STALE_AFTER_S: f64 = 2.0;
 
 const BIAS_CODE_TOOLTIP: &str = "Absolute 8-bit bias code programmed on the sensor, next to this unit's factory-trimmed default (the code for offset 0). The IMX636 publishes no conversion from this bias to a physical unit, so the code is the absolute value the sensor actually works with.";
 
 const DEAD_TIME_TOOLTIP: &str = "Refractory period measured by the sensor's own dead-time monitor — the absolute value this refr offset produces, i.e. the minimum time between two events from one pixel. Read live from the camera, not computed from the slider.";
+
+/// A settings section whose header stays live even when its controls do not.
+///
+/// Replay and locked recordings present these values as a read-only reference,
+/// and a reference nobody can expand is not a reference. Only the body is
+/// greyed out, so every section still opens and its values stay legible.
+fn section<R>(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    label: &str,
+    default_open: bool,
+    right: Option<&str>,
+    read_only: bool,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    crate::theme::collapse(ui, id_source, label, default_open, right, |ui| {
+        ui.add_enabled_ui(!read_only, body).inner
+    })
+}
 
 // A UI aggregator that threads scattered app state into one settings panel;
 // grouping the arguments would only move the plumbing elsewhere.
@@ -28,6 +47,7 @@ pub fn draw_settings(
     sensor_height: u16,
     pipeline_stats: Option<PipelineStatsSnapshot>,
     sensor_monitoring: Option<&SensorMonitoringSnapshot>,
+    read_only: bool,
 ) -> bool {
     let mut changed = false;
 
@@ -40,12 +60,13 @@ pub fn draw_settings(
 
     const BIAS_SLIDER_COUNT: usize = 5;
     let bias_count = format!("{BIAS_SLIDER_COUNT} / {BIAS_SLIDER_COUNT}");
-    crate::theme::collapse(
+    section(
         ui,
         "settings_biases",
         "Biases",
         false,
         Some(&bias_count),
+        read_only,
         |ui| {
             ui.weak("Analog pixel tuning. Values are relative offsets from factory defaults.");
             if bias_codes.is_none() {
@@ -122,27 +143,31 @@ pub fn draw_settings(
     // the conditions a bias setting only makes sense against, so they must be
     // readable at a glance rather than behind a collapsed section that appears
     // and disappears with the camera.
-    crate::theme::collapse(
+    section(
         ui,
         "settings_sensor_readout",
         "Sensor Readout",
         true,
         None,
+        read_only,
         |ui| {
-            ui.weak(
-                "Live values measured on the sensor itself, not derived from the settings above.",
-            );
+            // No standing preamble: with readings present the rows and their
+            // hover text say everything, and with none the single line below
+            // says the only thing worth saying. Two grey paragraphs used to
+            // fill the section while showing no numbers at all.
             match sensor_monitoring {
                 Some(snapshot) => draw_sensor_readout(ui, snapshot),
                 None => {
-                    ui.small("Illumination and die temperature appear while the camera runs.");
+                    ui.small(
+                        "Illumination, die temperature and dead time appear while the camera runs.",
+                    );
                 }
             }
         },
     );
 
     ui.separator();
-    crate::theme::collapse(ui, "settings_roi", "ROI", false, None, |ui| {
+    section(ui, "settings_roi", "ROI", false, None, read_only, |ui| {
         ui.weak("Hardware Region of Interest. Only pixels inside this rectangle are active. Inactive pixels consume no power and produce no events.");
         crate::theme::field_label(ui, "Rect", Some("px"));
         ui.horizontal_wrapped(|ui| {
@@ -184,12 +209,13 @@ pub fn draw_settings(
         cfg.pixel_mask.masked_pixels.len(),
         IMX636_DEM_SLOTS
     );
-    crate::theme::collapse(
+    section(
         ui,
         "settings_pixel_mask",
         "Pixel Mask (DEM)",
         false,
         Some(&mask_count),
+        read_only,
         |ui| {
             ui.weak("Digital Event Mask. Suppresses events from up to 64 individual defective or hot pixels in hardware. Use this to silence persistently noisy pixels.");
             ui.horizontal_wrapped(|ui| {
@@ -275,12 +301,13 @@ pub fn draw_settings(
     );
 
     ui.separator();
-    crate::theme::collapse(
+    section(
         ui,
         "settings_external_triggers",
         "External Triggers",
         false,
         None,
+        read_only,
         |ui| {
             ui.weak(
                 "EVK4 TRIG_IN monitoring. Channel 0 is the only supported input in this release.",
@@ -329,12 +356,13 @@ pub fn draw_settings(
     );
 
     ui.separator();
-    crate::theme::collapse(
+    section(
         ui,
         "settings_filters",
         "Digital Filters",
         false,
         None,
+        read_only,
         |ui| {
             ui.weak("Hardware noise filters on the sensor's digital pipeline. STC and Trail are mutually exclusive — they share the same on-chip processing block.");
             if ui
@@ -371,6 +399,12 @@ pub fn draw_settings(
     changed
 }
 
+/// Two-column sensor row: label left, measured value right-aligned. Hovering
+/// anywhere on the row explains what the sensor actually measured.
+fn readout_row(ui: &mut egui::Ui, label: &str, value: &str) -> egui::Response {
+    crate::theme::inspector_row(ui, label, value)
+}
+
 /// Muted monospace line used for the absolute readouts under a slider.
 fn readout_line(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
     let palette = crate::theme::palette_for_visuals(ui.visuals());
@@ -403,21 +437,21 @@ fn draw_sensor_readout(ui: &mut egui::Ui, snapshot: &SensorMonitoringSnapshot) {
     let values = &snapshot.values;
     let mut any_reading = false;
 
+    // Two-column rows rather than space-padded monospace: the values line up
+    // on the right edge whatever their width, and stay aligned if a label or
+    // a unit ever changes length.
     if let Some(dead_time_us) = values.pixel_dead_time_us {
-        readout_line(
-            ui,
-            format!("dead time     {}", format_measurement(dead_time_us, "µs")),
-        )
-        .on_hover_text(DEAD_TIME_TOOLTIP);
+        readout_row(ui, "dead time", &format_measurement(dead_time_us, "µs"))
+            .on_hover_text(DEAD_TIME_TOOLTIP);
         any_reading = true;
     }
     if let Some(lux) = values.illumination_lux {
-        readout_line(ui, format!("illumination  {}", format_measurement(lux, "lux")))
+        readout_row(ui, "illumination", &format_measurement(lux, "lux"))
             .on_hover_text("Scene illumination integrated by the sensor's LIFO block. Worth recording next to a bias setting, since the usable bias range depends on the light level.");
         any_reading = true;
     }
     if let Some(temperature_c) = values.temperature_c {
-        readout_line(ui, format!("die temp      {temperature_c:.1} °C"))
+        readout_row(ui, "die temp", &format!("{temperature_c:.1} °C"))
             .on_hover_text("Sensor die temperature from the on-chip ADC. Analog bias behaviour drifts with temperature, so this belongs in the log of a bias sweep.");
         any_reading = true;
     }
@@ -445,7 +479,7 @@ fn draw_sensor_readout(ui: &mut egui::Ui, snapshot: &SensorMonitoringSnapshot) {
 
 /// Three significant digits, so a value that jitters in its last decimal does
 /// not make the panel look unstable.
-fn format_measurement(value: f32, unit: &str) -> String {
+pub(crate) fn format_measurement(value: f32, unit: &str) -> String {
     if value >= 100.0 {
         format!("{value:.0} {unit}")
     } else if value >= 10.0 {

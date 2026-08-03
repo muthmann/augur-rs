@@ -66,6 +66,11 @@ The GUI exposes a dedicated Plugin Manager window:
 
 Load failures are recorded per plugin instead of aborting the app.
 
+They are **also** surfaced in the analysis panel's `Status & warnings` section, one row per failed
+plugin (`<name> · not loaded: <error>`), and counted in that section's badge. A plugin that never
+loaded is a capability the session does not have, so "All clear" must not be able to hide one — see
+ADR 033.
+
 The loader validates both the exported `PluginVTable` size and the explicit ABI version before it
 calls any plugin function pointers. A stale plugin now shows up as a normal load error in the
 Plugin Manager instead of crashing AugurRS during startup.

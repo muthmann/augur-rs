@@ -102,6 +102,20 @@ recording into fixed windows and process every one of them
 (`augur-runtime/src/offline.rs`). Live output is for watching, not for
 measuring.
 
+## The ImageJ bridge is sampled too, and now says so
+
+The same rule applies to preview frames handed to an external tool. The ImageJ
+bridge holds a bounded queue (32 envelopes) and drops rather than back-pressure
+the preview path — correct, since it is a preview, not a capture path — but it
+used to report `Streaming` regardless, so an incomplete series arriving in
+ImageJ looked complete.
+
+`ExternalTool::throughput()` now returns `frames_offered` and `frames_dropped`.
+Any drop turns the top-bar chip to warning tone (`ImageJ: Streaming · 37
+dropped`) and adds a delivered/dropped breakdown to the `Stream to ImageJ`
+dialog, pointing at TIFF export or an analysis run for a gap-free series
+(ADR 033).
+
 ## Known limits
 
 - The stall counter is host-side. It cannot observe a device-side FIFO overflow

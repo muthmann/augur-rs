@@ -978,19 +978,24 @@ fn draw_3d_canvas_overlay(
     // the first frame so we read the measurement saved last frame; the first render falls back
     // to full-canvas width (old behaviour) and subsequent frames are correctly centred.
     let tray_width_id = ui.id().with("overlay_tray_w");
-    let prev_tray_w: f32 = ui
+    let natural_tray_w: f32 = ui
         .memory(|mem| mem.data.get_temp::<f32>(tray_width_id))
         .unwrap_or(0.0);
     let max_tray_w = (paint_rect.width() - 16.0).max(0.0);
-    let tray_w = if prev_tray_w > 0.0 {
-        prev_tray_w.min(max_tray_w)
+    let tray_w = if natural_tray_w > 0.0 {
+        natural_tray_w.min(max_tray_w)
     } else {
         max_tray_w
     };
+    // A canvas too narrow for the controls (the Split layout, typically) used
+    // to scroll them out of sight and clip a reading mid-token. Give the tray
+    // a second row instead, so everything stays on screen.
+    let wrapped = natural_tray_w > max_tray_w;
+    let tray_h = if wrapped { 64.0 } else { 38.0 };
     let tray_left = paint_rect.left() + ((paint_rect.width() - tray_w) * 0.5).max(0.0);
     let tray_rect = egui::Rect::from_min_size(
         egui::pos2(tray_left, paint_rect.top() + 8.0),
-        egui::vec2(tray_w, 38.0),
+        egui::vec2(tray_w, tray_h),
     );
     let painter = ui.painter_at(paint_rect);
     painter.rect_filled(
@@ -1006,176 +1011,189 @@ fn draw_3d_canvas_overlay(
 
     let content_rect = tray_rect.shrink2(egui::vec2(6.0, 4.0));
     ui.allocate_ui_at_rect(content_rect, |ui| {
-        // Capture the natural content width from inside the scroll area's inner UI.
-        // The inner UI is unbounded, so min_rect reflects the true content extent.
-        let content_w = egui::ScrollArea::horizontal()
-            .id_source("investigation_3d_canvas_overlay")
-            .auto_shrink([false, false])
-            .max_height(30.0)
-            .show(ui, |ui| {
-                ui.scope(|ui| {
-                    ui.style_mut().wrap = Some(false);
-                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
-                    ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
-                    ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
-                    ui.visuals_mut().widgets.active.fg_stroke.color = egui::Color32::WHITE;
-                    // Make slider tracks and checkbox borders legible on the dark overlay.
-                    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_white_alpha(40);
-                    ui.visuals_mut().widgets.inactive.bg_stroke =
-                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(80));
-                    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_white_alpha(65);
-                    ui.visuals_mut().widgets.hovered.bg_stroke =
-                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(120));
-                    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_white_alpha(90);
-                    ui.visuals_mut().widgets.active.bg_stroke =
-                        egui::Stroke::new(1.0, egui::Color32::WHITE);
-                    ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
-                    ui.spacing_mut().slider_width = 56.0;
-                    ui.horizontal(|ui| {
-                        let presets = [
-                            AxisPreset::Isometric,
-                            AxisPreset::Xy,
-                            AxisPreset::Xz,
-                            AxisPreset::Yz,
-                        ];
-                        let labels = ["ISO", "XY", "XT", "YT"];
-                        let selected = presets.iter().position(|p| *p == state.preset).unwrap_or(0);
-                        for (i, label) in labels.iter().enumerate() {
-                            let is_selected = i == selected;
-                            let fill = if is_selected {
-                                egui::Color32::from_white_alpha(42)
-                            } else {
-                                egui::Color32::from_white_alpha(12)
-                            };
-                            let stroke = egui::Stroke::new(
-                                1.0,
-                                if is_selected {
-                                    egui::Color32::from_white_alpha(120)
-                                } else {
-                                    egui::Color32::from_white_alpha(45)
-                                },
-                            );
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(*label)
-                                            .monospace()
-                                            .size(11.0)
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(fill)
-                                    .stroke(stroke)
-                                    .min_size(egui::vec2(27.0, 22.0)),
-                                )
-                                .clicked()
-                            {
-                                state.set_axis_preset(presets[i]);
-                            }
-                        }
-                        crate::theme::toolbar_separator(ui);
-                        ui.label("Pt");
-                        ui.add_sized(
-                            egui::vec2(50.0, 18.0),
-                            egui::Slider::new(&mut state.point_scale, 2.0..=24.0)
-                                .logarithmic(true)
-                                .show_value(false),
-                        )
-                        .on_hover_text("Rendered point size.");
-                        if let Some(history) = raw_history {
-                            ui.label("Hist");
-                            ui.add_sized(
-                                egui::vec2(58.0, 18.0),
-                                egui::Slider::new(&mut history.time_window_ms, 5.0..=5_000.0)
-                                    .logarithmic(true)
-                                    .show_value(false),
-                            )
-                            .on_hover_text("Raw-event history span shown in 3D.");
-                            let status = RawHistoryFooterStatus::from_state(
-                                history,
-                                raw_history_anchor_end_us,
-                            );
-                            ui.monospace(format!(
-                                "{:.0} ms",
-                                status.retained_ms.unwrap_or(status.requested_ms)
-                            ));
-                            ui.label("Max pts");
-                            ui.scope(|ui| {
-                                ui.visuals_mut().extreme_bg_color =
-                                    egui::Color32::from_rgba_premultiplied(10, 14, 18, 210);
-                                ui.visuals_mut().widgets.inactive.bg_fill =
-                                    egui::Color32::from_white_alpha(18);
-                                ui.visuals_mut().widgets.hovered.bg_fill =
-                                    egui::Color32::from_white_alpha(34);
-                                ui.visuals_mut().widgets.active.bg_fill =
-                                    egui::Color32::from_white_alpha(46);
-                                ui.add_sized(
-                                    egui::vec2(68.0, 18.0),
-                                    egui::DragValue::new(&mut history.point_limit)
-                                        .clamp_range(1_000..=100_000)
-                                        .speed(1_000.0),
-                                )
-                                .on_hover_text(
-                                    "Maximum raw-event points sampled into the 3D view.",
-                                );
-                            });
-                        }
-                        crate::theme::toolbar_separator(ui);
-                        // Use explicit fills so these buttons are legible on the dark
-                        // overlay tray regardless of the host theme.
-                        let btn_fill = egui::Color32::from_white_alpha(22);
-                        let btn_stroke =
-                            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70));
-                        let btn_text = |label: &str| {
-                            egui::RichText::new(label)
+        // The overlay styling and the control row are shared between the
+        // scrolling single-row tray and the wrapped two-row tray, so both
+        // are bound once and consumed by exactly one branch below.
+        let style_overlay = |ui: &mut egui::Ui| {
+            ui.style_mut().wrap = Some(false);
+            ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+            ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
+            ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+            ui.visuals_mut().widgets.active.fg_stroke.color = egui::Color32::WHITE;
+            // Make slider tracks and checkbox borders legible on the dark overlay.
+            ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_white_alpha(40);
+            ui.visuals_mut().widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(80));
+            ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_white_alpha(65);
+            ui.visuals_mut().widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(120));
+            ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_white_alpha(90);
+            ui.visuals_mut().widgets.active.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::WHITE);
+            ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
+            ui.spacing_mut().slider_width = 56.0;
+        };
+        let controls = |ui: &mut egui::Ui| {
+            let presets = [
+                AxisPreset::Isometric,
+                AxisPreset::Xy,
+                AxisPreset::Xz,
+                AxisPreset::Yz,
+            ];
+            let labels = ["ISO", "XY", "XT", "YT"];
+            let selected = presets.iter().position(|p| *p == state.preset).unwrap_or(0);
+            for (i, label) in labels.iter().enumerate() {
+                let is_selected = i == selected;
+                let fill = if is_selected {
+                    egui::Color32::from_white_alpha(42)
+                } else {
+                    egui::Color32::from_white_alpha(12)
+                };
+                let stroke = egui::Stroke::new(
+                    1.0,
+                    if is_selected {
+                        egui::Color32::from_white_alpha(120)
+                    } else {
+                        egui::Color32::from_white_alpha(45)
+                    },
+                );
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(*label)
+                                .monospace()
                                 .size(11.0)
-                                .color(egui::Color32::WHITE)
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(btn_text("Reset"))
-                                    .fill(btn_fill)
-                                    .stroke(btn_stroke)
-                                    .min_size(egui::vec2(0.0, 22.0)),
-                            )
-                            .on_hover_text("Reset orbit camera and view controls.")
-                            .clicked()
-                        {
-                            state.reset_camera();
-                        }
-                        if ui
-                            .add_enabled(
-                                !scene_empty,
-                                egui::Button::new(btn_text("Fit"))
-                                    .fill(btn_fill)
-                                    .stroke(btn_stroke)
-                                    .min_size(egui::vec2(0.0, 22.0)),
-                            )
-                            .on_hover_text("Frame all visible 3D data.")
-                            .clicked()
-                        {
-                            state.fit_to_scene(scene);
-                        }
-                        if ui
-                            .add_enabled(
-                                selected_focus_target.is_some(),
-                                egui::Button::new(btn_text("Focus"))
-                                    .fill(btn_fill)
-                                    .stroke(btn_stroke)
-                                    .min_size(egui::vec2(0.0, 22.0)),
-                            )
-                            .on_hover_text("Center the selected point in 3D.")
-                            .clicked()
-                        {
-                            output.focus_target = selected_focus_target;
-                        }
-                    });
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(fill)
+                        .stroke(stroke)
+                        .min_size(egui::vec2(27.0, 22.0)),
+                    )
+                    .clicked()
+                {
+                    state.set_axis_preset(presets[i]);
+                }
+            }
+            crate::theme::toolbar_separator(ui);
+            ui.label("Pt");
+            ui.add_sized(
+                egui::vec2(50.0, 18.0),
+                egui::Slider::new(&mut state.point_scale, 2.0..=24.0)
+                    .logarithmic(true)
+                    .show_value(false),
+            )
+            .on_hover_text("Rendered point size.");
+            if let Some(history) = raw_history {
+                ui.label("Hist");
+                ui.add_sized(
+                    egui::vec2(58.0, 18.0),
+                    egui::Slider::new(&mut history.time_window_ms, 5.0..=5_000.0)
+                        .logarithmic(true)
+                        .show_value(false),
+                )
+                .on_hover_text("Raw-event history span shown in 3D.");
+                let status = RawHistoryFooterStatus::from_state(history, raw_history_anchor_end_us);
+                ui.monospace(format!(
+                    "{:.0} ms",
+                    status.retained_ms.unwrap_or(status.requested_ms)
+                ));
+                ui.label("Max pts");
+                ui.scope(|ui| {
+                    ui.visuals_mut().extreme_bg_color =
+                        egui::Color32::from_rgba_premultiplied(10, 14, 18, 210);
+                    ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_white_alpha(18);
+                    ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_white_alpha(34);
+                    ui.visuals_mut().widgets.active.bg_fill = egui::Color32::from_white_alpha(46);
+                    ui.add_sized(
+                        egui::vec2(68.0, 18.0),
+                        egui::DragValue::new(&mut history.point_limit)
+                            .clamp_range(1_000..=100_000)
+                            .speed(1_000.0),
+                    )
+                    .on_hover_text("Maximum raw-event points sampled into the 3D view.");
                 });
-                ui.min_rect().width() // natural content width, returned to outer scope
+            }
+            crate::theme::toolbar_separator(ui);
+            // Use explicit fills so these buttons are legible on the dark
+            // overlay tray regardless of the host theme.
+            let btn_fill = egui::Color32::from_white_alpha(22);
+            let btn_stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70));
+            let btn_text = |label: &str| {
+                egui::RichText::new(label)
+                    .size(11.0)
+                    .color(egui::Color32::WHITE)
+            };
+            if ui
+                .add(
+                    egui::Button::new(btn_text("Reset"))
+                        .fill(btn_fill)
+                        .stroke(btn_stroke)
+                        .min_size(egui::vec2(0.0, 22.0)),
+                )
+                .on_hover_text("Reset orbit camera and view controls.")
+                .clicked()
+            {
+                state.reset_camera();
+            }
+            if ui
+                .add_enabled(
+                    !scene_empty,
+                    egui::Button::new(btn_text("Fit"))
+                        .fill(btn_fill)
+                        .stroke(btn_stroke)
+                        .min_size(egui::vec2(0.0, 22.0)),
+                )
+                .on_hover_text("Frame all visible 3D data.")
+                .clicked()
+            {
+                state.fit_to_scene(scene);
+            }
+            if ui
+                .add_enabled(
+                    selected_focus_target.is_some(),
+                    egui::Button::new(btn_text("Focus"))
+                        .fill(btn_fill)
+                        .stroke(btn_stroke)
+                        .min_size(egui::vec2(0.0, 22.0)),
+                )
+                .on_hover_text("Center the selected point in 3D.")
+                .clicked()
+            {
+                output.focus_target = selected_focus_target;
+            }
+        };
+        let content_w = if wrapped {
+            // No horizontal scroll area here: it would hand the row an
+            // unbounded width and the wrapping layout would never wrap.
+            ui.scope(|ui| {
+                style_overlay(ui);
+                crate::theme::wrap_row(ui, controls);
+                ui.min_rect().width()
             })
-            .inner;
-        // Save content width so the tray can be centred on the next frame.
-        let measured_w = (content_w + 12.0).min(max_tray_w);
-        ui.memory_mut(|mem| mem.data.insert_temp(tray_width_id, measured_w));
+            .inner
+        } else {
+            egui::ScrollArea::horizontal()
+                .id_source("investigation_3d_canvas_overlay")
+                .auto_shrink([false, false])
+                .max_height(30.0)
+                .show(ui, |ui| {
+                    ui.scope(|ui| {
+                        style_overlay(ui);
+                        ui.horizontal(controls);
+                    });
+                    ui.min_rect().width() // natural content width
+                })
+                .inner
+        };
+        // Save the *natural* content width for the next frame — unclamped, so
+        // it stays a usable "does this fit?" signal. Clamping it to the canvas
+        // (as this used to) made a too-wide tray look exactly like one that
+        // fits. The wrapped branch measures a wrapped row, which is not the
+        // natural width, so it leaves the stored value alone; the row unwraps
+        // and re-measures as soon as the canvas is wide enough again.
+        if !wrapped {
+            ui.memory_mut(|mem| mem.data.insert_temp(tray_width_id, content_w + 12.0));
+        }
     });
 
     let help_rect = egui::Rect::from_min_size(

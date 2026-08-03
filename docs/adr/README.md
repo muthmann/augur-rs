@@ -45,3 +45,4 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 030: Reader-Owned Transfer Buffers And Recording Completeness Accounting](./030-recording-completeness-accounting.md)
 - [ADR 031: Optional Sensor-Telemetry Companion Recording](./031-sensor-telemetry-companion-recording.md)
 - [ADR 032: Installer Distribution And In-App Updates](./032-installer-distribution-and-in-app-updates.md)
+- [ADR 033: Measurement Provenance In The UI](./033-measurement-provenance-in-the-ui.md)

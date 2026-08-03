@@ -104,6 +104,21 @@ Three host-side rules keep that surface predictable:
   root viewport (`request_root_repaint`) whenever a request is pending, because only the app
   services them.
 
+## Chip, Tab, And Empty-State Presentation
+
+- **Chips wrap as whole units.** The view-chip row uses `theme::wrap_row`, not
+  `horizontal_wrapped`. The Analysis panel enables text wrapping for its whole subtree, and egui
+  measures a `Button`'s label against the width left on the current line — so a chip that does not
+  fit was breaking its label one character per line into a vertical strip instead of moving down.
+  Shortened titles (`short_host_view_chip_title`) reduce how often the row fills up; they do not
+  fix the wrap itself. Any new row of chips or buttons in a side panel must use `wrap_row`.
+- **A dock tab shows the kind once.** The leading Phosphor glyph encodes the view kind; the textual
+  kind tag lives in the tooltip alongside the dataset id. The close button appears only on the
+  active or hovered tab, in a permanently reserved slot so revealing it does not reflow the strip.
+- **Empty views centre their message.** `host_views::empty_state` renders a view's
+  `empty_message` centred and muted in the space the data would occupy. A bare `ui.label` stranded
+  it in the top-left corner of what is often a very tall empty dock.
+
 ## Reconstruction Direction
 
 Reconstruction is modeled as a generic host-view composition. A runtime plugin publishes a table dataset, and the host renders it through table, scatter, and density views.
