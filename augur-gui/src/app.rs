@@ -5289,8 +5289,7 @@ impl CameraApp {
             let tab_rect = tab_response.response.rect;
             // Recorded for the next frame: the close button has to be laid out
             // before the finished tab rect exists to hit-test against.
-            ui.ctx()
-                .data_mut(|d| d.insert_temp(hover_id, ui.rect_contains_pointer(tab_rect)));
+            store_hover_state(ui, hover_id, tab_rect);
             // Active tab accent: 2px bottom ink line.
             if is_active {
                 let accent_rect = egui::Rect::from_min_size(
@@ -11593,6 +11592,19 @@ fn sanitize_file_stem(title: &str) -> String {
 /// configured request: `validated_output_path` inserts a timestamp and dodges
 /// collisions, so naming the request would point people at a file that does
 /// not exist.
+/// Record whether `rect` is under the pointer, for the next frame to read.
+///
+/// The probe is evaluated *before* `data_mut` is called, and that ordering is
+/// the whole point of this helper. `Context::data_mut` holds the context's
+/// `RwLock` for the duration of its closure, and `rect_contains_pointer` reads
+/// `Context::memory`, which takes the same lock. `parking_lot` locks are not
+/// reentrant, so probing from inside the closure deadlocks the UI thread
+/// outright — the window simply stops repainting.
+fn store_hover_state(ui: &egui::Ui, id: egui::Id, rect: egui::Rect) {
+    let hovered = ui.rect_contains_pointer(rect);
+    ui.ctx().data_mut(|data| data.insert_temp(id, hovered));
+}
+
 fn recording_target_name(active_recording_path: Option<&Path>) -> String {
     active_recording_path
         .and_then(Path::file_name)
@@ -11839,7 +11851,7 @@ mod tests {
         replay_step_target_time_us, replay_step_uses_current_controller,
         replay_time_from_position_sources, resolve_plugin_recording_path,
         roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
-        should_dispatch_live_analysis_for_state, sync_acq_time_atomic,
+        should_dispatch_live_analysis_for_state, store_hover_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
         viewport_stream_active, CameraApp, PluginRecordingSession, PopupSharedData,
         RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
@@ -11856,8 +11868,10 @@ mod tests {
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc, Mutex,
+            mpsc, Arc, Mutex,
         },
+        thread,
+        time::Duration,
     };
 
     fn unique_recording_test_dir() -> PathBuf {
@@ -11912,6 +11926,30 @@ mod tests {
         assert_eq!(code, "path_outside_output_directory");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storing_hover_state_never_reenters_the_context_lock() {
+        // `Context::data_mut` holds the context RwLock across its closure and
+        // `rect_contains_pointer` takes the same lock; parking_lot locks are
+        // not reentrant, so the nested form deadlocks the UI thread. That is
+        // not a failure a normal test can observe — it hangs forever — so the
+        // probe runs on its own thread and the test fails on a timeout.
+        let (tx, rx) = mpsc::channel();
+        let probe = thread::spawn(move || {
+            egui::__run_test_ui(|ui| {
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 24.0));
+                store_hover_state(ui, egui::Id::new("dock_tab_hover_probe"), rect);
+            });
+            let _ = tx.send(());
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "store_hover_state deadlocked: the hover probe must be evaluated \
+             before Context::data_mut takes the context lock"
+        );
+        probe.join().expect("probe thread finished");
     }
 
     #[test]

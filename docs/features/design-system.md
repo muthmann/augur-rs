@@ -745,6 +745,26 @@ of the same action in one panel violates one-primary-per-surface. The footer
 button's tooltip now states *why* it is disabled (locked, or nothing to send)
 instead of leaving a dead control unexplained.
 
+### Never touch `ui` or `ctx` inside a `data_mut` / `memory_mut` closure
+
+`Context::data_mut` and `memory_mut` hold the context's `RwLock` for the whole
+closure, and `parking_lot` locks are **not** reentrant. Any `ui.*` or `ctx.*`
+call that reads context state from inside one — `rect_contains_pointer`,
+`input`, `fonts`, `style` — self-deadlocks the UI thread: the window stops
+repainting with no panic and no log line.
+
+**Rule:** compute the value first, then store it.
+
+```rust
+let hovered = ui.rect_contains_pointer(rect);          // read the lock, release
+ui.ctx().data_mut(|d| d.insert_temp(id, hovered));     // then take it for writing
+```
+
+`app::store_hover_state` is the sanctioned form for the hover-probe case, and
+`storing_hover_state_never_reenters_the_context_lock` guards it — the probe runs
+on its own thread so a regression fails on a timeout instead of hanging the
+suite forever.
+
 ### Read-only means legible, not inert
 
 `ui.add_enabled_ui(false, …)` around a whole section disables its collapsing
