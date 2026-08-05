@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use augur_core::{config::RoiConfig, replay::ReplayFileInfo};
 
-use crate::export::{estimate_tiff_stack_frames, TiffStackExportParams};
+use crate::{
+    app::ensure_extension,
+    export::{estimate_tiff_stack_frames, TiffStackExportParams},
+};
 
 #[derive(Debug)]
 pub(crate) enum ExportDialogAction {
@@ -24,6 +27,11 @@ pub(crate) struct ExportDialog {
     acq_time_ms: u64,
     crop_to_roi: bool,
     output_path: String,
+    /// The native save dialog already asked about overwriting the path it
+    /// returned, so re-asking would be noise. Any manual edit clears this and
+    /// the in-dialog confirmation takes over.
+    overwrite_confirmed: bool,
+    pending_overwrite: Option<TiffStackExportParams>,
     error: Option<String>,
     info: Option<String>,
 }
@@ -43,6 +51,8 @@ impl Default for ExportDialog {
             acq_time_ms: 50,
             crop_to_roi: false,
             output_path: String::new(),
+            overwrite_confirmed: false,
+            pending_overwrite: None,
             error: None,
             info: None,
         }
@@ -70,6 +80,8 @@ impl ExportDialog {
         self.acq_time_ms = acq_time_ms.max(1);
         self.crop_to_roi = !roi_matches_full_frame(roi, info.width, info.height);
         self.output_path = default_export_path(replay_path).display().to_string();
+        self.overwrite_confirmed = false;
+        self.pending_overwrite = None;
         self.error = None;
         self.info = None;
     }
@@ -79,6 +91,7 @@ impl ExportDialog {
         if exporting {
             self.error = None;
             self.info = None;
+            self.pending_overwrite = None;
         }
     }
 
@@ -109,116 +122,169 @@ impl ExportDialog {
 
         let mut action = None;
         let mut open = self.open;
-        egui::Window::new("Export TIFF Stack")
-            .open(&mut open)
+        let mut window = egui::Window::new("Export TIFF Stack")
             .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label("Batch export replay frames as a multi-page 16-bit grayscale TIFF.");
-                ui.small("Each page stores total ON+OFF counts for one accumulation window.");
-                ui.separator();
+            .resizable(false);
+        // A running export cannot be stopped, so there is nothing for a close
+        // button to mean except "hide the truth". Withdraw it until the export
+        // finishes.
+        if !self.exporting {
+            window = window.open(&mut open);
+        }
+        window.show(ctx, |ui| {
+            ui.label("Batch export replay frames as a multi-page 16-bit grayscale TIFF.");
+            ui.small("Each page stores total ON+OFF counts for one accumulation window.");
+            ui.separator();
 
-                ui.add_enabled_ui(!self.exporting, |ui| {
-                    ui.label("Time range [s]");
-                    let start_response = ui.add(
-                        egui::Slider::new(&mut self.start_seconds, 0.0..=total_duration_s)
-                            .text("Start")
-                            .fixed_decimals(3),
-                    );
-                    if start_response.changed() {
-                        self.end_seconds = self.end_seconds.max(self.start_seconds);
-                    }
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.end_seconds,
-                            self.start_seconds..=total_duration_s,
-                        )
+            ui.add_enabled_ui(!self.exporting, |ui| {
+                ui.label("Time range [s]");
+                let start_response = ui.add(
+                    egui::Slider::new(&mut self.start_seconds, 0.0..=total_duration_s)
+                        .text("Start")
+                        .fixed_decimals(3),
+                );
+                if start_response.changed() {
+                    self.end_seconds = self.end_seconds.max(self.start_seconds);
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.end_seconds, self.start_seconds..=total_duration_s)
                         .text("End")
                         .fixed_decimals(3),
-                    );
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Acquisition time [ms]");
-                        ui.add(egui::DragValue::new(&mut self.acq_time_ms).clamp_range(1..=60_000));
-                    });
-
-                    let roi_label = format!(
-                        "Crop to current ROI ({},{} {}x{})",
-                        self.current_roi.x,
-                        self.current_roi.y,
-                        self.current_roi.width,
-                        self.current_roi.height
-                    );
-                    ui.checkbox(&mut self.crop_to_roi, roi_label);
-
-                    ui.separator();
-                    ui.label("Output path");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.output_path).desired_width(360.0),
-                        );
-                        if ui.button("Browse…").clicked() {
-                            let file_name = Path::new(self.output_path.trim())
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .filter(|name| !name.is_empty())
-                                .unwrap_or_else(|| "replay_stack.tiff".into());
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_file_name(&file_name)
-                                .add_filter("TIFF", &["tif", "tiff"])
-                                .save_file()
-                            {
-                                self.output_path = path.display().to_string();
-                            }
-                        }
-                    });
-                });
-
-                let estimated_frames = estimate_tiff_stack_frames(
-                    seconds_to_us(self.start_seconds),
-                    seconds_to_us(self.end_seconds),
-                    self.acq_time_ms.saturating_mul(1_000),
                 );
-                ui.small(format!("Estimated frame count: {estimated_frames}"));
-
-                if self.exporting {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Exporting TIFF stack...");
-                    });
-                }
-                if let Some(info) = &self.info {
-                    ui.colored_label(egui::Color32::from_rgb(40, 140, 90), info);
-                }
-                if let Some(error) = &self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
 
                 ui.separator();
                 ui.horizontal(|ui| {
+                    ui.label("Acquisition time [ms]");
+                    ui.add(egui::DragValue::new(&mut self.acq_time_ms).clamp_range(1..=60_000));
+                });
+
+                let roi_label = format!(
+                    "Crop to current ROI ({},{} {}x{})",
+                    self.current_roi.x,
+                    self.current_roi.y,
+                    self.current_roi.width,
+                    self.current_roi.height
+                );
+                ui.checkbox(&mut self.crop_to_roi, roi_label);
+
+                ui.separator();
+                ui.label("Output path");
+                ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!self.exporting, egui::Button::new("Export"))
-                        .clicked()
+                        .add(egui::TextEdit::singleline(&mut self.output_path).desired_width(360.0))
+                        .changed()
                     {
-                        match self.build_export_params() {
-                            Ok(params) => {
-                                self.error = None;
-                                self.info = None;
-                                action = Some(ExportDialogAction::Export(params));
-                            }
-                            Err(err) => self.error = Some(err),
-                        }
+                        // A hand-typed path has not been confirmed by
+                        // anyone yet.
+                        self.overwrite_confirmed = false;
+                        self.pending_overwrite = None;
                     }
-                    if ui
-                        .add_enabled(!self.exporting, egui::Button::new("Cancel"))
-                        .clicked()
-                    {
-                        action = Some(ExportDialogAction::Cancel);
-                        self.open = false;
+                    if ui.button("Browse…").clicked() {
+                        let file_name = Path::new(self.output_path.trim())
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| "replay_stack.tiff".into());
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name(&file_name)
+                            .add_filter("TIFF", &["tif", "tiff"])
+                            .save_file()
+                        {
+                            self.output_path = path.display().to_string();
+                            // The native dialog already handled the
+                            // overwrite prompt for this exact path.
+                            self.overwrite_confirmed = true;
+                            self.pending_overwrite = None;
+                        }
                     }
                 });
             });
+
+            let estimated_frames = estimate_tiff_stack_frames(
+                seconds_to_us(self.start_seconds),
+                seconds_to_us(self.end_seconds),
+                self.acq_time_ms.saturating_mul(1_000),
+            );
+            ui.small(format!("Estimated frame count: {estimated_frames}"));
+
+            if self.exporting {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Exporting TIFF stack...");
+                });
+                // The window's close button is withdrawn below while this
+                // runs, so the state on screen matches the state on disk.
+                ui.small(
+                    "The export writes on a background thread and cannot be \
+                         interrupted. This window stays open until it finishes.",
+                );
+            }
+            if let Some(pending) = &self.pending_overwrite {
+                ui.separator();
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{} already exists.", pending.output_path.display()),
+                );
+                ui.small("Exporting replaces the whole file; the current contents are lost.");
+                ui.horizontal(|ui| {
+                    if ui.button("Overwrite").clicked() {
+                        self.overwrite_confirmed = true;
+                        if let Some(params) = self.pending_overwrite.take() {
+                            self.error = None;
+                            self.info = None;
+                            action = Some(ExportDialogAction::Export(params));
+                        }
+                    }
+                    if ui.button("Keep existing file").clicked() {
+                        self.pending_overwrite = None;
+                    }
+                });
+            }
+            if let Some(info) = &self.info {
+                ui.colored_label(egui::Color32::from_rgb(40, 140, 90), info);
+            }
+            if let Some(error) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.exporting, egui::Button::new("Export"))
+                    .clicked()
+                {
+                    match self.build_export_params() {
+                        // Writing the stack truncates the target, so an
+                        // existing file the user typed in by hand is only
+                        // replaced after they say so.
+                        Ok(params) if !self.overwrite_confirmed && params.output_path.exists() => {
+                            self.error = None;
+                            self.info = None;
+                            self.pending_overwrite = Some(params);
+                        }
+                        Ok(params) => {
+                            self.error = None;
+                            self.info = None;
+                            self.pending_overwrite = None;
+                            action = Some(ExportDialogAction::Export(params));
+                        }
+                        Err(err) => self.error = Some(err),
+                    }
+                }
+                if ui
+                    .add_enabled(!self.exporting, egui::Button::new("Cancel"))
+                    .clicked()
+                {
+                    action = Some(ExportDialogAction::Cancel);
+                    self.open = false;
+                }
+            });
+        });
+        if self.exporting {
+            // `open` was never handed to the window this frame; keep it true so
+            // the dialog does not disappear out from under a running export.
+            open = true;
+        }
 
         self.open = open;
         if !self.open && action.is_none() {
@@ -245,7 +311,10 @@ impl ExportDialog {
             start_us: self.first_timestamp_us.saturating_add(start_offset_us),
             end_us: self.first_timestamp_us.saturating_add(end_offset_us),
             roi: self.crop_to_roi.then_some(self.current_roi),
-            output_path: PathBuf::from(output_path),
+            // Resolve the extension here, not at dispatch: the overwrite check
+            // and the confirmation text must name the file that actually gets
+            // written.
+            output_path: ensure_extension(PathBuf::from(output_path), "tiff"),
             width: self.width,
             height: self.height,
         })
@@ -267,4 +336,42 @@ fn default_export_path(replay_path: &Path) -> PathBuf {
 
 fn seconds_to_us(seconds: f64) -> u64 {
     (seconds.max(0.0) * 1_000_000.0).round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExportDialog;
+
+    fn dialog_for(output_path: &str) -> ExportDialog {
+        ExportDialog {
+            output_path: output_path.to_owned(),
+            end_seconds: 1.0,
+            width: 4,
+            height: 4,
+            ..ExportDialog::default()
+        }
+    }
+
+    #[test]
+    fn params_name_the_file_that_will_actually_be_written() {
+        // The exporter forces a .tiff extension, so the overwrite check and the
+        // confirmation text must see the same resolved path — not the stem the
+        // user typed.
+        let params = dialog_for("/tmp/stack")
+            .build_export_params()
+            .expect("params build");
+        assert_eq!(params.output_path.to_string_lossy(), "/tmp/stack.tiff");
+
+        let params = dialog_for("/tmp/stack.tif")
+            .build_export_params()
+            .expect("params build");
+        assert_eq!(params.output_path.to_string_lossy(), "/tmp/stack.tif");
+    }
+
+    #[test]
+    fn a_hand_typed_path_starts_unconfirmed_for_overwriting() {
+        let dialog = dialog_for("/tmp/stack.tiff");
+        assert!(!dialog.overwrite_confirmed);
+        assert!(dialog.pending_overwrite.is_none());
+    }
 }

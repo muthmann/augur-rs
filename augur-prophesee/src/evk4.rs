@@ -1,10 +1,14 @@
 use augur_core::{
-    camera::{DeviceInfo, EventCamera, PacketStreamCamera},
+    camera::{
+        DeviceInfo, EventCamera, PacketStreamCamera, PacketStreamReader, SensorMonitoring,
+        SensorMonitoringSelection,
+    },
     config::CameraConfig,
     CameraError, Result,
 };
 
 use crate::{
+    async_stream::{AsyncBulkStreamReader, QUEUED_TRANSFERS},
     debug,
     sensors::{Imx636, PseeSensor},
     transport::Transport,
@@ -129,6 +133,11 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
     fn configure(&mut self, config: &CameraConfig) -> Result<()> {
         let (w, h) = self.sensor.geometry();
         config.validate(w, h)?;
+        if self.streaming && config.external_triggers != self.config.external_triggers {
+            return Err(CameraError::Config(
+                "external triggers cannot be toggled while streaming".into(),
+            ));
+        }
         self.sensor
             .set_biases(&mut self.transport, &config.biases)?;
         self.sensor.set_roi(&mut self.transport, &config.roi)?;
@@ -136,6 +145,10 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
             .set_pixel_mask(&mut self.transport, &config.pixel_mask)?;
         self.sensor
             .set_digital_filter(&mut self.transport, &config.digital_filter)?;
+        if !self.streaming || config.external_triggers != self.config.external_triggers {
+            self.sensor
+                .set_external_trigger(&mut self.transport, &config.external_triggers)?;
+        }
         self.config = config.clone();
         Ok(())
     }
@@ -159,11 +172,53 @@ impl<S: PseeSensor> EventCamera for Evk4Camera<S> {
     fn device_info(&self) -> DeviceInfo {
         self.info.clone()
     }
+
+    fn read_monitoring(&mut self) -> Result<SensorMonitoring> {
+        self.sensor.read_monitoring(&mut self.transport)
+    }
+
+    fn read_monitoring_selected(
+        &mut self,
+        selection: SensorMonitoringSelection,
+    ) -> Result<SensorMonitoring> {
+        self.sensor
+            .read_monitoring_selected(&mut self.transport, selection)
+    }
+}
+
+/// Stream-endpoint reader sharing the camera's USB handle. Bulk reads on the
+/// stream endpoint are safe to run concurrently with control transfers on the
+/// control endpoints, which is what lets reconfiguration avoid stalling reads.
+pub struct Evk4StreamReader {
+    transport: Transport,
+}
+
+impl PacketStreamReader for Evk4StreamReader {
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.transport.read_stream(buf)
+    }
 }
 
 impl<S: PseeSensor> PacketStreamCamera for Evk4Camera<S> {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.transport.read_stream(buf)
+    }
+
+    fn split_stream_reader(&mut self) -> Option<Box<dyn PacketStreamReader>> {
+        // Prefer the async multi-URB reader: it keeps transfers queued in the
+        // kernel so there is no dead time between reads. Fall back to
+        // synchronous single-transfer reads if setup fails.
+        match AsyncBulkStreamReader::new(self.transport.clone(), QUEUED_TRANSFERS) {
+            Ok(reader) => Some(Box::new(reader)),
+            Err(err) => {
+                debug::log(format!(
+                    "async stream reader unavailable ({err}); using synchronous stream reads"
+                ));
+                Some(Box::new(Evk4StreamReader {
+                    transport: self.transport.clone(),
+                }))
+            }
+        }
     }
 }
 

@@ -1,4 +1,7 @@
 [toolchain]
-channel = "1.97.1"
-components = ["rustfmt", "clippy"]
-profile = "minimal"
+# Pinned so CI and local checkouts agree. An unpinned "stable" means a new
+# clippy release can turn a green branch red without a single code change.
+# Bump this deliberately, in its own commit, with the lint fallout fixed.
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
+

@@ -7,16 +7,39 @@ use std::{
 };
 
 use augur_plugin_api::{
-    HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind, HostViewPlacement,
-    HostViewRegistry, Image2dV1, Series1dV1, TableDatasetV1, TableSchema,
+    HostActionDescriptor, HostActionScope, HostDatasetDescriptor, HostDatasetKind,
+    HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dV1,
+    TableColumnDisplayFormat, TableColumnDisplayMetadata, TableColumnValues, TableDatasetV1,
+    TableSchema,
 };
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{CoordinatesFormatter, Corner, Legend, Line, Plot, PlotPoints, Points, VLine};
 use image::{ImageFormat, RgbaImage};
 
-use crate::colormap::Colormap;
+use crate::{
+    colormap::Colormap,
+    investigation::{
+        row_index_for_key, row_key_for_row, InvestigationSortDirection,
+        InvestigationTableViewState, StableRowKey, TablePageSize,
+    },
+};
 
-pub const COMPACT_TABLE_PREVIEW_ROWS: usize = 10;
+/// Placeholder for a view that has no data yet.
+///
+/// A bare `ui.label` strands the message in the top-left corner of what is
+/// often a very tall empty dock. Centring it in the space the data would have
+/// occupied reads as "nothing here yet" instead of "stray caption".
+pub fn empty_state(ui: &mut egui::Ui, message: &str) {
+    let palette = crate::theme::palette_for_visuals(ui.visuals());
+    let height = ui.available_height().clamp(48.0, 160.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+        |ui| {
+            ui.label(egui::RichText::new(message).size(12.0).color(palette.fg_3));
+        },
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostViewProviderKey {
@@ -44,16 +67,43 @@ pub struct ResolvedHostView {
     pub provider_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedHostAction {
+    pub descriptor: HostActionDescriptor,
+    pub provider: HostViewProviderKey,
+    pub provider_name: String,
+}
+
+impl ResolvedHostAction {
+    pub fn dataset_id(&self) -> &str {
+        match &self.descriptor.scope {
+            HostActionScope::Dataset { dataset_id }
+            | HostActionScope::Row { dataset_id }
+            | HostActionScope::Cluster { dataset_id, .. } => dataset_id.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedHostViewRegistry {
     datasets: Vec<ResolvedHostDataset>,
     views: Vec<ResolvedHostView>,
+    actions: Vec<ResolvedHostAction>,
     dataset_indices: HashMap<String, usize>,
     view_indices: HashMap<String, usize>,
+    action_indices: HashMap<String, usize>,
     warnings: Vec<String>,
 }
 
 impl ResolvedHostViewRegistry {
+    pub fn datasets(&self) -> impl Iterator<Item = &ResolvedHostDataset> {
+        self.datasets.iter()
+    }
+
+    pub fn views(&self) -> impl Iterator<Item = &ResolvedHostView> {
+        self.views.iter()
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -85,6 +135,19 @@ impl ResolvedHostViewRegistry {
             .iter()
             .filter(|view| view.descriptor.placement == HostViewPlacement::Window)
     }
+
+    pub fn window_views_for_provider(
+        &self,
+        provider: HostViewProviderKey,
+    ) -> impl Iterator<Item = &ResolvedHostView> {
+        self.views.iter().filter(move |view| {
+            view.provider == provider && view.descriptor.placement == HostViewPlacement::Window
+        })
+    }
+
+    pub fn actions(&self) -> impl Iterator<Item = &ResolvedHostAction> {
+        self.actions.iter()
+    }
 }
 
 fn host_view_kind_matches_dataset(
@@ -97,7 +160,8 @@ fn host_view_kind_matches_dataset(
             HostViewKind::CompactTable
                 | HostViewKind::TableWindow
                 | HostViewKind::Density2dFromTable { .. }
-                | HostViewKind::Scatter2dFromTable { .. },
+                | HostViewKind::Scatter2dFromTable { .. }
+                | HostViewKind::Scatter3dFromTable { .. },
             HostDatasetKind::TableV1(_)
         ) | (HostViewKind::ImageWindow, HostDatasetKind::Image2dV1)
             | (HostViewKind::LineSeriesWindow, HostDatasetKind::Series1dV1)
@@ -110,6 +174,7 @@ fn host_view_kind_label(kind: &HostViewKind) -> &'static str {
         HostViewKind::TableWindow => "table",
         HostViewKind::Density2dFromTable { .. } => "density",
         HostViewKind::Scatter2dFromTable { .. } => "scatter",
+        HostViewKind::Scatter3dFromTable { .. } => "scatter-3d",
         HostViewKind::ImageWindow => "image",
         HostViewKind::LineSeriesWindow => "line-series",
     }
@@ -195,6 +260,39 @@ pub fn resolve_host_view_registry(
                 provider_name: contribution.provider_name.clone(),
             });
         }
+
+        for descriptor in contribution.registry.actions {
+            if descriptor.id.trim().is_empty() {
+                resolved.warnings.push(format!(
+                    "Ignoring action with an empty id from {}.",
+                    contribution.provider_name
+                ));
+                continue;
+            }
+
+            if let Some(index) = resolved.action_indices.get(&descriptor.id).copied() {
+                let current = &mut resolved.actions[index];
+                if current.descriptor == descriptor {
+                    current.provider = contribution.provider;
+                    current.provider_name = contribution.provider_name.clone();
+                } else {
+                    resolved.warnings.push(format!(
+                        "Ignoring conflicting action id {} from {}; it does not match the earlier descriptor from {}.",
+                        descriptor.id, contribution.provider_name, current.provider_name
+                    ));
+                }
+                continue;
+            }
+
+            resolved
+                .action_indices
+                .insert(descriptor.id.clone(), resolved.actions.len());
+            resolved.actions.push(ResolvedHostAction {
+                descriptor,
+                provider: contribution.provider,
+                provider_name: contribution.provider_name.clone(),
+            });
+        }
     }
 
     let mut filtered_views = Vec::with_capacity(resolved.views.len());
@@ -229,39 +327,28 @@ pub fn resolve_host_view_registry(
     }
     resolved.views = filtered_views;
     resolved.view_indices = filtered_indices;
+
+    let mut filtered_actions = Vec::with_capacity(resolved.actions.len());
+    let mut filtered_action_indices = HashMap::new();
+    for action in resolved.actions.drain(..) {
+        let dataset_id = action.dataset_id().to_string();
+        if !resolved.dataset_indices.contains_key(&dataset_id) {
+            resolved.warnings.push(format!(
+                "Ignoring action id {} from {} because dataset {} is not resolved.",
+                action.descriptor.id, action.provider_name, dataset_id
+            ));
+            continue;
+        }
+        filtered_action_indices.insert(action.descriptor.id.clone(), filtered_actions.len());
+        filtered_actions.push(action);
+    }
+    resolved.actions = filtered_actions;
+    resolved.action_indices = filtered_action_indices;
+
     resolved
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum HostDatasetSnapshot {
-    Table(Arc<TableDatasetV1>),
-    Image2d(Arc<Image2dV1>),
-    Series1d(Arc<Series1dV1>),
-}
-
-pub fn decode_dataset_snapshot(
-    descriptor: &HostDatasetDescriptor,
-    bytes: &[u8],
-) -> Result<HostDatasetSnapshot, String> {
-    match &descriptor.kind {
-        HostDatasetKind::TableV1(schema) => {
-            let dataset: TableDatasetV1 = serde_json::from_slice(bytes)
-                .map_err(|err| format!("table dataset JSON is invalid: {err}"))?;
-            dataset.validate_against_schema(schema)?;
-            Ok(HostDatasetSnapshot::Table(Arc::new(dataset)))
-        }
-        HostDatasetKind::Image2dV1 => {
-            let dataset: Image2dV1 = serde_json::from_slice(bytes)
-                .map_err(|err| format!("image dataset JSON is invalid: {err}"))?;
-            Ok(HostDatasetSnapshot::Image2d(Arc::new(dataset)))
-        }
-        HostDatasetKind::Series1dV1 => {
-            let dataset: Series1dV1 = serde_json::from_slice(bytes)
-                .map_err(|err| format!("series dataset JSON is invalid: {err}"))?;
-            Ok(HostDatasetSnapshot::Series1d(Arc::new(dataset)))
-        }
-    }
-}
+pub use augur_runtime::{decode_dataset_snapshot, HostDatasetSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostViewImageFormat {
@@ -546,89 +633,399 @@ pub struct Scatter2dViewOptions<'a> {
     pub allow_clear: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompactTableSummary {
-    pub shown_rows: usize,
-    pub total_rows: usize,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TableCellFormatOptions {
+    /// Replay-origin timestamp (µs) used to render relative `mm:ss.uuu`.
+    /// When `None`, `TimestampMicros` falls back to absolute µs.
+    pub replay_origin_us: Option<u64>,
 }
 
-impl CompactTableSummary {
-    pub fn is_empty(self) -> bool {
-        self.total_rows == 0
+/// Render a cell value according to its display metadata. Raw values are used
+/// when no metadata is present; formatting never leaks into CSV exports.
+pub fn format_cell_value(
+    values: &TableColumnValues,
+    index: usize,
+    display: Option<&TableColumnDisplayMetadata>,
+    options: TableCellFormatOptions,
+) -> String {
+    let raw = values.display_value(index).unwrap_or_else(|| "-".into());
+    let Some(meta) = display else { return raw };
+    let Some(format) = meta.format.as_ref() else {
+        return raw;
+    };
+    match format {
+        TableColumnDisplayFormat::TimestampMicros => {
+            format_timestamp_micros(values_as_u64(values, index), options.replay_origin_us)
+                .unwrap_or(raw)
+        }
+        TableColumnDisplayFormat::FixedPrecision { digits } => match values {
+            TableColumnValues::F64(v) => v
+                .get(index)
+                .map(|value| format!("{:.*}", *digits as usize, value))
+                .unwrap_or(raw),
+            _ => raw,
+        },
+        TableColumnDisplayFormat::Identifier | TableColumnDisplayFormat::Category => raw,
     }
 }
 
-pub fn compact_table_summary(dataset: Option<&TableDatasetV1>) -> CompactTableSummary {
-    let total_rows = dataset.map(TableDatasetV1::row_count).unwrap_or(0);
-    CompactTableSummary {
-        shown_rows: total_rows.min(COMPACT_TABLE_PREVIEW_ROWS),
-        total_rows,
+fn values_as_u64(values: &TableColumnValues, index: usize) -> Option<u64> {
+    match values {
+        TableColumnValues::U64(v) => v.get(index).copied(),
+        TableColumnValues::I64(v) => v.get(index).copied().map(|value| value as u64),
+        _ => None,
     }
 }
 
-pub fn render_compact_table(
+fn format_timestamp_micros(value_us: Option<u64>, replay_origin_us: Option<u64>) -> Option<String> {
+    let value = value_us?;
+    let relative = match replay_origin_us {
+        Some(origin) => value.saturating_sub(origin),
+        None => return Some(format!("{value} µs")),
+    };
+    let total_millis = relative / 1_000;
+    let seconds = total_millis / 1_000;
+    let minutes = seconds / 60;
+    let secs = seconds % 60;
+    let millis = (total_millis % 1_000) as u32;
+    Some(format!("{minutes:02}:{secs:02}.{millis:03}"))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SummaryCardOptions<'a> {
+    pub dataset_id: &'a str,
+    pub generation: u64,
+    pub selected_row: Option<&'a StableRowKey>,
+    pub format: TableCellFormatOptions,
+    pub allow_export: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SummaryCardOutput {
+    pub actions: HostViewUiActions,
+    pub open_full_table: bool,
+}
+
+/// Render a summary card: row count, selected-row detail (formatted via
+/// `TableColumnDisplayMetadata`, respecting `hide_in_compact` and `headline`),
+/// and action buttons. Replaces the old 10-row free-text preview.
+pub fn render_summary_card(
     ui: &mut egui::Ui,
     schema: &TableSchema,
     dataset: Option<&TableDatasetV1>,
     empty_message: &str,
-) {
-    let summary = compact_table_summary(dataset);
-    if summary.is_empty() {
-        ui.label(empty_message);
-        return;
+    options: SummaryCardOptions<'_>,
+) -> SummaryCardOutput {
+    let mut output = SummaryCardOutput::default();
+    let total_rows = dataset.map(TableDatasetV1::row_count).unwrap_or(0);
+
+    crate::theme::wrap_row(ui, |ui| {
+        ui.label(format!("Rows: {total_rows}"));
+        ui.separator();
+        if ui.button("Open full table").clicked() {
+            output.open_full_table = true;
+        }
+        if options.allow_export && total_rows > 0 && ui.button("Export CSV").clicked() {
+            output.actions.export_csv = true;
+        }
+    });
+
+    if total_rows == 0 {
+        ui.separator();
+        empty_state(ui, empty_message);
+        return output;
     }
 
-    render_table_header(ui, schema);
+    let Some(dataset) = dataset else {
+        return output;
+    };
+
+    let selected_row_index = options.selected_row.and_then(|key| {
+        row_index_for_key(options.dataset_id, dataset, schema, options.generation, key)
+    });
+
     ui.separator();
-    if let Some(dataset) = dataset {
-        for row in 0..summary.shown_rows {
-            render_table_row(ui, schema, dataset, row);
+    match selected_row_index {
+        Some(row) => render_summary_detail(
+            ui,
+            schema,
+            dataset,
+            row,
+            options.dataset_id,
+            options.generation,
+            options.format,
+        ),
+        None => {
+            ui.small("Select a row in the full table to see details here.");
         }
     }
-    ui.separator();
-    ui.label(format!(
-        "showing {} of {}",
-        summary.shown_rows, summary.total_rows
-    ));
+
+    output
 }
 
-pub fn render_table_window(
+fn render_summary_detail(
+    ui: &mut egui::Ui,
+    schema: &TableSchema,
+    dataset: &TableDatasetV1,
+    row: usize,
+    dataset_id: &str,
+    generation: u64,
+    format_options: TableCellFormatOptions,
+) {
+    let display_map: std::collections::HashMap<&str, &TableColumnDisplayMetadata> = schema
+        .column_display
+        .iter()
+        .map(|e| (e.column_id.as_str(), &e.display))
+        .collect();
+    let is_headline = |column_id: &str| {
+        display_map
+            .get(column_id)
+            .map(|d| d.headline)
+            .unwrap_or(false)
+    };
+
+    if let Some(column) = schema.columns.iter().find(|c| is_headline(&c.id)) {
+        if let Some(values) = dataset.column(&column.id) {
+            let display = display_map.get(column.id.as_str()).copied();
+            let formatted = format_cell_value(&values.values, row, display, format_options);
+            ui.heading(formatted);
+        }
+    }
+
+    egui::Grid::new(("summary_card_grid", dataset_id, generation, row))
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for column in &schema.columns {
+                let display = display_map.get(column.id.as_str()).copied();
+                if display.map(|d| d.hide_in_compact).unwrap_or(false) {
+                    continue;
+                }
+                if is_headline(&column.id) {
+                    continue;
+                }
+                let Some(column_data) = dataset.column(&column.id) else {
+                    continue;
+                };
+                let label = display
+                    .and_then(|d| d.label.as_deref())
+                    .unwrap_or(&column.title);
+                ui.label(label);
+                let value = format_cell_value(&column_data.values, row, display, format_options);
+                ui.monospace(value);
+                ui.end_row();
+            }
+        });
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinkedTableViewOptions<'a> {
+    pub dataset_id: &'a str,
+    pub generation: u64,
+    pub rows: &'a [usize],
+    pub selected_row: Option<&'a StableRowKey>,
+    pub hovered_row: Option<&'a StableRowKey>,
+    pub allow_export: bool,
+    pub allow_clear: bool,
+    pub format: TableCellFormatOptions,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinkedTableViewOutput {
+    pub actions: HostViewUiActions,
+    pub selected_row: Option<StableRowKey>,
+    pub sort_column: Option<String>,
+    pub page_size: Option<TablePageSize>,
+    pub page_index: Option<usize>,
+}
+
+pub fn render_linked_table_view(
     ui: &mut egui::Ui,
     schema: &TableSchema,
     dataset: Option<&TableDatasetV1>,
+    table_state: &InvestigationTableViewState,
     empty_message: &str,
-) -> HostViewUiActions {
-    let mut actions = HostViewUiActions::default();
-    ui.horizontal(|ui| {
-        if ui.button("Export CSV").clicked() {
-            actions.export_csv = true;
+    options: LinkedTableViewOptions<'_>,
+) -> LinkedTableViewOutput {
+    use egui_extras::{Column, TableBuilder};
+
+    let mut output = LinkedTableViewOutput::default();
+    let total_rows_in_dataset = dataset.map(TableDatasetV1::row_count).unwrap_or(0);
+    let filtered_total = options.rows.len();
+    let mut effective_state = table_state.clone();
+    effective_state.clamp_page(filtered_total);
+    let (page_start, page_end) = effective_state.visible_slice(filtered_total);
+
+    crate::theme::wrap_row(ui, |ui| {
+        if options.allow_export && ui.button("Export CSV").clicked() {
+            output.actions.export_csv = true;
+        }
+        if options.allow_clear && ui.button("Clear").clicked() {
+            output.actions.clear_requested = true;
         }
         ui.separator();
+        ui.label(format!("Rows: {filtered_total} / {total_rows_in_dataset}",));
+        ui.separator();
+        ui.label("Page size");
+        let mut selected_size = effective_state.page_size;
+        egui::ComboBox::from_id_source(("table_page_size", options.dataset_id))
+            .selected_text(selected_size.label())
+            .show_ui(ui, |ui| {
+                for size in TablePageSize::ALL {
+                    if ui
+                        .selectable_value(&mut selected_size, size, size.label())
+                        .changed()
+                    {}
+                }
+            });
+        if selected_size != effective_state.page_size {
+            output.page_size = Some(selected_size);
+            output.page_index = Some(0);
+        }
+        let page_count = effective_state.page_count(filtered_total);
+        ui.separator();
         ui.label(format!(
-            "Rows: {}",
-            dataset.map(TableDatasetV1::row_count).unwrap_or(0)
+            "Page {}/{}",
+            effective_state.page_index + 1,
+            page_count
         ));
+        if ui
+            .add_enabled(effective_state.page_index > 0, egui::Button::new("◀"))
+            .clicked()
+        {
+            output.page_index = Some(effective_state.page_index - 1);
+        }
+        if ui
+            .add_enabled(
+                effective_state.page_index + 1 < page_count,
+                egui::Button::new("▶"),
+            )
+            .clicked()
+        {
+            output.page_index = Some(effective_state.page_index + 1);
+        }
     });
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
-        return actions;
+        empty_state(ui, empty_message);
+        return output;
     };
 
-    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-    render_table_header(ui, schema);
-    ui.separator();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, dataset.row_count(), |ui, range| {
-            for row in range {
-                render_table_row(ui, schema, dataset, row);
+    if options.rows.is_empty() {
+        ui.small("No rows match the current linked ROI/filter state.");
+        return output;
+    }
+
+    let page_rows: Vec<usize> = options.rows[page_start..page_end].to_vec();
+    let page_keys: Vec<StableRowKey> = page_rows
+        .iter()
+        .map(|&row| row_key_for_row(options.dataset_id, options.generation, schema, dataset, row))
+        .collect();
+    let display_map: std::collections::HashMap<&str, &TableColumnDisplayMetadata> = schema
+        .column_display
+        .iter()
+        .map(|e| (e.column_id.as_str(), &e.display))
+        .collect();
+    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 8.0;
+
+    let mut builder = TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+    for column in &schema.columns {
+        let width_priority = display_map
+            .get(column.id.as_str())
+            .and_then(|d| d.width_priority);
+        let initial = match width_priority {
+            Some(augur_plugin_api::TableColumnWidthPriority::High) => 160.0,
+            Some(augur_plugin_api::TableColumnWidthPriority::Medium) => 100.0,
+            Some(augur_plugin_api::TableColumnWidthPriority::Low) => 60.0,
+            None => 100.0,
+        };
+        builder = builder.column(Column::initial(initial).at_least(40.0).resizable(true));
+    }
+
+    builder
+        .header(row_height, |mut header| {
+            for column in &schema.columns {
+                header.col(|ui| {
+                    let sort_indicator =
+                        if effective_state.sort_column.as_deref() == Some(&column.id) {
+                            match effective_state.sort_direction {
+                                InvestigationSortDirection::Ascending => " ↑",
+                                InvestigationSortDirection::Descending => " ↓",
+                            }
+                        } else {
+                            ""
+                        };
+                    let label = display_map
+                        .get(column.id.as_str())
+                        .and_then(|d| d.label.as_deref())
+                        .unwrap_or(&column.title);
+                    if ui
+                        .small_button(format!("{label}{sort_indicator}"))
+                        .clicked()
+                    {
+                        output.sort_column = Some(column.id.clone());
+                    }
+                });
             }
+        })
+        .body(|body| {
+            body.rows(row_height, page_rows.len(), |mut row_ui| {
+                let row_index_in_page = row_ui.index();
+                let Some(row) = page_rows.get(row_index_in_page).copied() else {
+                    return;
+                };
+                let key = &page_keys[row_index_in_page];
+                let is_selected = options.selected_row == Some(key);
+                let is_hovered = options.hovered_row == Some(key);
+                for column in &schema.columns {
+                    row_ui.col(|ui| {
+                        if is_selected {
+                            ui.painter().rect_filled(
+                                ui.max_rect(),
+                                0.0,
+                                ui.visuals().selection.bg_fill,
+                            );
+                        } else if is_hovered {
+                            ui.painter().rect_filled(
+                                ui.max_rect(),
+                                0.0,
+                                ui.visuals().widgets.hovered.bg_fill,
+                            );
+                        }
+                        let Some(column_data) = dataset.column(&column.id) else {
+                            ui.label("-");
+                            return;
+                        };
+                        let display = display_map.get(column.id.as_str()).copied();
+                        let value =
+                            format_cell_value(&column_data.values, row, display, options.format);
+                        let raw = column_data
+                            .values
+                            .display_value(row)
+                            .unwrap_or_else(|| "-".into());
+                        let response = ui.add(
+                            egui::Label::new(&value)
+                                .sense(egui::Sense::click())
+                                .truncate(true),
+                        );
+                        let response = if raw != value {
+                            response.on_hover_text(raw)
+                        } else {
+                            response
+                        };
+                        if response.clicked() {
+                            output.selected_row = Some(key.clone());
+                        }
+                    });
+                }
+            });
         });
-    ui.separator();
-    ui.label(format!("{} rows", dataset.row_count()));
-    actions
+
+    output
 }
 
 pub fn render_density2d_view(
@@ -641,7 +1038,7 @@ pub fn render_density2d_view(
 ) -> HostViewUiActions {
     let mut actions = HostViewUiActions::default();
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         if ui.button("Export CSV").clicked() {
             actions.export_csv = true;
         }
@@ -688,7 +1085,7 @@ pub fn render_density2d_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return actions;
     };
 
@@ -700,7 +1097,7 @@ pub fn render_density2d_view(
                 ui.add(egui::Image::new(texture).fit_to_exact_size(size));
             });
     } else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
     }
 
     ui.separator();
@@ -735,7 +1132,7 @@ pub fn render_image2d_view(
 ) -> HostViewUiActions {
     let mut actions = HostViewUiActions::default();
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         ui.menu_button("Export Image", |ui| {
             if ui.button("PNG").clicked() {
                 actions.export_image = Some(HostViewImageFormat::Png);
@@ -775,7 +1172,7 @@ pub fn render_image2d_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return actions;
     };
 
@@ -787,7 +1184,7 @@ pub fn render_image2d_view(
                 ui.add(egui::Image::new(texture).fit_to_exact_size(size));
             });
     } else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
     }
 
     ui.separator();
@@ -819,7 +1216,7 @@ pub fn render_scatter2d_view(
 ) -> HostViewUiActions {
     let mut actions = HostViewUiActions::default();
 
-    ui.horizontal_wrapped(|ui| {
+    crate::theme::wrap_row(ui, |ui| {
         if ui.button("Export CSV").clicked() {
             actions.export_csv = true;
         }
@@ -840,7 +1237,7 @@ pub fn render_scatter2d_view(
     ui.separator();
 
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return actions;
     };
 
@@ -864,6 +1261,68 @@ pub fn render_scatter2d_view(
     actions
 }
 
+/// Measurement cursors on a series plot, kept in egui memory so they work
+/// identically in the analysis panel, the dock, and deferred windows.
+#[derive(Clone, Copy, Default)]
+struct SeriesCursors {
+    a: Option<f64>,
+    b: Option<f64>,
+}
+
+/// Statistics of the series points inside the visible x-range: mean of the
+/// primary (first) line plus min/max across all lines. Computed from the
+/// published points, so envelope lines make min/max exact even when the
+/// primary trace is bucket-averaged.
+fn series_visible_stats(
+    dataset: &Series1dV1,
+    x_min: f64,
+    x_max: f64,
+) -> Option<(f64, f64, f64, usize)> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut primary_sum = 0.0;
+    let mut primary_n = 0_usize;
+    for (index, line) in dataset.lines.iter().enumerate() {
+        for point in &line.points {
+            if point.x < x_min || point.x > x_max {
+                continue;
+            }
+            min = min.min(point.y);
+            max = max.max(point.y);
+            if index == 0 {
+                primary_sum += point.y;
+                primary_n += 1;
+            }
+        }
+    }
+    (primary_n > 0).then(|| (primary_sum / primary_n as f64, min, max, primary_n))
+}
+
+/// y-value of the primary line at the point nearest to `x`.
+fn primary_y_near(dataset: &Series1dV1, x: f64) -> Option<f64> {
+    dataset
+        .lines
+        .first()?
+        .points
+        .iter()
+        .min_by(|a, b| {
+            (a.x - x)
+                .abs()
+                .partial_cmp(&(b.x - x).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|point| point.y)
+}
+
+fn format_si(value: f64) -> String {
+    let magnitude = value.abs();
+    if magnitude == 0.0 || (0.01..10_000.0).contains(&magnitude) {
+        format!("{value:.4}")
+    } else {
+        format!("{value:.3e}")
+    }
+}
+
 pub fn render_line_series_view(
     ui: &mut egui::Ui,
     view_id: &str,
@@ -871,37 +1330,147 @@ pub fn render_line_series_view(
     empty_message: &str,
 ) {
     let Some(dataset) = dataset else {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return;
     };
     if dataset.is_empty() {
-        ui.label(empty_message);
+        empty_state(ui, empty_message);
         return;
     }
 
-    Plot::new(format!("{view_id}_series"))
+    let cursor_id = egui::Id::new(("series_cursors", view_id));
+    let mut cursors: SeriesCursors = ui
+        .ctx()
+        .data_mut(|data| data.get_temp(cursor_id))
+        .unwrap_or_default();
+
+    // Y-axis mode is remembered per view. Default anchors the range to zero, so
+    // a nearly-constant signal reads as flat instead of egui auto-fitting to its
+    // noise; the operator can opt into local (current-window) auto-scaling.
+    let y_from_zero_id = egui::Id::new(("series_y_from_zero", view_id));
+    let mut y_from_zero: bool = ui
+        .ctx()
+        .data_mut(|data| data.get_temp(y_from_zero_id))
+        .unwrap_or(true);
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut y_from_zero, "Y from 0")
+            .on_hover_text(
+                "Anchor the y-axis to zero so a constant signal looks flat. Uncheck for local \
+                 auto-scaling to the current view's min/max.",
+            )
+            .changed()
+        {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(y_from_zero_id, y_from_zero));
+        }
+    });
+
+    let mut plot = Plot::new(format!("{view_id}_series"))
         .legend(Legend::default())
         .height(280.0)
         .x_axis_label(&dataset.x_label)
         .y_axis_label(&dataset.y_label)
-        .show(ui, |plot_ui| {
-            for (index, series) in dataset.lines.iter().enumerate() {
-                if series.points.is_empty() {
-                    continue;
-                }
-                let points =
-                    PlotPoints::from_iter(series.points.iter().map(|point| [point.x, point.y]));
-                let name = if series.name.trim().is_empty() {
-                    format!("Series {}", index + 1)
-                } else {
-                    series.name.clone()
-                };
-                plot_ui.line(Line::new(points).name(name));
+        .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default());
+    if y_from_zero {
+        plot = plot.include_y(0.0);
+    }
+    let inner = plot.show(ui, |plot_ui| {
+        for (index, series) in dataset.lines.iter().enumerate() {
+            if series.points.is_empty() {
+                continue;
             }
-        });
+            let points =
+                PlotPoints::from_iter(series.points.iter().map(|point| [point.x, point.y]));
+            let name = if series.name.trim().is_empty() {
+                format!("Series {}", index + 1)
+            } else {
+                series.name.clone()
+            };
+            plot_ui.line(Line::new(points).name(name));
+        }
+        if let Some(a) = cursors.a {
+            plot_ui.vline(VLine::new(a).name("A"));
+        }
+        if let Some(b) = cursors.b {
+            plot_ui.vline(VLine::new(b).name("B"));
+        }
+        if plot_ui.response().clicked() {
+            if let Some(coord) = plot_ui.pointer_coordinate() {
+                let shift = plot_ui.ctx().input(|input| input.modifiers.shift);
+                if shift {
+                    cursors.b = Some(coord.x);
+                } else {
+                    cursors.a = Some(coord.x);
+                }
+            }
+        }
+        plot_ui.plot_bounds()
+    });
+    let bounds = inner.inner;
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(cursor_id, cursors));
 
     ui.separator();
     ui.horizontal_wrapped(|ui| {
+        if let Some((mean, min, max, points)) =
+            series_visible_stats(dataset, bounds.min()[0], bounds.max()[0])
+        {
+            ui.label(format!(
+                "visible: mean {}  min {}  max {}  Vpp {}  ({points} pts)",
+                format_si(mean),
+                format_si(min),
+                format_si(max),
+                format_si(max - min),
+            ))
+            .on_hover_text(
+                "Statistics over the points inside the current x-range: mean of the \
+                 primary line, min/max across all lines (envelope lines included).",
+            );
+            ui.separator();
+        }
+        match (cursors.a, cursors.b) {
+            (Some(a), Some(b)) => {
+                let dx = (b - a).abs();
+                let dy = match (primary_y_near(dataset, a), primary_y_near(dataset, b)) {
+                    (Some(ya), Some(yb)) => Some(yb - ya),
+                    _ => None,
+                };
+                let mut readout = format!(
+                    "A {}  B {}  Δx {}",
+                    format_si(a),
+                    format_si(b),
+                    format_si(dx)
+                );
+                if dx > 0.0 {
+                    // Only claim a frequency unit when the x-axis is seconds.
+                    let unit = if dataset.x_label.contains("[s]") {
+                        " Hz"
+                    } else {
+                        ""
+                    };
+                    readout.push_str(&format!("  1/Δx {}{unit}", format_si(1.0 / dx)));
+                }
+                if let Some(dy) = dy {
+                    readout.push_str(&format!("  Δy {}", format_si(dy)));
+                }
+                ui.label(readout);
+            }
+            (Some(a), None) => {
+                ui.label(format!("A {}  (shift-click sets B)", format_si(a)));
+            }
+            _ => {
+                ui.weak("click: cursor A · shift-click: cursor B")
+                    .on_hover_text(
+                        "Two x-cursors with Δx, 1/Δx (frequency), and Δy on the primary line.",
+                    );
+            }
+        }
+        if (cursors.a.is_some() || cursors.b.is_some()) && ui.small_button("Clear").clicked() {
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(cursor_id, SeriesCursors::default()));
+        }
+        ui.separator();
         ui.label(format!("Lines: {}", dataset.lines.len()));
         ui.separator();
         ui.label(format!("Points: {}", dataset.total_points()));
@@ -910,12 +1479,25 @@ pub fn render_line_series_view(
 
 #[derive(Clone, Default)]
 pub struct TableWindowViewportData {
-    pub schema: TableSchema,
+    pub dataset_id: String,
+    pub generation: u64,
+    pub schema: Arc<TableSchema>,
     pub dataset: Option<Arc<TableDatasetV1>>,
+    pub filtered_rows: Arc<Vec<usize>>,
+    pub table_state: InvestigationTableViewState,
+    pub selected_row: Option<StableRowKey>,
+    pub hovered_row: Option<StableRowKey>,
     pub empty_message: String,
     pub error_message: Option<String>,
     pub close_requested: bool,
     pub export_csv_requested: bool,
+    pub selected_row_requested: Option<StableRowKey>,
+    pub sort_column_requested: Option<String>,
+    pub page_size_requested: Option<TablePageSize>,
+    pub page_index_requested: Option<usize>,
+    pub replay_origin_us: Option<u64>,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -931,6 +1513,8 @@ pub struct DensityWindowViewportData {
     pub export_csv_requested: bool,
     pub export_image_requested: Option<HostViewImageFormat>,
     pub clear_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -944,6 +1528,8 @@ pub struct ImageWindowViewportData {
     pub close_requested: bool,
     pub export_image_requested: Option<HostViewImageFormat>,
     pub clear_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -957,6 +1543,8 @@ pub struct ScatterWindowViewportData {
     pub close_requested: bool,
     pub export_csv_requested: bool,
     pub clear_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -965,19 +1553,196 @@ pub struct SeriesWindowViewportData {
     pub empty_message: String,
     pub error_message: Option<String>,
     pub close_requested: bool,
+    pub frozen: bool,
+    pub freeze_toggle_requested: bool,
+    pub export_png_requested: bool,
+    /// Screenshot captured by the viewport in response to a PNG export
+    /// request; the app takes it and writes the file.
+    pub screenshot: Option<Arc<ColorImage>>,
+}
+
+/// Frame payload shared between the app and one popped-out host-view window.
+///
+/// A deferred viewport runs its UI *after* the parent frame that registered it,
+/// so a request raised inside the window (close, export, freeze, sort, …) lands
+/// in the shared cell once the parent has already published the next frame. The
+/// app therefore keeps one long-lived cell per view and republishes into it;
+/// `carry_pending_requests_from` moves requests that have not been consumed yet
+/// onto the incoming payload so they survive the swap.
+pub trait HostWindowFrameData {
+    /// Copy not-yet-consumed requests from the payload being replaced.
+    fn carry_pending_requests_from(&mut self, previous: &Self);
+
+    /// True while at least one request is waiting for the app to consume it.
+    fn has_pending_requests(&self) -> bool;
+
+    /// Ask the app to close this window (raised when the OS close button or
+    /// the embedded window's ✕ is used).
+    fn request_close(&mut self);
+}
+
+impl HostWindowFrameData for TableWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.export_csv_requested |= previous.export_csv_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.selected_row_requested = previous.selected_row_requested.clone();
+        self.sort_column_requested = previous.sort_column_requested.clone();
+        self.page_size_requested = previous.page_size_requested;
+        self.page_index_requested = previous.page_index_requested;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.export_csv_requested
+            || self.freeze_toggle_requested
+            || self.selected_row_requested.is_some()
+            || self.sort_column_requested.is_some()
+            || self.page_size_requested.is_some()
+            || self.page_index_requested.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for DensityWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.export_csv_requested |= previous.export_csv_requested;
+        self.clear_requested |= previous.clear_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.export_image_requested = previous.export_image_requested;
+        // Render settings are owned by the window, not by the app frame.
+        self.settings = previous.settings;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.export_csv_requested
+            || self.clear_requested
+            || self.freeze_toggle_requested
+            || self.export_image_requested.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for ImageWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.clear_requested |= previous.clear_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.export_image_requested = previous.export_image_requested;
+        self.settings = previous.settings;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.clear_requested
+            || self.freeze_toggle_requested
+            || self.export_image_requested.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for ScatterWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.export_csv_requested |= previous.export_csv_requested;
+        self.clear_requested |= previous.clear_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.export_csv_requested
+            || self.clear_requested
+            || self.freeze_toggle_requested
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+impl HostWindowFrameData for SeriesWindowViewportData {
+    fn carry_pending_requests_from(&mut self, previous: &Self) {
+        self.close_requested |= previous.close_requested;
+        self.freeze_toggle_requested |= previous.freeze_toggle_requested;
+        self.export_png_requested |= previous.export_png_requested;
+        self.screenshot = previous.screenshot.clone();
+    }
+
+    fn has_pending_requests(&self) -> bool {
+        self.close_requested
+            || self.freeze_toggle_requested
+            || self.export_png_requested
+            || self.screenshot.is_some()
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
+    }
+}
+
+/// Freeze/resume toggle shown in every host-view window. Returns true when
+/// the user toggled it this frame. While frozen the host pins the dataset
+/// snapshot for inspection/export; plugin acquisition keeps running.
+pub fn freeze_toggle_button(ui: &mut egui::Ui, frozen: bool) -> bool {
+    ui.selectable_label(frozen, if frozen { "❄ Frozen" } else { "❄ Freeze" })
+        .on_hover_text(
+            "Pause display updates to inspect or export this exact snapshot. \
+             Acquisition continues in the background; resume jumps to now.",
+        )
+        .clicked()
 }
 
 pub fn render_table_window_viewport(
     ui: &mut egui::Ui,
     shared: &Arc<Mutex<TableWindowViewportData>>,
 ) {
-    let (schema, dataset, empty_message, error_message) = {
+    {
+        let mut data = shared.lock().expect("table viewport mutex poisoned");
+        let frozen = data.frozen;
+        ui.horizontal(|ui| {
+            if freeze_toggle_button(ui, frozen) {
+                data.freeze_toggle_requested = true;
+            }
+        });
+    }
+    let (
+        dataset_id,
+        generation,
+        schema,
+        dataset,
+        filtered_rows,
+        table_state,
+        selected_row,
+        hovered_row,
+        empty_message,
+        error_message,
+        replay_origin_us,
+    ) = {
         let data = shared.lock().expect("table viewport mutex poisoned");
         (
-            data.schema.clone(),
+            data.dataset_id.clone(),
+            data.generation,
+            Arc::clone(&data.schema),
             data.dataset.clone(),
+            Arc::clone(&data.filtered_rows),
+            data.table_state.clone(),
+            data.selected_row.clone(),
+            data.hovered_row.clone(),
             data.empty_message.clone(),
             data.error_message.clone(),
+            data.replay_origin_us,
         )
     };
 
@@ -986,10 +1751,45 @@ pub fn render_table_window_viewport(
         return;
     }
 
-    let actions = render_table_window(ui, &schema, dataset.as_deref(), &empty_message);
-    if actions.export_csv {
+    let output = render_linked_table_view(
+        ui,
+        &schema,
+        dataset.as_deref(),
+        &table_state,
+        &empty_message,
+        LinkedTableViewOptions {
+            dataset_id: &dataset_id,
+            generation,
+            rows: &filtered_rows,
+            selected_row: selected_row.as_ref(),
+            hovered_row: hovered_row.as_ref(),
+            allow_export: true,
+            allow_clear: false,
+            format: TableCellFormatOptions { replay_origin_us },
+        },
+    );
+    if output.actions.export_csv {
         let mut data = shared.lock().expect("table viewport mutex poisoned");
         data.export_csv_requested = true;
+    }
+    if output.selected_row.is_some()
+        || output.sort_column.is_some()
+        || output.page_size.is_some()
+        || output.page_index.is_some()
+    {
+        let mut data = shared.lock().expect("table viewport mutex poisoned");
+        if let Some(selected_row) = output.selected_row {
+            data.selected_row_requested = Some(selected_row);
+        }
+        if let Some(sort_column) = output.sort_column {
+            data.sort_column_requested = Some(sort_column);
+        }
+        if let Some(page_size) = output.page_size {
+            data.page_size_requested = Some(page_size);
+        }
+        if let Some(page_index) = output.page_index {
+            data.page_index_requested = Some(page_index);
+        }
     }
 }
 
@@ -1009,7 +1809,10 @@ pub fn render_density_window_viewport(
     ) = {
         let mut data = shared.lock().expect("density viewport mutex poisoned");
 
-        ui.horizontal_wrapped(|ui| {
+        crate::theme::wrap_row(ui, |ui| {
+            if freeze_toggle_button(ui, data.frozen) {
+                data.freeze_toggle_requested = true;
+            }
             if ui.button("Export CSV").clicked() {
                 data.export_csv_requested = true;
             }
@@ -1079,7 +1882,7 @@ pub fn render_density_window_viewport(
             });
     } else {
         ui.centered_and_justified(|ui| {
-            ui.label(empty_message);
+            empty_state(ui, &empty_message);
         });
     }
 
@@ -1108,7 +1911,10 @@ pub fn render_image_window_viewport(
     let (texture, rendered_width, rendered_height, settings, empty_message, error_message) = {
         let mut data = shared.lock().expect("image viewport mutex poisoned");
 
-        ui.horizontal_wrapped(|ui| {
+        crate::theme::wrap_row(ui, |ui| {
+            if freeze_toggle_button(ui, data.frozen) {
+                data.freeze_toggle_requested = true;
+            }
             ui.menu_button("Export Image", |ui| {
                 if ui.button("PNG").clicked() {
                     data.export_image_requested = Some(HostViewImageFormat::Png);
@@ -1169,7 +1975,7 @@ pub fn render_image_window_viewport(
             });
     } else {
         ui.centered_and_justified(|ui| {
-            ui.label(empty_message);
+            empty_state(ui, &empty_message);
         });
     }
 
@@ -1192,7 +1998,13 @@ pub fn render_scatter_window_viewport(
     shared: &Arc<Mutex<ScatterWindowViewportData>>,
 ) {
     let (schema, dataset, x_column, y_column, empty_message, error_message) = {
-        let data = shared.lock().expect("scatter viewport mutex poisoned");
+        let mut data = shared.lock().expect("scatter viewport mutex poisoned");
+        let frozen = data.frozen;
+        ui.horizontal(|ui| {
+            if freeze_toggle_button(ui, frozen) {
+                data.freeze_toggle_requested = true;
+            }
+        });
         (
             data.schema.clone(),
             data.dataset.clone(),
@@ -1231,7 +2043,20 @@ pub fn render_series_window_viewport(
     shared: &Arc<Mutex<SeriesWindowViewportData>>,
 ) {
     let (dataset, empty_message, error_message) = {
-        let data = shared.lock().expect("series viewport mutex poisoned");
+        let mut data = shared.lock().expect("series viewport mutex poisoned");
+        let frozen = data.frozen;
+        ui.horizontal(|ui| {
+            if freeze_toggle_button(ui, frozen) {
+                data.freeze_toggle_requested = true;
+            }
+            if ui
+                .button("Save PNG")
+                .on_hover_text("Save this window as a PNG image")
+                .clicked()
+            {
+                data.export_png_requested = true;
+            }
+        });
         (
             data.dataset.clone(),
             data.empty_message.clone(),
@@ -1284,28 +2109,6 @@ pub fn export_image_to_path(path: &Path, image: &ColorImage) -> Result<(), Strin
         .map_err(|err| format!("saving {} failed: {err}", path.display()))
 }
 
-fn render_table_header(ui: &mut egui::Ui, schema: &TableSchema) {
-    ui.horizontal_wrapped(|ui| {
-        for column in &schema.columns {
-            ui.monospace(&column.title);
-            ui.add_space(8.0);
-        }
-    });
-}
-
-fn render_table_row(ui: &mut egui::Ui, schema: &TableSchema, dataset: &TableDatasetV1, row: usize) {
-    ui.horizontal_wrapped(|ui| {
-        for column in &schema.columns {
-            let value = dataset
-                .column(&column.id)
-                .and_then(|column| column.values.display_value(row))
-                .unwrap_or_else(|| "-".into());
-            ui.label(value);
-            ui.add_space(8.0);
-        }
-    });
-}
-
 fn write_table_csv(
     mut writer: impl Write,
     schema: &TableSchema,
@@ -1326,13 +2129,26 @@ fn write_table_csv(
             }
             let value = dataset
                 .column(&column.id)
-                .and_then(|column| column.values.display_value(row))
+                .and_then(|column| raw_cell_value(&column.values, row))
                 .unwrap_or_default();
             write!(writer, "\"{}\"", value.replace('"', "\"\""))?;
         }
         writeln!(writer)?;
     }
     writer.flush()
+}
+
+/// Full-precision raw cell values for exports. UI display formatting (e.g.
+/// four-digit float rounding in `display_value`) must never leak into CSV
+/// output.
+fn raw_cell_value(values: &TableColumnValues, row: usize) -> Option<String> {
+    match values {
+        TableColumnValues::U64(values) => values.get(row).map(ToString::to_string),
+        TableColumnValues::I64(values) => values.get(row).map(ToString::to_string),
+        TableColumnValues::F64(values) => values.get(row).map(ToString::to_string),
+        TableColumnValues::String(values) => values.get(row).cloned(),
+        TableColumnValues::Bool(values) => values.get(row).map(ToString::to_string),
+    }
 }
 
 struct RenderedDensityImage {
@@ -1552,9 +2368,10 @@ fn scatter_plot_points(
 mod tests {
     use super::*;
     use augur_plugin_api::{
-        HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
-        HostViewPlacement, Image2dV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn,
-        TableColumnData, TableColumnValues, TableDatasetV1, TableSchema, TableValueType,
+        HostActionDescriptor, HostActionScope, HostDatasetDescriptor, HostDatasetKind,
+        HostViewDescriptor, HostViewKind, HostViewPlacement, Image2dV1, Series1dLine,
+        Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues, TableDatasetV1,
+        TableSchema, TableValueType,
     };
 
     fn table_schema() -> TableSchema {
@@ -1572,6 +2389,13 @@ mod tests {
                 },
             ],
             coordinate_space_2d: None,
+            coordinate_space_3d: None,
+            row_id_column: None,
+            time_column: None,
+            layer_id: None,
+            semantic_label: None,
+            provenance: None,
+            column_display: Vec::new(),
         }
     }
 
@@ -1619,6 +2443,7 @@ mod tests {
             registry: HostViewRegistry {
                 datasets: vec![dataset],
                 views: vec![view],
+                actions: Vec::new(),
             },
         }
     }
@@ -1633,6 +2458,8 @@ mod tests {
                 title: "Localizations".into(),
                 kind: HostDatasetKind::TableV1(table_schema()),
                 empty_message: "No rows".into(),
+                display: None,
+                relations: Vec::new(),
             },
             HostViewDescriptor {
                 id: "view.localization".into(),
@@ -1650,6 +2477,8 @@ mod tests {
                 title: "Different".into(),
                 kind: HostDatasetKind::TableV1(table_schema()),
                 empty_message: "No rows".into(),
+                display: None,
+                relations: Vec::new(),
             },
             HostViewDescriptor {
                 id: "view.localization".into(),
@@ -1684,6 +2513,8 @@ mod tests {
             title: "Localizations".into(),
             kind: HostDatasetKind::TableV1(table_schema()),
             empty_message: "No rows".into(),
+            display: None,
+            relations: Vec::new(),
         };
         let view = HostViewDescriptor {
             id: "view.localization".into(),
@@ -1718,15 +2549,42 @@ mod tests {
     }
 
     #[test]
-    fn compact_table_summary_reports_empty_and_populated_states() {
-        let empty = compact_table_summary(None);
-        assert!(empty.is_empty());
-        assert_eq!(empty.shown_rows, 0);
+    fn format_cell_value_renders_timestamp_micros_relative_to_replay_origin() {
+        let values = TableColumnValues::U64(vec![1_500_000]);
+        let formatted = format_cell_value(
+            &values,
+            0,
+            Some(&TableColumnDisplayMetadata {
+                format: Some(TableColumnDisplayFormat::TimestampMicros),
+                ..Default::default()
+            }),
+            TableCellFormatOptions {
+                replay_origin_us: Some(500_000),
+            },
+        );
+        assert_eq!(formatted, "00:01.000");
+    }
 
-        let populated = compact_table_summary(Some(&table_dataset()));
-        assert!(!populated.is_empty());
-        assert_eq!(populated.shown_rows, 3);
-        assert_eq!(populated.total_rows, 3);
+    #[test]
+    fn format_cell_value_respects_fixed_precision() {
+        let values = TableColumnValues::F64(vec![1.23456]);
+        let formatted = format_cell_value(
+            &values,
+            0,
+            Some(&TableColumnDisplayMetadata {
+                format: Some(TableColumnDisplayFormat::FixedPrecision { digits: 2 }),
+                ..Default::default()
+            }),
+            TableCellFormatOptions::default(),
+        );
+        assert_eq!(formatted, "1.23");
+    }
+
+    #[test]
+    fn format_cell_value_falls_back_to_raw_without_metadata() {
+        let values = TableColumnValues::U64(vec![42]);
+        let formatted = format_cell_value(&values, 0, None, TableCellFormatOptions::default());
+        assert_eq!(formatted, "42");
     }
 
     #[test]
@@ -1736,6 +2594,8 @@ mod tests {
             title: "Localizations".into(),
             kind: HostDatasetKind::TableV1(table_schema()),
             empty_message: "No rows".into(),
+            display: None,
+            relations: Vec::new(),
         };
         let bytes = serde_json::to_vec(&table_dataset()).expect("dataset json");
 
@@ -1753,6 +2613,8 @@ mod tests {
             title: "Image".into(),
             kind: HostDatasetKind::Image2dV1,
             empty_message: "No image".into(),
+            display: None,
+            relations: Vec::new(),
         };
         let image_bytes = serde_json::to_vec(&image_dataset()).expect("image json");
         let image_snapshot =
@@ -1767,6 +2629,8 @@ mod tests {
             title: "Series".into(),
             kind: HostDatasetKind::Series1dV1,
             empty_message: "No series".into(),
+            display: None,
+            relations: Vec::new(),
         };
         let series_bytes = serde_json::to_vec(&series_dataset()).expect("series json");
         let series_snapshot =
@@ -1784,6 +2648,8 @@ mod tests {
             title: "Localizations".into(),
             kind: HostDatasetKind::TableV1(table_schema()),
             empty_message: "No rows".into(),
+            display: None,
+            relations: Vec::new(),
         };
         let resolved = resolve_host_view_registry([
             contribution(
@@ -1823,6 +2689,56 @@ mod tests {
     }
 
     #[test]
+    fn resolver_surfaces_actions_whose_scope_dataset_is_resolved() {
+        let dataset = HostDatasetDescriptor {
+            id: "dataset.candidates".into(),
+            title: "Candidates".into(),
+            kind: HostDatasetKind::TableV1(table_schema()),
+            empty_message: "No rows".into(),
+            display: None,
+            relations: Vec::new(),
+        };
+        let contribution = HostRegistryContribution {
+            provider: HostViewProviderKey::Runtime(0),
+            provider_name: "Fitting".into(),
+            registry: HostViewRegistry {
+                datasets: vec![dataset],
+                views: Vec::new(),
+                actions: vec![
+                    HostActionDescriptor {
+                        id: "refit_cluster".into(),
+                        title: "Tune fit".into(),
+                        scope: HostActionScope::Cluster {
+                            dataset_id: "dataset.candidates".into(),
+                            group_column: "cluster_id".into(),
+                        },
+                        param_schema: None,
+                    },
+                    HostActionDescriptor {
+                        id: "orphan".into(),
+                        title: "Orphan".into(),
+                        scope: HostActionScope::Row {
+                            dataset_id: "dataset.does_not_exist".into(),
+                        },
+                        param_schema: None,
+                    },
+                ],
+            },
+        };
+
+        let resolved = resolve_host_view_registry([contribution]);
+        let actions: Vec<_> = resolved
+            .actions()
+            .map(|a| a.descriptor.id.clone())
+            .collect();
+        assert_eq!(actions, vec!["refit_cluster".to_owned()]);
+        assert!(resolved
+            .warnings()
+            .iter()
+            .any(|w| w.contains("orphan") && w.contains("does_not_exist")));
+    }
+
+    #[test]
     fn incompatible_view_dataset_pairs_are_filtered_with_warning() {
         let resolved = resolve_host_view_registry([contribution(
             HostViewProviderKey::Runtime(0),
@@ -1832,6 +2748,8 @@ mod tests {
                 title: "Image".into(),
                 kind: HostDatasetKind::Image2dV1,
                 empty_message: "No image".into(),
+                display: None,
+                relations: Vec::new(),
             },
             HostViewDescriptor {
                 id: "view.table".into(),
@@ -1855,6 +2773,8 @@ mod tests {
                 title: "Localizations".into(),
                 kind: HostDatasetKind::TableV1(table_schema()),
                 empty_message: "No rows".into(),
+                display: None,
+                relations: Vec::new(),
             },
             provider: HostViewProviderKey::Runtime(2),
             provider_name: "Runtime".into(),

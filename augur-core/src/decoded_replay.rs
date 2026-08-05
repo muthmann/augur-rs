@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use augur_event_types::{CompactEvent, EventChunk, EventSource, FetchError};
+
 use crate::{
     camera::{DeviceInfo, EventCamera, PacketStreamCamera},
     config::CameraConfig,
@@ -50,6 +52,55 @@ pub struct DecodedEventFileCamera {
     playback_started_at: Option<Instant>,
     paused_at: Option<Instant>,
     total_paused: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedReplayEventSource {
+    events: Arc<Vec<CdEvent>>,
+}
+
+impl DecodedReplayEventSource {
+    pub fn new(events: Arc<Vec<CdEvent>>) -> Self {
+        Self { events }
+    }
+
+    pub fn events(&self) -> &Arc<Vec<CdEvent>> {
+        &self.events
+    }
+}
+
+impl EventSource for DecodedReplayEventSource {
+    fn fetch_range(
+        &self,
+        start_us: u64,
+        end_us: u64,
+    ) -> std::result::Result<EventChunk, FetchError> {
+        if start_us > end_us {
+            return Err(FetchError::OutOfTimeline);
+        }
+        let start = self
+            .events
+            .partition_point(|event| event.timestamp < start_us);
+        let end = self
+            .events
+            .partition_point(|event| event.timestamp <= end_us);
+        if start >= end {
+            return Err(FetchError::OutOfTimeline);
+        }
+
+        Ok(EventChunk {
+            events: self.events[start..end]
+                .iter()
+                .copied()
+                .map(CompactEvent::from)
+                .collect(),
+            // Decoded imports (CSV/HDF5/packed) carry no trigger channel in
+            // v1; only EVT3 RAW sources deliver external triggers.
+            triggers: Vec::new(),
+            start_us,
+            end_us,
+        })
+    }
 }
 
 impl DecodedEventFileCamera {
@@ -1079,6 +1130,35 @@ mod tests {
         );
 
         fs::remove_file(path).expect("temp file must be removed");
+    }
+
+    #[test]
+    fn decoded_replay_event_source_fetches_timestamp_ranges() {
+        let source = DecodedReplayEventSource::new(Arc::new(sample_events()));
+
+        let chunk = source.fetch_range(110, 150).expect("range fetch succeeds");
+
+        assert_eq!(
+            chunk.events,
+            vec![
+                CompactEvent::from(CdEvent {
+                    x: 11,
+                    y: 21,
+                    polarity: false,
+                    timestamp: 120,
+                }),
+                CompactEvent::from(CdEvent {
+                    x: 12,
+                    y: 22,
+                    polarity: true,
+                    timestamp: 150,
+                }),
+            ]
+        );
+        assert!(matches!(
+            source.fetch_range(151, 200),
+            Err(FetchError::OutOfTimeline)
+        ));
     }
 
     #[test]

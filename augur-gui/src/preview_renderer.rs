@@ -9,9 +9,9 @@ use egui_wgpu::wgpu;
 use crate::{
     colormap::Colormap,
     preview::{
-        encode_time_surface_tick, query_time_surface_value, time_surface_value_u8_from_tick,
-        with_prepared_preview_frame, CpuPreviewImageCache, PreparedPreviewFrame,
-        PreviewDisplaySettings, PreviewMode, TIME_SURFACE_BINS, TIME_SURFACE_TICK_US,
+        encode_time_surface_tick, query_time_surface_value, with_prepared_preview_frame,
+        CpuPreviewImageCache, PreparedPreviewFrame, PreviewDisplaySettings, PreviewMode,
+        TIME_SURFACE_BINS, TIME_SURFACE_TICK_US,
     },
     preview_perf::PreviewPerfStats,
     viewer_widget::PreviewHistogramRequest,
@@ -116,13 +116,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let brightness = normalize_value(total);
+        let polarity_on = vec3<f32>(0.9098, 0.2431, 0.6902);
+        let polarity_off = vec3<f32>(0.0000, 0.7216, 0.8314);
         if on > off {
-            return vec4<f32>(brightness, 0.0, 0.0, 1.0);
+            return vec4<f32>(polarity_on * brightness, 1.0);
         }
         if off > on {
-            return vec4<f32>(0.0, 0.0, brightness, 1.0);
+            return vec4<f32>(polarity_off * brightness, 1.0);
         }
-        return vec4<f32>(brightness, 0.0, brightness, 1.0);
+        return vec4<f32>(((polarity_on + polarity_off) * 0.5) * brightness, 1.0);
     }
     if uniforms.mode == 2u {
         let counts = textureLoad(polarity_tex, coord, 0).rg;
@@ -323,13 +325,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if uniforms.mode == 1u {
         let brightness = normalize_value(total);
+        let polarity_on = vec3<f32>(0.9098, 0.2431, 0.6902);
+        let polarity_off = vec3<f32>(0.0000, 0.7216, 0.8314);
         if on > off {
-            return vec4<f32>(brightness, 0.0, 0.0, 1.0);
+            return vec4<f32>(polarity_on * brightness, 1.0);
         }
         if off > on {
-            return vec4<f32>(0.0, 0.0, brightness, 1.0);
+            return vec4<f32>(polarity_off * brightness, 1.0);
         }
-        return vec4<f32>(brightness, 0.0, brightness, 1.0);
+        return vec4<f32>(((polarity_on + polarity_off) * 0.5) * brightness, 1.0);
     }
 
     let magnitude = normalize_value(u32(abs(i32(on) - i32(off))));
@@ -712,12 +716,6 @@ struct IntensityR16<'a> {
     values: &'a [u16],
 }
 
-#[derive(Debug, Default, Clone)]
-struct PolarityRg16 {
-    size: [usize; 2],
-    values: Vec<[u16; 2]>,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum PackedPreviewPayload<'a> {
     Intensity(IntensityR16<'a>),
@@ -860,7 +858,6 @@ pub struct WgpuPreviewRenderer {
     time_surface_tick_buffer: Option<wgpu::Buffer>,
     time_surface_histogram_buffer: wgpu::Buffer,
     time_surface_histogram_readback: wgpu::Buffer,
-    time_surface_hover_readback: wgpu::Buffer,
     time_surface_packed_events: Vec<u32>,
     time_surface_accumulation_key: Option<TimeSurfaceAccumulationKey>,
     time_surface_hover_cache: Option<TimeSurfaceHoverCache>,
@@ -883,7 +880,7 @@ pub struct WgpuPreviewRenderer {
     display_view: Option<wgpu::TextureView>,
     display_texture_id: Option<egui::TextureId>,
     size: Option<[usize; 2]>,
-    polarity_payload: PolarityRg16,
+    polarity_payload: Vec<[u16; 2]>,
 }
 
 impl WgpuPreviewRenderer {
@@ -1294,12 +1291,6 @@ impl WgpuPreviewRenderer {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let time_surface_hover_readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("augur_time_surface_hover_readback"),
-            size: std::mem::size_of::<u32>() as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         Ok(Self {
             render_state,
@@ -1340,7 +1331,6 @@ impl WgpuPreviewRenderer {
             time_surface_tick_buffer: None,
             time_surface_histogram_buffer,
             time_surface_histogram_readback,
-            time_surface_hover_readback,
             time_surface_packed_events: Vec::new(),
             time_surface_accumulation_key: None,
             time_surface_hover_cache: None,
@@ -1363,7 +1353,7 @@ impl WgpuPreviewRenderer {
             display_view: None,
             display_texture_id: None,
             size: None,
-            polarity_payload: PolarityRg16::default(),
+            polarity_payload: Vec::new(),
         })
     }
 
@@ -1379,12 +1369,12 @@ impl WgpuPreviewRenderer {
             time_surface_tau_us,
             ..
         } = request;
-        if uses_gpu_count_accumulation(mode) && frame.events.is_some() {
+        if uses_gpu_count_accumulation(mode) && frame.raw_events_available() {
             return self.render_count_accumulated(frame, settings, mode, perf);
         }
 
         if matches!(mode, PreviewMode::TimeSurface) {
-            if frame.events.is_some() {
+            if frame.raw_events_available() {
                 return self.render_time_surface_accumulated(
                     frame,
                     settings,
@@ -1415,12 +1405,12 @@ impl WgpuPreviewRenderer {
         if histogram_request == PreviewHistogramRequest::None {
             return Ok(None);
         }
-        if matches!(mode, PreviewMode::TimeSurface) && frame.events.is_some() {
+        if matches!(mode, PreviewMode::TimeSurface) && frame.raw_events_available() {
             return self
                 .compute_time_surface_histogram(frame, time_surface_tau_us, histogram_request)
                 .map(Some);
         }
-        if !uses_gpu_count_accumulation(mode) || frame.events.is_none() {
+        if !uses_gpu_count_accumulation(mode) || !frame.raw_events_available() {
             return Ok(None);
         }
 
@@ -1433,12 +1423,9 @@ impl WgpuPreviewRenderer {
         time_surface_tau_us: u64,
         index: usize,
     ) -> Option<u8> {
-        if frame.events.is_none() {
-            return query_time_surface_value(frame, time_surface_tau_us, index);
-        }
-        self.query_time_surface_value_gpu(frame, time_surface_tau_us, index)
-            .ok()
-            .flatten()
+        // Use the CPU fallback for hover queries to avoid stalling the GPU
+        // pipeline with a single-pixel readback.
+        query_time_surface_value(frame, time_surface_tau_us, index)
     }
 
     fn render_time_surface_accumulated(
@@ -1565,7 +1552,7 @@ impl WgpuPreviewRenderer {
                 mode,
                 size,
                 settings,
-                frame.events.as_deref().map_or(0, |events| events.len()),
+                frame.event_count().unwrap_or(0),
             )),
         );
         self.ensure_count_render_bind_group()?;
@@ -1599,7 +1586,7 @@ impl WgpuPreviewRenderer {
                 mode,
                 size,
                 PreviewDisplaySettings::default(),
-                frame.events.as_deref().map_or(0, |events| events.len()),
+                frame.event_count().unwrap_or(0),
             )),
         );
 
@@ -1655,7 +1642,7 @@ impl WgpuPreviewRenderer {
     ) -> Result<PreviewDisplayTexture, String> {
         let size = match payload {
             PackedPreviewPayload::Intensity(data) => data.size,
-            PackedPreviewPayload::Polarity { size } => size,
+            PackedPreviewPayload::Polarity { size, .. } => size,
         };
         self.ensure_textures(size)?;
         self.ensure_bind_group();
@@ -1683,21 +1670,23 @@ impl WgpuPreviewRenderer {
         frame: &augur_core::pipeline::PreviewFrame,
         mode: PreviewMode,
     ) -> Result<(), String> {
-        let events = frame
-            .events
-            .as_deref()
+        let event_count = frame
+            .event_count()
             .ok_or_else(|| "count accumulation requires raw preview events".to_owned())?;
         let key = CountAccumulationKey {
             width: frame.width,
             height: frame.height,
             window_start_us: frame.window_start_us,
             window_end_us: frame.window_end_us,
-            event_count: events.len(),
+            event_count,
         };
         if self.count_accumulation_key == Some(key) {
             return Ok(());
         }
 
+        let events = frame
+            .events_snapshot()
+            .ok_or_else(|| "count accumulation requires raw preview events".to_owned())?;
         let size = [frame.width as usize, frame.height as usize];
         self.ensure_count_buffers(size, events.len())?;
 
@@ -1933,12 +1922,11 @@ impl WgpuPreviewRenderer {
         &mut self,
         frame: &augur_core::pipeline::PreviewFrame,
     ) -> Result<(), String> {
-        let events = frame
-            .events
-            .as_deref()
+        let event_count = frame
+            .event_count()
             .ok_or_else(|| "time-surface accumulation requires raw preview events".to_owned())?;
         let size = [frame.width as usize, frame.height as usize];
-        self.ensure_time_surface_buffers(size, events.len())?;
+        self.ensure_time_surface_buffers(size, event_count)?;
 
         let accumulation_key = TimeSurfaceAccumulationKey {
             width: frame.width,
@@ -1972,6 +1960,9 @@ impl WgpuPreviewRenderer {
             return Ok(());
         }
 
+        let events = frame
+            .events_snapshot()
+            .ok_or_else(|| "time-surface accumulation requires raw preview events".to_owned())?;
         self.time_surface_packed_events.clear();
         self.time_surface_packed_events.reserve(events.len() * 2);
         self.time_surface_packed_events
@@ -2164,56 +2155,6 @@ impl WgpuPreviewRenderer {
         Ok(())
     }
 
-    fn query_time_surface_value_gpu(
-        &mut self,
-        frame: &augur_core::pipeline::PreviewFrame,
-        time_surface_tau_us: u64,
-        index: usize,
-    ) -> Result<Option<u8>, String> {
-        let pixel_count = usize::from(frame.width.max(1)) * usize::from(frame.height.max(1));
-        if index >= pixel_count {
-            return Ok(None);
-        }
-        if let Some(cache) = self.time_surface_hover_cache {
-            if cache.frame_end_us == frame.window_end_us
-                && cache.tau_us == time_surface_tau_us
-                && cache.index == index
-            {
-                return Ok(Some(cache.value));
-            }
-        }
-
-        self.ensure_time_surface_accumulation(frame)?;
-        let mut encoder = self
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("augur_time_surface_hover_encoder"),
-            });
-        encoder.copy_buffer_to_buffer(
-            self.time_surface_tick_buffer
-                .as_ref()
-                .ok_or_else(|| "missing time-surface tick buffer".to_owned())?,
-            (index * std::mem::size_of::<u32>()) as u64,
-            &self.time_surface_hover_readback,
-            0,
-            std::mem::size_of::<u32>() as u64,
-        );
-        self.queue().submit(Some(encoder.finish()));
-        let tick = read_single_u32_buffer(self.device(), &self.time_surface_hover_readback)?;
-        let value = time_surface_value_u8_from_tick(
-            tick,
-            encode_time_surface_tick(frame.window_end_us),
-            time_surface_tau_us.max(1),
-        );
-        self.time_surface_hover_cache = Some(TimeSurfaceHoverCache {
-            frame_end_us: frame.window_end_us,
-            tau_us: time_surface_tau_us,
-            index,
-            value,
-        });
-        Ok(Some(value))
-    }
-
     fn reset(&mut self) {
         self.free_display_texture();
         self.bind_group = None;
@@ -2244,7 +2185,7 @@ impl WgpuPreviewRenderer {
         self.display_texture = None;
         self.display_view = None;
         self.size = None;
-        self.polarity_payload.values.clear();
+        self.polarity_payload.clear();
     }
 
     fn free_display_texture(&mut self) {
@@ -2264,13 +2205,8 @@ impl WgpuPreviewRenderer {
             }
             PreparedPreviewFrame::PolarityRg16 { size, on, off, .. } => {
                 let pixel_count = size[0].saturating_mul(size[1]);
-                self.polarity_payload.size = size;
-                self.polarity_payload
-                    .values
-                    .resize(pixel_count, [0_u16, 0_u16]);
-                for ((packed, &on), &off) in
-                    self.polarity_payload.values.iter_mut().zip(on).zip(off)
-                {
+                self.polarity_payload.resize(pixel_count, [0_u16, 0_u16]);
+                for ((packed, &on), &off) in self.polarity_payload.iter_mut().zip(on).zip(off) {
                     *packed = [on, off];
                 }
                 PackedPreviewPayload::Polarity { size }
@@ -2419,7 +2355,7 @@ impl WgpuPreviewRenderer {
                         queue,
                         texture,
                         size,
-                        bytemuck::cast_slice(&self.polarity_payload.values),
+                        bytemuck::cast_slice(&self.polarity_payload),
                         4,
                     );
                 }
@@ -2665,11 +2601,6 @@ fn read_histogram_buffer(
     Ok(histogram)
 }
 
-fn read_single_u32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<u32, String> {
-    let values = map_buffer_sync(device, buffer, std::mem::size_of::<u32>() as u64, "hover")?;
-    Ok(values.first().copied().unwrap_or(0))
-}
-
 fn create_dummy_texture(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("augur_preview_dummy"),
@@ -2766,8 +2697,8 @@ fn write_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        pack_time_surface_event, preview_uniforms, time_surface_histogram_uniforms, PolarityRg16,
-        MODE_INTENSITY, MODE_SIGNED_COUNT,
+        pack_time_surface_event, preview_uniforms, time_surface_histogram_uniforms, MODE_INTENSITY,
+        MODE_SIGNED_COUNT,
     };
     use crate::{
         colormap::Colormap,
@@ -2792,6 +2723,9 @@ mod tests {
             on_count: 5,
             off_count: 5,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         }
@@ -2830,10 +2764,35 @@ mod tests {
                     let brightness = (normalize_value(total, settings) * 255.0)
                         .round()
                         .clamp(0.0, 255.0) as u8;
+                    let scale = |c: u8| {
+                        ((c as f32) * (brightness as f32 / 255.0))
+                            .round()
+                            .clamp(0.0, 255.0) as u8
+                    };
+                    let mix = |a: [u8; 3], b: [u8; 3]| -> [u8; 3] {
+                        [
+                            ((a[0] as u16 + b[0] as u16) / 2) as u8,
+                            ((a[1] as u16 + b[1] as u16) / 2) as u8,
+                            ((a[2] as u16 + b[2] as u16) / 2) as u8,
+                        ]
+                    };
+                    let on_tint = crate::theme::POLARITY_ON_RGB;
+                    let off_tint = crate::theme::POLARITY_OFF_RGB;
                     match on[index].cmp(&off[index]) {
-                        std::cmp::Ordering::Greater => Color32::from_rgb(brightness, 0, 0),
-                        std::cmp::Ordering::Less => Color32::from_rgb(0, 0, brightness),
-                        std::cmp::Ordering::Equal => Color32::from_rgb(brightness, 0, brightness),
+                        std::cmp::Ordering::Greater => Color32::from_rgb(
+                            scale(on_tint[0]),
+                            scale(on_tint[1]),
+                            scale(on_tint[2]),
+                        ),
+                        std::cmp::Ordering::Less => Color32::from_rgb(
+                            scale(off_tint[0]),
+                            scale(off_tint[1]),
+                            scale(off_tint[2]),
+                        ),
+                        std::cmp::Ordering::Equal => {
+                            let m = mix(on_tint, off_tint);
+                            Color32::from_rgb(scale(m[0]), scale(m[1]), scale(m[2]))
+                        }
                     }
                 }
             }
@@ -2855,6 +2814,33 @@ mod tests {
                 }
             }
             _ => panic!("unexpected payload/mode combination"),
+        }
+    }
+
+    #[test]
+    fn polarity_shader_literals_match_theme_constants() {
+        // The WGSL fragment shaders hardcode the polarity tints as normalized
+        // float literals. They must stay byte-identical to the CPU-path theme
+        // constants, or the GPU and CPU previews would render different colours.
+        fn wgsl_rgb(rgb: [u8; 3]) -> String {
+            format!(
+                "vec3<f32>({:.4}, {:.4}, {:.4})",
+                f32::from(rgb[0]) / 255.0,
+                f32::from(rgb[1]) / 255.0,
+                f32::from(rgb[2]) / 255.0,
+            )
+        }
+        let on = wgsl_rgb(crate::theme::POLARITY_ON_RGB);
+        let off = wgsl_rgb(crate::theme::POLARITY_OFF_RGB);
+        for shader in [super::PREVIEW_SHADER, super::COUNT_RENDER_SHADER] {
+            assert!(
+                shader.contains(&on),
+                "shader missing polarity-on literal {on}"
+            );
+            assert!(
+                shader.contains(&off),
+                "shader missing polarity-off literal {off}"
+            );
         }
     }
 
@@ -2909,24 +2895,23 @@ mod tests {
     #[test]
     fn polarity_payload_packs_on_and_off_counts() {
         let frame = frame();
-        let mut payload = PolarityRg16 {
-            size: [0, 0],
-            values: Vec::new(),
-        };
+        let mut payload: Vec<[u16; 2]> = Vec::new();
+        let mut size = [0, 0];
         with_prepared_preview_frame(&frame, PreviewMode::SignedCount, 30_000, |prepared| {
-            if let crate::preview::PreparedPreviewFrame::PolarityRg16 { size, on, off, .. } =
-                prepared
+            if let crate::preview::PreparedPreviewFrame::PolarityRg16 {
+                size: s, on, off, ..
+            } = prepared
             {
-                payload.size = size;
-                payload.values.resize(size[0] * size[1], [0, 0]);
-                for ((packed, &on), &off) in payload.values.iter_mut().zip(on).zip(off) {
+                size = s;
+                payload.resize(s[0] * s[1], [0, 0]);
+                for ((packed, &on), &off) in payload.iter_mut().zip(on).zip(off) {
                     *packed = [on, off];
                 }
             }
         });
 
-        assert_eq!(payload.size, [2, 1]);
-        assert_eq!(payload.values, vec![[3, 1], [2, 4]]);
+        assert_eq!(size, [2, 1]);
+        assert_eq!(payload, vec![[3, 1], [2, 4]]);
     }
 
     #[test]

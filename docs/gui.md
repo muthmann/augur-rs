@@ -19,12 +19,12 @@ A single menu bar row at the top of the window:
 | `File` | Output path/browse, Open Replay, Save/Load Config, Close Replay, Export TIFF Stack during replay |
 | `Camera` | Probe Camera, Preview, Record, Stop, Apply Settings; replay mode adds Play/Pause, Restart, and Speed selection |
 | `Settings` | Pixel scale, sensor geometry, Acq time, EventStore budget, and advanced preview / point-cloud / disk-writer controls |
-| `View` | Toggle Settings/Analysis panels, show/hide the scale bar, toggle Dark Mode, switch 2D/3D view mode |
+| `View` | Toggle Settings/Analysis panels, show/hide the scale bar, toggle Dark Mode, switch investigation layout (2D / Split / 3D) |
 | `Tools` | Connect or disconnect the ImageJ/Fiji bridge |
 | `Plugins` | Plugin Manager, Scan for New Plugins, Open Plugins Folder |
 | `Analysis` | Per-plugin enable/disable checkboxes (shown only when plugins exist) |
 
-The right side of the menu bar shows the `2D / 3D` view-mode toggle, status indicators (● REC, Finished), the ImageJ bridge status when connected, and the current camera/session status label.
+The right side of the menu bar shows the investigation layout selector (`2D` / `Split` / `3D`), status indicators (● REC, Finished), the ImageJ bridge status when connected, and the current camera/session status label.
 
 ---
 
@@ -91,14 +91,57 @@ Use the toolbar **Plugins** menu to open the **Plugin Manager** window.
 
 ---
 
-## Preview Workspace
+## Investigation Workspace
 
-The center panel is now an interactive preview workspace shared by the embedded view and the enlarged popup.
+The center panel is an interactive investigation workspace where 2D preview, GPU-accelerated 3D point cloud, data tables, and plugin overlays are linked views of the same data. The embedded viewer and the enlarged popup share the same layout model and investigation state.
+
+For the current ownership and buffer model behind those linked views, see
+[Investigation Dataflow And Memory Model](./features/investigation-dataflow-and-memory-model.md).
 
 - the entire central viewer, including the heading strip, toolbar, canvas, replay transport, and
   lower control area, is rendered by one shared viewer component
 - when the popup is open, that same viewer state moves into the popup host and the main window
   shows a placeholder plus a return button instead of running a second divergent renderer
+- the replay transport strip stays available in the popup/external viewer
+
+### Investigation layouts
+
+Switch between three layouts with the toolbar selector or keyboard shortcuts:
+
+| Shortcut | Layout | Description |
+|---|---|---|
+| `1` | **2D only** | Full-size event preview with all 2D tools |
+| `2` | **Split 2D + 3D** | Side-by-side with a draggable divider |
+| `3` | **3D only** | Full-size GPU-accelerated 3D point cloud |
+
+The split layout uses a visible draggable divider. Narrow panes clip correctly to their allocated rects, and toolbars scroll horizontally at narrow widths.
+
+### Cross-view linked selection
+
+Selecting a point in any view propagates the selection to all other views:
+
+- **Table row click** highlights the matching marker in 2D and point in 3D
+- **2D marker click** scrolls the linked table to the matching row and highlights in 3D; rich overlay markers with stable IDs resolve into the host selection model
+- **3D point click** updates the table and 2D highlight, focuses the 3D camera on the selection
+- **ROI linking** (`L` key): when active, the 2D ROI filters the 3D point cloud spatially with a visible focus volume — points inside stay emphasized, outside points remain at low opacity for context
+
+Additional keyboard shortcuts:
+
+| Key | Action |
+|---|---|
+| `L` | Toggle 2D-to-3D ROI linking |
+| `Esc` | Clear the linked selection |
+| `F` | Focus the 3D camera on the current selection |
+
+### Investigation inspector (right panel)
+
+The right-side investigation inspector shows:
+
+- **Workspace** section: ROI linking controls, selected and hovered rows
+- **Layers** section: grouped controls separating raw-event ON/OFF point-cloud styling from analysis layers, with per-layer visibility toggles, style presets, and color pickers
+- **Status & warnings** section: concrete warning messages, stale-parameter indicators, and provenance notices
+- **Analysis Extensions** cards: host hotpixel detection plus enabled runtime plugins, each showing status metrics, dependency links, and collapsible parameter settings
+- a reminder that raw-event history controls live in the 3D toolbar
 
 ### 2D preview tools
 
@@ -119,19 +162,43 @@ The center panel is now an interactive preview workspace shared by the embedded 
 - `Crop to ROI` switches between full-frame and ROI-only rendering without changing the allocated canvas size; with a selected software annotation it crops to that ROI, otherwise it falls back to the hardware ROI, and ellipse crop uses the ellipse bounding box
 - a scale-bar overlay can be toggled from `View` or from the preview controls and positioned in any corner
 - `Enlarge` opens a larger resizable popup that reuses the same zoom/crop/ROI state as the main preview
+- host-owned linked markers are painted on top of the preview image, including generic marker-overlay shapes and overlay hit-testing for cross-view selection
 
 If a ROI is configured, the full-frame preview shows its outline. While dragging a new ROI, the pending selection rectangle is drawn live on top of the image.
 
-### 3D point-cloud view
+### 3D point-cloud inspection
 
-Switch the toolbar `View` control to `3D` to replace the image preview with a point cloud built from recent raw `CdEvent`s.
+The 3D view renders raw events and plugin data on a GPU-accelerated WGPU point cloud with proper depth testing.
 
-- `Time range [ms]` controls how far back in time to show events
-- `Max render` caps the rendered sample count for performance
-- `Reset Camera` resets the orbit camera
-- drag the point cloud to orbit and use the mouse wheel to zoom
+**Camera controls:**
+- **Left drag**: orbit (azimuth + elevation)
+- **Right drag**: pan (translate orbit target)
+- **Scroll**: zoom (distance)
+- **Middle-click / Reset button**: reset camera
+- **Double-click / `F`**: focus on selection
 
-The point cloud always shows the most recent events and is filtered to the currently configured hardware ROI.
+**3D toolbar controls:**
+- **Axis presets** (`XY` / `XT` / `YT`): snap to standard orthographic-like views
+- **Depth slab sliders**: clip the visible depth (time) range
+- **Point scale**: adjust rendered point size
+- **History range**: how far back in time to show raw events
+- **Point budget**: cap the rendered sample count for performance
+- all controls have hover tooltips
+
+**Raw-event behavior:**
+- raw events from every drained preview frame are retained, not only the newest frame — this removes temporal gaps caused by 2D display throttling
+- depth scaling adapts to the actually retained buffer span, so requesting more history than available does not compress the cloud
+- the 3D coordinate system flips the sensor `y` axis to match the 2D preview: `x` right, `y` up, older events deeper
+- the footer reports both requested and retained history
+
+**Plugin data in 3D:**
+- datasets exposed through `HostViewKind::Scatter3dFromTable` are projected into the point cloud with distinct layer styling
+- marker overlays remain a 2D annotation / hit-testing path; they are not the current source of 3D plugin points
+- per-layer visibility and style controls live in the investigation inspector
+
+**Linked ROI focus:**
+- when ROI linking is active, the 3D view draws a focus cuboid across the retained time span
+- points inside the ROI stay emphasized, outside points remain visible at low opacity for context
 
 ## Replay Mode
 
@@ -140,7 +207,7 @@ Opening a replay file starts a preview-only pipeline:
 - `.raw` files use `RawFileCamera`
 - decoded `.csv`, `.bin`, `.npy`, and optional `.h5` / `.hdf5` files use `DecodedEventFileCamera`
 - all formats share the same transport controls, plugin path, and preview rendering
-- the same replay session can be viewed in either 2D or 3D via the toolbar `View` toggle
+- the full investigation workspace (2D, Split, 3D layouts) is available during replay
 - raw EVT3 replay also restores recorded device identity, firmware, serial, and pixel-pitch metadata from the file header
 
 Decoded replay files carry geometry differently:
@@ -179,6 +246,8 @@ setting still applies to live preview instead of replay.
 time range, acquisition time, optional ROI crop, and output path, then writes one 16-bit grayscale
 TIFF page per accumulation window.
 
+When replay is paused, changing any hotpixel or plugin parameter triggers an immediate recompute of the current frame. All views update in place, providing instant feedback for parameter tuning without re-running the full recording.
+
 At EOF, replay shuts down its controller threads but stays in replay mode so the last frame, timeline, and transport controls remain available. Use `Restart`, drag the timeline, or click `Stop` to leave replay mode.
 
 ---
@@ -198,7 +267,7 @@ The 2D preview uses a shared display model for the base image and ROI-grid overl
 - changing the preview mode, time-surface decay, or histogram contrast controls immediately re-renders the current frame, including paused replay frames
 - ruler, line-profile, and scale-bar overlays use outline/shadow rendering so they remain readable on bright colormaps
 
-In 3D mode, the scroll area still switches over to point-cloud metrics instead of 2D display controls.
+In 3D-only layout, the scroll area switches to point-cloud metrics instead of 2D display controls. In split layout, both sets of controls are accessible within their respective panes.
 
 ---
 

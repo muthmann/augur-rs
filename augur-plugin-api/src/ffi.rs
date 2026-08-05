@@ -2,6 +2,9 @@ use std::{ffi::c_void, str::Utf8Error};
 
 use serde::{Deserialize, Serialize};
 
+pub type FfiCdEvent = augur_event_types::CompactEvent;
+pub type FfiExternalTriggerEvent = augur_event_types::ExternalTriggerEvent;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FfiSlice<T> {
@@ -104,6 +107,25 @@ pub enum PluginInput {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginStateKind {
+    #[default]
+    Accumulating = 0,
+    Stateless = 1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginDiscontinuity {
+    Seek = 0,
+    SourceChanged = 1,
+    HistoryEvicted = 2,
+    SettingsChanged = 3,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCapabilities {
     pub retained_event_history: bool,
 }
@@ -119,15 +141,6 @@ pub enum AnalysisSeverity {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FfiCdEvent {
-    pub timestamp: u64,
-    pub x: u16,
-    pub y: u16,
-    pub polarity: u8,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FfiPixel {
     pub x: u16,
     pub y: u16,
@@ -138,6 +151,20 @@ pub struct FfiPixel {
 pub struct FfiSubpixelMarker {
     pub x: f32,
     pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FfiMarkerShape {
+    Circle = 0,
+    Square = 1,
+    Point = 2,
+    Cross = 3,
+    Box = 4,
+    Ellipse = 5,
+    Diamond = 6,
+    FilledCircle = 7,
 }
 
 #[repr(C)]
@@ -162,6 +189,25 @@ impl FfiColorRgba {
     pub const fn to_rgba(self) -> [u8; 4] {
         [self.r, self.g, self.b, self.a]
     }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FfiMarkerOverlayItem {
+    pub x: f32,
+    pub y: f32,
+    pub shape: FfiMarkerShape,
+    pub size: f32,
+    pub color: FfiColorRgba,
+    pub timestamp_us: u64,
+    pub has_timestamp: bool,
+    pub stable_id: FfiString,
+    /// Optional pointer to the row that backs this marker. When set, a
+    /// click on the marker selects `(source_dataset_id, source_row_id)`
+    /// instead of falling back to `(overlay.dataset_id, stable_id)`.
+    /// Empty `FfiString`s mean "no explicit source row".
+    pub source_dataset_id: FfiString,
+    pub source_row_id: FfiString,
 }
 
 #[repr(C)]
@@ -205,13 +251,73 @@ pub struct FfiPreviewFrame {
     pub height: u16,
     pub pixels: FfiSlice<u16>,
     pub events: FfiSlice<FfiCdEvent>,
+    /// EVT3 `EXT_TRIGGER` edges inside this frame's window, camera-clock
+    /// timestamps, in timestamp order.
+    pub external_triggers: FfiSlice<FfiExternalTriggerEvent>,
     pub window_start_us: u64,
     pub window_end_us: u64,
+}
+
+/// Where a plugin invocation is running and whether hardware side effects
+/// are permitted. Plugins that talk to lab instruments must fail closed
+/// unless `mode == LiveCapture` **and** `effects_allowed != 0`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    LiveCapture = 0,
+    Replay = 1,
+    OfflineAnalysis = 2,
+}
+
+/// Which host-owned instance role a dynamic plugin is serving.
+///
+/// Only `LiveWorker` may receive a control context with effects enabled.
+/// UI mirrors and offline instances use settings as inert requested
+/// configuration and must never open devices or mutate laboratory state.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntimeRole {
+    #[default]
+    UiMirror = 0,
+    LiveWorker = 1,
+    OfflineAnalysis = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiExecutionContext {
+    pub mode: ExecutionMode,
+    /// Boolean as a fixed-layout byte: nonzero = effects allowed.
+    pub effects_allowed: u8,
+    pub _reserved: [u8; 7],
+    /// Optional host-assigned session identifier (empty = none).
+    pub session_id: FfiString,
+}
+
+impl FfiExecutionContext {
+    /// The most restrictive context: replay semantics, no effects.
+    pub const fn fail_closed() -> Self {
+        Self {
+            mode: ExecutionMode::Replay,
+            effects_allowed: 0,
+            _reserved: [0; 7],
+            session_id: FfiString::empty(),
+        }
+    }
 }
 
 pub type AddHighlightPixelsFn = unsafe extern "C" fn(*mut c_void, FfiSlice<FfiPixel>, FfiColorRgba);
 pub type AddCrosshairMarkersFn =
     unsafe extern "C" fn(*mut c_void, FfiSlice<FfiSubpixelMarker>, FfiColorRgba, u16);
+pub type AddMarkerOverlayFn = unsafe extern "C" fn(
+    *mut c_void,
+    FfiSlice<FfiMarkerOverlayItem>,
+    FfiString,
+    FfiString,
+    FfiString,
+);
 pub type AddWarningFn = unsafe extern "C" fn(*mut c_void, FfiString, AnalysisSeverity, FfiString);
 
 #[repr(C)]
@@ -220,6 +326,7 @@ pub struct FfiOutputCallbacks {
     pub ctx: *mut c_void,
     pub add_highlight_pixels: AddHighlightPixelsFn,
     pub add_crosshair_markers: AddCrosshairMarkersFn,
+    pub add_marker_overlay: AddMarkerOverlayFn,
     pub add_warning: AddWarningFn,
 }
 
@@ -234,8 +341,12 @@ pub type EventStoreOldestTsFn = unsafe extern "C" fn(*const c_void) -> u64;
 pub type EventStoreFrameCountFn = unsafe extern "C" fn(*const c_void) -> usize;
 pub type HostViewDatasetGenerationFn = unsafe extern "C" fn(*const c_void, FfiString) -> u64;
 pub type PluginCapabilitiesFn = unsafe extern "C" fn(*const c_void) -> PluginCapabilities;
+pub type PluginStateKindFn = unsafe extern "C" fn(*const c_void) -> PluginStateKind;
+pub type PluginDiscontinuityFn = unsafe extern "C" fn(*mut c_void, PluginDiscontinuity);
+pub type PluginRuntimeRoleFn = unsafe extern "C" fn(*mut c_void, PluginRuntimeRole);
+pub type ControlEmitFn = unsafe extern "C" fn(*mut c_void, FfiSlice<u8>);
 
-pub const PLUGIN_ABI_VERSION: u64 = 2;
+pub const PLUGIN_ABI_VERSION: u64 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -256,6 +367,19 @@ pub struct FfiPluginContext {
     pub get: ContextGetFn,
     pub publish_persistent: ContextPublishFn,
     pub get_persistent: ContextGetFn,
+    pub execution: FfiExecutionContext,
+}
+
+/// Frame-independent control invocation. `inbox_json` and every callback
+/// context are borrowed for this call only and must not be retained.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiPluginControlContext {
+    pub ctx: *mut c_void,
+    pub inbox_json: FfiSlice<u8>,
+    pub execution: FfiExecutionContext,
+    pub emit_service_request: ControlEmitFn,
+    pub emit_host_command: ControlEmitFn,
 }
 
 #[repr(C)]
@@ -275,9 +399,12 @@ pub struct PluginVTable {
     pub description: unsafe extern "C" fn(*const c_void) -> FfiString,
     pub enabled: unsafe extern "C" fn(*const c_void) -> bool,
     pub set_enabled: unsafe extern "C" fn(*mut c_void, bool),
+    pub set_runtime_role: PluginRuntimeRoleFn,
     pub reset: unsafe extern "C" fn(*mut c_void),
+    pub on_discontinuity: PluginDiscontinuityFn,
     pub input_kind: unsafe extern "C" fn(*const c_void) -> PluginInput,
     pub capabilities: PluginCapabilitiesFn,
+    pub plugin_state_kind: PluginStateKindFn,
     pub num_dependencies: unsafe extern "C" fn(*const c_void) -> usize,
     pub dependency: unsafe extern "C" fn(*const c_void, usize) -> FfiString,
     pub process_frame: unsafe extern "C" fn(
@@ -287,6 +414,15 @@ pub struct PluginVTable {
         *mut FfiPluginContext,
         *const FfiEventStoreHandle,
     ),
+    pub process_control: unsafe extern "C" fn(*mut c_void, *mut FfiPluginControlContext),
+    pub handle_service_request: unsafe extern "C" fn(
+        *mut c_void,
+        FfiSlice<u8>,
+        FfiExecutionContext,
+        *mut *const u8,
+        *mut usize,
+    ),
+    pub control_snapshots: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub settings_schema: unsafe extern "C" fn(*const c_void, *mut *const u8, *mut usize),
     pub get_setting:
         unsafe extern "C" fn(*const c_void, FfiString, *mut *const u8, *mut usize) -> bool,

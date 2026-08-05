@@ -4,6 +4,8 @@ use augur_core::pipeline::PreviewFrame;
 use egui::Color32;
 use egui_plot::{Legend, Line, Plot};
 
+use super::scale_bar::PixelScale;
+
 const LINE_PROFILE_VIEWPORT_TITLE: &str = "Line Profile - AugurRS";
 
 #[derive(Debug)]
@@ -12,6 +14,10 @@ pub struct LineProfileTool {
     pub end: Option<(u16, u16)>,
     pub profile_on: Vec<f32>,
     pub profile_off: Vec<f32>,
+    /// Euclidean distance of each sample from the line's start, in sensor
+    /// pixels. A Bresenham walk takes diagonal steps of length √2, so the
+    /// sample index is *not* a distance and must never be plotted as one.
+    pub profile_distance_px: Vec<f32>,
     pub window_open: bool,
     shared: Arc<Mutex<LineProfileViewportData>>,
 }
@@ -23,6 +29,7 @@ impl Default for LineProfileTool {
             end: None,
             profile_on: Vec::new(),
             profile_off: Vec::new(),
+            profile_distance_px: Vec::new(),
             window_open: false,
             shared: Arc::new(Mutex::new(LineProfileViewportData::default())),
         }
@@ -33,6 +40,8 @@ impl Default for LineProfileTool {
 struct LineProfileViewportData {
     profile_on: Vec<f32>,
     profile_off: Vec<f32>,
+    profile_distance_px: Vec<f32>,
+    scale: PixelScale,
     show_sum: bool,
     close_requested: bool,
 }
@@ -43,10 +52,12 @@ impl LineProfileTool {
         self.end = None;
         self.profile_on.clear();
         self.profile_off.clear();
+        self.profile_distance_px.clear();
         self.window_open = false;
         if let Ok(mut data) = self.shared.lock() {
             data.profile_on.clear();
             data.profile_off.clear();
+            data.profile_distance_px.clear();
             data.close_requested = false;
         }
     }
@@ -72,24 +83,32 @@ impl LineProfileTool {
         let (Some(start), Some(end)) = (self.start, self.end) else {
             self.profile_on.clear();
             self.profile_off.clear();
+            self.profile_distance_px.clear();
             return;
         };
 
         self.profile_on.clear();
         self.profile_off.clear();
+        self.profile_distance_px.clear();
         let width = usize::from(frame.width.max(1));
         for (x, y) in bresenham_line(start, end) {
             let idx = usize::from(y) * width + usize::from(x);
             self.profile_on.push(frame.pixels_on[idx] as f32);
             self.profile_off.push(frame.pixels_off[idx] as f32);
+            let dx = f32::from(x) - f32::from(start.0);
+            let dy = f32::from(y) - f32::from(start.1);
+            self.profile_distance_px.push((dx * dx + dy * dy).sqrt());
         }
     }
 
-    pub fn show_window(&mut self, ctx: &egui::Context) {
+    pub fn show_window(&mut self, ctx: &egui::Context, scale: PixelScale) {
         {
             let mut data = self.shared.lock().unwrap();
             data.profile_on.clone_from(&self.profile_on);
             data.profile_off.clone_from(&self.profile_off);
+            data.profile_distance_px
+                .clone_from(&self.profile_distance_px);
+            data.scale = scale;
         }
 
         if !self.window_open {
@@ -156,17 +175,26 @@ fn render_line_profile_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<LineProfil
         return;
     }
 
+    // Plot against the Euclidean distance from the line's start, not the
+    // sample index: on a diagonal the two differ by up to √2 and the index
+    // would silently compress the axis.
+    let distance = |index: usize| -> f64 {
+        data.profile_distance_px
+            .get(index)
+            .map(|value| f64::from(*value))
+            .unwrap_or(index as f64)
+    };
     let on_points: Vec<[f64; 2]> = data
         .profile_on
         .iter()
         .enumerate()
-        .map(|(index, value)| [index as f64, f64::from(*value)])
+        .map(|(index, value)| [distance(index), f64::from(*value)])
         .collect();
     let off_points: Vec<[f64; 2]> = data
         .profile_off
         .iter()
         .enumerate()
-        .map(|(index, value)| [index as f64, f64::from(*value)])
+        .map(|(index, value)| [distance(index), f64::from(*value)])
         .collect();
     let show_sum = data.show_sum;
     let sum_points: Vec<[f64; 2]> = data
@@ -174,15 +202,34 @@ fn render_line_profile_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<LineProfil
         .iter()
         .zip(&data.profile_off)
         .enumerate()
-        .map(|(index, (on, off))| [index as f64, f64::from(*on + *off)])
+        .map(|(index, (on, off))| [distance(index), f64::from(*on + *off)])
         .collect();
+
+    let length_px = data
+        .profile_distance_px
+        .last()
+        .copied()
+        .map(f64::from)
+        .unwrap_or(0.0);
+    let scale = data.scale;
+    let length_note = ui.small(format!(
+        "Line length {length_px:.1} px \u{00B7} {:.2} \u{00B5}m{} \u{00B7} \
+         {} samples along the Bresenham walk",
+        scale.micrometers(length_px),
+        scale.suffix(),
+        data.profile_on.len()
+    ));
+    if !scale.calibrated {
+        length_note.on_hover_text(super::scale_bar::UNCALIBRATED_TOOLTIP);
+    }
+
     Plot::new("line_profile_plot")
         .allow_boxed_zoom(false)
         .allow_drag(false)
         .allow_scroll(false)
         .allow_zoom(false)
-        .x_axis_label("Position (px)")
-        .y_axis_label("Intensity")
+        .x_axis_label("Distance along line (px)")
+        .y_axis_label("Events per pixel")
         .legend(Legend::default())
         .height(260.0)
         .show(ui, |plot_ui| {
@@ -238,12 +285,42 @@ pub fn bresenham_line(start: (u16, u16), end: (u16, u16)) -> Vec<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::bresenham_line;
+    use super::{bresenham_line, LineProfileTool};
+    use augur_core::pipeline::PreviewFrame;
 
     #[test]
     fn bresenham_covers_both_endpoints() {
         let points = bresenham_line((1, 1), (4, 2));
         assert_eq!(points.first().copied(), Some((1, 1)));
         assert_eq!(points.last().copied(), Some((4, 2)));
+    }
+
+    #[test]
+    fn diagonal_samples_carry_geometric_distance_not_the_sample_index() {
+        let frame = PreviewFrame {
+            width: 4,
+            height: 4,
+            pixels: vec![0; 16],
+            pixels_on: vec![0; 16],
+            pixels_off: vec![0; 16],
+            cached_total_histogram: Vec::new(),
+            cached_signed_histogram: Vec::new(),
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
+            window_start_us: 0,
+            window_end_us: 1,
+        };
+
+        let mut tool = LineProfileTool::default();
+        tool.set_line((0, 0), (3, 3), &frame);
+
+        // Four samples, but the last one is 3√2 ≈ 4.24 px from the start.
+        assert_eq!(tool.profile_distance_px.len(), 4);
+        let last = tool.profile_distance_px.last().copied().expect("samples");
+        assert!((last - 3.0 * 2f32.sqrt()).abs() < 1e-4, "got {last}");
     }
 }

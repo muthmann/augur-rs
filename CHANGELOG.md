@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### ⚠ BREAKING CHANGES
+
+* **plugin-api:** `FfiMarkerOverlayItem` gains `source_dataset_id` and `source_row_id` fields and `PLUGIN_ABI_VERSION` bumps from 3 to 4. Runtime plugins must rebuild against current `augur-plugin-api`.
+
+### Features
+
+* ✨ clickable 2D overlays bound to their backing row via marker `source_row`, with reason-first summary card for rejected-fit rows.
+* ✨ generic host action bus: plugins declare `HostActionDescriptor`s with `Dataset`/`Row`/`Cluster` scope and an optional `param_schema`; the host renders scope-aware buttons plus a schema-driven modal and publishes `HostActionRequest`s to `CTX_INVESTIGATION_ACTION_REQUESTS`.
+
 ## [1.0.0](https://github.com/muthmann/augur-rs/compare/v0.1.0...v1.0.0) (2026-04-07)
 
 

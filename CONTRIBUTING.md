@@ -8,6 +8,20 @@ Contributions are welcome, but changes should stay tight, testable, and document
 - Keep hardware scope explicit when a change is specific to EVK4 or IMX636 behavior
 - Prefer small pull requests over broad mixed-purpose changes
 
+## Toolchain
+
+The Rust version is pinned in `rust-toolchain.toml`, and CI reads it from there. Use the rustup
+shim so your checks run against the same compiler:
+
+```bash
+cargo --version   # must match rust-toolchain.toml
+```
+
+If it does not, another `cargo` is earlier on your `PATH` — a Homebrew-installed one, for instance,
+which ignores `rust-toolchain.toml` entirely. Put `~/.cargo/bin` first, or call
+`~/.cargo/bin/cargo` explicitly. Checks that pass against a different compiler prove nothing about
+CI.
+
 ## Development Checklist
 
 Run the relevant checks before opening a pull request:
@@ -24,6 +38,17 @@ same steps in the same order as the GitHub Actions pipeline.
 CI tests every pull request on macOS, Linux, and Windows, and on both arm64 and x86_64. Threading
 bugs and FFI signedness mismatches often surface on only one architecture, so a green run on your
 own machine is not sufficient — wait for the full matrix.
+
+Changes that touch packaging can be verified without pushing a tag:
+
+```bash
+bash resources/packaging/macos/build-dmg.sh            # -> dist/
+bash resources/packaging/linux/build-appimage.sh       # -> dist/
+pwsh resources/packaging/windows/build-installer.ps1   # -> dist\
+```
+
+CI builds all of them on any pull request that touches `resources/`, `assets/`, `.github/`, or the
+manifests.
 
 If your change touches hardware-facing behavior, include the result of any manual EVK4 validation you performed.
 

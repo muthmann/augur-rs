@@ -32,22 +32,26 @@ Library extensions vary by platform:
 Each plugin directory must contain a `plugin.toml`:
 
 ```toml
+id = "example.plugin"
 name = "Example Plugin"
 version = "0.2.0"
 description = "Demonstrates the runtime plugin manifest format."
 domain = "general"
 library = "augur_plugin_example"
+host_commands = ["start_recording", "stop_recording"]
 ```
 
 Fields:
 
 | Field | Required | Description |
 |---|---|---|
+| `id` | for control plane | Stable, unique routing identity. Lowercase ASCII letters/digits plus `.`, `-`, `_`. |
 | `name` | yes | Display name shown in the Plugin Manager |
 | `version` | yes | Semantic version string |
 | `description` | yes | One-line summary |
 | `domain` | yes | Category tag (e.g. `general`, `analysis`, `vision`, `robotics`) |
 | `library` | no | Base name of the dynamic library, **without** the `lib` prefix and without the platform extension (`.dylib`, `.so`, `.dll`). If omitted, the loader auto-discovers a single library file in the directory. |
+| `host_commands` | no | Closed recording verbs the plugin may request. Omitted means no host-command capability. |
 
 For example, `library = "augur_plugin_example"` resolves to `libaugur_plugin_example.dylib` on macOS, `libaugur_plugin_example.so` on Linux, and `augur_plugin_example.dll` on Windows.
 
@@ -62,9 +66,18 @@ The GUI exposes a dedicated Plugin Manager window:
 
 Load failures are recorded per plugin instead of aborting the app.
 
+They are **also** surfaced in the analysis panel's `Status & warnings` section, one row per failed
+plugin (`<name> · not loaded: <error>`), and counted in that section's badge. A plugin that never
+loaded is a capability the session does not have, so "All clear" must not be able to hide one — see
+ADR 033.
+
 The loader validates both the exported `PluginVTable` size and the explicit ABI version before it
 calls any plugin function pointers. A stale plugin now shows up as a normal load error in the
 Plugin Manager instead of crashing AugurRS during startup.
+
+The loader and FFI callback bridges live in `augur-runtime`. `augur-gui` keeps a
+GUI-side plugin manager for settings and status, while live analysis uses a
+worker-owned plugin manager loaded from the same plugin directory.
 
 ## Runtime Plugin Sources
 
@@ -96,6 +109,10 @@ The library was built against a different version of the plugin API. Rebuild it 
 The plugin was compiled against an older `augur-plugin-api` layout whose vtable size may still look
 compatible by coincidence. Rebuild the plugin against the current host release, then replace the
 old library in `~/.augur/plugins/<plugin-name>/`.
+
+The current host expects ABI v6. It adds explicit runtime roles and the
+frame-independent semantic service/host-command control plane. Rebuild every
+runtime plugin after upgrading the host.
 
 ## Why C FFI + `libloading`
 

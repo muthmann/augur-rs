@@ -6,21 +6,36 @@ mod macros;
 mod settings;
 
 pub use context::{
-    GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor, HostViewKind,
-    HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine, Series1dPoint, Series1dV1,
-    TableColumn, TableColumnData, TableColumnValues, TableCoordinateSpace2d, TableDatasetV1,
-    TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
+    HostActionScope, HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply,
+    HostCommandRequest, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
+    HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement,
+    HostViewRegistry, Image2dV1, PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome,
+    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasReadbackV1,
+    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
+    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
+    TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
+    TableDatasetV1, TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    CTX_INVESTIGATION_ACTION_REQUESTS, CTX_SENSOR_MONITORING, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 pub use event_store::EventStore;
 pub use ffi::{
-    AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
-    FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiOutputCallbacks, FfiPixel,
-    FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString, FfiSubpixelMarker,
-    HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn, PluginEntry,
-    PluginInput, PluginVTable, PLUGIN_ABI_VERSION, PLUGIN_ENTRY_SYMBOL,
+    AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, ExecutionMode,
+    FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiExecutionContext,
+    FfiExternalTriggerEvent, FfiMarkerOverlayItem, FfiMarkerShape, FfiOutputCallbacks, FfiPixel,
+    FfiPluginContext, FfiPluginControlContext, FfiPreviewFrame, FfiSlice, FfiString,
+    FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
+    PluginDiscontinuity, PluginDiscontinuityFn, PluginEntry, PluginInput, PluginRuntimeRole,
+    PluginRuntimeRoleFn, PluginStateKind, PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
+    PLUGIN_ENTRY_SYMBOL,
 };
-pub use helpers::{EventStoreHandle, HostContext, HostOutput, Plugin, PluginFrame};
-pub use settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry};
+pub use helpers::{
+    EventStoreHandle, ExecutionContext, HostContext, HostOutput, Plugin, PluginControlContext,
+    PluginFrame,
+};
+pub use settings::{
+    PathDialogKind, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+};
 
 #[doc(hidden)]
 pub mod __private {
@@ -67,17 +82,26 @@ pub mod __private {
 mod tests {
     use super::{
         context::{
-            GlobalSettings, HostDatasetDescriptor, HostDatasetKind, HostViewDescriptor,
+            GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
+            HostActionScope, HostActionScopePayload, HostDatasetDescriptor,
+            HostDatasetDisplayMetadata, HostDatasetKind, HostMarkerShape, HostViewDescriptor,
             HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine,
             Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
-            TableCoordinateSpace2d, TableDatasetV1, TableSchema, TableValueType,
-            CTX_GLOBAL_SETTINGS,
+            TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1, TableSchema,
+            TableValueType, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+            CTX_SENSOR_MONITORING,
         },
-        settings::{SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry},
+        settings::{
+            PathDialogKind, SettingItem, SettingKind, SettingsSchema, SettingsSection, StatusEntry,
+        },
         AnalysisSeverity, EventStoreFrameAtFn, EventStoreFrameRangeForTimestampsFn, FfiCdEvent,
-        FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiPixel, FfiSlice, FfiString,
-        FfiSubpixelMarker, HostViewDatasetGenerationFn, PluginCapabilities, PluginCapabilitiesFn,
-        PluginInput, PluginVTable, PLUGIN_ABI_VERSION,
+        FfiColorRgba, FfiEventFrame, FfiEventStoreHandle, FfiMarkerOverlayItem, FfiMarkerShape,
+        FfiPixel, FfiPluginControlContext, FfiSlice, FfiString, FfiSubpixelMarker, HostCommand,
+        HostCommandOutcome, HostCommandReply, HostCommandRequest, HostViewDatasetGenerationFn,
+        PluginCapabilities, PluginCapabilitiesFn, PluginControlInbox, PluginControlSnapshot,
+        PluginDiscontinuity, PluginDiscontinuityFn, PluginInput, PluginRuntimeRole,
+        PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginStateKind,
+        PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
     };
 
     #[test]
@@ -89,8 +113,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<FfiColorRgba>(), 4);
         assert_eq!(std::mem::size_of::<FfiPixel>(), 4);
         assert_eq!(std::mem::size_of::<FfiSubpixelMarker>(), 8);
+        assert_eq!(std::mem::size_of::<FfiMarkerShape>(), 4);
+        assert_eq!(std::mem::size_of::<FfiMarkerOverlayItem>(), 88);
         assert_eq!(std::mem::size_of::<FfiEventStoreHandle>(), 40);
-        assert_eq!(std::mem::size_of::<PluginVTable>(), 168);
+        assert_eq!(std::mem::size_of::<PluginVTable>(), 216);
+        assert_eq!(std::mem::size_of::<FfiPluginControlContext>(), 72);
         assert_eq!(std::mem::size_of::<EventStoreFrameAtFn>(), 8);
         assert_eq!(
             std::mem::size_of::<EventStoreFrameRangeForTimestampsFn>(),
@@ -98,7 +125,16 @@ mod tests {
         );
         assert_eq!(std::mem::size_of::<HostViewDatasetGenerationFn>(), 8);
         assert_eq!(std::mem::size_of::<PluginCapabilitiesFn>(), 8);
-        assert_eq!(PLUGIN_ABI_VERSION, 2);
+        assert_eq!(std::mem::size_of::<PluginStateKindFn>(), 8);
+        assert_eq!(std::mem::size_of::<PluginDiscontinuityFn>(), 8);
+        assert_eq!(std::mem::size_of::<PluginStateKind>(), 4);
+        assert_eq!(std::mem::size_of::<PluginDiscontinuity>(), 4);
+        assert_eq!(std::mem::size_of::<crate::FfiExternalTriggerEvent>(), 16);
+        assert_eq!(std::mem::align_of::<crate::FfiExternalTriggerEvent>(), 8);
+        assert_eq!(std::mem::size_of::<crate::ExecutionMode>(), 4);
+        assert_eq!(std::mem::size_of::<PluginRuntimeRole>(), 4);
+        assert_eq!(std::mem::size_of::<crate::FfiExecutionContext>(), 32);
+        assert_eq!(PLUGIN_ABI_VERSION, 6);
     }
 
     #[test]
@@ -124,6 +160,29 @@ mod tests {
                             default: 1,
                         },
                     },
+                    SettingItem {
+                        key: "run_name".into(),
+                        label: "Run name".into(),
+                        tooltip: None,
+                        kind: SettingKind::Text {
+                            default: "run".into(),
+                        },
+                    },
+                    SettingItem {
+                        key: "data_dir".into(),
+                        label: "Data directory".into(),
+                        tooltip: None,
+                        kind: SettingKind::Path {
+                            dialog: PathDialogKind::Directory,
+                            default: String::new(),
+                        },
+                    },
+                    SettingItem {
+                        key: "save_snapshot".into(),
+                        label: "Save snapshot".into(),
+                        tooltip: None,
+                        kind: SettingKind::Button { enabled: false },
+                    },
                 ],
             }],
         };
@@ -135,6 +194,14 @@ mod tests {
     }
 
     #[test]
+    fn button_without_enabled_field_defaults_to_enabled() {
+        // Schemas emitted by plugins built against the pre-`enabled` API.
+        let decoded: SettingKind =
+            serde_json::from_str(r#"{"kind":"button"}"#).expect("legacy button deserializes");
+        assert_eq!(decoded, SettingKind::Button { enabled: true });
+    }
+
+    #[test]
     fn global_settings_round_trip_through_json() {
         let settings = GlobalSettings {
             nm_per_pixel: 65.0,
@@ -142,6 +209,13 @@ mod tests {
             sensor_height: 720,
             acq_time_ms: 50,
             event_store_budget_bytes: 100 * 1024 * 1024,
+            roi: crate::RoiV1 {
+                x: 4,
+                y: 8,
+                width: 640,
+                height: 480,
+            },
+            masked_pixels: vec![(1, 2), (3, 4)],
         };
 
         let json = serde_json::to_vec(&settings).expect("settings must serialize");
@@ -152,9 +226,59 @@ mod tests {
     }
 
     #[test]
+    fn sensor_monitoring_round_trips_through_json() {
+        let monitoring = crate::SensorMonitoringV1 {
+            pixel_dead_time_us: Some(6.35),
+            illumination_lux: Some(412.0),
+            temperature_c: Some(41.3),
+            bias_codes: Some(crate::SensorBiasReadbackV1 {
+                current: crate::SensorBiasCodesV1 {
+                    diff_on: 114,
+                    diff_off: 40,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 118,
+                },
+                factory_default: crate::SensorBiasCodesV1 {
+                    diff_on: 102,
+                    diff_off: 40,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 138,
+                },
+            }),
+            age_s: 0.25,
+        };
+
+        let json = serde_json::to_vec(&monitoring).expect("monitoring must serialize");
+        let decoded: crate::SensorMonitoringV1 =
+            serde_json::from_slice(&json).expect("monitoring must deserialize");
+        assert_eq!(decoded, monitoring);
+        assert_eq!(CTX_SENSOR_MONITORING, "augur.sensor_monitoring");
+    }
+
+    #[test]
+    fn sensor_monitoring_tolerates_a_host_that_reports_nothing() {
+        // A sensor without a monitoring block, and older hosts that only wrote
+        // some of the fields, must both decode rather than fail the frame.
+        let decoded: crate::SensorMonitoringV1 =
+            serde_json::from_slice(br#"{"illumination_lux":12.5}"#)
+                .expect("partial monitoring must deserialize");
+        assert_eq!(decoded.illumination_lux, Some(12.5));
+        assert_eq!(decoded.pixel_dead_time_us, None);
+        assert_eq!(decoded.bias_codes, None);
+        assert_eq!(decoded.age_s, 0.0);
+    }
+
+    #[test]
     fn plugin_capabilities_default_to_no_optional_features() {
         let capabilities = PluginCapabilities::default();
         assert!(!capabilities.retained_event_history);
+    }
+
+    #[test]
+    fn plugin_state_kind_defaults_to_accumulating() {
+        assert_eq!(PluginStateKind::default(), PluginStateKind::Accumulating);
     }
 
     #[test]
@@ -215,20 +339,49 @@ mod tests {
                             y_min: 0.0,
                             y_max: 100.0,
                         }),
+                        coordinate_space_3d: Some(TableCoordinateSpace3d {
+                            x_column: "x_nm".into(),
+                            y_column: "y_nm".into(),
+                            z_column: "frame".into(),
+                            x_min: 0.0,
+                            x_max: 100.0,
+                            y_min: 0.0,
+                            y_max: 100.0,
+                            z_min: 0.0,
+                            z_max: 20.0,
+                        }),
+                        row_id_column: Some("frame".into()),
+                        time_column: Some("frame".into()),
+                        layer_id: Some("reconstruction".into()),
+                        semantic_label: Some("localization".into()),
+                        provenance: None,
+                        column_display: Vec::new(),
                     }),
                     empty_message: "No rows yet".into(),
+                    display: Some(HostDatasetDisplayMetadata {
+                        layer_title: Some("Reconstruction".into()),
+                        default_visibility: Some(true),
+                        default_color: Some([255, 180, 80, 255]),
+                        default_marker_shape: Some(HostMarkerShape::Circle),
+                        default_size: Some(3.5),
+                    }),
+                    relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
                     id: "image.preview".into(),
                     title: "Rendered Image".into(),
                     kind: HostDatasetKind::Image2dV1,
                     empty_message: "No image yet".into(),
+                    display: None,
+                    relations: Vec::new(),
                 },
                 HostDatasetDescriptor {
                     id: "series.focus".into(),
                     title: "Focus Series".into(),
                     kind: HostDatasetKind::Series1dV1,
                     empty_message: "No samples yet".into(),
+                    display: None,
+                    relations: Vec::new(),
                 },
             ],
             views: vec![
@@ -247,6 +400,17 @@ mod tests {
                     kind: HostViewKind::Density2dFromTable {
                         x_column: "x_nm".into(),
                         y_column: "y_nm".into(),
+                    },
+                },
+                HostViewDescriptor {
+                    id: "window.scatter3d".into(),
+                    title: "Localization 3D".into(),
+                    dataset_id: "table.localization".into(),
+                    placement: HostViewPlacement::Window,
+                    kind: HostViewKind::Scatter3dFromTable {
+                        x_column: "x_nm".into(),
+                        y_column: "y_nm".into(),
+                        z_column: "frame".into(),
                     },
                 },
                 HostViewDescriptor {
@@ -274,12 +438,140 @@ mod tests {
                     kind: HostViewKind::LineSeriesWindow,
                 },
             ],
+            actions: vec![HostActionDescriptor {
+                id: "refit_cluster".into(),
+                title: "Tune fit on this cluster".into(),
+                scope: HostActionScope::Cluster {
+                    dataset_id: "table.candidates".into(),
+                    group_column: "cluster_id".into(),
+                },
+                param_schema: Some(serde_json::json!({
+                    "sections": [{
+                        "label": "Fit",
+                        "items": [{
+                            "key": "sigma_max",
+                            "label": "σ max",
+                            "kind": { "type": "f64", "default": 3.0 }
+                        }]
+                    }]
+                })),
+            }],
         };
 
         let json = serde_json::to_vec(&registry).expect("registry must serialize");
         let decoded: HostViewRegistry =
             serde_json::from_slice(&json).expect("registry must deserialize");
         assert_eq!(decoded, registry);
+    }
+
+    #[test]
+    fn host_action_request_queue_round_trips_through_json() {
+        let queue = HostActionRequestQueue {
+            requests: vec![
+                HostActionRequest {
+                    request_id: 1,
+                    action_id: "refit_cluster".into(),
+                    scope_payload: HostActionScopePayload::Cluster {
+                        dataset_id: "table.candidates".into(),
+                        group_column: "cluster_id".into(),
+                        group_value: "7".into(),
+                    },
+                    params: serde_json::json!({ "sigma_max": 3.5 }),
+                },
+                HostActionRequest {
+                    request_id: 2,
+                    action_id: "commit_refit".into(),
+                    scope_payload: HostActionScopePayload::Row {
+                        dataset_id: "table.refit_preview".into(),
+                        row_id: "refit-42".into(),
+                    },
+                    params: serde_json::Value::Null,
+                },
+            ],
+        };
+
+        let json = serde_json::to_vec(&queue).expect("queue must serialize");
+        let decoded: HostActionRequestQueue =
+            serde_json::from_slice(&json).expect("queue must deserialize");
+        assert_eq!(decoded, queue);
+        assert_eq!(
+            CTX_INVESTIGATION_ACTION_REQUESTS,
+            "augur.investigation.action_requests"
+        );
+    }
+
+    #[test]
+    fn plugin_control_messages_round_trip_through_json() {
+        let inbox = PluginControlInbox {
+            service_replies: vec![PluginServiceReply {
+                request_id: 7,
+                source_plugin_id: "workflow.a1".into(),
+                target_plugin_id: "device.modulation".into(),
+                service: "apply.v1".into(),
+                outcome: PluginServiceOutcome::Accepted {
+                    payload: serde_json::json!({"revision": 3}),
+                },
+            }],
+            host_replies: vec![
+                HostCommandReply {
+                    request_id: 8,
+                    outcome: HostCommandOutcome::RecordingStarted {
+                        actual_raw_path: "/data/run.raw".into(),
+                        started_at: "2026-07-20T12:00:00Z".into(),
+                    },
+                },
+                HostCommandReply {
+                    request_id: 9,
+                    outcome: HostCommandOutcome::RecordingPartial {
+                        actual_raw_path: "/data/run.raw".into(),
+                        size: Some(123),
+                        sha256: None,
+                        duration_us: 42,
+                        reason: "writer failed".into(),
+                    },
+                },
+            ],
+            snapshots: vec![PluginControlSnapshot {
+                plugin_id: "device.modulation".into(),
+                topic: "state.v1".into(),
+                revision: 3,
+                payload: serde_json::json!({"connected": true}),
+            }],
+        };
+        let encoded = serde_json::to_vec(&inbox).expect("control inbox must encode");
+        assert_eq!(
+            serde_json::from_slice::<PluginControlInbox>(&encoded).unwrap(),
+            inbox
+        );
+
+        let request = HostCommandRequest {
+            request_id: 9,
+            command: HostCommand::StartRecording {
+                run_id: "run-9".into(),
+                base_path: "/data/run-9".into(),
+                metadata: [("reference_set".into(), "ref-1".into())]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        let encoded = serde_json::to_vec(&request).expect("host request must encode");
+        assert_eq!(
+            serde_json::from_slice::<HostCommandRequest>(&encoded).unwrap(),
+            request
+        );
+
+        let service = PluginServiceRequest {
+            request_id: 10,
+            source_plugin_id: String::new(),
+            target_plugin_id: "device.modulation".into(),
+            service: "output_off.v1".into(),
+            payload: serde_json::Value::Null,
+        };
+        let encoded = serde_json::to_vec(&service).expect("service request must encode");
+        assert_eq!(
+            serde_json::from_slice::<PluginServiceRequest>(&encoded).unwrap(),
+            service
+        );
     }
 
     #[test]

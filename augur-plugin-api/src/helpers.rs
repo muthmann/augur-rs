@@ -2,13 +2,116 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     ffi::{
-        AnalysisSeverity, FfiCdEvent, FfiColorRgba, FfiEventFrame, FfiEventStoreHandle,
-        FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPreviewFrame, FfiSlice, FfiString,
-        FfiSubpixelMarker, PluginCapabilities, PluginInput,
+        AnalysisSeverity, ExecutionMode, FfiCdEvent, FfiColorRgba, FfiEventFrame,
+        FfiEventStoreHandle, FfiExecutionContext, FfiExternalTriggerEvent, FfiMarkerOverlayItem,
+        FfiOutputCallbacks, FfiPixel, FfiPluginContext, FfiPluginControlContext, FfiPreviewFrame,
+        FfiSlice, FfiString, FfiSubpixelMarker, PluginCapabilities, PluginDiscontinuity,
+        PluginInput, PluginRuntimeRole, PluginStateKind,
     },
     settings::{SettingsSchema, StatusEntry},
-    HostViewRegistry,
+    HostCommandRequest, HostViewRegistry, PluginControlInbox, PluginControlSnapshot,
+    PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, SensorMonitoringV1,
+    CTX_SENSOR_MONITORING,
 };
+
+/// Owned view of the host-provided execution context.
+///
+/// Plugins with hardware side effects (serial ports, instruments) must gate
+/// on [`ExecutionContext::hardware_effects_allowed`]: it is `true` only for
+/// the active live-capture worker, never for replay, offline analysis, or
+/// secondary GUI instances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionContext {
+    pub mode: ExecutionMode,
+    pub effects_allowed: bool,
+    pub session_id: Option<String>,
+}
+
+impl ExecutionContext {
+    /// The most restrictive context: replay semantics, no effects.
+    pub fn fail_closed() -> Self {
+        Self {
+            mode: ExecutionMode::Replay,
+            effects_allowed: false,
+            session_id: None,
+        }
+    }
+
+    pub fn hardware_effects_allowed(&self) -> bool {
+        self.mode == ExecutionMode::LiveCapture && self.effects_allowed
+    }
+
+    pub fn from_ffi(raw: &FfiExecutionContext) -> Self {
+        Self {
+            mode: raw.mode,
+            effects_allowed: raw.effects_allowed != 0,
+            session_id: unsafe { raw.session_id.as_str() }
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// Borrows this context into its FFI representation. The returned value
+    /// is only valid while `self` is alive (it borrows `session_id`).
+    pub fn as_ffi(&self) -> FfiExecutionContext {
+        FfiExecutionContext {
+            mode: self.mode,
+            effects_allowed: u8::from(self.effects_allowed),
+            _reserved: [0; 7],
+            session_id: self
+                .session_id
+                .as_deref()
+                .map_or_else(FfiString::empty, FfiString::borrowed),
+        }
+    }
+}
+
+/// Safe, call-scoped wrapper for the frame-independent plugin service plane.
+pub struct PluginControlContext<'a> {
+    raw: &'a mut FfiPluginControlContext,
+    inbox: PluginControlInbox,
+}
+
+impl<'a> PluginControlContext<'a> {
+    pub fn new(raw: &'a mut FfiPluginControlContext) -> Self {
+        let inbox =
+            serde_json::from_slice(unsafe { raw.inbox_json.as_slice() }).unwrap_or_default();
+        Self { raw, inbox }
+    }
+
+    pub fn execution(&self) -> ExecutionContext {
+        ExecutionContext::from_ffi(&self.raw.execution)
+    }
+
+    pub fn inbox(&self) -> &PluginControlInbox {
+        &self.inbox
+    }
+
+    pub fn request_service(&mut self, request: &PluginServiceRequest) -> Result<(), String> {
+        self.emit(request, self.raw.emit_service_request)
+    }
+
+    pub fn request_host(&mut self, request: &HostCommandRequest) -> Result<(), String> {
+        self.emit(request, self.raw.emit_host_command)
+    }
+
+    fn emit<T: Serialize>(
+        &mut self,
+        value: &T,
+        callback: unsafe extern "C" fn(*mut std::ffi::c_void, FfiSlice<u8>),
+    ) -> Result<(), String> {
+        let json = serde_json::to_vec(value).map_err(|err| err.to_string())?;
+        unsafe { callback(self.raw.ctx, FfiSlice::from_slice(&json)) };
+        Ok(())
+    }
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self::fail_closed()
+    }
+}
 
 pub struct PluginFrame<'a> {
     raw: &'a FfiPreviewFrame,
@@ -33,6 +136,13 @@ impl<'a> PluginFrame<'a> {
 
     pub fn events(&self) -> &[FfiCdEvent] {
         unsafe { self.raw.events.as_slice() }
+    }
+
+    /// EVT3 `EXT_TRIGGER` edges inside this frame's window, camera-clock
+    /// timestamps, in timestamp order. Live preview delivery is best-effort;
+    /// replayed RAW recordings deliver exactly.
+    pub fn external_triggers(&self) -> &[FfiExternalTriggerEvent] {
+        unsafe { self.raw.external_triggers.as_slice() }
     }
 
     pub fn window_start_us(&self) -> u64 {
@@ -75,6 +185,24 @@ impl<'a> HostOutput<'a> {
                 FfiSlice::from_slice(markers),
                 FfiColorRgba::from_rgba(color),
                 arm_len,
+            );
+        }
+    }
+
+    pub fn add_marker_overlay(
+        &mut self,
+        markers: &[FfiMarkerOverlayItem],
+        dataset_id: Option<&str>,
+        layer_id: Option<&str>,
+        source_label: Option<&str>,
+    ) {
+        unsafe {
+            (self.raw.add_marker_overlay)(
+                self.raw.ctx,
+                FfiSlice::from_slice(markers),
+                dataset_id.map_or_else(FfiString::empty, FfiString::from),
+                layer_id.map_or_else(FfiString::empty, FfiString::from),
+                source_label.map_or_else(FfiString::empty, FfiString::from),
             );
         }
     }
@@ -169,9 +297,9 @@ impl<'a> EventStoreHandle<'a> {
                 continue;
             };
             let events = unsafe { frame.as_slice() };
-            let start_index = events.partition_point(|event| event.timestamp < start_us);
-            let end_index = events.partition_point(|event| event.timestamp <= end_us);
-            out.extend_from_slice(&events[start_index..end_index]);
+            out.extend_from_slice(augur_event_types::inclusive_window(
+                events, start_us, end_us,
+            ));
         }
     }
 
@@ -191,6 +319,31 @@ impl<'a> HostContext<'a> {
 
     pub fn raw_events(&self) -> &[FfiCdEvent] {
         unsafe { self.raw.raw_events.as_slice() }
+    }
+
+    /// The host-provided execution context for this invocation.
+    pub fn execution(&self) -> ExecutionContext {
+        let raw = &self.raw.execution;
+        ExecutionContext {
+            mode: raw.mode,
+            effects_allowed: raw.effects_allowed != 0,
+            session_id: unsafe { raw.session_id.as_str() }
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// Absolute values measured by the sensor for this frame's capture.
+    ///
+    /// `None` whenever the host has nothing to report — replay, decoded
+    /// imports, offline analysis runs, or a camera without a monitoring block.
+    /// Treat it as optional context (logging, provenance, a sanity check on
+    /// the light level); a plugin whose *results* depend on it would produce
+    /// different answers live than in a deterministic offline re-run of the
+    /// same recording.
+    pub fn sensor_monitoring(&self) -> Option<SensorMonitoringV1> {
+        self.get(CTX_SENSOR_MONITORING).ok().flatten()
     }
 
     pub fn publish_raw(&mut self, key: &str, value: &[u8]) {
@@ -280,10 +433,24 @@ pub trait Plugin: Default {
 
     fn set_enabled(&mut self, enabled: bool);
 
+    /// Informs the instance whether it is a configuration mirror, the
+    /// effectful live worker, or an offline analysis instance.
+    fn set_runtime_role(&mut self, _role: PluginRuntimeRole) {}
+
     fn reset(&mut self);
+
+    fn on_discontinuity(&mut self, _reason: PluginDiscontinuity) {
+        if self.plugin_state_kind() == PluginStateKind::Accumulating {
+            self.reset();
+        }
+    }
 
     fn input_kind(&self) -> PluginInput {
         PluginInput::FrameOnly
+    }
+
+    fn plugin_state_kind(&self) -> PluginStateKind {
+        PluginStateKind::Accumulating
     }
 
     fn capabilities(&self) -> PluginCapabilities {
@@ -301,6 +468,35 @@ pub trait Plugin: Default {
         context: &mut HostContext<'_>,
         event_store: &EventStoreHandle<'_>,
     );
+
+    /// Frame-independent service-plane tick. The live worker invokes this at
+    /// a bounded cadence even when no camera frame is available.
+    fn process_control(&mut self, _context: &mut PluginControlContext<'_>) {}
+
+    /// Handle one semantic request on the target plugin's worker-owned
+    /// instance. The default is fail-closed.
+    fn handle_service_request(
+        &mut self,
+        request: &PluginServiceRequest,
+        _execution: &ExecutionContext,
+    ) -> PluginServiceReply {
+        PluginServiceReply {
+            request_id: request.request_id,
+            source_plugin_id: request.source_plugin_id.clone(),
+            target_plugin_id: request.target_plugin_id.clone(),
+            service: request.service.clone(),
+            outcome: PluginServiceOutcome::Rejected {
+                code: "unsupported_service".into(),
+                message: format!("service '{}' is not supported", request.service),
+            },
+        }
+    }
+
+    /// Small versioned status snapshots available to peer plugins on the
+    /// next control tick. Bulk data must use datasets or plugin-owned files.
+    fn control_snapshots(&self) -> Vec<PluginControlSnapshot> {
+        Vec::new()
+    }
 
     fn settings_schema(&self) -> SettingsSchema {
         SettingsSchema::default()
@@ -381,12 +577,7 @@ mod tests {
     }
 
     fn event(timestamp: u64, x: u16) -> FfiCdEvent {
-        FfiCdEvent {
-            timestamp,
-            x,
-            y: 0,
-            polarity: 1,
-        }
+        FfiCdEvent::new(x, 0, timestamp, 1)
     }
 
     unsafe extern "C" fn frame_count(ctx: *const c_void) -> usize {
@@ -450,6 +641,66 @@ mod tests {
     }
 
     #[test]
+    fn execution_context_round_trips_through_ffi() {
+        use super::ExecutionContext;
+        use crate::ffi::ExecutionMode;
+
+        let owned = ExecutionContext {
+            mode: ExecutionMode::LiveCapture,
+            effects_allowed: true,
+            session_id: Some("run-42".into()),
+        };
+        let ffi = owned.as_ffi();
+
+        let mut capture = PublishCapture::default();
+        let mut context = FfiPluginContext {
+            ctx: &mut capture as *mut _ as *mut c_void,
+            raw_events: FfiSlice::empty(),
+            publish: publish_transient,
+            get: get_missing,
+            publish_persistent,
+            get_persistent: get_missing,
+            execution: ffi,
+        };
+        let host = HostContext::new(&mut context);
+
+        let decoded = host.execution();
+        assert_eq!(decoded, owned);
+        assert!(decoded.hardware_effects_allowed());
+
+        // Fail-closed default: replay + no effects + no session.
+        let closed = ExecutionContext::fail_closed();
+        assert!(!closed.hardware_effects_allowed());
+        assert_eq!(closed.mode, ExecutionMode::Replay);
+        assert!(closed.session_id.is_none());
+    }
+
+    #[test]
+    fn plugin_frame_exposes_external_triggers() {
+        use crate::ffi::FfiExternalTriggerEvent;
+        use crate::PluginFrame;
+
+        let triggers = [
+            FfiExternalTriggerEvent::new(10, 0, true),
+            FfiExternalTriggerEvent::new(20, 0, false),
+        ];
+        let raw = crate::FfiPreviewFrame {
+            width: 4,
+            height: 4,
+            pixels: FfiSlice::empty(),
+            events: FfiSlice::empty(),
+            external_triggers: FfiSlice::from_slice(&triggers),
+            window_start_us: 0,
+            window_end_us: 30,
+        };
+        let frame = PluginFrame::new(&raw);
+
+        assert_eq!(frame.external_triggers().len(), 2);
+        assert!(frame.external_triggers()[0].is_rising());
+        assert_eq!(frame.external_triggers()[1].timestamp_us, 20);
+    }
+
+    #[test]
     fn host_context_supports_raw_and_json_publishing() {
         let mut capture = PublishCapture::default();
         let mut ffi = FfiPluginContext {
@@ -459,6 +710,7 @@ mod tests {
             get: get_missing,
             publish_persistent,
             get_persistent: get_missing,
+            execution: crate::ffi::FfiExecutionContext::fail_closed(),
         };
         let mut host = HostContext::new(&mut ffi);
 

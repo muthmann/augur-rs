@@ -1,0 +1,35 @@
+name: Packaging
+
+# Packaging used to be exercised only when a tag was pushed, which meant a
+# broken installer script was discovered at the worst possible moment and could
+# not be retried without cutting another tag. Build the real artifacts on any
+# pull request that touches packaging, and publish nothing.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/packaging.yml"
+      - ".github/workflows/release.yml"
+      - ".github/scripts/**"
+      - "resources/**"
+      - "assets/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dry-run:
+    name: Build installers
+    uses: ./.github/workflows/release.yml
+    # A called workflow cannot request more than its caller grants, and
+    # release.yml needs contents:write for the publishing path. Nothing is
+    # published here: `publish: false` skips that step outright.
+    permissions:
+      contents: write
+    with:
+      tag: ${{ github.head_ref || github.ref_name }}
+      publish: false

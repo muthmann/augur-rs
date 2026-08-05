@@ -10,6 +10,8 @@ macro_rules! export_plugin {
                 status_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 host_views_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
                 host_view_dataset_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
+                service_reply_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
+                control_snapshots_json: ::std::cell::RefCell<::std::vec::Vec<u8>>,
             }
 
             impl __AugurExportedPlugin {
@@ -21,6 +23,8 @@ macro_rules! export_plugin {
                         status_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         host_views_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                         host_view_dataset_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
+                        service_reply_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
+                        control_snapshots_json: ::std::cell::RefCell::new(::std::vec::Vec::new()),
                     }
                 }
             }
@@ -101,10 +105,32 @@ macro_rules! export_plugin {
                 }));
             }
 
+            unsafe extern "C" fn __set_runtime_role(
+                instance: *mut ::std::ffi::c_void,
+                role: $crate::PluginRuntimeRole,
+            ) {
+                let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    if let Some(plugin) = __instance_mut(instance) {
+                        plugin.plugin.set_runtime_role(role);
+                    }
+                }));
+            }
+
             unsafe extern "C" fn __reset(instance: *mut ::std::ffi::c_void) {
                 let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     if let Some(plugin) = __instance_mut(instance) {
                         plugin.plugin.reset();
+                    }
+                }));
+            }
+
+            unsafe extern "C" fn __on_discontinuity(
+                instance: *mut ::std::ffi::c_void,
+                reason: $crate::PluginDiscontinuity,
+            ) {
+                let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    if let Some(plugin) = __instance_mut(instance) {
+                        plugin.plugin.on_discontinuity(reason);
                     }
                 }));
             }
@@ -118,6 +144,17 @@ macro_rules! export_plugin {
                         .unwrap_or($crate::PluginInput::FrameOnly)
                 })
                 .unwrap_or($crate::PluginInput::FrameOnly)
+            }
+
+            unsafe extern "C" fn __plugin_state_kind(
+                instance: *const ::std::ffi::c_void,
+            ) -> $crate::PluginStateKind {
+                ::std::panic::catch_unwind(|| {
+                    __instance_ref(instance)
+                        .map(|plugin| plugin.plugin.plugin_state_kind())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
             }
 
             unsafe extern "C" fn __capabilities(
@@ -191,6 +228,83 @@ macro_rules! export_plugin {
                         .plugin
                         .process_frame(&frame, &mut output, &mut context, &event_store);
                 }));
+            }
+
+            unsafe extern "C" fn __process_control(
+                instance: *mut ::std::ffi::c_void,
+                context: *mut $crate::FfiPluginControlContext,
+            ) {
+                let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    let Some(plugin) = __instance_mut(instance) else {
+                        return;
+                    };
+                    let Some(context) = context.as_mut() else {
+                        return;
+                    };
+                    let mut context = $crate::PluginControlContext::new(context);
+                    plugin.plugin.process_control(&mut context);
+                }));
+            }
+
+            unsafe extern "C" fn __handle_service_request(
+                instance: *mut ::std::ffi::c_void,
+                request: $crate::FfiSlice<u8>,
+                execution: $crate::FfiExecutionContext,
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) {
+                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    let Some(plugin) = __instance_mut(instance) else {
+                        unsafe { $crate::__private::clear_out_bytes(out_ptr, out_len) };
+                        return;
+                    };
+                    let Ok(request) = ::serde_json::from_slice::<$crate::PluginServiceRequest>(
+                        request.as_slice(),
+                    ) else {
+                        unsafe { $crate::__private::clear_out_bytes(out_ptr, out_len) };
+                        return;
+                    };
+                    let execution = $crate::ExecutionContext::from_ffi(&execution);
+                    let reply = plugin.plugin.handle_service_request(&request, &execution);
+                    let json = ::serde_json::to_vec(&reply).unwrap_or_default();
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.service_reply_json,
+                            json,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
+                }));
+                if result.is_err() {
+                    unsafe { $crate::__private::clear_out_bytes(out_ptr, out_len) };
+                }
+            }
+
+            unsafe extern "C" fn __control_snapshots(
+                instance: *const ::std::ffi::c_void,
+                out_ptr: *mut *const u8,
+                out_len: *mut usize,
+            ) {
+                let result = ::std::panic::catch_unwind(|| {
+                    let Some(plugin) = __instance_ref(instance) else {
+                        unsafe { $crate::__private::clear_out_bytes(out_ptr, out_len) };
+                        return;
+                    };
+                    let json = ::serde_json::to_vec(&plugin.plugin.control_snapshots())
+                        .unwrap_or_default();
+                    unsafe {
+                        $crate::__private::write_bytes(
+                            &plugin.control_snapshots_json,
+                            json,
+                            out_ptr,
+                            out_len,
+                        );
+                    }
+                });
+                if result.is_err() {
+                    unsafe { $crate::__private::clear_out_bytes(out_ptr, out_len) };
+                }
             }
 
             unsafe extern "C" fn __settings_schema(
@@ -393,12 +507,18 @@ macro_rules! export_plugin {
                 description: __description,
                 enabled: __enabled,
                 set_enabled: __set_enabled,
+                set_runtime_role: __set_runtime_role,
                 reset: __reset,
+                on_discontinuity: __on_discontinuity,
                 input_kind: __input_kind,
                 capabilities: __capabilities,
+                plugin_state_kind: __plugin_state_kind,
                 num_dependencies: __num_dependencies,
                 dependency: __dependency,
                 process_frame: __process_frame,
+                process_control: __process_control,
+                handle_service_request: __handle_service_request,
+                control_snapshots: __control_snapshots,
                 settings_schema: __settings_schema,
                 get_setting: __get_setting,
                 set_setting: __set_setting,

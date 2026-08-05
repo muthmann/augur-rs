@@ -1,82 +1,151 @@
-use std::collections::VecDeque;
+use std::{cell::RefCell, collections::VecDeque, ops::Range, sync::Arc};
 
-use augur_core::{config::RoiConfig, pipeline::CdEvent};
+use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
+use augur_event_types::FrameWindowEntry;
 
-use crate::app::PANEL_ROUNDING;
 const DEFAULT_TIME_WINDOW_MS: f32 = 120.0;
 const MIN_TIME_WINDOW_MS: f32 = 5.0;
-const MAX_TIME_WINDOW_MS: f32 = 2_000.0;
+const MAX_TIME_WINDOW_MS: f32 = MAX_HISTORY_MS;
 const DEFAULT_POINT_LIMIT: usize = 12_000;
 const MIN_POINT_LIMIT: usize = 1_000;
 const MAX_POINT_LIMIT: usize = 100_000;
 const MAX_HISTORY_POINTS: usize = 400_000;
 const MAX_HISTORY_MS: f32 = 5_000.0;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PointCloudMetrics {
-    pub visible_points: usize,
-    pub rendered_points: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VisibleHistoryWindow {
-    lo: usize,
-    hi: usize,
-    start_ts: u64,
-    end_ts: u64,
-    step: usize,
+#[derive(Debug, Clone)]
+struct RetainedEventFrame {
+    source: LiveEventSource,
+    event_range: Range<u64>,
+    window_start_us: u64,
+    window_end_us: u64,
+    event_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct PointCloudState {
-    history: VecDeque<CdEvent>,
+    frames: VecDeque<RetainedEventFrame>,
     pub time_window_ms: f32,
     pub point_limit: usize,
-    azimuth: f32,
-    elevation: f32,
-    distance: f32,
+    /// Bumped whenever `frames` changes so a stale memoized summary is rejected.
+    generation: u64,
+    /// Memoized result of the last `visible_summary_at` so the per-frame scene
+    /// build and footer status don't each re-scan and re-decode the ring.
+    summary_cache: RefCell<Option<CachedSummary>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SummaryKey {
+    anchor_end_us: u64,
+    time_window_bits: u32,
+    point_limit: usize,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSummary {
+    key: SummaryKey,
+    value: VisiblePointCloudEvents,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VisiblePointCloudEvents {
+    /// Shared so the memoized summary can be handed out per UI frame without
+    /// cloning up to `point_limit` events each time.
+    pub events: Arc<[CdEvent]>,
+    pub retained_time_span_ms: Option<f32>,
+    pub sampled_count: usize,
+    pub effective_time_window_ms: f32,
 }
 
 impl Default for PointCloudState {
     fn default() -> Self {
         Self {
-            history: VecDeque::with_capacity(32_768),
+            frames: VecDeque::with_capacity(512),
             time_window_ms: DEFAULT_TIME_WINDOW_MS,
             point_limit: DEFAULT_POINT_LIMIT,
-            azimuth: 0.65,
-            elevation: 0.55,
-            distance: 2.35,
+            generation: 0,
+            summary_cache: RefCell::new(None),
         }
     }
 }
 
 impl PointCloudState {
     pub fn clear(&mut self) {
-        self.history.clear();
+        self.frames.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
-    pub fn reset_camera(&mut self) {
-        self.azimuth = 0.65;
-        self.elevation = 0.55;
-        self.distance = 2.35;
-    }
-
-    pub fn push_events(&mut self, events: &[CdEvent]) {
-        if events.is_empty() {
+    pub fn push_frame(&mut self, frame: &PreviewFrame) {
+        let Some(source) = frame.event_source.clone() else {
+            return;
+        };
+        let Some(event_range) = frame.event_range.clone() else {
+            return;
+        };
+        let Some(event_count) = frame.event_count() else {
+            return;
+        };
+        if event_count == 0 {
             return;
         }
 
-        // When the incoming batch alone exceeds the cap, only keep its tail —
-        // extending and then immediately draining would waste an allocation.
-        let events = if events.len() >= MAX_HISTORY_POINTS {
-            self.history.clear();
-            &events[events.len() - MAX_HISTORY_POINTS..]
+        if event_count >= MAX_HISTORY_POINTS {
+            self.frames.clear();
         } else {
-            events
-        };
+            self.trim_to_point_budget(MAX_HISTORY_POINTS.saturating_sub(event_count));
+        }
 
-        self.history.extend(events.iter().copied());
+        self.frames.push_back(RetainedEventFrame {
+            source,
+            event_range,
+            window_start_us: frame.window_start_us,
+            window_end_us: frame.window_end_us,
+            event_count,
+        });
         self.trim_history();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Whether the retained history fully spans `[start_us, end_us]`, so an
+    /// anchored summary inside that window can be served without refilling.
+    pub fn covers_window(&self, start_us: u64, end_us: u64) -> bool {
+        let (Some(front), Some(back)) = (self.frames.front(), self.frames.back()) else {
+            return false;
+        };
+        front.window_start_us <= start_us && back.window_end_us >= end_us
+    }
+
+    /// Replaces the retained history with the frame windows currently
+    /// resident in the upstream ring. Used after a replay seek: the seek
+    /// sprint archives every decoded frame into the ring even when the
+    /// bounded preview channel drops the frame object, so rebuilding from the
+    /// ring gives the 3D view a gap-free look-back window.
+    pub fn rebuild_from_source_frames(
+        &mut self,
+        source: &LiveEventSource,
+        entries: &[FrameWindowEntry],
+    ) {
+        self.frames.clear();
+        for entry in entries {
+            let event_count = entry.event_count as usize;
+            if event_count == 0 {
+                continue;
+            }
+            if event_count >= MAX_HISTORY_POINTS {
+                self.frames.clear();
+            } else {
+                self.trim_to_point_budget(MAX_HISTORY_POINTS.saturating_sub(event_count));
+            }
+            self.frames.push_back(RetainedEventFrame {
+                source: source.clone(),
+                event_range: entry.first_event_idx..entry.end_event_idx(),
+                window_start_us: entry.window_start_us,
+                window_end_us: entry.window_end_us,
+                event_count,
+            });
+        }
+        self.trim_history();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn sanitize_controls(&mut self) {
@@ -86,367 +155,306 @@ impl PointCloudState {
         self.point_limit = self.point_limit.clamp(MIN_POINT_LIMIT, MAX_POINT_LIMIT);
     }
 
-    pub fn draw(
-        &mut self,
-        ui: &mut egui::Ui,
-        roi: RoiConfig,
-        max_height: f32,
-    ) -> PointCloudMetrics {
-        self.sanitize_controls();
+    pub fn visible_summary(&self) -> VisiblePointCloudEvents {
+        let Some(latest) = self.frames.back() else {
+            return self.empty_visible_summary();
+        };
+        self.visible_summary_at(latest.window_end_us)
+    }
 
-        let available = ui.available_size_before_wrap();
-        let desired_size = egui::vec2(
-            available.x.max(320.0),
-            available.y.min(max_height).max(260.0),
-        );
-        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
-        let painter = ui.painter_at(rect.intersect(ui.clip_rect()));
-
-        painter.rect_filled(rect, PANEL_ROUNDING, ui.visuals().extreme_bg_color);
-        painter.rect_stroke(
-            rect,
-            PANEL_ROUNDING,
-            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
-        );
-
-        if response.dragged() {
-            let delta = ui.ctx().input(|input| input.pointer.delta());
-            self.azimuth -= delta.x * 0.01;
-            self.elevation = (self.elevation + delta.y * 0.01).clamp(-1.2, 1.2);
-        }
-
-        if response.hovered() {
-            let scroll_y = ui.ctx().input(|input| input.raw_scroll_delta.y);
-            if scroll_y.abs() > f32::EPSILON {
-                self.distance = (self.distance * (1.0 - scroll_y * 0.0015)).clamp(1.1, 7.5);
+    pub fn visible_summary_at(&self, anchor_end_us: u64) -> VisiblePointCloudEvents {
+        let key = SummaryKey {
+            anchor_end_us,
+            time_window_bits: self.time_window_ms.to_bits(),
+            point_limit: self.point_limit,
+            generation: self.generation,
+        };
+        if let Some(cached) = self.summary_cache.borrow().as_ref() {
+            if cached.key == key {
+                return cached.value.clone();
             }
         }
+        let value = self.compute_visible_summary_at(anchor_end_us);
+        *self.summary_cache.borrow_mut() = Some(CachedSummary {
+            key,
+            value: value.clone(),
+        });
+        value
+    }
 
-        let metrics = self.paint_points(&painter, rect, roi);
-        if metrics.rendered_points == 0 {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "No recent raw events available for the 3D view.",
-                egui::FontId::proportional(15.0),
-                ui.visuals().weak_text_color(),
-            );
+    fn compute_visible_summary_at(&self, anchor_end_us: u64) -> VisiblePointCloudEvents {
+        let mut events = self.visible_event_candidates_at(anchor_end_us);
+        if events.is_empty() {
+            return self.empty_visible_summary();
         }
 
-        metrics
+        let retained_time_span_ms = events
+            .first()
+            .zip(events.last())
+            .map(|(first, last)| last.timestamp.saturating_sub(first.timestamp) as f32 / 1_000.0);
+        let step = events.len().div_ceil(self.point_limit.max(1)).max(1);
+        if step > 1 {
+            let mut sampled = Vec::with_capacity(events.len() / step + 1);
+            sampled.extend(events.into_iter().step_by(step));
+            events = sampled;
+        }
+        let sampled_count = events.len();
+        VisiblePointCloudEvents {
+            events: events.into(),
+            retained_time_span_ms,
+            sampled_count,
+            effective_time_window_ms: retained_time_span_ms
+                .unwrap_or(self.time_window_ms)
+                .max(1.0),
+        }
+    }
+
+    fn empty_visible_summary(&self) -> VisiblePointCloudEvents {
+        VisiblePointCloudEvents {
+            events: Arc::from(Vec::new()),
+            retained_time_span_ms: None,
+            sampled_count: 0,
+            effective_time_window_ms: self.time_window_ms.max(1.0),
+        }
     }
 
     fn trim_history(&mut self) {
-        let len = self.history.len();
-        if len > MAX_HISTORY_POINTS {
-            self.history.drain(..len - MAX_HISTORY_POINTS);
-        }
+        self.trim_to_point_budget(MAX_HISTORY_POINTS);
 
-        let Some(latest) = self.history.back() else {
+        let Some(latest) = self.frames.back() else {
             return;
         };
         let cutoff = latest
-            .timestamp
+            .window_end_us
             .saturating_sub((MAX_HISTORY_MS * 1_000.0).round() as u64);
-        let cutoff_idx = self.history.partition_point(|e| e.timestamp < cutoff);
-        if cutoff_idx > 0 {
-            self.history.drain(..cutoff_idx);
+        while self
+            .frames
+            .front()
+            .is_some_and(|frame| frame.window_end_us < cutoff)
+        {
+            self.frames.pop_front();
         }
     }
 
-    fn downsample_step(&self, slice_len: usize) -> usize {
-        slice_len.div_ceil(self.point_limit.max(1)).max(1)
+    fn trim_to_point_budget(&mut self, max_points: usize) {
+        let mut total = self.retained_event_count();
+        while self.frames.len() > 1 && total > max_points {
+            total -= self.frames.pop_front().map(|f| f.event_count).unwrap_or(0);
+        }
     }
 
-    fn visible_history_window(&self) -> Option<VisibleHistoryWindow> {
-        let latest = self.history.back()?;
-        let end_ts = latest.timestamp;
+    fn retained_event_count(&self) -> usize {
+        self.frames.iter().map(|frame| frame.event_count).sum()
+    }
+
+    fn visible_event_candidates_at(&self, end_ts: u64) -> Vec<CdEvent> {
         let start_ts = end_ts.saturating_sub((self.time_window_ms * 1_000.0).round() as u64);
-
-        // Binary-search the sorted history to get only the time-windowed slice.
-        // This avoids iterating the full (up to 400 K) history on every frame.
-        let lo = self.history.partition_point(|e| e.timestamp < start_ts);
-        let hi = self.history.partition_point(|e| e.timestamp <= end_ts);
-        if lo >= hi {
-            return None;
-        }
-
-        Some(VisibleHistoryWindow {
-            lo,
-            hi,
-            start_ts,
-            end_ts,
-            step: self.downsample_step(hi - lo),
-        })
-    }
-
-    fn paint_points(
-        &self,
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        roi: RoiConfig,
-    ) -> PointCloudMetrics {
-        let Some(window) = self.visible_history_window() else {
-            return PointCloudMetrics::default();
+        let overlapping = |frame: &&RetainedEventFrame| {
+            frame.window_end_us >= start_ts && frame.window_start_us <= end_ts
         };
-
-        let roi = sanitize_roi(roi);
-
-        // Precompute the camera transform once — avoids sin/cos per point.
-        let cam = CameraView::new(self.azimuth, self.elevation, self.distance, rect);
-        draw_axes(painter, cam);
-
-        let mut visible_points = 0usize;
-        let mut rendered_points = 0usize;
-        for (idx, event) in self.history.range(window.lo..window.hi).enumerate() {
-            if !roi_contains(event, &roi) {
-                continue;
-            }
-            visible_points += 1;
-            if idx % window.step != 0 {
-                continue;
-            }
-            let Some(projected) = project_event(event, &roi, window.start_ts, window.end_ts, cam)
-            else {
-                continue;
-            };
-
-            painter.circle_filled(
-                projected.position,
-                projected.radius,
-                if event.polarity {
-                    egui::Color32::from_rgb(244, 244, 244)
-                } else {
-                    egui::Color32::from_rgb(55, 96, 210)
-                },
-            );
-            rendered_points += 1;
-        }
-
-        PointCloudMetrics {
-            visible_points,
-            rendered_points,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProjectedPoint {
-    position: egui::Pos2,
-    radius: f32,
-}
-
-fn sanitize_roi(roi: RoiConfig) -> RoiConfig {
-    let width = roi.width.max(1);
-    let height = roi.height.max(1);
-    RoiConfig {
-        x: roi.x,
-        y: roi.y,
-        width,
-        height,
-    }
-}
-
-/// Precomputed camera transform — compute once per frame, reuse for every projected point.
-#[derive(Clone, Copy)]
-struct CameraView {
-    cos_az: f32,
-    sin_az: f32,
-    cos_el: f32,
-    sin_el: f32,
-    distance: f32,
-    /// `min(width, height) * 0.42` — constant for a given rect.
-    scale: f32,
-    center: egui::Pos2,
-}
-
-impl CameraView {
-    fn new(azimuth: f32, elevation: f32, distance: f32, rect: egui::Rect) -> Self {
-        Self {
-            cos_az: azimuth.cos(),
-            sin_az: azimuth.sin(),
-            cos_el: elevation.cos(),
-            sin_el: elevation.sin(),
-            distance,
-            scale: rect.width().min(rect.height()) * 0.42,
-            center: rect.center(),
-        }
-    }
-
-    fn project(&self, point: [f32; 3]) -> Option<ProjectedPoint> {
-        let [mut x, y, mut z] = point;
-        let rotated_x = x * self.cos_az - z * self.sin_az;
-        let rotated_z = x * self.sin_az + z * self.cos_az;
-        x = rotated_x;
-        z = rotated_z;
-
-        let rotated_y = y * self.cos_el - z * self.sin_el;
-        let rotated_z = y * self.sin_el + z * self.cos_el;
-
-        let depth = self.distance + rotated_z;
-        if depth <= 0.05 {
-            return None;
-        }
-
-        let perspective = self.scale / depth;
-        Some(ProjectedPoint {
-            position: egui::pos2(
-                self.center.x + x * perspective,
-                self.center.y - rotated_y * perspective,
-            ),
-            radius: (1.2 + 1.2 / depth).clamp(1.0, 3.2),
-        })
-    }
-}
-
-fn roi_contains(event: &CdEvent, roi: &RoiConfig) -> bool {
-    event.x >= roi.x
-        && event.x < roi.x.saturating_add(roi.width)
-        && event.y >= roi.y
-        && event.y < roi.y.saturating_add(roi.height)
-}
-
-#[cfg(test)]
-fn point_is_visible(event: &CdEvent, roi: &RoiConfig, start_ts: u64, end_ts: u64) -> bool {
-    event.timestamp >= start_ts && event.timestamp <= end_ts && roi_contains(event, roi)
-}
-
-fn draw_axes(painter: &egui::Painter, cam: CameraView) {
-    let axes = [
-        (
-            [0.0, 0.0, 0.0f32],
-            [1.0, 0.0, 0.0f32],
-            egui::Color32::from_rgb(220, 96, 96),
-            "x",
-        ),
-        (
-            [0.0, 0.0, 0.0f32],
-            [0.0, 1.0, 0.0f32],
-            egui::Color32::from_rgb(96, 220, 140),
-            "y",
-        ),
-        (
-            [0.0, 0.0, 0.0f32],
-            [0.0, 0.0, 1.0f32],
-            egui::Color32::from_rgb(96, 160, 240),
-            "t",
-        ),
-    ];
-
-    for (start, end, color, label) in axes {
-        let Some(start) = cam.project(start) else {
-            continue;
-        };
-        let Some(end) = cam.project(end) else {
-            continue;
-        };
-        painter.line_segment(
-            [start.position, end.position],
-            egui::Stroke::new(1.5_f32, color),
+        let mut events = Vec::with_capacity(
+            self.frames
+                .iter()
+                .filter(overlapping)
+                .map(|frame| frame.event_count)
+                .sum(),
         );
-        painter.text(
-            end.position,
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(13.0),
-            color,
-        );
+        for frame in self.frames.iter().filter(overlapping) {
+            // Zero-copy visit straight out of the shared ring: the previous
+            // per-frame `events_for_range` path allocated two vectors per
+            // retained frame on every recompute.
+            frame
+                .source
+                .for_each_compact_event_in_range(frame.event_range.clone(), |compact| {
+                    let event = CdEvent::from(compact);
+                    if event.timestamp >= start_ts && event.timestamp <= end_ts {
+                        events.push(event);
+                    }
+                });
+        }
+        events
     }
-}
-
-fn project_event(
-    event: &CdEvent,
-    roi: &RoiConfig,
-    start_ts: u64,
-    end_ts: u64,
-    cam: CameraView,
-) -> Option<ProjectedPoint> {
-    let x = (event.x.saturating_sub(roi.x)) as f32 / roi.width as f32 - 0.5;
-    let y = 0.5 - (event.y.saturating_sub(roi.y)) as f32 / roi.height as f32;
-    let t_span = end_ts.saturating_sub(start_ts).max(1) as f32;
-    let z = (event.timestamp.saturating_sub(start_ts)) as f32 / t_span - 0.5;
-    cam.project([x, y, z])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{point_is_visible, CameraView, PointCloudState};
-    use augur_core::{config::RoiConfig, pipeline::CdEvent};
+    use super::PointCloudState;
+    use augur_core::pipeline::{CdEvent, LiveEventSource, PreviewFrame};
+
+    fn event(timestamp: u64, x: u16, y: u16) -> CdEvent {
+        CdEvent {
+            timestamp,
+            x,
+            y,
+            polarity: true,
+        }
+    }
+
+    fn frame(events: &[CdEvent]) -> PreviewFrame {
+        let source = LiveEventSource::default();
+        let window_start_us = events.first().map_or(0, |event| event.timestamp);
+        let window_end_us = events
+            .last()
+            .map_or(window_start_us, |event| event.timestamp);
+        let event_range = source
+            .append_cd_frame(events, window_start_us, window_end_us)
+            .expect("frame events must append");
+        PreviewFrame {
+            width: 1280,
+            height: 720,
+            pixels: Vec::new(),
+            pixels_on: Vec::new(),
+            pixels_off: Vec::new(),
+            cached_total_histogram: Vec::new(),
+            cached_signed_histogram: Vec::new(),
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            event_range: Some(event_range),
+            event_source: Some(source),
+            external_triggers: Vec::new(),
+            window_start_us,
+            window_end_us,
+        }
+    }
 
     #[test]
-    fn point_cloud_trims_old_history_and_excess_points() {
-        let mut state = PointCloudState::default();
-        let events: Vec<CdEvent> = (0..410_000)
-            .map(|idx| CdEvent {
-                x: 10,
-                y: 10,
-                timestamp: idx as u64,
-                polarity: idx % 2 == 0,
-            })
-            .collect();
-
-        state.push_events(&events);
-
+    fn default_controls_have_sane_values() {
+        let state = PointCloudState::default();
+        assert!(state.time_window_ms >= 5.0);
         assert!(state.point_limit >= 1_000);
     }
 
     #[test]
-    fn visible_window_uses_latest_time_slice_and_downsamples() {
+    fn visible_events_respect_time_window_and_limit() {
         let mut state = PointCloudState {
-            time_window_ms: 1_000.0,
+            time_window_ms: 1.0,
             point_limit: 2,
-            ..Default::default()
+            ..PointCloudState::default()
         };
+        state.push_frame(&frame(&[
+            event(0, 0, 0),
+            event(500, 1, 0),
+            event(1_000, 2, 0),
+            event(1_250, 3, 0),
+            event(1_500, 4, 0),
+        ]));
 
-        let events: Vec<CdEvent> = (0..6)
-            .map(|idx| CdEvent {
-                x: 10,
-                y: 10,
-                timestamp: idx as u64 * 10,
-                polarity: idx % 2 == 0,
-            })
-            .collect();
-        state.push_events(&events);
+        let visible = state.visible_summary().events;
 
-        let window = state.visible_history_window().expect("window should exist");
-        assert_eq!((window.lo, window.hi), (0, 6));
-        assert_eq!(window.start_ts, 0);
-        assert_eq!(window.end_ts, 50);
-        assert_eq!(window.step, 3);
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().all(|event| event.timestamp >= 500));
     }
 
     #[test]
-    fn point_visibility_respects_roi_and_time_window() {
-        let roi = RoiConfig {
-            x: 5,
-            y: 8,
-            width: 20,
-            height: 10,
-        };
-        let visible = CdEvent {
-            x: 10,
-            y: 12,
-            timestamp: 120,
-            polarity: true,
-        };
-        let outside = CdEvent {
-            x: 40,
-            y: 12,
-            timestamp: 120,
-            polarity: false,
-        };
+    fn clear_drops_history() {
+        let mut state = PointCloudState::default();
+        state.push_frame(&frame(&[event(10, 1, 1), event(20, 2, 2)]));
 
-        assert!(point_is_visible(&visible, &roi, 100, 130));
-        assert!(!point_is_visible(&outside, &roi, 100, 130));
+        state.clear();
+
+        let summary = state.visible_summary();
+        assert!(summary.events.is_empty());
+        assert_eq!(summary.sampled_count, 0);
     }
 
     #[test]
-    fn projection_returns_screen_point_for_visible_depth() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
-        let cam = CameraView::new(0.6, 0.5, 2.0, rect);
-        let projected = cam.project([0.1, 0.2, 0.1]).expect("point should project");
+    fn effective_time_window_tracks_retained_history_span() {
+        let mut state = PointCloudState {
+            time_window_ms: 400.0,
+            point_limit: 8,
+            ..PointCloudState::default()
+        };
+        state.push_frame(&frame(&[
+            event(10_000, 0, 0),
+            event(10_500, 1, 0),
+            event(11_000, 2, 0),
+        ]));
 
-        assert!(rect.contains(projected.position));
-        assert!(projected.radius >= 1.0);
+        let summary = state.visible_summary();
+        assert_eq!(summary.retained_time_span_ms, Some(1.0));
+        assert_eq!(summary.effective_time_window_ms, 1.0);
+    }
+
+    #[test]
+    fn covers_window_reflects_retained_span() {
+        let mut state = PointCloudState::default();
+        assert!(!state.covers_window(0, 10));
+
+        state.push_frame(&frame(&[event(1_000, 0, 0), event(2_000, 1, 0)]));
+        state.push_frame(&frame(&[event(3_000, 2, 0), event(4_000, 3, 0)]));
+
+        assert!(state.covers_window(1_000, 4_000));
+        assert!(state.covers_window(2_000, 3_000));
+        assert!(!state.covers_window(500, 3_000), "starts before history");
+        assert!(!state.covers_window(2_000, 5_000), "ends after history");
+    }
+
+    #[test]
+    fn rebuild_from_source_frames_replaces_history_from_ring_entries() {
+        use augur_core::pipeline::LiveEventSource;
+
+        let mut state = PointCloudState {
+            time_window_ms: 100.0,
+            ..PointCloudState::default()
+        };
+        // Stale history that must be replaced.
+        state.push_frame(&frame(&[event(99_000, 9, 9)]));
+
+        let source = LiveEventSource::with_capacity(16);
+        source
+            .append_cd_frame(&[event(1_000, 0, 0), event(2_000, 1, 0)], 1_000, 2_000)
+            .expect("first ring frame appends");
+        source
+            .append_cd_frame(&[event(3_000, 2, 0)], 2_000, 3_000)
+            .expect("second ring frame appends");
+        let entries = source.retained_frame_entries();
+        assert_eq!(entries.len(), 2);
+
+        state.rebuild_from_source_frames(&source, &entries);
+
+        let summary = state.visible_summary_at(3_000);
+        assert_eq!(
+            summary
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000],
+            "rebuilt history must reflect exactly the ring frames",
+        );
+        assert!(state.covers_window(1_000, 3_000));
+        assert!(!state.covers_window(99_000, 99_000));
+    }
+
+    #[test]
+    fn visible_summary_can_anchor_to_displayed_frame_end() {
+        let mut state = PointCloudState {
+            time_window_ms: 2.0,
+            point_limit: 16,
+            ..PointCloudState::default()
+        };
+        state.push_frame(&frame(&[event(0, 0, 0), event(1_000, 1, 0)]));
+        state.push_frame(&frame(&[event(2_000, 2, 0), event(3_000, 3, 0)]));
+
+        let anchored = state.visible_summary_at(1_000);
+        let latest = state.visible_summary();
+
+        assert_eq!(
+            anchored
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![0, 1_000]
+        );
+        assert_eq!(
+            latest
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000]
+        );
     }
 }

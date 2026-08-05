@@ -105,6 +105,7 @@ impl AnnotationManager {
         self.selected = None;
     }
 
+    #[allow(dead_code)]
     pub fn display_label(&self, id: usize) -> Option<String> {
         self.annotations
             .iter()
@@ -183,6 +184,7 @@ impl AnnotationManager {
         true
     }
 
+    #[allow(dead_code)]
     pub fn statistics_for_selected(&self, frame: &PreviewFrame) -> Option<RoiStatistics> {
         let annotation = self.selected_annotation()?;
         let label = self
@@ -335,6 +337,7 @@ fn translate_point(point: (u16, u16), dx: i32, dy: i32) -> (u16, u16) {
     )
 }
 
+#[allow(dead_code)]
 fn channel_stats(values: &[u16]) -> ChannelStats {
     let mut min = u16::MAX;
     let mut max = u16::MIN;
@@ -394,6 +397,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };

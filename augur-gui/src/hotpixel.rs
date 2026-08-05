@@ -15,6 +15,7 @@ pub(crate) struct BuiltInHotpixelDetection {
     frame_dims: Option<(u16, u16)>,
     last_detected_pixels: Vec<(u16, u16)>,
     last_detected_count: usize,
+    ui_dirty: bool,
 }
 
 impl Default for BuiltInHotpixelDetection {
@@ -28,6 +29,7 @@ impl Default for BuiltInHotpixelDetection {
             frame_dims: None,
             last_detected_pixels: Vec::new(),
             last_detected_count: 0,
+            ui_dirty: false,
         }
     }
 }
@@ -41,57 +43,87 @@ impl BuiltInHotpixelDetection {
         if self.enabled != enabled {
             self.enabled = enabled;
             self.reset();
+            self.ui_dirty = true;
         }
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.ui_dirty
     }
 
     pub(crate) fn detected_pixels(&self) -> &[(u16, u16)] {
         &self.last_detected_pixels
     }
 
-    pub(crate) fn render_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Hotpixel Detection")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.weak(
-                    "Tracks persistent event-rate spikes and highlights suspected hot pixels on the preview.",
-                );
+    pub(crate) fn render_ui(&mut self, ui: &mut egui::Ui, show_header: bool) -> bool {
+        let mut changed = false;
+        let body = |ui: &mut egui::Ui, changed: &mut bool, this: &mut Self| {
+            ui.weak(
+                "Tracks persistent event-rate spikes and highlights suspected hot pixels on the preview.",
+            );
 
-                ui.add(
-                    egui::Slider::new(&mut self.history_depth, 4..=64)
-                        .text("Smoothing depth")
-                        .clamp_to_range(true),
-                )
-                .on_hover_text(
-                    "Higher values react more slowly but suppress frame-to-frame flicker.",
-                );
+            *changed |= ui
+                .push_id("hotpixel_history_depth", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut this.history_depth, 4..=64)
+                            .text("Smoothing depth")
+                            .clamp_to_range(true),
+                    )
+                    .on_hover_text(
+                        "Higher values react more slowly but suppress frame-to-frame flicker.",
+                    )
+                    .changed()
+                })
+                .inner;
 
-                ui.add(
-                    egui::Slider::new(&mut self.threshold_factor, 2.0..=50.0)
-                        .text("Threshold factor")
-                        .clamp_to_range(true),
-                )
-                .on_hover_text(
-                    "A pixel is flagged when its activity exceeds this multiple of the global mean.",
-                );
+            *changed |= ui
+                .push_id("hotpixel_threshold_factor", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut this.threshold_factor, 2.0..=50.0)
+                            .text("Threshold factor")
+                            .clamp_to_range(true),
+                    )
+                    .on_hover_text(
+                        "A pixel is flagged when its activity exceeds this multiple of the global mean.",
+                    )
+                    .changed()
+                })
+                .inner;
 
-                ui.add(
-                    egui::Slider::new(&mut self.min_absolute_count, 1..=100)
-                        .text("Min absolute count")
-                        .clamp_to_range(true),
-                )
-                .on_hover_text(
-                    "Minimum per-frame event count required before a pixel can be treated as hot.",
-                );
+            *changed |= ui
+                .push_id("hotpixel_min_absolute_count", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut this.min_absolute_count, 1..=100)
+                            .text("Min absolute count")
+                            .clamp_to_range(true),
+                    )
+                    .on_hover_text(
+                        "Minimum per-frame event count required before a pixel can be treated as hot.",
+                    )
+                    .changed()
+                })
+                .inner;
 
-                ui.separator();
-                ui.label(format!(
-                    "Last frame: {} detected hotpixels.",
-                    self.last_detected_count
-                ));
-            });
+            ui.separator();
+            ui.label(format!(
+                "Last frame: {} detected hotpixels.",
+                this.last_detected_count
+            ));
+        };
+
+        if show_header {
+            egui::CollapsingHeader::new("Hotpixel Detection")
+                .default_open(true)
+                .show(ui, |ui| body(ui, &mut changed, self));
+        } else {
+            body(ui, &mut changed, self);
+        }
+        self.ui_dirty |= changed;
+        changed
     }
 
     pub(crate) fn process_frame(&mut self, frame: &PreviewFrame, output: &mut AnalysisOutput) {
+        self.ui_dirty = false;
         self.last_detected_pixels.clear();
         self.last_detected_count = 0;
 
@@ -155,6 +187,7 @@ impl BuiltInHotpixelDetection {
         self.frame_dims = None;
         self.last_detected_pixels.clear();
         self.last_detected_count = 0;
+        self.ui_dirty = false;
     }
 
     fn ensure_state(&mut self, frame: &PreviewFrame) {
@@ -183,6 +216,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         }

@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Superseded in part by [ADR 032](./032-installer-distribution-and-in-app-updates.md), which replaces
+the artifact set and the release trigger described here. The `cargo-release` / `CHANGELOG.md`
+conventions below still stand.
 
 ## Context
 

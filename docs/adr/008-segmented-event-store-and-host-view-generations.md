@@ -4,6 +4,12 @@
 
 Accepted
 
+Planned successor: ADR 020, `Unified Upstream Event Source`, is Proposed and
+will supersede the retained-event-history portion of this decision once the
+plugin-runtime cutover is accepted. Host-view generation caching remains in
+force. The GUI host now backs retained history with upstream event ranges while
+preserving the segmented `EventStoreHandle` API shape.
+
 ## Context
 
 The first host-owned `EventStore` design kept one flat `Vec<FfiCdEvent>` plus frame boundaries.

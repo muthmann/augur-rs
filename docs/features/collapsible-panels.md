@@ -8,6 +8,8 @@ The GUI settings panel and analysis panel can now be collapsed independently fro
 
 - the left settings panel collapses to a narrow 22 px edge strip with a frameless `▶` arrow
 - the right analysis panel collapses to a narrow 22 px edge strip with a frameless `◀` arrow
+- collapsed arrows are pinned near the top of the edge strip so the reopen affordance remains
+  visible in tall replay/split layouts
 - collapsed arrows use 14 px weak text color for a minimal, non-button appearance; hover highlights are still present
 - each expanded panel shows its collapse arrow on the inner separator edge
 - panel visibility can also be toggled from the `View` menu in the menu bar

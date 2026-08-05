@@ -6,73 +6,69 @@ on:
       - main
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  lint:
-    name: Format and clippy
+  format:
+    name: Format
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        run: rustup toolchain install
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev libx11-dev libxi-dev \
-            libgl1-mesa-dev libegl1-mesa-dev pkg-config
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  test:
-    name: Test and build (${{ matrix.name }})
+  build:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Threading bugs and FFI signedness mismatches often surface on only one
+      # architecture, so every supported platform is covered on both arm64 and
+      # x86_64 rather than one runner per operating system.
       matrix:
         include:
-          - name: macOS arm64
-            os: macos-latest
-          - name: macOS x86_64
-            os: macos-15-intel
-          - name: Linux x86_64
-            os: ubuntu-latest
-          - name: Linux arm64
-            os: ubuntu-24.04-arm
-          - name: Windows x86_64
-            os: windows-latest
+          - os: ubuntu-latest
+            name: Linux x86_64
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+          - os: macos-latest
+            name: macOS arm64
+          - os: macos-15-intel
+            name: macOS x86_64
+          - os: windows-latest
+            name: Windows x86_64
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        run: rustup toolchain install
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
+      - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev libx11-dev libxi-dev \
-            libgl1-mesa-dev libegl1-mesa-dev pkg-config
+        run: bash .github/scripts/install-linux-deps.sh
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --locked
 
+      # Linking the GUI on Linux and Windows used to be skipped entirely
+      # (`cargo check` only), which is why release builds could break without
+      # a single red CI run. Build the whole workspace on every platform.
       - name: Build workspace
         run: cargo build --workspace --locked
 
@@ -86,21 +82,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        run: rustup toolchain install
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Install Linux system dependencies
+        run: bash .github/scripts/install-linux-deps.sh
 
       - name: Install HDF5
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev libx11-dev libxi-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            pkg-config libhdf5-dev
+        run: sudo apt-get install -y --no-install-recommends libhdf5-dev
 
       - name: Test augur-core with hdf5
         run: cargo test --locked -p augur-core --features hdf5

@@ -8,3 +8,4 @@ authors.workspace = true
 [dependencies]
 augur-core = { path = "../augur-core" }
 rusb.workspace = true
+libc = "0.2"

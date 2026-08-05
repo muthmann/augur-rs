@@ -2,77 +2,104 @@
 
 ## Distribution
 
-AugurRS ships in five forms:
+Every tagged release publishes an installer and a plain archive per platform, plus `SHA256SUMS`.
 
-| Channel | Audience | Contents |
-|---------|----------|----------|
-| **Source** | Developers | `cargo build --workspace` from the repository |
-| **macOS CLI archive** | Terminal users | `augur-macos.zip` — prebuilt `augur` / `AugurRS` binaries, docs, example config, changelog |
-| **macOS GUI installer** | Desktop users | `AugurRS.dmg` — unsigned drag-to-Applications installer |
-| **Linux archive** | Terminal and desktop users | `augur-linux.tar.gz` — prebuilt Linux binaries, docs, example config, changelog |
-| **Windows archive** | Terminal and desktop users | `augur-windows.zip` — prebuilt Windows binaries, docs, example config, changelog |
+| Channel | Audience | Asset |
+|---------|----------|-------|
+| **macOS installer** | Desktop users | `AugurRS-<version>-macos-universal.dmg` — drag to Applications, runs on Apple Silicon and Intel |
+| **macOS archive** | Terminal users | `augur-<version>-macos-universal.tar.gz` — `augur` / `AugurRS` binaries, docs, example config |
+| **Linux installer** | Desktop users | `AugurRS-<version>-linux-x86_64.AppImage` — one executable file, no install step |
+| **Linux archive** | Terminal and HPC users | `augur-<version>-linux-x86_64.tar.gz` |
+| **Windows installer** | Desktop users | `AugurRS-<version>-windows-x86_64-setup.exe` — Start Menu entry, icon, uninstaller |
+| **Windows archive** | Portable use | `augur-<version>-windows-x86_64.zip` — includes a `AugurRS.cmd` launcher |
+| **Source** | Developers | `cargo build --workspace` |
 
-All release artifacts are built by GitHub Actions and attached to every tagged release.
+All artifacts are built in public by GitHub Actions. Verify any download against the published
+digests:
 
-## Current UX By Platform
+```bash
+sha256sum -c SHA256SUMS      # Linux
+shasum -a 256 -c SHA256SUMS  # macOS
+```
 
-- macOS: GitHub releases provide an unsigned `AugurRS.dmg`. It is usable, but Gatekeeper may
-  prompt on first launch. Users who clone the repository can avoid the downloaded-app friction by
-  running `./scripts/build-macos-app.sh --install`, which builds and installs `AugurRS.app`
-  locally.
-- Linux: GitHub releases provide a runnable extracted archive, not a native installer. Users can
-  unpack the archive and run `AugurRS` directly, but no `.desktop` entry or distro package is
-  installed automatically.
-- Windows: GitHub releases provide a runnable zip archive, not an installer. Users can unpack the
-  archive and run `AugurRS.exe` directly, but no Start Menu shortcut or installer-managed uninstall
-  flow is created automatically.
+## Installing
+
+**macOS** — open the DMG, drag `AugurRS.app` to Applications. On first launch, right-click the app
+and choose **Open** (a plain double-click is refused). The build is ad-hoc signed rather than
+notarized, so Gatekeeper asks once. If macOS claims the app is damaged, clear the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AugurRS.app
+```
+
+**Linux** — `chmod +x AugurRS-*.AppImage` and run it. No install step, no root, no distro packages.
+
+**Windows** — run the setup. It installs per user into `%LOCALAPPDATA%\Programs\AugurRS`, so no
+admin rights are needed, and it appears in Add/Remove Programs like any other application.
+
+## Staying Up To Date
+
+AugurRS updates itself. `Help ▸ Check for updates…` in the GUI, or `augur update` on the command
+line; a background check runs at most once a day and can be switched off. Downloads are verified
+against `SHA256SUMS` before anything is replaced, and an update is refused while a recording or
+analysis run is active. See [In-App Updates](./features/in-app-updates.md).
+
+The `.tar.gz` and portable `.zip` archives cannot self-update — install from the DMG, AppImage, or
+setup if you want that.
 
 ## Release Workflow
 
-Releases are automated via [release-please](https://github.com/googleapis/release-please). No manual tagging is needed.
-
-### Day-to-day flow
+Releases are automated via [release-please](https://github.com/googleapis/release-please). No manual
+tagging is needed.
 
 1. Merge PRs to `main` using [conventional commits](https://www.conventionalcommits.org/):
-   - `feat: …` — new feature → minor version bump
-   - `fix: …` — bug fix → patch version bump
-   - `feat!: …` or `BREAKING CHANGE:` footer → major version bump
-   - `chore:`, `docs:`, `test:` — no version bump
-2. After each merge, release-please opens or updates a **"Release PR"** that accumulates `CHANGELOG.md` entries and bumps `Cargo.toml`.
-3. When the team is ready to ship, merge the Release PR.
-4. release-please pushes a `v<version>` tag → the CI release pipeline triggers automatically.
+   - `feat: …` → minor bump
+   - `fix: …` → patch bump
+   - `feat!: …` or a `BREAKING CHANGE:` footer → major bump
+   - `chore:`, `docs:`, `test:` → no bump
+2. release-please opens or updates a **Release PR** accumulating `CHANGELOG.md` entries and the
+   `Cargo.toml` version bump.
+3. Merging the Release PR creates the tag and GitHub release, and — in the same workflow run —
+   calls the release build, which attaches all seven assets.
 
-### What the CI release pipeline does
+### Why the build is not triggered by the tag
 
-On a pushed version tag, the pipeline:
+release-please pushes the tag using the default `GITHUB_TOKEN`, and GitHub deliberately does not
+start workflow runs from `GITHUB_TOKEN`-created events. A `on: push: tags` trigger therefore never
+fires — which is why `v1.0.0` was published with zero assets. `release-please.yml` calls
+`release.yml` directly instead, which needs no personal access token.
 
-1. Builds `augur` and `AugurRS` on macOS, Linux, and Windows
-2. Packages the macOS CLI archive, Linux tarball, and Windows zip with binaries, docs, example config, and changelog
-3. Assembles `AugurRS.app`, stages it alongside an `Applications` symlink, and wraps it in `AugurRS.dmg`
-4. Uploads all four release artifacts to the GitHub Release
+### Testing packaging without cutting a tag
+
+- Any pull request touching `resources/`, `assets/`, `.github/`, or the manifests runs the
+  **Packaging** workflow, which builds every installer and publishes nothing. Download them from the
+  run's artifacts.
+- **Release** can also be started manually (`workflow_dispatch`) with a `tag` and a `publish`
+  toggle, to rebuild an existing release or dry-run from a branch.
 
 ### Manual release (fallback)
 
-If you need to release without release-please, use `cargo-release`:
-
 ```bash
 cargo install cargo-release
-cargo release patch --dry-run   # preview changes
-cargo release patch --execute   # bump, tag, push → triggers CI
+cargo release patch --dry-run
+cargo release patch --execute
 ```
 
-### Conventional commit → version bump reference
+A tag pushed this way carries a real user's credentials, so it does trigger workflows normally.
 
-| Commit prefix | Version bump |
-|---|---|
-| `fix:` | patch (0.1.0 → 0.1.1) |
-| `feat:` | minor (0.1.0 → 0.2.0) |
-| `feat!:` or `BREAKING CHANGE:` | major (0.1.0 → 1.0.0) |
-| `chore:`, `docs:`, `test:` | no bump |
+## Toolchain
+
+`rust-toolchain.toml` pins the exact Rust version, and CI reads it rather than tracking `stable`.
+An unpinned toolchain meant a new clippy release could turn a green branch red without a code
+change. Bump it deliberately, in its own commit, with the lint fallout fixed.
+
+Use the rustup shim (`~/.cargo/bin/cargo`) locally — a Homebrew-installed `cargo` earlier on `PATH`
+ignores `rust-toolchain.toml`, so checks would run against a different compiler than CI.
 
 ## Known Limitations
 
-- Tagged binaries still build without the optional `hdf5` feature, so `.h5` / `.hdf5` replay remains a source-build-only workflow.
-- The macOS `.dmg` is still unsigned, so Gatekeeper may require the usual right-click → Open workaround on first launch.
-- The raw CLI archives are packaged convenience artifacts rather than installer-managed distributions.
-- Windows releases assume the default workspace feature set. If optional native features are enabled in the future, the release job may need extra dependency packaging.
+- Tagged binaries build without the optional `hdf5` feature, so `.h5` / `.hdf5` replay stays
+  source-build-only.
+- macOS artifacts are ad-hoc signed, not notarized, so Gatekeeper prompts on first launch.
+- Linux builds x86_64 only.
+- The Windows installer is per-user by design; machine-wide deployment uses the portable zip.

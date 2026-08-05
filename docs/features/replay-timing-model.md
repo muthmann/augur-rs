@@ -35,6 +35,38 @@ That keeps the visible preview closer to the actual frame-production cadence
 and the GUI shows the derived effective rate as informational text during
 replay.
 
+### Scrubbing and 2D/3D window alignment
+
+The 2D frame shows one acquisition window `[T - acq_time, T]`; the 3D point
+cloud shows its own look-back window `[T - time_window, T]`. Both share the
+same right-edge timestamp `T` (the displayed frame's `window_end_us`). Seeks
+and steps preserve that contract:
+
+- **Paused seeks decode a 3D look-back.** When the 3D view is open, a paused
+  scrub to `T` reopens the transport one 3D time window before `T` and sprints
+  forward unthrottled. Every decoded frame is archived into the event ring, so
+  after the sprint the 3D history is rebuilt from the ring and shows the full
+  `[T - window, T]` span instead of a single acquisition frame. The user's
+  replay speed is restored when the target frame is displayed.
+- **The 2D view never overshoots the seek target.** During the sprint, the
+  first frame whose window reaches the target is displayed; later frames only
+  feed the 3D history. Frames that arrive after replay is paused (in-flight
+  packets, sprint leftovers) are added to the 3D history but do not advance
+  the paused 2D display.
+- **Backward steps keep the 3D history.** Stepping back through the frame
+  snapshot history re-anchors the 3D summary to the older frame's end
+  timestamp without clearing retained history, so the look-back window stays
+  full. Only when the retained history no longer covers the snapshot's window
+  does the view fall back to that single frame.
+
+### Acquisition time during replay
+
+The `Settings -> Acquisition time` slider now applies to the running pipeline
+immediately (it is a host-side preview parameter, not a sensor setting, so it
+does not go through Apply Settings — which replay mode locks out). While
+replay is paused, releasing the slider rebuilds the displayed frame at the
+same position with the new window.
+
 ### Preview-thread load shedding
 
 If the preview-frame queue is already full when the preview thread reaches the

@@ -14,6 +14,8 @@ pub struct CameraConfig {
     pub pixel_mask: PixelMaskConfig,
     pub digital_filter: DigitalFilterConfig,
     #[serde(default)]
+    pub external_triggers: ExternalTriggerConfig,
+    #[serde(default)]
     pub global: GlobalSettingsConfig,
 }
 
@@ -24,6 +26,7 @@ impl Default for CameraConfig {
             roi: RoiConfig::full_frame(),
             pixel_mask: PixelMaskConfig::default(),
             digital_filter: DigitalFilterConfig::default(),
+            external_triggers: ExternalTriggerConfig::default(),
             global: GlobalSettingsConfig::default(),
         }
     }
@@ -41,6 +44,11 @@ impl CameraConfig {
         if self.digital_filter.stc_threshold_us == 0 {
             return Err(CameraError::Config(
                 "stc_threshold_us must be greater than 0".into(),
+            ));
+        }
+        if self.external_triggers.channel != 0 {
+            return Err(CameraError::Config(
+                "only external trigger channel 0 is supported".into(),
             ));
         }
         Ok(())
@@ -62,6 +70,14 @@ impl CameraConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalSettingsConfig {
     pub nm_per_pixel: f64,
+    /// Whether `nm_per_pixel` describes the sample plane of *this* setup.
+    ///
+    /// The default is the bare IMX636 pixel pitch, which is only the true
+    /// sample-plane scale for direct detection. Behind any optics it is off by
+    /// the magnification, so measurements derived from it (scale bar, ruler)
+    /// stay labelled as uncalibrated until someone states otherwise.
+    #[serde(default)]
+    pub pixel_scale_calibrated: bool,
     pub sensor_width: u16,
     pub sensor_height: u16,
     pub acq_time_ms: u64,
@@ -75,6 +91,7 @@ impl Default for GlobalSettingsConfig {
     fn default() -> Self {
         Self {
             nm_per_pixel: 4_860.0,
+            pixel_scale_calibrated: false,
             sensor_width: 1280,
             sensor_height: 720,
             acq_time_ms: 50,
@@ -183,6 +200,15 @@ impl Default for DigitalFilterConfig {
     }
 }
 
+/// External trigger input (EVK4 TRIG_IN). When enabled, the sensor inserts
+/// EVT3 `EXT_TRIGGER` events into the stream on each edge of the selected
+/// channel, timestamped on the same clock as CD events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ExternalTriggerConfig {
+    pub enabled: bool,
+    pub channel: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,10 +261,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_external_trigger_channel() {
+        let cfg = CameraConfig {
+            external_triggers: ExternalTriggerConfig {
+                enabled: true,
+                channel: 1,
+            },
+            ..CameraConfig::default()
+        };
+
+        let err = cfg.validate(1280, 720).expect_err("must reject");
+        assert!(err.to_string().contains("channel 0"));
+    }
+
+    #[test]
     fn global_settings_round_trip_through_toml() {
         let cfg = CameraConfig {
             global: GlobalSettingsConfig {
                 nm_per_pixel: 42.5,
+                pixel_scale_calibrated: true,
                 sensor_width: 640,
                 sensor_height: 480,
                 acq_time_ms: 75,
@@ -285,5 +326,9 @@ mod tests {
         .expect("legacy toml without global must load");
 
         assert_eq!(cfg.global, GlobalSettingsConfig::default());
+        // A config written before calibration provenance existed cannot claim
+        // to be calibrated.
+        assert!(!cfg.global.pixel_scale_calibrated);
+        assert_eq!(cfg.external_triggers, ExternalTriggerConfig::default());
     }
 }

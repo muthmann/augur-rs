@@ -28,6 +28,7 @@ Current view kinds:
 - `HostViewKind::TableWindow`
 - `HostViewKind::Density2dFromTable`
 - `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::Scatter3dFromTable`
 - `HostViewKind::ImageWindow`
 - `HostViewKind::LineSeriesWindow`
 
@@ -65,17 +66,58 @@ alive until either the dataset generation changes or the view settings change.
 
 `augur-gui` currently renders:
 
-- compact panel tables with a 10-row preview cap
+- compact panel summaries inside the owning plugin card
 - read-only table windows with CSV export
 - density maps derived from numeric table columns, with zoom/contrast/colormap/image export
 - scatter plots derived from numeric table columns, with CSV export
 - generic 2D image windows with zoom/contrast/colormap/image export
 - generic 1D line-series plots
 
+`Scatter3dFromTable` is intentionally not dockable. The host uses those descriptors as
+investigation 3D scene layers in the main split/3D viewer, so plugin cards and the View menu do not
+offer them as separate host-view windows.
+
 Exports stay generic:
 
 - CSV export for table-backed views
 - PNG/TIFF export for rendered image/density views
+
+## Dock And Pop-Out Window Contract
+
+Dockable views are shown either as tabs in the bottom host-view dock or as popped-out OS windows.
+Three host-side rules keep that surface predictable:
+
+- **The dock never claims space it does not own.** egui gives every panel a screen-wide clip rect,
+  so the dock clips its own contents (`clip_to_panel`) and scrolls its tab strip horizontally with
+  the control cluster (pop out / maximize / collapse) reserved on the right. Without this a long tab
+  strip paints across the analysis side panel.
+- **`dock_tabs` is user intent, not derived state.** Default tabs are seeded exactly once, since
+  every analysis parameter change re-resolves the registry and re-seeding would resurrect views the
+  user closed. Ids that do not currently resolve (plugin reload, epoch bump) are skipped while
+  rendering instead of being pruned, so a momentarily empty registry cannot retire a tab for good.
+- **Window requests travel through a long-lived cell.** A deferred viewport renders *after* the
+  parent frame that registered it, so each popped-out view keeps one `Arc<Mutex<…ViewportData>>`
+  (`HostViewWindowChannels`) that outlives a frame. The app republishes frame inputs into that cell
+  and `HostWindowFrameData::carry_pending_requests_from` preserves requests the window raised in the
+  meantime — close, freeze, CSV/PNG export, sorting, paging. A per-frame cell drops those requests
+  on the floor, which is what made pop-out windows impossible to close. The window also wakes the
+  root viewport (`request_root_repaint`) whenever a request is pending, because only the app
+  services them.
+
+## Chip, Tab, And Empty-State Presentation
+
+- **Chips wrap as whole units.** The view-chip row uses `theme::wrap_row`, not
+  `horizontal_wrapped`. The Analysis panel enables text wrapping for its whole subtree, and egui
+  measures a `Button`'s label against the width left on the current line — so a chip that does not
+  fit was breaking its label one character per line into a vertical strip instead of moving down.
+  Shortened titles (`short_host_view_chip_title`) reduce how often the row fills up; they do not
+  fix the wrap itself. Any new row of chips or buttons in a side panel must use `wrap_row`.
+- **A dock tab shows the kind once.** The leading Phosphor glyph encodes the view kind; the textual
+  kind tag lives in the tooltip alongside the dataset id. The close button appears only on the
+  active or hovered tab, in a permanently reserved slot so revealing it does not reflow the strip.
+- **Empty views centre their message.** `host_views::empty_state` renders a view's
+  `empty_message` centred and muted in the space the data would occupy. A bare `ui.label` stranded
+  it in the top-left corner of what is often a very tall empty dock.
 
 ## Reconstruction Direction
 
