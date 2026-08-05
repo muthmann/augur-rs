@@ -1253,7 +1253,7 @@ pub fn render_scatter2d_view(
     plot.show(ui, |plot_ui| {
         plot_ui.points(
             Points::new(points)
-                .radius(2.0)
+                .radius(2.0_f32)
                 .name(format!("{} vs {}", options.x_column, options.y_column)),
         );
     });
