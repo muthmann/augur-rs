@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "augur-cli"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "augur-core",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "augur-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "augur-event-types",
  "crossbeam-channel",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "augur-event-types"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "bytemuck",
  "serde",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "augur-gui"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "augur-core",
  "augur-event-types",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "augur-plugin-api"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "augur-event-types",
  "serde",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "augur-plugin-types"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "augur-prophesee"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "augur-core",
  "libc",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "augur-runtime"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "augur-core",
  "augur-event-types",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "augur-update"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde",
  "serde_json",
