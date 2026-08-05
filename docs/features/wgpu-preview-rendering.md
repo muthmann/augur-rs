@@ -145,3 +145,21 @@ cargo bench -p augur-gui --bench preview_bench -- --warm-up-time 0.1 --measureme
 - `augur-core` keeps CPU frame planes and cached histograms because viewer tools, plugins, and external bridges consume `PreviewFrame` on the CPU.
 - `TimeSurface` is fully GPU-backed only when the WGPU renderer is active and raw preview events are available; the CPU fallback path remains intact for `glow` and runtime fallback.
 - Host-view density/image renderers use their own CPU texture path.
+
+## Dispatch sizing
+
+Every compute pass here runs one invocation per item — one per event for the
+accumulate passes, one per pixel for the histograms. A dispatch dimension is
+capped at `max_compute_workgroups_per_dimension` (65535 on every desktop
+backend), so at the 64-wide workgroup a flat `(n, 1, 1)` dispatch is only valid
+up to 4 194 240 items, and exceeding it is a **panic**, not a recoverable error.
+
+Dispatches are therefore laid out as a grid that fills `x` up to the device's
+reported limit and then grows into `y`; the shaders recover the linear index as
+`gid.x + gid.y * dispatch_width`, where `dispatch_width` is one grid row's worth
+of invocations. A single-row dispatch has `gid.y == 0`, so the ordinary case is
+byte-for-byte the old behaviour.
+
+This is not a theoretical bound: a 2 Hz, `a = 1.7` A1 point delivered 4 952 000
+events in one preview frame and took the whole process down mid-survey
+([ADR 035](../adr/035-preview-dispatch-grid.md)).
