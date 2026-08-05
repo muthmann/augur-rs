@@ -44,7 +44,7 @@ jobs:
           - name: macOS arm64
             os: macos-latest
           - name: macOS x86_64
-            os: macos-13
+            os: macos-15-intel
           - name: Linux x86_64
             os: ubuntu-latest
           - name: Linux arm64
@@ -109,7 +109,9 @@ jobs:
 
       - name: Install HDF5 (macOS)
         if: runner.os == 'macOS'
-        run: brew install hdf5
+        run: |
+          brew install hdf5
+          echo "HDF5_DIR=$(brew --prefix hdf5)" >> "$GITHUB_ENV"
 
       - name: Test augur-core with hdf5
         run: cargo test --locked -p augur-core --features hdf5
