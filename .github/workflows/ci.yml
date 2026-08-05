@@ -7,19 +7,26 @@ on:
   pull_request:
 
 jobs:
-  macos:
-    name: macOS test and build
-    runs-on: macos-latest
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -27,31 +34,85 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace --locked
-
-      - name: Build workspace
-        run: cargo build --workspace --locked
-
-  portability:
-    name: Portability check (${{ matrix.os }})
+  test:
+    name: Test and build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
+        include:
+          - name: macOS arm64
+            os: macos-latest
+          - name: macOS x86_64
+            os: macos-13
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+          - name: Windows x86_64
+            os: windows-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Check workspace compiles
-        run: cargo check --workspace --locked
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+  hdf5:
+    name: HDF5 feature (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-latest
+          - name: Linux x86_64
+            os: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install HDF5 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            pkg-config libhdf5-dev
+
+      - name: Install HDF5 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install hdf5
+
+      - name: Test augur-core with hdf5
+        run: cargo test --locked -p augur-core --features hdf5
+
+      - name: Build augur-gui with hdf5
+        run: cargo build --locked -p augur-gui --features hdf5
