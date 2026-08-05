@@ -76,17 +76,13 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
+  # Linux only: hdf5-metno-sys 0.11.2 cannot parse HDF5 2.x version strings
+  # ("Invalid H5_VERSION"), and Homebrew no longer ships a versioned 1.x
+  # formula, so macOS has no supported HDF5 available. Debian's libhdf5-dev
+  # is still 1.x. Add macOS back once hdf5-metno is upgraded.
   hdf5:
-    name: HDF5 feature (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS arm64
-            os: macos-latest
-          - name: Linux x86_64
-            os: ubuntu-latest
+    name: HDF5 feature (Linux x86_64)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
@@ -98,20 +94,13 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install HDF5 (Linux)
-        if: runner.os == 'Linux'
+      - name: Install HDF5
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libxkbcommon-dev libx11-dev libxi-dev \
             libgl1-mesa-dev libegl1-mesa-dev \
             pkg-config libhdf5-dev
-
-      - name: Install HDF5 (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install hdf5
-          echo "HDF5_DIR=$(brew --prefix hdf5)" >> "$GITHUB_ENV"
 
       - name: Test augur-core with hdf5
         run: cargo test --locked -p augur-core --features hdf5
