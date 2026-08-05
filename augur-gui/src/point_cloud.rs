@@ -106,7 +106,7 @@ impl PointCloudState {
         painter.rect_stroke(
             rect,
             PANEL_ROUNDING,
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
 
         if response.dragged() {
@@ -342,7 +342,7 @@ fn draw_axes(painter: &egui::Painter, cam: CameraView) {
         };
         painter.line_segment(
             [start.position, end.position],
-            egui::Stroke::new(1.5, color),
+            egui::Stroke::new(1.5_f32, color),
         );
         painter.text(
             end.position,

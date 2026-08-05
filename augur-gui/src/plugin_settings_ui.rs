@@ -214,7 +214,7 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
     painter.rect_stroke(
         rect,
         6.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(72)),
     );
 
     if values.len() < 2 {
@@ -251,6 +251,6 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
 
     painter.add(egui::Shape::line(
         points,
-        egui::Stroke::new(2.0, stroke_color),
+        egui::Stroke::new(2.0_f32, stroke_color),
     ));
 }

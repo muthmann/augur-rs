@@ -243,7 +243,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
                     } else {
                         Color32::from_rgb(0, 220, 255)
                     })
-                    .width(if min_active { 3.5 } else { 2.0 })
+                    .width(if min_active { 3.5_f32 } else { 2.0_f32 })
                     .style(LineStyle::Solid),
             );
             plot_ui.vline(
@@ -253,19 +253,19 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
                     } else {
                         Color32::from_rgb(255, 196, 64)
                     })
-                    .width(if max_active { 3.5 } else { 2.0 })
+                    .width(if max_active { 3.5_f32 } else { 2.0_f32 })
                     .style(LineStyle::Solid),
             );
             plot_ui.points(
                 Points::new(vec![[f64::from(data.contrast.display_min), handle_y]])
                     .shape(MarkerShape::Down)
-                    .radius(if min_active { 8.0 } else { 6.0 })
+                    .radius(if min_active { 8.0_f32 } else { 6.0_f32 })
                     .color(Color32::from_rgb(0, 220, 255)),
             );
             plot_ui.points(
                 Points::new(vec![[f64::from(data.contrast.display_max), handle_y]])
                     .shape(MarkerShape::Down)
-                    .radius(if max_active { 8.0 } else { 6.0 })
+                    .radius(if max_active { 8.0_f32 } else { 6.0_f32 })
                     .color(Color32::from_rgb(255, 196, 64)),
             );
             plot_ui.text(
@@ -377,7 +377,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
     gradient_painter.rect_stroke(
         gradient_rect,
         1.0,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
     ui.small(match data.mode {
         PreviewMode::Intensity(colormap) => format!("{} display ramp", colormap.label()),
