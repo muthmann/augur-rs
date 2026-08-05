@@ -892,6 +892,22 @@ fn draw_status_footer(
                             ui.colored_label(ui.visuals().error_fg_color, err);
                         }
 
+                        // Named here because the startup message announcing it
+                        // goes to a stderr that a double-clicked build does not
+                        // have. A crash log nobody can find is not a crash log.
+                        if let Some(log) = crate::diagnostics::log_path() {
+                            rendered_anything = true;
+                            ui.separator();
+                            let log = log.display().to_string();
+                            ui.horizontal(|ui| {
+                                ui.small("Session log:");
+                                if ui.small_button("Copy path").clicked() {
+                                    ui.output_mut(|out| out.copied_text = log.clone());
+                                }
+                            });
+                            ui.small(log);
+                        }
+
                         if !rendered_anything {
                             ui.small("No additional diagnostics.");
                         }
