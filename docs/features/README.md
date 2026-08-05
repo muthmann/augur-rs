@@ -56,5 +56,6 @@ See the [Plugin Authoring Guide](./plugin-authoring-guide.md) for the interface 
 - [Dynamic Plugin Loading](./dynamic-plugins.md) — plugin directory layout, manifest expectations, and Plugin Manager workflow
 - [Output File Timestamps](./output-file-timestamps.md) — overwrite protection and automatic timestamp suffixes for recordings
 - [Photodiode Lab Workflow (design)](./photodiode-lab-workflow-design.md) — proposal: raw export with device-clock timestamps, photodiode ⊕ modulation overlay via firmware phase markers, freeze-for-inspection, cursors/stats/FFT
+- [Session Log and Crash Visibility](./session-log-and-crash-visibility.md) — append-only session log with a panic hook and a breadcrumb that detects the crashes no hook can catch; the activity line names the protocol row a run died on (ADR 034)
 
 Community runtime plugins, the plugin template, and contributor docs are maintained in the companion [augur-plugins](https://github.com/muthmann/augur-plugins) repository.

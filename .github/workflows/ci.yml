@@ -33,14 +33,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Threading bugs and FFI signedness mismatches often surface on only one
+      # architecture, so every supported platform is covered on both arm64 and
+      # x86_64 rather than one runner per operating system.
       matrix:
         include:
           - os: ubuntu-latest
-            name: Linux
+            name: Linux x86_64
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
           - os: macos-latest
-            name: macOS
+            name: macOS arm64
+          - os: macos-15-intel
+            name: macOS x86_64
           - os: windows-latest
-            name: Windows
+            name: Windows x86_64
 
     steps:
       - name: Check out repository
@@ -64,3 +71,30 @@ jobs:
       # a single red CI run. Build the whole workspace on every platform.
       - name: Build workspace
         run: cargo build --workspace --locked
+
+  # Linux only: hdf5-metno-sys 0.11.2 cannot parse HDF5 2.x version strings
+  # ("Invalid H5_VERSION"), and Homebrew no longer ships a versioned 1.x
+  # formula, so macOS has no supported HDF5 available. Debian's libhdf5-dev
+  # is still 1.x. Add macOS back once hdf5-metno is upgraded.
+  hdf5:
+    name: HDF5 feature (Linux x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install Linux system dependencies
+        run: bash .github/scripts/install-linux-deps.sh
+
+      - name: Install HDF5
+        run: sudo apt-get install -y --no-install-recommends libhdf5-dev
+
+      - name: Test augur-core with hdf5
+        run: cargo test --locked -p augur-core --features hdf5
+
+      - name: Build augur-gui with hdf5
+        run: cargo build --locked -p augur-gui --features hdf5

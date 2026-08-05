@@ -562,7 +562,7 @@ pub(crate) fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, me
     painter.rect_stroke(
         rect,
         PANEL_ROUNDING,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
     painter.text(
         rect.center(),
@@ -890,6 +890,22 @@ fn draw_status_footer(
                             rendered_anything = true;
                             ui.separator();
                             ui.colored_label(ui.visuals().error_fg_color, err);
+                        }
+
+                        // Named here because the startup message announcing it
+                        // goes to a stderr that a double-clicked build does not
+                        // have. A crash log nobody can find is not a crash log.
+                        if let Some(log) = crate::diagnostics::log_path() {
+                            rendered_anything = true;
+                            ui.separator();
+                            let log = log.display().to_string();
+                            ui.horizontal(|ui| {
+                                ui.small("Session log:");
+                                if ui.small_button("Copy path").clicked() {
+                                    ui.output_mut(|out| out.copied_text = log.clone());
+                                }
+                            });
+                            ui.small(log);
                         }
 
                         if !rendered_anything {
@@ -1696,7 +1712,7 @@ fn draw_preview_canvas(
                 image_rect,
                 viewport,
                 current_roi,
-                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 196, 64)),
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 196, 64)),
             );
         }
     }
@@ -1706,7 +1722,7 @@ fn draw_preview_canvas(
             image_rect,
             viewport,
             pending_roi,
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
         );
     }
     if let (Some(start), Some(end)) = (line_profile_tool.start, line_profile_tool.end) {
@@ -2469,10 +2485,10 @@ fn paint_analysis_overlays(
                         egui::pos2(center.x, center.y - arm_y),
                         egui::pos2(center.x, center.y + arm_y),
                     ];
-                    painter.line_segment(horizontal, egui::Stroke::new(3.0, shadow));
-                    painter.line_segment(vertical, egui::Stroke::new(3.0, shadow));
-                    painter.line_segment(horizontal, egui::Stroke::new(1.5, overlay_color));
-                    painter.line_segment(vertical, egui::Stroke::new(1.5, overlay_color));
+                    painter.line_segment(horizontal, egui::Stroke::new(3.0_f32, shadow));
+                    painter.line_segment(vertical, egui::Stroke::new(3.0_f32, shadow));
+                    painter.line_segment(horizontal, egui::Stroke::new(1.5_f32, overlay_color));
+                    painter.line_segment(vertical, egui::Stroke::new(1.5_f32, overlay_color));
                 }
             }
             Overlay::MarkerOverlay { markers, .. } => {
@@ -2596,7 +2612,7 @@ fn paint_annotation_shape(
     color: egui::Color32,
     selected: bool,
 ) {
-    let stroke = egui::Stroke::new(if selected { 2.5 } else { 1.5 }, color);
+    let stroke = egui::Stroke::new(if selected { 2.5_f32 } else { 1.5_f32 }, color);
     match shape {
         AnnotationShape::Rectangle { min, max } => {
             let rect = egui::Rect::from_min_max(

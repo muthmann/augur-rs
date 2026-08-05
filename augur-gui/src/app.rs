@@ -3343,6 +3343,22 @@ impl CameraApp {
                         return;
                     }
                 };
+                // Written into the crash breadcrumb before the recording starts,
+                // so a death during an unattended survey is pinned to the point
+                // it was on rather than to the night it happened. The plugin
+                // states its own position when it has one; an ordinary
+                // recording is just its run id.
+                let position = match (
+                    metadata.get("protocol_point_index"),
+                    metadata.get("protocol_point_total"),
+                ) {
+                    (Some(index), Some(total)) => format!(" (protocol row {index}/{total})"),
+                    _ => String::new(),
+                };
+                crate::diagnostics::note(format!(
+                    "recording {run_id}{position} → {}",
+                    path.display()
+                ));
                 let mut recording_metadata = metadata
                     .into_iter()
                     .map(|(key, value)| (format!("plugin_{}", sanitize_file_stem(&key)), value))
@@ -3419,6 +3435,10 @@ impl CameraApp {
             return;
         };
         self.plugin_recording_finalize_task = None;
+        // The point is on disk. A crash from here until the next row started is
+        // a crash *between* points, which is a different fault from one during
+        // a recording — the breadcrumb has to be able to say which.
+        crate::diagnostics::note("idle between plugin recordings");
         let partial = matches!(
             &result.reply.outcome,
             HostCommandOutcome::RecordingPartial { .. }

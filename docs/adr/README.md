@@ -46,4 +46,5 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 031: Optional Sensor-Telemetry Companion Recording](./031-sensor-telemetry-companion-recording.md)
 - [ADR 032: Installer Distribution And In-App Updates](./032-installer-distribution-and-in-app-updates.md)
 - [ADR 033: Measurement Provenance In The UI](./033-measurement-provenance-in-the-ui.md)
+- [ADR 034: A Crash Leaves Evidence, And The Two Kinds Are Told Apart](./034-crash-visibility.md)
 - [ADR 035: Preview Compute Dispatches Are Sized Against The Device's Limit](./035-preview-dispatch-grid.md)
