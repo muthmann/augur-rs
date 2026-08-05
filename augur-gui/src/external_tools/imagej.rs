@@ -11,12 +11,14 @@ use std::{
 use augur_core::pipeline::PreviewFrame;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
-use super::{ExternalTool, ExternalToolStatus};
+use super::{ExternalTool, ExternalToolStatus, ExternalToolThroughput};
 
 pub const BUNDLED_IMAGEJ_PLUGIN_JAR: &[u8] = include_bytes!("../../imagej-plugin/AugurBridge_.jar");
 pub const BUNDLED_IMAGEJ_PLUGIN_JAR_NAME: &str = "AugurBridge_.jar";
 pub const DEFAULT_IMAGEJ_BRIDGE_PORT: u16 = 57_294;
-const FRAME_QUEUE_CAPACITY: usize = 32;
+/// Frames buffered between the GUI thread and the socket writer. Beyond this
+/// the bridge drops rather than stalling the preview, and counts the drop.
+pub const IMAGEJ_FRAME_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug)]
 struct FrameEnvelope {
@@ -47,6 +49,7 @@ pub struct ImageJBridge {
     status: Arc<Mutex<ExternalToolStatus>>,
     frame_tx: Option<Sender<FrameEnvelope>>,
     frame_seq: AtomicU64,
+    dropped_frames: AtomicU64,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -58,6 +61,7 @@ impl ImageJBridge {
             status: Arc::new(Mutex::new(ExternalToolStatus::Disconnected)),
             frame_tx: None,
             frame_seq: AtomicU64::new(0),
+            dropped_frames: AtomicU64::new(0),
             handle: None,
         }
     }
@@ -79,8 +83,9 @@ impl ExternalTool for ImageJBridge {
 
         *self.status.lock().unwrap() = ExternalToolStatus::Connecting;
         self.frame_seq.store(0, Ordering::Relaxed);
+        self.dropped_frames.store(0, Ordering::Relaxed);
 
-        let (tx, rx) = bounded::<FrameEnvelope>(FRAME_QUEUE_CAPACITY);
+        let (tx, rx) = bounded::<FrameEnvelope>(IMAGEJ_FRAME_QUEUE_CAPACITY);
         let host = self.host.clone();
         let port = self.port;
         let status = Arc::clone(&self.status);
@@ -108,8 +113,23 @@ impl ExternalTool for ImageJBridge {
 
         let seq = self.frame_seq.fetch_add(1, Ordering::Relaxed) + 1;
         match tx.try_send(FrameEnvelope::from_preview_frame(frame, nm_per_pixel, seq)) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Ok(()) => Ok(()),
+            // The socket cannot keep up. Dropping is the right call — the
+            // bridge is a preview, not a capture path — but the drop is
+            // counted so the series ImageJ receives never looks gap-free
+            // when it is not. See `Frames` in the ImageJ dialog.
+            Err(TrySendError::Full(_)) => {
+                self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Err(TrySendError::Disconnected(_)) => Err("ImageJ bridge is not connected".into()),
+        }
+    }
+
+    fn throughput(&self) -> ExternalToolThroughput {
+        ExternalToolThroughput {
+            frames_offered: self.frame_seq.load(Ordering::Relaxed),
+            frames_dropped: self.dropped_frames.load(Ordering::Relaxed),
         }
     }
 }
@@ -202,7 +222,57 @@ impl Drop for ImageJBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{write_frame_packet, FrameEnvelope};
+    use super::{
+        write_frame_packet, ExternalTool, FrameEnvelope, ImageJBridge, IMAGEJ_FRAME_QUEUE_CAPACITY,
+    };
+    use augur_core::pipeline::PreviewFrame;
+    use crossbeam_channel::bounded;
+
+    fn blank_frame() -> PreviewFrame {
+        PreviewFrame {
+            width: 1,
+            height: 1,
+            pixels: vec![0],
+            pixels_on: vec![0],
+            pixels_off: vec![0],
+            cached_total_histogram: Vec::new(),
+            cached_signed_histogram: Vec::new(),
+            on_count: 0,
+            off_count: 0,
+            events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
+            window_start_us: 0,
+            window_end_us: 1,
+        }
+    }
+
+    #[test]
+    fn frames_dropped_by_a_full_queue_are_counted() {
+        let mut bridge = ImageJBridge::new("127.0.0.1", 1);
+        // Attach a queue without a reader so every send past the capacity is
+        // rejected — the same back-pressure a slow ImageJ produces.
+        let (tx, _rx) = bounded(IMAGEJ_FRAME_QUEUE_CAPACITY);
+        bridge.frame_tx = Some(tx);
+
+        let frame = blank_frame();
+        let sends = IMAGEJ_FRAME_QUEUE_CAPACITY + 5;
+        for _ in 0..sends {
+            bridge
+                .send_frame(&frame, 1.0)
+                .expect("drops are not errors");
+        }
+
+        let throughput = bridge.throughput();
+        assert_eq!(throughput.frames_offered, sends as u64);
+        assert_eq!(throughput.frames_dropped, 5);
+        assert_eq!(
+            throughput.frames_delivered(),
+            IMAGEJ_FRAME_QUEUE_CAPACITY as u64
+        );
+        assert!(throughput.has_gaps());
+    }
 
     #[test]
     fn frame_packet_writes_header_and_little_endian_pixels() {

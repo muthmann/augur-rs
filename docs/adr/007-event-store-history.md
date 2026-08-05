@@ -4,6 +4,12 @@
 
 Accepted
 
+Planned successor: ADR 020, `Unified Upstream Event Source`, is Proposed and
+will supersede this decision once the plugin-runtime cutover is accepted. The
+GUI host has already moved its runtime retained history to a projection over
+upstream event ranges; the public `EventStoreHandle` contract remains in force
+until ADR 020 is accepted.
+
 ## Context
 
 Runtime plugins increasingly need more than the current frame:
@@ -28,6 +34,17 @@ The host:
 - keeps two JSON context scopes:
   - per-frame context, cleared on each frame
   - persistent context, cleared on analysis reset / topology reset
+
+The retained frame deque is ordered by window, because
+`frame_range_for_timestamps` binary searches it and plugins walk the returned
+index range as a timeline. That ordering is enforced by the store itself, not by
+its callers: attaching a different upstream source drops the previous source's
+frames, and a frame whose window opens before the newest retained one drops the
+pre-jump history. Host discontinuity commands remain the primary mechanism —
+they also reset plugin state — but a missed command can no longer corrupt the
+deque. Range queries run on the plugin FFI callback path, where a panic crosses
+an `extern "C"` boundary and aborts the process, so they must never assert the
+invariant they depend on.
 
 This ships together with the v0.2 plugin API cleanup:
 

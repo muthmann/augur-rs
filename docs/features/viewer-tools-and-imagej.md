@@ -16,7 +16,7 @@ single-window overwrite workflow.
 - hover the preview to see `x` and `y` plus a mode-aware pixel readout: most modes show `ON`, `OFF`, and `Total`, while `Time Surface` shows the rendered decay `Value` and `Total`
 - the preview toolbar now uses compact icon buttons with hover tooltips instead of long text labels, and it stays on one row instead of wrapping the hover readout
 - `Esc` clears the active ROI/line/ruler drawing mode, and `Delete` / `Backspace` removes the selected software annotation
-- `Histogram` opens a mode-aware histogram with labeled intensity/count axes, better hover readouts, and:
+- `Histogram` opens a mode-aware histogram whose axes name what is actually counted — `Pixel value (ON+OFF events)`, `Pixel value (|ON − OFF| events)` or `Pixel value (time-surface decay, 0–255)` on x, `Pixels` on y — with a caption stating what one bin means in the active preview mode, plus:
   - auto percentile mode
   - manual min/max range
   - gamma control
@@ -32,6 +32,9 @@ single-window overwrite workflow.
 - changing preview mode, time-surface decay, or histogram contrast now re-renders the current frame immediately instead of waiting for another decoded frame
 - the shared false-color LUTs now use the requested official ImageJ ramps instead of the earlier preview-only matplotlib/ImageJ mix
 - `Line Profile` samples ON and OFF values along a dragged line, opens its separate window after the drag completes, and can optionally overlay the ON+OFF sum trace
+  - its x axis is the **Euclidean distance from the line start in sensor pixels**, not the Bresenham sample index; on a diagonal the two differ by √2 and plotting the index would compress the axis by 41%
+  - its y axis is labelled `Events per pixel`
+  - a note above the plot states the line length in px and µm plus the sample count
 - `Ruler` measures dragged distances in both pixels and µm using the current pixel scale
 - `Rect` and `Ellipse` create host-side software annotations with live ROI statistics
 - the annotations list is now directly interactive: clicking a row selects that ROI, switches back to pointer/edit mode, and shows a color swatch that matches the overlay on the preview
@@ -39,6 +42,7 @@ single-window overwrite workflow.
 - visible ROI numbering in the annotations list now stays contiguous after deletes even though the underlying annotation IDs remain stable for selection/crop state
 - `Crop to ROI` now crops to the selected software annotation when one is selected, otherwise it falls back to the current hardware ROI; toggling it again returns to the full frame, and ellipse crop uses the ellipse bounding box
 - `Scale bar` can be toggled from the UI and placed in any preview corner
+- **µm readouts state their provenance.** The scale bar, ruler and line-profile length note append `(uncal.)` until the pixel scale is confirmed for the optical setup — see [Pixel Scale Calibration](./pixel-scale-calibration.md) and ADR 033
 - ruler/scale-bar text and line overlays now use outline/shadow rendering so they remain legible on grayscale and fire-like backgrounds
 - the top-bar `Settings -> Advanced` controls now display preview and point-cloud update cadence in Hz instead of milliseconds
 
@@ -78,6 +82,16 @@ text command protocol and a binary frame protocol for live streaming.
   persistent `ImagePlus` window updated in place via `setPixels()` + `updateAndDraw()`
 - the Rust bridge now uses a bounded background frame queue (`32` envelopes) so brief ImageJ/Fiji
   stalls can absorb short bursts without backpressuring Augur's preview/capture path
+- **overflow is counted, not silent.** When the queue is full the bridge drops the frame — stalling
+  the preview would be worse — and increments a drop counter exposed through
+  `ExternalTool::throughput() -> ExternalToolThroughput { frames_offered, frames_dropped }`:
+  - the top-bar chip switches from `Success` to `Warn` tone and reads
+    `ImageJ: Streaming · 37 dropped`
+  - the `Stream to ImageJ` dialog shows a `Frames:` row (`1163 frames sent · 37 dropped (3.1%)`)
+    and, once anything has been dropped, a line pointing at TIFF export or an analysis run for a
+    complete series
+  - the trait method has **no default implementation**, so a future bridge cannot opt out of drop
+    accounting (ADR 033)
 - the ImageJ plugin drains pending frames onto the EDT in batches instead of blocking the socket
   thread with one `invokeAndWait` call per frame
 - while streaming is active, the center panel shows a placeholder plus a `Return to augur` button

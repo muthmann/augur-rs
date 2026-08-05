@@ -12,6 +12,7 @@ Available commands:
 
 - `status`
 - `record`
+- `analyze`
 - `config show`
 - `config set-bias`
 - `config set-roi`
@@ -43,6 +44,34 @@ Optional metadata flags:
 - `--experiment-id` stores a lab or notebook reference in the sidecar metadata
 - `--operator` stores who ran the recording in the sidecar metadata
 - `--notes` stores free-form recording notes in the sidecar metadata
+
+## `analyze`
+
+Run deterministic whole-file plugin analysis and export host-view datasets.
+
+```bash
+cargo run --bin augur -- analyze captures/session.raw --out analysis/session
+cargo run --bin augur -- analyze captures/session.raw --config analysis.toml --out analysis/session
+cargo run --bin augur -- analyze captures/session.raw --plugins-dir ~/.augur/plugins --out analysis/session
+```
+
+The output directory must not already exist. The runner writes into a temporary
+directory and renames it only after the analysis and exports complete.
+
+Example config:
+
+```toml
+t_start_us = 0
+acq_time_ms = 1
+
+[plugins."Example Plugin"]
+enabled = true
+
+[plugins."Example Plugin".settings]
+threshold = 12.5
+```
+
+Press `Ctrl+C` during `analyze` to cancel cleanly.
 
 ## `config show`
 

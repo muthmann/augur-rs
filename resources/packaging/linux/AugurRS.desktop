@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AugurRS
+GenericName=Event Camera Recorder
+Comment=Record, preview, and analyse event-camera data
+Exec=AugurRS %f
+Icon=AugurRS
+Terminal=false
+Categories=Science;Graphics;DataVisualization;
+Keywords=event camera;neuromorphic;DVS;Prophesee;IMX636;recording;
+StartupWMClass=AugurRS
+MimeType=application/x-augur-raw;

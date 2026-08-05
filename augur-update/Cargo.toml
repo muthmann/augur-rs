@@ -1,0 +1,15 @@
+[package]
+name = "augur-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Checks GitHub releases for a newer AugurRS and applies the platform update payload."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Blocking HTTP with rustls. The app has no async runtime and should not grow
+# one just to fetch a JSON document and a file.
+ureq = { workspace = true }

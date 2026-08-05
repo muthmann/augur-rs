@@ -6,31 +6,42 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = []
+default = ["self-update"]
 hdf5 = ["augur-core/hdf5"]
+# In-app update checking. On by default for the binaries we publish; packagers
+# who manage upgrades themselves can build without it.
+self-update = ["dep:augur-update", "dep:dirs"]
 
 [[bin]]
 name = "AugurRS"
 path = "src/main.rs"
 
 [dependencies]
+augur-event-types.workspace = true
 augur-core = { path = "../augur-core" }
+augur-runtime.workspace = true
 augur-plugin-api = { path = "../augur-plugin-api" }
 augur-prophesee = { path = "../augur-prophesee" }
+augur-update = { workspace = true, optional = true }
 bytemuck.workspace = true
 crossbeam-channel.workspace = true
+dirs = { workspace = true, optional = true }
 eframe = { workspace = true, features = ["wgpu"] }
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-phosphor.workspace = true
+egui_extras.workspace = true
 egui_plot.workspace = true
+glam = "0.27"
 libloading.workspace = true
 image.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tiff.workspace = true
 toml.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"

@@ -8,7 +8,15 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
 
 - The output file and EVT3 header are prepared before the camera starts streaming. If file creation or header writing fails, the pipeline now fails fast instead of starting capture and erroring asynchronously later.
 - Once the USB reader has accepted a packet, shutdown now keeps trying to enqueue that packet to the disk writer instead of discarding it when stop and backpressure overlap.
+- The disk writer thread drains its queue until the USB reader hangs up the channel, never on the stop flag. Exiting on the stop flag raced the USB reader's final packet (a bulk read can complete just after stop is requested) and silently dropped the tail of the recording. A regression test (`disk_writer_persists_packet_accepted_after_stop_request`) pins this.
+- The in-flight budget between the USB reader and the disk writer (`RAW_BUFFER_POOL_CAPACITY` / `DISK_QUEUE_CAPACITY`) is 256 × 64 KiB = 16 MiB. This budget is what rides out disk-write hiccups: once the pool is empty the USB reader stops reading and the camera-side FIFO overflows, which shows up as a hard multi-millisecond gap in the recording. The previous 8-buffer (512 KiB) budget only covered ~2.5 ms at EVK4 peak ingress — less than a single 4 MiB `BufWriter` flush on a slow disk. The path stays bounded and explicit; only the bound grew.
 - The USB reader does not scan every packet to estimate event counts. Ingress bytes remain authoritative on the capture path, while decoded-event stats are measured on the lossy preview side.
+- Camera control and stream reads now run on separate threads for split-capable cameras (EVK4): sensor reconfiguration (USB control transfers) executes on a dedicated control thread while the stream thread keeps reading, so applying settings during a recording no longer pauses reads or overflows the device FIFO (see ADR 023). A regression test (`split_camera_keeps_reading_during_runtime_reconfigure`) pins this.
+- The GUI asks for confirmation before applying settings during an active recording, because the reconfigure itself (bias/ROI/filter changes and a brief sensor disturbance) is still part of the recorded data even though the stream stays gap-free.
+- EVK4 stream reads use an asynchronous multi-URB reader (8 × 64 KiB bulk transfers queued in the kernel at all times), so the host keeps receiving data between `read_packet` calls with no dead time. If async setup fails, the reader falls back to synchronous single-transfer reads and logs the reason.
+- The reader owns a spare buffer per transfer, so a completed transfer is re-armed immediately instead of waiting for its data to be copied into a pipeline buffer. While the raw-buffer pool is empty the stream loop calls `PacketStreamReader::service`, which reaps and re-arms without delivering a packet — otherwise the loop parked on the pool, stopped servicing libusb, and let the endpoint run dry, turning a short disk hiccup into a much longer FIFO overflow (ADR 030).
+- Timed-out and cancelled transfers keep whatever bytes the device already sent, and `PacketStreamReader::take_buffered_packet` drains transfers that completed but were never delivered into the disk queue at stop, so the transfer queue's contents are not discarded with the reader. A regression test (`packets_already_received_by_the_reader_reach_the_recording_after_stop`) pins this.
+- Every wait for a free raw buffer is counted, summed, and max-tracked in `PipelineStatsSnapshot` (`raw_pool_starvation_*`) and written into the recording sidecar (`reader_stall_*`), so a recording states whether the capture path ever failed to accept data. See [Recording Completeness](./recording-completeness.md).
 
 ## Preview / GUI Changes
 
@@ -16,14 +24,58 @@ The live GUI and replay preview are intentionally lossy so the recording path ca
 - Preview packet cloning is now lazy: the USB reader only copies bytes into the preview path when a preview buffer and queue slot are actually available.
 - Preview frames now recycle their large `pixels`, `pixels_on`, and `pixels_off` buffers instead of cloning full frame images on every acquisition window.
 - `PipelineStatsSnapshot` now exposes preview packet/frame drops, preview/disk queue high-water marks, and cumulative disk send/write time so overload is visible in the GUI.
-- The GUI only processes preview work at a capped cadence of roughly 30 Hz. This keeps egui from spending all of its time on texture uploads, overlay generation, and plugin work when frames arrive faster than the UI can present them.
+- The GUI only processes preview work at a capped cadence of roughly 30 Hz. This keeps egui from spending all of its time on texture uploads, overlay generation, and live-analysis dispatch when frames arrive faster than the UI can present them.
 - Point-cloud mode now runs at a lower presentation cadence than the 2D preview path so 3D view does not force the same repaint rate as texture mode.
 - Preview rendering now writes directly into `ColorImage` pixels as `Color32`, with reused histogram and ROI-grid scratch storage, instead of rebuilding an intermediate RGBA buffer every frame.
 - Paused replay no longer forces a continuous repaint loop.
 - Decoded replay opening now runs on a worker thread, so large decoded replays do not block the egui thread before playback begins.
+- Live runtime plugins run on a dedicated `augur-runtime` analysis worker. The
+  worker may coalesce frame triggers, but retained-history plugins drain all
+  upstream frames through their own cursor before processing.
 - When 3D point-cloud view is the only raw-event consumer, the GUI skips runtime-plugin FFI event marshaling and `EventStore` updates.
+- When no raw-event consumer is active, the preview thread skips per-event raw
+  retention and live-ring archival entirely; count-plane preview accumulation
+  still runs normally.
+- Enabled `FrameOnly` / `DerivedData` plugins no longer force current-frame
+  `FfiCdEvent` materialization. Only enabled `RawEvents` plugins receive the
+  raw slice for the current frame.
 - Dynamic-plugin settings/status reads are cached for 250 ms and invalidated on runtime mutations instead of being re-polled every update.
-- Host-view dataset snapshots are now cached by dataset generation instead of being cleared unconditionally on every processed frame.
+- Plugin `EventStoreHandle::frame_at` calls share one materialization cache
+  per analysis pass (all plugins of a frame reuse it), and global settings
+  context JSON is cached until the effective settings change.
+- Host-view dataset snapshots are cached by dataset generation instead of being cleared unconditionally on every processed frame. Providers that report generation 0 (no counter) refresh once per analysis pass instead of freezing.
+- The live worker decodes host-view dataset JSON on its own thread and skips
+  fetching datasets whose generation is unchanged; results carry `Arc`-shared
+  decoded payloads, so the GUI thread no longer parses dataset JSON or pays a
+  per-frame re-serialization for unchanged tables/images/series.
+- Worker host-view snapshots are also published on the 50 ms frame-independent
+  control path. Analysis and control publications share a monotonic sequence,
+  preventing stale cross-channel replacements without disabling generation
+  caching.
+- Worker results only trigger a host-view registry re-resolution when the
+  registries actually changed, and density/image view textures re-render only
+  on a real generation change — not on every frame.
+- Providers that expose no generation counter get a **content-derived**
+  generation (a hash of the fetched dataset bytes) in the worker. The worker
+  therefore skips the JSON decode for unchanged data, and — because the
+  generation no longer flips to `0` — the GUI keeps its decoded cache instead
+  of re-parsing every dataset 20×/s on a fully idle app. The GUI's dataset
+  refresh sequence is bumped only when a registry or a dataset generation
+  actually changed.
+- Plugin control-plane state is bounded and reset with the plugin instances
+  that key it: request/reply dedupe maps evict oldest-answered-first, reply
+  inboxes for disabled or unloaded plugins are pruned each tick, and every
+  entry is cleared on plugin reload. Previously all four maps grew for the
+  whole process lifetime (~29 k permanent entries per 8-hour session at
+  1 request/s).
+- The live worker's command handling is shared between its idle path and its
+  pre-job drain instead of being duplicated, so the two cannot drift apart.
+- The 3D investigation scene is only built when a 3D pane can actually be shown (3D/split layout or popup); 2D-only layouts skip selection resolution, dataset scans, and raw-event layer construction entirely.
+- The memoized 3D point-cloud summary hands out its event list behind an `Arc` instead of cloning up to `point_limit` events on every UI read (the scene build, overlay status, and footer status all read it each frame).
+- Raw-event 3D layers share one label allocation per layer instead of cloning a `String` per point, and per-event id hashing plus the occurrence map only run when a selection actually needs to be matched.
+- Point-cloud window recomputes now visit ring events in place (one lock, zero copies) instead of allocating two vectors per retained frame per recompute, and pre-reserve the output from the retained frame counts.
+- The wgpu 3D point renderer fills a persistent instance staging buffer in one pass (no per-frame vec pairs), packs colors as `Unorm8x4` (24-byte instances instead of 36), and picks hover/click points directly from the scene instead of materializing a parallel prepared-point list.
+- The 3D pipeline no longer writes depth for alpha-blended point sprites: a nearby faint (de-emphasised) point previously occluded brighter points drawn later, punching see-through holes in the cloud.
 
 ## Operational Implications
 

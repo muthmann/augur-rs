@@ -1,0 +1,23 @@
+AugurRS — first launch on macOS
+================================
+
+1. Drag AugurRS.app onto the Applications folder in this window.
+
+2. The first time you open it, right-click (or Control-click) AugurRS in
+   Applications and choose "Open", then confirm. A plain double-click will be
+   refused; the right-click route is what tells macOS you trust this copy.
+
+   You only have to do this once.
+
+If macOS says the app "is damaged and can't be opened", the quarantine flag
+survived the copy. Clear it in Terminal:
+
+    xattr -dr com.apple.quarantine /Applications/AugurRS.app
+
+Why: AugurRS is signed ad-hoc rather than with a paid Apple Developer ID, so
+it is not notarized. The binaries are built in public on GitHub Actions and
+every release ships a SHA256SUMS file you can verify against:
+
+    shasum -a 256 -c SHA256SUMS
+
+Once installed, AugurRS can update itself — Help ▸ Check for updates…

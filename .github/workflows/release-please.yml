@@ -12,6 +12,9 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -20,12 +23,12 @@ jobs:
           manifest-file: .release-please-manifest.json
 
       # Keep Cargo.lock in sync after release-please bumps Cargo.toml
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.release.outputs.pr
         with:
           ref: release-please--branches--main
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: steps.release.outputs.pr
       - name: Update Cargo.lock
         if: steps.release.outputs.pr
@@ -38,3 +41,18 @@ jobs:
             git commit -m "chore: update Cargo.lock after version bump"
             git push
           fi
+
+  # release-please pushes the version tag using GITHUB_TOKEN, and GitHub refuses
+  # to start new workflow runs from GITHUB_TOKEN-created events. The release
+  # build therefore cannot be triggered by the tag - it has to be called from
+  # here, in the same run. Without this job, tagged releases ship no binaries at
+  # all, which is exactly what happened to v1.0.0.
+  build-release:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
+      publish: true

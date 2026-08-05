@@ -1,11 +1,14 @@
 [workspace]
 members = [
+  "augur-event-types",
   "augur-core",
+  "augur-runtime",
   "augur-prophesee",
   "augur-cli",
   "augur-gui",
   "augur-plugin-api",
   "augur-plugin-types",
+  "augur-update",
 ]
 resolver = "2"
 
@@ -17,6 +20,9 @@ authors = ["Mika Uthmann <muthmann@physik.uni-bielefeld.de>"]
 
 [workspace.dependencies]
 anyhow = "1"
+augur-event-types = { path = "augur-event-types" }
+augur-runtime = { path = "augur-runtime" }
+augur-update = { path = "augur-update" }
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
@@ -24,6 +30,7 @@ eframe = "0.27"
 egui = "0.27"
 egui-wgpu = "0.27"
 egui-phosphor = "0.5"
+egui_extras = "0.27"
 egui_plot = "0.27"
 evt3-core = "0.2.0"
 hdf5 = { package = "hdf5-metno", version = "0.12.3" }
@@ -35,8 +42,11 @@ ctrlc = "3"
 rfd = "0.15"
 rustfft = "6"
 serde_json = "1"
+sha2 = "0.10"
 libloading = "0.8"
 image = { version = "0.24.9", default-features = false, features = ["png", "tiff"] }
 tiff = "0.9"
 gethostname = "1"
 time = { version = "=0.3.36", features = ["formatting"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+dirs = "5"

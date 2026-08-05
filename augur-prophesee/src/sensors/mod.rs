@@ -1,6 +1,10 @@
 mod imx636;
 
-use augur_core::{config::*, Result};
+use augur_core::{
+    camera::{SensorMonitoring, SensorMonitoringSelection},
+    config::*,
+    Result,
+};
 
 pub use imx636::Imx636;
 
@@ -19,6 +23,32 @@ pub trait PseeSensor: Send {
         transport: &mut Transport,
         filter: &DigitalFilterConfig,
     ) -> Result<()>;
+    fn set_external_trigger(
+        &mut self,
+        _transport: &mut Transport,
+        cfg: &ExternalTriggerConfig,
+    ) -> Result<()> {
+        if cfg.enabled {
+            return Err(augur_core::CameraError::Config(
+                "this sensor does not support external trigger input".into(),
+            ));
+        }
+        Ok(())
+    }
     fn start_streaming(&mut self, transport: &mut Transport) -> Result<()>;
     fn stop_streaming(&mut self, transport: &mut Transport) -> Result<()>;
+
+    /// Reads absolute values for settings the config only expresses as
+    /// relative offsets. Sensors without a monitoring block report nothing.
+    fn read_monitoring(&mut self, _transport: &mut Transport) -> Result<SensorMonitoring> {
+        Ok(SensorMonitoring::default())
+    }
+
+    fn read_monitoring_selected(
+        &mut self,
+        transport: &mut Transport,
+        _selection: SensorMonitoringSelection,
+    ) -> Result<SensorMonitoring> {
+        self.read_monitoring(transport)
+    }
 }

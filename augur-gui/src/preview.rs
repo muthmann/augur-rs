@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use augur_core::pipeline::{CdEvent, PreviewFrame, PREVIEW_HISTOGRAM_BINS};
 use egui::{Color32, ColorImage};
 
-use crate::colormap::Colormap;
+use crate::{colormap::Colormap, theme};
 
 thread_local! {
     static PREVIEW_SCRATCH: RefCell<PreviewRenderScratch> = RefCell::new(PreviewRenderScratch::default());
@@ -95,7 +95,7 @@ impl Default for PreviewMode {
 impl PreviewMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::RedBlue => "Red-Blue Polarity",
+            Self::RedBlue => "Polarity",
             Self::SignedCount => "Signed Count",
             Self::Intensity(colormap) => colormap.label(),
             Self::TimeSurface => "Time Surface",
@@ -108,7 +108,7 @@ impl PreviewMode {
 
     pub fn ramp_label(self) -> &'static str {
         match self {
-            Self::RedBlue => "Red-blue polarity ramp",
+            Self::RedBlue => "Polarity (magenta/cyan)",
             Self::SignedCount => "Signed-count diverging ramp",
             Self::Intensity(_) => "Intensity display ramp",
             Self::TimeSurface => "Time-surface decay ramp",
@@ -180,11 +180,13 @@ impl CpuPreviewImageCache {
                         } else {
                             let brightness = self.brightness_lut[total as usize];
                             match on.cmp(&off) {
-                                std::cmp::Ordering::Greater => Color32::from_rgb(brightness, 0, 0),
-                                std::cmp::Ordering::Less => Color32::from_rgb(0, 0, brightness),
-                                std::cmp::Ordering::Equal => {
-                                    Color32::from_rgb(brightness, 0, brightness)
+                                std::cmp::Ordering::Greater => {
+                                    polarity_color(brightness, theme::POLARITY_ON_RGB)
                                 }
+                                std::cmp::Ordering::Less => {
+                                    polarity_color(brightness, theme::POLARITY_OFF_RGB)
+                                }
+                                std::cmp::Ordering::Equal => polarity_balanced_color(brightness),
                             }
                         };
                     }
@@ -239,6 +241,30 @@ impl CpuPreviewImageCache {
             self.image = ColorImage::new(size, Color32::BLACK);
         }
     }
+}
+
+/// Modulate a fully-saturated polarity tint by a brightness in `[0, 255]`.
+fn polarity_color(brightness: u8, tint: [u8; 3]) -> Color32 {
+    let scale = brightness as f32 / 255.0;
+    let scale_channel = |c: u8| ((c as f32) * scale).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(
+        scale_channel(tint[0]),
+        scale_channel(tint[1]),
+        scale_channel(tint[2]),
+    )
+}
+
+/// Pixel where the ON / OFF counts are exactly equal — average the two
+/// polarity tints so the colour is unmistakably between the two endpoints.
+fn polarity_balanced_color(brightness: u8) -> Color32 {
+    let on = theme::POLARITY_ON_RGB;
+    let off = theme::POLARITY_OFF_RGB;
+    let tint = [
+        ((on[0] as u16 + off[0] as u16) / 2) as u8,
+        ((on[1] as u16 + off[1] as u16) / 2) as u8,
+        ((on[2] as u16 + off[2] as u16) / 2) as u8,
+    ];
+    polarity_color(brightness, tint)
 }
 
 pub fn reset_preview_render_cache() {
@@ -328,7 +354,9 @@ pub fn compute_frame_histogram(
     mode: PreviewMode,
     time_surface_tau_us: u64,
 ) -> Vec<u64> {
-    with_frame_histogram(frame, mode, time_surface_tau_us, trimmed_histogram)
+    with_frame_histogram(frame, mode, time_surface_tau_us, |histogram| {
+        trimmed_histogram(histogram).to_vec()
+    })
 }
 
 pub fn compute_auto_contrast_max(
@@ -421,11 +449,11 @@ fn ensure_time_surface_state(frame: &PreviewFrame, scratch: &mut PreviewRenderSc
         return true;
     }
 
-    let Some(events) = frame.events.as_deref() else {
+    let Some(events) = frame.events_snapshot() else {
         return false;
     };
     update_time_surface(
-        events,
+        &events,
         frame.width,
         frame.height,
         &mut scratch.time_surface_ticks,
@@ -510,13 +538,13 @@ fn histogram_from_values(values: impl IntoIterator<Item = u16>) -> Vec<u64> {
     histogram
 }
 
-fn trimmed_histogram(histogram: &[u64]) -> Vec<u64> {
+fn trimmed_histogram(histogram: &[u64]) -> &[u64] {
     let len = histogram
         .iter()
         .rposition(|&count| count != 0)
         .map(|index| index + 1)
         .unwrap_or(1);
-    histogram[..len].to_vec()
+    &histogram[..len]
 }
 
 fn percentile_bin(histogram: &[u64], percentile: f32) -> u16 {
@@ -582,6 +610,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -603,6 +634,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -634,6 +668,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -646,12 +683,16 @@ mod tests {
 
         assert_eq!(image.size, [2, 1]);
         assert_eq!(image.pixels.len(), 2);
-        assert!(image.pixels[0].to_array()[0] > 0);
-        assert_eq!(image.pixels[0].to_array()[1], 0);
-        assert_eq!(image.pixels[0].to_array()[2], 0);
-        assert_eq!(image.pixels[1].to_array()[0], 0);
-        assert_eq!(image.pixels[1].to_array()[1], 0);
-        assert!(image.pixels[1].to_array()[2] > 0);
+        // ON-dominant pixel: hot magenta tint — strong R+B, weaker G.
+        let on_px = image.pixels[0].to_array();
+        assert!(on_px[0] > 0, "ON pixel red channel should be lit");
+        assert!(on_px[2] > 0, "ON pixel blue channel should be lit");
+        assert!(on_px[0] >= on_px[1], "magenta R should dominate over G");
+        // OFF-dominant pixel: arctic cyan tint — no R, strong G+B.
+        let off_px = image.pixels[1].to_array();
+        assert_eq!(off_px[0], 0, "OFF pixel red channel should be dark");
+        assert!(off_px[1] > 0, "OFF pixel green channel should be lit");
+        assert!(off_px[2] > 0, "OFF pixel blue channel should be lit");
     }
 
     #[test]
@@ -667,6 +708,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -698,6 +742,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };
@@ -725,6 +772,9 @@ mod tests {
                 timestamp: 10,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 10,
         };
@@ -753,6 +803,9 @@ mod tests {
                 timestamp: 25,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 25,
         };
@@ -787,6 +840,9 @@ mod tests {
                 timestamp: 25,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 25,
         };
@@ -813,6 +869,9 @@ mod tests {
                 timestamp: 10,
                 polarity: true,
             }]),
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 10,
         };
@@ -838,6 +897,9 @@ mod tests {
             on_count: 0,
             off_count: 0,
             events: None,
+            event_range: None,
+            event_source: None,
+            external_triggers: Vec::new(),
             window_start_us: 0,
             window_end_us: 1,
         };

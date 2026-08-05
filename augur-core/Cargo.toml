@@ -10,6 +10,7 @@ default = []
 hdf5 = ["dep:hdf5"]
 
 [dependencies]
+augur-event-types.workspace = true
 crossbeam-channel.workspace = true
 evt3-core.workspace = true
 gethostname.workspace = true

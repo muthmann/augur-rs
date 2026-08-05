@@ -4,18 +4,18 @@
 
 `augur-gui` now extracts the full central viewer panel into `viewer_widget.rs`, so the same
 viewer component can render inside the main window or inside the popup viewport without diverging
-toolbar, canvas, replay, or lower-control behavior.
+toolbar, display-strip, canvas, replay, or footer behavior.
 
 ## Scope
 
 The shared viewer now owns:
 
 - the heading and camera-info strip
-- the 2D toolbar and 3D point-cloud controls
+- the 2D toolbar plus display-strip/footer layout
 - the main canvas or placeholder surface
 - replay transport controls
-- the scrollable lower controls area for preview mode, scale bar, annotations, stats, warnings,
-  notices, and errors
+- a collapsible display strip for preview-mode, scale-bar, time-surface, and annotation controls
+- a compact footer for status readouts, pipeline diagnostics, warnings, notices, and errors
 - histogram and line-profile auxiliary windows through one `ViewerState`
 
 The host app still owns pipeline lifecycle, replay controller actions, config writes, analysis
@@ -32,7 +32,8 @@ responsive even when focus is in the external window.
 
 - `ViewerState` for viewer-owned mutable state such as view mode, zoom/pan, tools, contrast,
   annotations, scale bar, and auxiliary windows
-- `ViewerInput` for per-frame host data such as texture handles, frames, pipeline stats, replay
+- `ViewerInput` for per-frame host data such as texture handles, frames, pipeline stats,
+  `sensor_monitoring` (the latest sensor readback, surfaced in the diagnostics footer), replay
   status, warnings, and error strings
 - `ViewerOutput` for host actions such as ROI commits, popup toggles, hotpixel masking, replay
   transport commands, and preview-rerender triggers
@@ -61,7 +62,7 @@ central panel UI again.
 
 | File | Role |
 |---|---|
-| `augur-gui/src/viewer_widget.rs` | shared viewer state, inputs/outputs, toolbar/canvas/replay/control rendering |
+| `augur-gui/src/viewer_widget.rs` | shared viewer state, inputs/outputs, toolbar/display-strip/canvas/footer rendering |
 | `augur-gui/src/app.rs` | host-side viewer orchestration, popup handoff, pipeline integration, and side effects |
 | `augur-gui/src/viewer_tools/` | histogram, line profile, ruler, annotation, and scale-bar helpers owned by `ViewerState` |
 | `docs/adr/011-reusable-viewer-widget.md` | architectural rationale for the extracted viewer-host boundary |

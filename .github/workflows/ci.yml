@@ -6,23 +6,52 @@ on:
       - main
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  macos:
-    name: macOS test and build
-    runs-on: macos-latest
+  format:
+    name: Format
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: macos-latest
+            name: macOS
+          - os: windows-latest
+            name: Windows
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/install-linux-deps.sh
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -30,28 +59,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      # Linking the GUI on Linux and Windows used to be skipped entirely
+      # (`cargo check` only), which is why release builds could break without
+      # a single red CI run. Build the whole workspace on every platform.
       - name: Build workspace
         run: cargo build --workspace --locked
-
-  portability:
-    name: Portability check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check workspace compiles
-        run: cargo check --workspace --locked

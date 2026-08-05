@@ -1,153 +1,169 @@
 name: Release
 
+# This workflow is deliberately NOT triggered by `on: push: tags`.
+#
+# release-please creates the version tag using the default GITHUB_TOKEN, and
+# GitHub does not start workflow runs from GITHUB_TOKEN-created events. A tag
+# trigger therefore never fired, which is why v1.0.0 shipped with zero release
+# assets. release-please.yml calls this workflow directly instead, and
+# workflow_dispatch gives a way to rebuild or dry-run packaging by hand.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build and attach artifacts to.
+        required: true
+        type: string
+      publish:
+        description: Upload artifacts to the GitHub release for that tag.
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag or ref to build (defaults to the branch this is run from).
+        required: false
+        type: string
+      publish:
+        description: Upload to the GitHub release. Leave off for a packaging dry run.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
-jobs:
-  macos-release:
-    name: Build macOS release artifacts
-    runs-on: macos-latest
+env:
+  CARGO_TERM_COLOR: always
 
+jobs:
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Build DMG and CLI archive
+        run: bash resources/packaging/macos/build-dmg.sh --out dist
 
-      - name: Build release binaries
-        run: cargo build --release --locked --bin augur --bin AugurRS
+      - name: Smoke-test the disk image
+        run: bash resources/packaging/macos/verify-dmg.sh dist
 
-      - name: Assemble macOS app bundle
-        run: bash resources/macos-bundle.sh target/release/AugurRS dist
+      # The bundle swap is the riskiest step in the whole update path: copy it
+      # with the wrong tool and the signature silently stops validating.
+      - name: Verify the in-app update swap
+        run: bash resources/packaging/macos/verify-update-swap.sh dist
 
-      - name: Create .dmg installer
-        run: |
-          STAGING_DIR="$RUNNER_TEMP/dmg-staging"
-          rm -rf "$STAGING_DIR"
-          mkdir -p "$STAGING_DIR"
-          cp -R dist/AugurRS.app "$STAGING_DIR/"
-          ln -s /Applications "$STAGING_DIR/Applications"
-          hdiutil create \
-            -volname "AugurRS" \
-            -srcfolder "$STAGING_DIR" \
-            -ov -format UDZO \
-            AugurRS.dmg
-
-      - name: Package CLI archive
-        run: |
-          mkdir -p dist/augur-macos/bin
-          cp target/release/augur dist/augur-macos/bin/
-          cp target/release/AugurRS dist/augur-macos/bin/
-          cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md dist/augur-macos/
-          mkdir -p dist/augur-macos/examples
-          cp examples/augur.toml dist/augur-macos/examples/
-          ditto -c -k --sequesterRsrc --keepParent dist/augur-macos augur-macos.zip
-
-      - name: Upload workflow artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: augur-macos-assets
+          name: macos
           path: |
-            augur-macos.zip
-            AugurRS.dmg
+            dist/*.dmg
+            dist/*.tar.gz
+          if-no-files-found: error
 
-      - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            augur-macos.zip
-            AugurRS.dmg
-
-  linux-release:
-    name: Build Linux release artifacts
+  linux:
+    name: Linux (x86_64)
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev libx11-dev libxi-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            pkg-config libhdf5-dev
+        run: bash .github/scripts/install-linux-deps.sh
 
-      - name: Build release binaries
-        run: cargo build --release --locked --bin augur --bin AugurRS
+      - name: Build AppImage and CLI archive
+        run: bash resources/packaging/linux/build-appimage.sh --out dist
 
-      - name: Package release archive
-        run: |
-          mkdir -p dist/augur-linux/bin
-          cp target/release/augur dist/augur-linux/bin/
-          cp target/release/AugurRS dist/augur-linux/bin/
-          cp README.md LICENSE CONTRIBUTING.md CHANGELOG.md dist/augur-linux/
-          mkdir -p dist/augur-linux/examples
-          cp examples/augur.toml dist/augur-linux/examples/
-          tar -czf augur-linux.tar.gz -C dist augur-linux
+      - name: Smoke-test the AppImage
+        run: bash resources/packaging/linux/verify-appimage.sh dist
 
-      - name: Upload workflow artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: augur-linux-assets
-          path: augur-linux.tar.gz
+          name: linux
+          path: |
+            dist/*.AppImage
+            dist/*.tar.gz
+          if-no-files-found: error
 
-      - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: augur-linux.tar.gz
-
-  windows-release:
-    name: Build Windows release artifacts
+  windows:
+    name: Windows (x86_64)
     runs-on: windows-latest
-
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binaries
-        run: cargo build --release --locked --bin augur --bin AugurRS
-
-      - name: Package release archive
+      - name: Build installer and portable archive
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/augur-windows/bin | Out-Null
-          Copy-Item target/release/augur.exe dist/augur-windows/bin/
-          Copy-Item target/release/AugurRS.exe dist/augur-windows/bin/
-          Copy-Item README.md, LICENSE, CONTRIBUTING.md, CHANGELOG.md dist/augur-windows/
-          New-Item -ItemType Directory -Force -Path dist/augur-windows/examples | Out-Null
-          Copy-Item examples/augur.toml dist/augur-windows/examples/
-          Compress-Archive -Path dist/augur-windows -DestinationPath augur-windows.zip
+        run: ./resources/packaging/windows/build-installer.ps1 -OutDir dist
 
-      - name: Upload workflow artifact
+      # Actually installs, runs, and uninstalls. The silent path exercised here
+      # is the same one the in-app updater invokes.
+      - name: Smoke-test the installer
+        shell: pwsh
+        run: ./resources/packaging/windows/verify-installer.ps1 -DistDir dist
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: augur-windows-assets
-          path: augur-windows.zip
+          name: windows
+          path: |
+            dist/*setup.exe
+            dist/*.zip
+          if-no-files-found: error
 
-      - name: Publish GitHub release assets
+  publish:
+    name: Checksum and publish
+    runs-on: ubuntu-latest
+    needs: [macos, linux, windows]
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staged
+
+      - name: Collect artifacts and write SHA256SUMS
+        run: |
+          mkdir -p dist
+          find staged -type f -exec mv -t dist {} +
+          cd dist
+          # The in-app updater treats this file as mandatory and refuses to
+          # apply anything whose hash is missing or does not match.
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload combined release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish to GitHub release
+        if: ${{ inputs.publish }}
         uses: softprops/action-gh-release@v2
         with:
-          files: augur-windows.zip
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true

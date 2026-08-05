@@ -9,6 +9,12 @@ mod colormap;
 mod line_profile;
 #[path = "../src/preview.rs"]
 mod preview;
+// `line_profile` refers to its sibling as `super::scale_bar`; mounting it at
+// the bench crate root keeps that path resolvable outside `viewer_tools`.
+#[path = "../src/viewer_tools/scale_bar.rs"]
+mod scale_bar;
+#[path = "../src/theme.rs"]
+mod theme;
 
 use colormap::Colormap;
 use line_profile::LineProfileTool;
@@ -88,6 +94,9 @@ fn synthetic_frame(width: u16, height: u16, density: FixtureDensity) -> PreviewF
         on_count: 0,
         off_count: 0,
         events: Some(events),
+        event_range: None,
+        event_source: None,
+        external_triggers: Vec::new(),
         window_start_us: 0,
         window_end_us: timestamp.max(1),
     }

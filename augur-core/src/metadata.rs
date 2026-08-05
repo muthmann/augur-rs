@@ -20,6 +20,9 @@ const HEADER_KEYS: &[&str] = &[
 const NON_HEADER_KEYS: &[&str] = &[
     "recording_duration_us",
     "total_events",
+    "reader_stall_events",
+    "reader_stall_max_us",
+    "reader_stall_total_us",
     "experiment_id",
     "operator",
     "notes",
@@ -66,6 +69,19 @@ pub struct RecordingMetadata {
     pub recording_duration_us: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_events: Option<u64>,
+    /// How often the recording path could not accept the next packet because
+    /// the raw-buffer pool was empty. `Some(0)` is the self-describing
+    /// "recorded without a single stall" statement; `None` means the writer did
+    /// not report integrity at all (older recordings).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_stall_events: Option<u64>,
+    /// Longest single wait for a free raw buffer. Non-zero means the camera
+    /// FIFO may have overflowed for that long, i.e. the file may have a gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_stall_max_us: Option<u64>,
+    /// Total time the recording path spent unable to accept data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_stall_total_us: Option<u64>,
     #[serde(default, skip_serializing_if = "annotations_are_empty")]
     pub annotations: RecordingAnnotations,
     #[serde(default, flatten)]
@@ -179,6 +195,14 @@ impl RecordingMetadata {
     pub fn update_timing(&mut self, recording_duration_us: Option<u64>, total_events: u64) {
         self.recording_duration_us = Some(recording_duration_us.unwrap_or(0));
         self.total_events = Some(total_events);
+    }
+
+    /// Records how the recording path behaved, so a file states its own
+    /// completeness instead of leaving it to be inferred.
+    pub fn update_integrity(&mut self, stall_events: u64, stall_max_us: u64, stall_total_us: u64) {
+        self.reader_stall_events = Some(stall_events);
+        self.reader_stall_max_us = Some(stall_max_us);
+        self.reader_stall_total_us = Some(stall_total_us);
     }
 }
 

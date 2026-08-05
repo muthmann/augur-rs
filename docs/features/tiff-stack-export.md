@@ -22,6 +22,28 @@ The dialog exposes:
 When you click `Export`, Augur runs the stack export on a background thread and writes a multi-page
 TIFF where each page corresponds to one accumulation window in the selected time range.
 
+### Overwrite protection
+
+Writing the stack truncates the target file, so an existing file is never replaced without a say-so:
+
+- the path is resolved to its final form (`.tiff` is appended when no extension was typed) **before**
+  the existence check, so the confirmation names the file that will actually be written
+- if that file exists, `Export` shows an inline
+  `<path> already exists. / Exporting replaces the whole file; the current contents are lost.`
+  block with `Overwrite` and `Keep existing file`
+- a path returned by the `Browse…` save dialog skips the prompt — the native dialog already asked.
+  Editing the path field by hand clears that confirmation again
+
+### While an export runs
+
+The export cannot be interrupted once dispatched. Rather than let a window close read as a
+cancellation it is not:
+
+- the window's close button is withdrawn for the duration of the export
+- the dialog states that the export writes on a background thread and that the window stays open
+  until it finishes
+- `Export` and `Cancel` stay disabled, as before
+
 ## Data Model
 
 - exported pages are 16-bit grayscale

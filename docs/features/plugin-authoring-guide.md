@@ -40,16 +40,90 @@ Loader failures are non-fatal and stay visible in the Plugin Manager.
 - `HostOutput`
 - `HostContext`
 - `EventStoreHandle`
+- `PluginDiscontinuity`
+- `PluginStateKind`
 - `PluginCapabilities`
+- `PluginRuntimeRole`
+- `PluginControlContext`
+- `PluginServiceRequest` / `PluginServiceReply`
+- `PluginControlSnapshot`
+- `HostCommandRequest` / `HostCommandReply`
 - `SettingsSchema` / `StatusEntry`
 - `HostViewRegistry`
 - `GlobalSettings`
+- `SensorMonitoringV1` / `SensorBiasReadbackV1` / `SensorBiasCodesV1`
 - `TableDatasetV1`
 - `Image2dV1`
 - `Series1dV1`
 - `CTX_GLOBAL_SETTINGS`
+- `CTX_SENSOR_MONITORING`
+
+### Sensor measurements (`HostContext::sensor_monitoring`)
+
+`HostContext::sensor_monitoring()` returns the absolute values reported by the
+sensor monitor for the current capture: estimated refractory period (µs),
+illumination (lux), die temperature (°C), and the absolute bias codes with their
+per-unit factory defaults. The camera configuration only carries relative bias
+offsets, so these cannot be derived plugin-side.
+
+```rust
+if let Some(monitoring) = context.sensor_monitoring() {
+    if let Some(lux) = monitoring.illumination_lux {
+        // log the light level this measurement was taken under
+    }
+}
+```
+
+**It is optional context, never an input to results.** The value is `None` on
+replay, decoded imports, and deterministic offline analysis runs — there is no
+device to ask. A plugin whose output changes with its presence would disagree
+between a live preview and an offline re-run of the same recording, which
+breaks the guarantee that analysis runs are reproducible (ADR 025). Use it for
+logging, provenance, and sanity checks on capture conditions.
+
+These are sensor-monitor conversion outputs, not traceably calibrated
+instruments. Public IMX636/OpenEB material does not specify uncertainty,
+spectral response, field of view, or monitor bandwidth. In particular, use the
+lux value to annotate broad operating conditions, not as a replacement for a
+synchronized photodiode in fast or quantitative optical experiments. The full
+trust model and recommended persistence cadence are documented in
+`docs/features/absolute-setting-values.md`.
+
+Each field is independently `Option`: `None` means the sensor cannot report that
+quantity. Among the biases only `refr` has a physical unit; the other four are
+exposed as absolute codes because no vendor-documented conversion exists
+(`docs/features/absolute-setting-values.md`).
+
+`age_s` is how long before this frame the host actually read the sensor. The
+host polls at a few hertz, so a reading is never simultaneous with its frame.
+The same cached sample may appear on multiple frames and the payload currently
+has no sample ID or error field; enforce an age limit and do not count each
+payload as a new acquisition.
 
 Domain-specific payloads live in companion crates rather than in `augur-plugin-api`. Plugins that share structured data with downstream consumers define their types in `augur-plugin-types` or their own companion crate.
+
+## Frame-Independent Control (ABI v6)
+
+Declare a stable manifest `id` before participating in control routing. The
+live worker invokes `process_control` at a bounded cadence even without camera
+frames. Use `PluginControlContext::request_service` for atomic, target-defined
+semantic operations; implement `handle_service_request` in the device-owner
+plugin and publish revisioned state through `control_snapshots`.
+
+Do not use generic remote setting mutation for hardware protocols. A device
+plugin remains the sole owner of its connection and validates complete domain
+commands itself. Deduplicate or resume workflows using request IDs and target
+snapshots.
+
+The host calls `set_runtime_role` before applying copied settings. Hardware
+effects are permitted only for `PluginRuntimeRole::LiveWorker` when
+`ExecutionContext::hardware_effects_allowed()` is true. `UiMirror` and
+`OfflineAnalysis` must stay inert.
+
+Recording commands additionally require the corresponding manifest
+`host_commands` entry. Recording paths are relative to the host-configured
+output directory; absolute paths and traversal are rejected. See
+[Plugin Service Control Plane](./plugin-service-control-plane.md).
 
 ## Host Views
 
@@ -66,7 +140,12 @@ The host resolves duplicate ids in plugin execution order:
 - views whose dataset ids do not resolve are ignored and logged
 - views whose kinds do not match the dataset kind are ignored and logged
 - dataset payloads are fetched lazily and cached by dataset id
-- cached snapshots reload only when the provider reports a higher generation
+- cached snapshots reload only when the provider reports a changed, nonzero
+  generation
+- providers that leave `host_view_dataset_generation` at the default `0` are
+  treated as generation-less: the host reloads their datasets once per
+  analysis pass instead of caching them forever — implement real generation
+  counters to avoid that per-pass reload cost
 
 Current generic dataset kinds:
 
@@ -80,11 +159,33 @@ Current host-rendered view kinds:
 - `HostViewKind::TableWindow`
 - `HostViewKind::Density2dFromTable`
 - `HostViewKind::Scatter2dFromTable`
+- `HostViewKind::Scatter3dFromTable`
 - `HostViewKind::ImageWindow`
 - `HostViewKind::LineSeriesWindow`
 
 The host owns rendering, exports, caching, and window state. Plugins do not render `egui`
 directly.
+
+## Overlay Outputs
+
+Plugins can still emit lightweight overlay data through `HostOutput`:
+
+- `add_highlight_pixels(...)`
+- `add_crosshair_markers(...)`
+- `add_marker_overlay(...)`
+- `add_warning(...)`
+
+`add_marker_overlay(...)` is the generic path for richer 2D markers. It supports:
+
+- per-item shape: point, cross, box, ellipse, diamond, filled circle
+- per-item color and size
+- optional timestamp
+- optional stable id
+- optional overlay-level dataset id, layer id, and source label
+
+Use host-view datasets plus metadata for the primary linked-workspace model. Use marker overlays
+when the plugin needs an additional 2D annotation layer or wants 2D hit-testing on marks that do
+not map cleanly to existing `HighlightPixels` / `CrosshairMarkers`.
 
 ## Event Inputs And Retained History
 
@@ -99,13 +200,42 @@ Raw-event delivery and retained history are now separate concerns:
 - `PluginInput::RawEvents` means the plugin needs current-frame raw events
 - `PluginCapabilities { retained_event_history: true }` means the plugin needs host-retained history
 
-`augur-gui` only appends decoded events into the host-owned `EventStore` when at least one enabled
-plugin declares `retained_event_history: true`.
+When at least one enabled plugin declares `retained_event_history: true`,
+`augur-gui` registers a dedicated lossless upstream cursor for runtime plugin
+history. The host copies complete decoded frame windows from that cursor into
+the ABI-stable `EventStoreHandle` history, so bounded preview-frame drops do
+not silently remove frames from retained plugin history.
 
 Empty-event frames are not retained.
 
-This keeps the default preview/record path cheap when no plugin actually needs historical event
-access.
+This keeps the default preview/record path cheap when no plugin actually needs
+historical event access. If the plugin-history cursor falls behind the resident
+upstream ring, the host surfaces an analysis error instead of continuing with
+missing retained frames.
+
+## Lifecycle And State
+
+The current dynamic plugin ABI is v4. Plugins built against older vtable layouts
+must be rebuilt before the host will load them.
+
+Plugins are accumulating by default. The default `on_discontinuity`
+implementation calls `reset()` for accumulating plugins, which is correct for
+most plugins that derive state from prior frames. Return
+`PluginStateKind::Stateless` only when the plugin has no cross-frame accumulator
+and every output can be recomputed from the current frame plus host context.
+
+The host calls `on_discontinuity` on every loaded plugin — including
+stateless ones, whose default implementation ignores it — when a timeline or
+configuration boundary would make existing accumulated state unsafe to reuse:
+
+- replay seek
+- source/file replacement
+- plugin or global setting change
+- retained-history eviction after the live worker falls behind ring capacity
+
+Do not cache `EventStoreHandle` frame ranges across `process_frame` calls or
+across discontinuities. Query ranges from the handle inside the frame that needs
+them.
 
 ## Example
 
@@ -207,7 +337,8 @@ If the plugin can degrade gracefully, prefer a runtime warning over a hard depen
 | `augur-plugin-api/src/context.rs` | generic host datasets/views and `GlobalSettings` |
 | `augur-plugin-types/src/` | optional domain-specific companion payloads |
 | `augur-plugin-api/src/macros.rs` | `export_plugin!` |
-| `augur-gui/src/plugin_loader.rs` | manifest parsing, library loading, callback bridges |
+| `augur-runtime/src/lib.rs` | manifest parsing, library loading, callback bridges, retained history, and live worker |
+| `augur-gui/src/plugin_loader.rs` | compatibility re-export for the runtime loader |
 | `augur-gui/src/host_views.rs` | registry resolution, dataset decoding, host-side rendering/export |
 | `augur-gui/src/plugin_settings_ui.rs` | declarative settings and status renderer |
 | `augur-gui/src/hotpixel.rs` | host-owned built-in hotpixel tool (not part of the runtime plugin ABI) |

@@ -167,6 +167,13 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         return;
     }
 
+    // The bins are raw per-pixel values of the *current* preview mode, and what
+    // one bin means changes with that mode. Naming it "intensity" would invite
+    // reading an event count as photometry.
+    let (x_axis_label, quantity_note) = histogram_quantity(data.mode);
+    ui.small(format!(
+        "Distribution of the current preview frame's pixel values. {quantity_note}"
+    ));
     ui.small("Drag the blue/yellow markers to adjust brightness & contrast.");
 
     let max_bin = histogram.len().saturating_sub(1);
@@ -194,9 +201,9 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         })
         .collect();
     let y_axis_label = if data.log_scale {
-        "Count (log)"
+        "Pixels (log)"
     } else {
-        "Count"
+        "Pixels"
     };
     let histogram_for_hover = Arc::clone(&histogram);
 
@@ -211,15 +218,12 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         .include_x(max_bin as f64)
         .include_y(0.0)
         .include_y(plot_max)
-        .x_axis_label("Pixel Intensity")
+        .x_axis_label(x_axis_label)
         .y_axis_label(y_axis_label)
         .label_formatter(move |_name, value| {
-            let intensity = value.x.round().clamp(0.0, max_bin as f64) as usize;
-            let count = histogram_for_hover
-                .get(intensity)
-                .copied()
-                .unwrap_or_default();
-            format!("Intensity: {intensity}\nCount: {count}")
+            let bin = value.x.round().clamp(0.0, max_bin as f64) as usize;
+            let count = histogram_for_hover.get(bin).copied().unwrap_or_default();
+            format!("Pixel value: {bin}\nPixels: {count}")
         })
         .height(220.0)
         .show(ui, |plot_ui| {
@@ -395,6 +399,28 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
     }
 }
 
+/// The x-axis label and the sentence that says what one bin actually counts.
+///
+/// The preview is an event map, so the bin index is an event count (or a decay
+/// value in the time-surface mode) — never a photometric intensity.
+fn histogram_quantity(mode: PreviewMode) -> (&'static str, &'static str) {
+    match mode {
+        PreviewMode::SignedCount => (
+            "Pixel value (|ON \u{2212} OFF| events)",
+            "One bin is the net polarity magnitude accumulated by a pixel in the current window.",
+        ),
+        PreviewMode::TimeSurface => (
+            "Pixel value (time-surface decay, 0\u{2013}255)",
+            "One bin is a pixel's exponential decay value since its last event, not an event count.",
+        ),
+        PreviewMode::RedBlue | PreviewMode::Intensity(_) => (
+            "Pixel value (ON+OFF events)",
+            "One bin is the total event count a pixel accumulated in the current window \u{2014} \
+             not a photometric intensity.",
+        ),
+    }
+}
+
 fn marker_hover(
     pointer_x: Option<f64>,
     display_min: u16,
@@ -475,7 +501,26 @@ fn log_value(value: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContrastMode, ContrastSettings};
+    use super::{histogram_quantity, ContrastMode, ContrastSettings};
+    use crate::{colormap::Colormap, preview::PreviewMode};
+
+    #[test]
+    fn no_preview_mode_labels_its_bins_as_an_intensity() {
+        for mode in [
+            PreviewMode::RedBlue,
+            PreviewMode::SignedCount,
+            PreviewMode::Intensity(Colormap::Grays),
+            PreviewMode::TimeSurface,
+        ] {
+            let (axis, note) = histogram_quantity(mode);
+            let lowered = format!("{axis} {note}").to_lowercase();
+            assert!(
+                !lowered.contains("pixel intensity"),
+                "{mode:?} still calls its bins an intensity: {axis}"
+            );
+            assert!(axis.starts_with("Pixel value"), "{mode:?} -> {axis}");
+        }
+    }
 
     #[test]
     fn auto_range_picks_percentile_bin() {

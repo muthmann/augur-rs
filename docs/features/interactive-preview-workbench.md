@@ -4,6 +4,12 @@
 
 `augur-gui` now treats the preview area as a shared workspace instead of a single passive image. The same preview state drives the main center panel and the enlarged popup, so zoom, crop, cursor readout, ROI selection, and the 2D/3D view toggle stay in sync while newer host-side viewer tools build on top of that workspace.
 
+Historical note: this document describes the original shared-workspace pass.
+The current end-to-end ownership and rendering model is documented in
+[Investigation Dataflow And Memory Model](./investigation-dataflow-and-memory-model.md)
+and the current 3D workspace behavior in
+[Investigation Workspace](./investigation-workspace.md).
+
 ## 2D Preview Behavior
 
 - hovering the preview shows the current sensor-space `x, y` cursor position
@@ -26,12 +32,15 @@ The toolbar now includes a `View` toggle for `2D` versus `3D`.
 
 The 3D mode:
 
-- renders recent raw `CdEvent`s as a point cloud with `x`, `y`, and time as the three axes
-- keeps a bounded recent-event history in `augur-gui` instead of changing the capture pipeline design
+- captures recent raw `CdEvent`s into a bounded GUI-owned history buffer, with
+  `x`, `y`, and event age forming the 3D coordinates
+- keeps that retained raw-event history in `augur-gui` instead of changing the capture pipeline design
 - requests raw events from the pipeline only while the 3D view is active or a plugin already needs them
-- exposes controls for time range and max render limit, plus camera reset
-- uses mouse drag for orbit and the mouse wheel for zoom
-- filters the point cloud to the currently configured hardware ROI
+- exposes controls for time range, max render limit, point size, and camera reset
+- now feeds the WGPU investigation renderer in `augur-gui/src/inspection_3d.rs`
+  rather than the earlier painter-only 3D prototype
+- can link the active ROI into the 3D scene as a host-owned focus volume and
+  emphasis mask
 
 ## Side Panels
 
@@ -89,7 +98,8 @@ analysis side panel is present or resizing.
 | File | Role |
 |---|---|
 | `augur-gui/src/app.rs` | shared preview workspace state, 2D preview controls, popup integration, panel arrows, toolbar layout |
-| `augur-gui/src/point_cloud.rs` | recent-event history, orbit-camera math, and point-cloud painter rendering |
+| `augur-gui/src/point_cloud.rs` | retained raw-event history buffer used by the current 3D investigation scene |
+| `augur-gui/src/inspection_3d.rs` | current WGPU-backed 3D renderer and interaction model |
 | `docs/gui.md` | user-facing GUI workflow documentation |
 
 ## Verification

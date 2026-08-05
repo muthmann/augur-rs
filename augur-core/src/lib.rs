@@ -9,6 +9,8 @@ pub mod pipeline;
 pub mod replay;
 
 pub use decoded_replay::{
-    DecodedEventFileCamera, PackedEventPreviewDecoder, PACKED_EVENT_RECORD_BYTES,
+    DecodedEventFileCamera, DecodedReplayEventSource, PackedEventPreviewDecoder,
+    PACKED_EVENT_RECORD_BYTES,
 };
 pub use error::{CameraError, Result};
+pub use replay::RawReplayEventSource;

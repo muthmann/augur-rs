@@ -77,6 +77,49 @@ pub fn compute_scale_bar(
     best_in_range.or(nearest_to_target)
 }
 
+/// Suffix appended to every physical reading taken from an unconfirmed pixel
+/// scale. See [`UNCALIBRATED_TOOLTIP`] for the long form.
+pub const UNCALIBRATED_SUFFIX: &str = " (uncal.)";
+
+pub const UNCALIBRATED_TOOLTIP: &str = "Uncalibrated: this length uses the bare sensor pixel pitch, not a measured sample-plane scale. Behind any optics it is wrong by the magnification. Set the real value under Settings ▸ Pixel scale (nm/px), then tick \"Calibrated for this setup\".";
+
+/// Decorate a physical reading with its calibration provenance.
+pub fn calibration_suffix(calibrated: bool) -> &'static str {
+    if calibrated {
+        ""
+    } else {
+        UNCALIBRATED_SUFFIX
+    }
+}
+
+/// The sensor-to-sample scale together with whether anyone has confirmed it
+/// for this setup. The two travel as one value so no readout can print
+/// micrometres while forgetting to say where the scale came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PixelScale {
+    pub nm_per_pixel: f64,
+    pub calibrated: bool,
+}
+
+impl Default for PixelScale {
+    fn default() -> Self {
+        Self {
+            nm_per_pixel: 4_860.0,
+            calibrated: false,
+        }
+    }
+}
+
+impl PixelScale {
+    pub fn micrometers(self, pixels: f64) -> f64 {
+        pixels * self.nm_per_pixel / 1_000.0
+    }
+
+    pub fn suffix(self) -> &'static str {
+        calibration_suffix(self.calibrated)
+    }
+}
+
 fn scale_bar_label(length_um: f64) -> String {
     if (length_um.fract()).abs() < f64::EPSILON {
         format!("{length_um:.0} µm")

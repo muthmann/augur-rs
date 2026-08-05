@@ -92,6 +92,15 @@ Raw replay re-establishes its pacing baseline after a seek on the first decoded 
 Decoded replay can reset immediately from the reopened event index because the event vector is
 already in memory.
 
+Decoded replay files also expose that shared event vector through
+`DecodedReplayEventSource`, a timestamp-range `EventSource` used by the
+upstream raw-event migration. Raw `.raw` replay exposes `RawReplayEventSource`
+with correct cold-scan range reads. The remaining ADR 020 performance work is a
+sparse `.idx` sidecar keyed by file size, mtime, and header bytes, with
+timestamp / byte-offset checkpoints that let the host seek before a requested
+timestamp, decode forward, and repaginate events without scanning from the data
+start each time.
+
 For raw `.raw` seeks, both the packet-reader timing feedback and the preview decoder are seeded
 from the reopened byte position so the first replacement frame lands in the correct EVT3 rollover
 epoch instead of appearing near timestamp `0`.
@@ -103,6 +112,15 @@ visible during that handoff instead of dropping to the empty replay placeholder.
 For paused raw replay seeks and `←` / `→` frame steps, Augur keeps decoding after the reopen until
 the requested target timestamp is actually reached; it does not stop on the first decoded frame if
 that frame still lands earlier than the requested acquisition window.
+
+Whenever replay opens or reopens the preview pipeline, it also reapplies the current replay
+acquisition-time setting to the new controller, so seek/restart/step paths keep using the same
+frame-window length instead of drifting back to the default `50 ms` preview window.
+
+Replay preview accumulation also now closes frames at the first decoded event that reaches the
+requested acquisition window, even when one file-read / decode packet spans multiple frame windows.
+That keeps replay event counts and visible frame content responsive to acquisition-time changes
+instead of letting large packet boundaries dominate the frame size.
 
 Paused `→` frame steps reuse the current replay controller whenever it is still active. Instead of
 reopening the file from an approximate byte offset, Augur briefly resumes decoding from the current
