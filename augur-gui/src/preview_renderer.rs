@@ -2865,11 +2865,25 @@ mod tests {
         assert_eq!(grid.x, 1_000u32.div_ceil(COUNT_WORKGROUP_SIZE));
     }
 
-    /// A device to run the shaders on, or `None` where there is no adapter
-    /// (headless CI). Callers skip rather than fail: a machine without a GPU
-    /// cannot answer the question, which is different from answering it "no".
+    /// A device to run the shaders on, or `None` where there is none. Callers
+    /// skip rather than fail: a machine without a GPU cannot answer the
+    /// question, which is different from answering it "no".
+    ///
+    /// **`PRIMARY` only — deliberately not `all()`, which is what the renderer
+    /// itself asks for.** The GL backend is unusable from a test binary on a
+    /// headless runner: `wgpu-hal`'s EGL context does an `unwrap` inside
+    /// `make_current`, so a GL adapter panics somewhere in the middle of wgpu
+    /// rather than returning an error this code could skip on. Excluding it
+    /// means a runner with no Vulkan/Metal/DX12 adapter reports nothing at all
+    /// and the test skips cleanly, which is the honest outcome.
+    ///
+    /// Coverage is not lost: `create_shader_module` runs naga's validation,
+    /// which is what these tests are checking and is backend-independent.
     fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
