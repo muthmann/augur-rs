@@ -166,6 +166,10 @@ struct CountUniforms {
     inverse_range: f32,
     gamma: f32,
     event_count: u32,
+    dispatch_width: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0)
@@ -195,7 +199,10 @@ fn pixel_index(x: u32, y: u32, width: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn cs_accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let event_index = gid.x;
+    // The grid is two-dimensional once one row of workgroups is not enough to
+    // cover the events; `dispatch_width` is that row's length in invocations.
+    // For a single-row dispatch `gid.y` is 0 and this is just `gid.x`.
+    let event_index = gid.x + gid.y * uniforms.dispatch_width;
     if event_index >= uniforms.event_count {
         return;
     }
@@ -217,7 +224,7 @@ fn cs_accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(64)
 fn cs_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let index = gid.x;
+    let index = gid.x + gid.y * uniforms.dispatch_width;
     let pixel_count = uniforms.width * uniforms.height;
     if index >= pixel_count {
         return;
@@ -244,6 +251,10 @@ struct CountUniforms {
     inverse_range: f32,
     gamma: f32,
     event_count: u32,
+    dispatch_width: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0)
@@ -352,7 +363,7 @@ struct TimeSurfaceAccumulateUniforms {
     width: u32,
     height: u32,
     event_count: u32,
-    _pad0: u32,
+    dispatch_width: u32,
 };
 
 struct AtomicValues {
@@ -368,7 +379,9 @@ var<storage, read_write> tick_buf: AtomicValues;
 
 @compute @workgroup_size(64)
 fn cs_accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let event_index = gid.x;
+    // See the count shader: `dispatch_width` is one grid row's worth of
+    // invocations, and is 0-free even for a single-row dispatch.
+    let event_index = gid.x + gid.y * uniforms.dispatch_width;
     if event_index >= uniforms.event_count {
         return;
     }
@@ -483,7 +496,7 @@ struct TimeSurfaceHistogramUniforms {
     sample_stride: u32,
     frame_end_tick: u32,
     tick_period_us: u32,
-    _pad0: u32,
+    dispatch_width: u32,
     _pad1: u32,
     time_surface_tau_us: f32,
     _pad2: u32,
@@ -519,7 +532,7 @@ fn decay_value(last_tick: u32) -> u32 {
 @compute @workgroup_size(64)
 fn cs_histogram(@builtin(global_invocation_id) gid: vec3<u32>) {
     let stride = max(uniforms.sample_stride, 1u);
-    let index = gid.x * stride;
+    let index = (gid.x + gid.y * uniforms.dispatch_width) * stride;
     let pixel_count = uniforms.width * uniforms.height;
     if index >= pixel_count {
         return;
@@ -750,6 +763,13 @@ struct CountPreviewUniforms {
     inverse_range: f32,
     gamma: f32,
     event_count: u32,
+    /// Invocations per grid row, so the shader can linearize a 2D dispatch.
+    /// Padded to 48 bytes: a uniform-address-space struct is 16-byte aligned,
+    /// and the WGSL declarations must match this layout field for field.
+    dispatch_width: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
@@ -758,7 +778,8 @@ struct TimeSurfaceAccumulateUniforms {
     width: u32,
     height: u32,
     event_count: u32,
-    _pad0: u32,
+    /// Was padding, now carries the 2D grid's row length. Same 16 bytes.
+    dispatch_width: u32,
 }
 
 #[repr(C)]
@@ -787,7 +808,7 @@ struct TimeSurfaceHistogramUniforms {
     sample_stride: u32,
     frame_end_tick: u32,
     tick_period_us: u32,
-    _pad0: u32,
+    dispatch_width: u32,
     _pad1: u32,
     time_surface_tau_us: f32,
     _pad2: u32,
@@ -890,6 +911,17 @@ impl WgpuPreviewRenderer {
 
     fn queue(&self) -> &wgpu::Queue {
         &self.render_state.queue
+    }
+
+    /// How to lay out a one-invocation-per-item compute dispatch on *this*
+    /// adapter. Asked of the device rather than assumed: exceeding the limit is
+    /// a validation panic, not a recoverable error, so the number has to be the
+    /// real one.
+    fn dispatch_grid(&self, items: u32) -> DispatchGrid {
+        DispatchGrid::for_items(
+            items,
+            self.device().limits().max_compute_workgroups_per_dimension,
+        )
     }
 
     fn display_texture_result(&self, size: [usize; 2]) -> Result<PreviewDisplayTexture, String> {
@@ -1484,6 +1516,8 @@ impl WgpuPreviewRenderer {
             PreviewHistogramRequest::Full | PreviewHistogramRequest::None => 1,
         };
 
+        let sampled_items = pixel_count.div_ceil(sample_stride) as u32;
+        let grid = self.dispatch_grid(sampled_items);
         self.queue().write_buffer(
             &self.time_surface_histogram_uniform_buffer,
             0,
@@ -1492,6 +1526,7 @@ impl WgpuPreviewRenderer {
                 frame.window_end_us,
                 time_surface_tau_us,
                 sample_stride,
+                grid.span,
             )),
         );
 
@@ -1515,8 +1550,7 @@ impl WgpuPreviewRenderer {
                     .ok_or_else(|| "missing time-surface histogram bind group".to_owned())?,
                 &[],
             );
-            let sampled_items = pixel_count.div_ceil(sample_stride) as u32;
-            compute_pass.dispatch_workgroups(dispatch_workgroups(sampled_items), 1, 1);
+            compute_pass.dispatch_workgroups(grid.x, grid.y, 1);
         }
         encoder.copy_buffer_to_buffer(
             &self.time_surface_histogram_buffer,
@@ -1553,6 +1587,9 @@ impl WgpuPreviewRenderer {
                 size,
                 settings,
                 frame.event_count().unwrap_or(0),
+                // No compute pass follows this write — the render pipeline
+                // reads the same buffer and never indexes by dispatch.
+                0,
             )),
         );
         self.ensure_count_render_bind_group()?;
@@ -1579,6 +1616,8 @@ impl WgpuPreviewRenderer {
     ) -> Result<Vec<u64>, String> {
         self.ensure_count_accumulation(frame, mode)?;
         let size = [frame.width as usize, frame.height as usize];
+        // One invocation per pixel here, not per event.
+        let grid = self.dispatch_grid(size[0].saturating_mul(size[1]) as u32);
         self.queue().write_buffer(
             &self.count_uniform_buffer,
             0,
@@ -1587,6 +1626,7 @@ impl WgpuPreviewRenderer {
                 size,
                 PreviewDisplaySettings::default(),
                 frame.event_count().unwrap_or(0),
+                grid.span,
             )),
         );
 
@@ -1610,11 +1650,7 @@ impl WgpuPreviewRenderer {
                     .ok_or_else(|| "missing count compute bind group".to_owned())?,
                 &[],
             );
-            compute_pass.dispatch_workgroups(
-                dispatch_workgroups(size[0].saturating_mul(size[1]) as u32),
-                1,
-                1,
-            );
+            compute_pass.dispatch_workgroups(grid.x, grid.y, 1);
         }
         encoder.copy_buffer_to_buffer(
             &self.count_histogram_buffer,
@@ -1704,6 +1740,10 @@ impl WgpuPreviewRenderer {
             0,
             bytemuck::cast_slice(&self.count_packed_events),
         );
+        // One invocation per event. This is the dispatch that used to die: a
+        // 2 Hz, high-contrast A1 point delivers millions of events in a single
+        // preview frame.
+        let grid = self.dispatch_grid(events.len() as u32);
         self.queue().write_buffer(
             &self.count_uniform_buffer,
             0,
@@ -1712,6 +1752,7 @@ impl WgpuPreviewRenderer {
                 size,
                 PreviewDisplaySettings::default(),
                 events.len(),
+                grid.span,
             )),
         );
 
@@ -1754,7 +1795,7 @@ impl WgpuPreviewRenderer {
                     .ok_or_else(|| "missing count compute bind group".to_owned())?,
                 &[],
             );
-            compute_pass.dispatch_workgroups(dispatch_workgroups(events.len() as u32), 1, 1);
+            compute_pass.dispatch_workgroups(grid.x, grid.y, 1);
         }
         self.queue().submit(Some(encoder.finish()));
         self.count_accumulation_key = Some(key);
@@ -1975,10 +2016,16 @@ impl WgpuPreviewRenderer {
             0,
             bytemuck::cast_slice(&self.time_surface_packed_events),
         );
+        // The time-surface accumulate is the same shape, and was the same bug.
+        let grid = self.dispatch_grid(events.len() as u32);
         self.queue().write_buffer(
             &self.time_surface_accumulate_uniform_buffer,
             0,
-            bytemuck::bytes_of(&time_surface_accumulate_uniforms(size, events.len())),
+            bytemuck::bytes_of(&time_surface_accumulate_uniforms(
+                size,
+                events.len(),
+                grid.span,
+            )),
         );
 
         let mut encoder = self
@@ -1999,7 +2046,7 @@ impl WgpuPreviewRenderer {
                     .ok_or_else(|| "missing time-surface compute bind group".to_owned())?,
                 &[],
             );
-            compute_pass.dispatch_workgroups(dispatch_workgroups(events.len() as u32), 1, 1);
+            compute_pass.dispatch_workgroups(grid.x, grid.y, 1);
         }
         self.queue().submit(Some(encoder.finish()));
         self.time_surface_accumulation_key = Some(accumulation_key);
@@ -2423,6 +2470,7 @@ fn count_preview_uniforms(
     size: [usize; 2],
     settings: PreviewDisplaySettings,
     event_count: usize,
+    dispatch_width: u32,
 ) -> CountPreviewUniforms {
     let (display_min, inverse_range, gamma) = display_range_params(settings);
     let (mode_id, colormap_row) = mode_id_and_colormap(mode);
@@ -2435,18 +2483,23 @@ fn count_preview_uniforms(
         inverse_range,
         gamma,
         event_count: event_count.min(u32::MAX as usize) as u32,
+        dispatch_width,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     }
 }
 
 fn time_surface_accumulate_uniforms(
     size: [usize; 2],
     event_count: usize,
+    dispatch_width: u32,
 ) -> TimeSurfaceAccumulateUniforms {
     TimeSurfaceAccumulateUniforms {
         width: size[0].max(1) as u32,
         height: size[1].max(1) as u32,
         event_count: event_count.min(u32::MAX as usize) as u32,
-        _pad0: 0,
+        dispatch_width,
     }
 }
 
@@ -2478,6 +2531,7 @@ fn time_surface_histogram_uniforms(
     frame_end_us: u64,
     time_surface_tau_us: u64,
     sample_stride: usize,
+    dispatch_width: u32,
 ) -> TimeSurfaceHistogramUniforms {
     TimeSurfaceHistogramUniforms {
         width: size[0].max(1) as u32,
@@ -2486,7 +2540,7 @@ fn time_surface_histogram_uniforms(
         sample_stride: sample_stride.max(1).min(u32::MAX as usize) as u32,
         frame_end_tick: encode_time_surface_tick(frame_end_us),
         tick_period_us: TIME_SURFACE_TICK_US as u32,
-        _pad0: 0,
+        dispatch_width,
         _pad1: 0,
         time_surface_tau_us: time_surface_tau_us.max(1) as f32,
         _pad2: 0,
@@ -2553,8 +2607,46 @@ fn pack_time_surface_event(event: &augur_core::pipeline::CdEvent) -> [u32; 2] {
     ]
 }
 
-fn dispatch_workgroups(items: u32) -> u32 {
-    items.max(1).div_ceil(COUNT_WORKGROUP_SIZE)
+/// A compute dispatch laid out so no dimension exceeds the device's limit.
+///
+/// One item per invocation is the natural shape for every compute pass here —
+/// one per event, one per pixel — but a dispatch dimension is capped
+/// (`max_compute_workgroups_per_dimension`, 65535 in the guaranteed floor and
+/// on every desktop backend). At the 64-wide workgroup this file uses, a flat
+/// `(n, 1, 1)` dispatch therefore dies above 4_194_240 items — and it dies as a
+/// *validation panic*, not an error, taking the process with it.
+///
+/// A low-frequency, high-contrast A1 point reaches that in one preview frame:
+/// 2 Hz at `a = 1.7` produced 4_952_000 events, asking for 77_375 workgroups.
+///
+/// So the grid grows into `y` once `x` is full, and the shader recovers the
+/// linear index as `gid.x + gid.y * span`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchGrid {
+    x: u32,
+    y: u32,
+    /// Invocations covered by one full row of `x` — the shader's `y` stride.
+    span: u32,
+}
+
+impl DispatchGrid {
+    /// `max_per_dimension` comes from the live device rather than a constant:
+    /// the limit is a property of the adapter, and a machine that allows more
+    /// should not be forced into a taller grid than it needs.
+    fn for_items(items: u32, max_per_dimension: u32) -> Self {
+        let groups = items.max(1).div_ceil(COUNT_WORKGROUP_SIZE);
+        let max = max_per_dimension.max(1);
+        let x = groups.min(max);
+        // `y` cannot overflow the same limit in turn: `items` is a `u32`, so
+        // `groups` is at most 2^26, and dividing that by a limit of 65535
+        // leaves at most 1024 rows.
+        let y = groups.div_ceil(x);
+        Self {
+            x,
+            y,
+            span: x.saturating_mul(COUNT_WORKGROUP_SIZE),
+        }
+    }
 }
 
 fn map_buffer_sync(
@@ -2710,6 +2802,266 @@ mod tests {
     };
     use augur_core::pipeline::{CdEvent, PreviewFrame};
     use egui::Color32;
+
+    use super::{
+        wgpu, DispatchGrid, COUNT_COMPUTE_SHADER, COUNT_RENDER_SHADER, COUNT_WORKGROUP_SIZE,
+        PREVIEW_SHADER, TIME_SURFACE_COMPUTE_SHADER, TIME_SURFACE_HISTOGRAM_SHADER,
+        TIME_SURFACE_RENDER_SHADER,
+    };
+
+    /// The dispatch limit every desktop backend reports, and wgpu's guaranteed
+    /// floor. Hard-coded here so the expectations below are readable.
+    const LIMIT: u32 = 65_535;
+
+    /// The crash, as a number. 4_952_000 events at a 64-wide workgroup is
+    /// 77_375 workgroups — past the limit, and fatal as a validation panic
+    /// rather than an error.
+    #[test]
+    fn the_dispatch_that_killed_a_protocol_run_now_fits() {
+        let items = 4_952_000u32;
+        let flat = items.div_ceil(COUNT_WORKGROUP_SIZE);
+        assert!(
+            flat > LIMIT,
+            "the regression case no longer overflows: {flat}"
+        );
+
+        let grid = DispatchGrid::for_items(items, LIMIT);
+        assert!(grid.x <= LIMIT && grid.y <= LIMIT, "{grid:?}");
+        assert!(grid.y > 1, "the grid did not grow into y: {grid:?}");
+        // Every item is still covered — this fix must not silently drop events.
+        assert!(
+            u64::from(grid.x) * u64::from(grid.y) * u64::from(COUNT_WORKGROUP_SIZE)
+                >= u64::from(items),
+            "{grid:?} does not cover {items} items"
+        );
+    }
+
+    /// The shader recovers `i` from `gid.x + gid.y * span`. If `span` and the
+    /// grid ever disagree, the preview silently reads the wrong events — so the
+    /// mapping is checked here rather than trusted.
+    #[test]
+    fn the_grid_and_its_span_address_every_item_exactly_once() {
+        for items in [1u32, 63, 64, 65, 4096, 4_194_240, 4_194_241, 9_000_000] {
+            let grid = DispatchGrid::for_items(items, LIMIT);
+            assert_eq!(grid.span, grid.x * COUNT_WORKGROUP_SIZE, "items={items}");
+            let mut highest = 0u64;
+            for y in 0..u64::from(grid.y) {
+                for x in 0..u64::from(grid.span) {
+                    highest = highest.max(x + y * u64::from(grid.span));
+                }
+            }
+            assert!(
+                highest + 1 >= u64::from(items),
+                "items={items}: the grid reaches {highest}, short of {items}"
+            );
+        }
+    }
+
+    /// A single row stays one-dimensional, so the ordinary case is unchanged.
+    #[test]
+    fn a_small_dispatch_is_still_flat() {
+        let grid = DispatchGrid::for_items(1_000, LIMIT);
+        assert_eq!(grid.y, 1);
+        assert_eq!(grid.x, 1_000u32.div_ceil(COUNT_WORKGROUP_SIZE));
+    }
+
+    /// A device to run the shaders on, or `None` where there is no adapter
+    /// (headless CI). Callers skip rather than fail: a machine without a GPU
+    /// cannot answer the question, which is different from answering it "no".
+    fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    }
+
+    /// The linearization, executed rather than argued about. A wrong
+    /// `gid.x + gid.y * span` would not crash — it would silently count the
+    /// wrong events, which is worse than the panic this change removes.
+    ///
+    /// The grid is forced two-dimensional by handing `DispatchGrid` a limit of
+    /// one workgroup per dimension, so 200 events exercise exactly the shape
+    /// the bench reaches with five million.
+    #[test]
+    fn the_count_shader_reads_every_event_across_a_two_dimensional_grid() {
+        let Some((device, queue)) = test_device() else {
+            eprintln!("no wgpu device available — skipping");
+            return;
+        };
+
+        const WIDTH: u32 = 8;
+        const EVENTS: u32 = 200;
+        // Pixel `p` receives every event whose index is `p mod 8`, and those
+        // all share one polarity because the stride is even — so the expected
+        // on/off split is exact rather than statistical.
+        let packed: Vec<u32> = (0..EVENTS)
+            .map(|i| {
+                // Packed as the shader unpacks it: x in the low 16 bits, y in
+                // the next 15 (always row 0 here), polarity in the top bit.
+                let x = i % WIDTH;
+                let polarity = i % 2;
+                x | (polarity << 31)
+            })
+            .collect();
+
+        let grid = DispatchGrid::for_items(EVENTS, 1);
+        assert!(grid.y > 1, "the test did not force a 2D grid: {grid:?}");
+
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("count_compute"),
+            source: wgpu::ShaderSource::Wgsl(COUNT_COMPUTE_SHADER.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                super::storage_uniform_entry(0, wgpu::ShaderStages::COMPUTE),
+                super::storage_buffer_entry(1, wgpu::ShaderStages::COMPUTE, true),
+                super::storage_buffer_entry(2, wgpu::ShaderStages::COMPUTE, false),
+                super::storage_buffer_entry(3, wgpu::ShaderStages::COMPUTE, false),
+                super::storage_buffer_entry(4, wgpu::ShaderStages::COMPUTE, false),
+                super::storage_buffer_entry(5, wgpu::ShaderStages::COMPUTE, false),
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: "cs_accumulate",
+        });
+
+        let counts_bytes = (WIDTH as u64) * 4;
+        let storage = |size: u64, label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let events_buffer = storage((packed.len() * 4) as u64, "events");
+        let total = storage(counts_bytes, "total");
+        let on = storage(counts_bytes, "on");
+        let off = storage(counts_bytes, "off");
+        let histogram = storage((super::PREVIEW_HISTOGRAM_BINS * 4) as u64, "histogram");
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms"),
+            size: std::mem::size_of::<super::CountPreviewUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: counts_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        queue.write_buffer(&events_buffer, 0, bytemuck::cast_slice(&packed));
+        queue.write_buffer(
+            &uniform,
+            0,
+            bytemuck::bytes_of(&super::count_preview_uniforms(
+                PreviewMode::Intensity(Colormap::Green),
+                [WIDTH as usize, 1],
+                PreviewDisplaySettings::default(),
+                EVENTS as usize,
+                grid.span,
+            )),
+        );
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: events_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: total.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: on.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: off.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: histogram.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.clear_buffer(&total, 0, None);
+        encoder.clear_buffer(&on, 0, None);
+        encoder.clear_buffer(&off, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(grid.x, grid.y, 1);
+        }
+        encoder.copy_buffer_to_buffer(&total, 0, &readback, 0, counts_bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let totals =
+            super::map_buffer_sync(&device, &readback, counts_bytes, "total").expect("readback");
+        assert_eq!(
+            totals.iter().sum::<u32>(),
+            EVENTS,
+            "events were lost or double-counted: {totals:?}"
+        );
+        assert!(
+            totals.iter().all(|count| *count == EVENTS / WIDTH),
+            "events were not spread as written: {totals:?}"
+        );
+    }
+
+    /// WGSL is compiled by the driver at pipeline creation, so a mistake in a
+    /// shader is a *runtime* fault on the bench, not a build error here. These
+    /// are the edits this change made, so they are validated against a real
+    /// device — skipped, not failed, where no adapter exists.
+    #[test]
+    fn every_shader_still_compiles_on_a_real_device() {
+        let Some((device, _queue)) = test_device() else {
+            eprintln!("no wgpu device available — skipping shader validation");
+            return;
+        };
+
+        for (label, source) in [
+            ("preview", PREVIEW_SHADER),
+            ("count_compute", COUNT_COMPUTE_SHADER),
+            ("count_render", COUNT_RENDER_SHADER),
+            ("time_surface_compute", TIME_SURFACE_COMPUTE_SHADER),
+            ("time_surface_render", TIME_SURFACE_RENDER_SHADER),
+            ("time_surface_histogram", TIME_SURFACE_HISTOGRAM_SHADER),
+        ] {
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let _module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+                panic!("{label} shader failed validation: {error}");
+            }
+        }
+    }
 
     fn frame() -> PreviewFrame {
         PreviewFrame {
@@ -2881,7 +3233,7 @@ mod tests {
 
     #[test]
     fn time_surface_histogram_uniforms_encode_sampling_and_tau() {
-        let uniforms = time_surface_histogram_uniforms([320, 240], 64_000, 30_000, 4);
+        let uniforms = time_surface_histogram_uniforms([320, 240], 64_000, 30_000, 4, 1_024);
 
         assert_eq!(uniforms.width, 320);
         assert_eq!(uniforms.height, 240);
