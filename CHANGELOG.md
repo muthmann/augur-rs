@@ -11,6 +11,75 @@
 * ✨ clickable 2D overlays bound to their backing row via marker `source_row`, with reason-first summary card for rejected-fit rows.
 * ✨ generic host action bus: plugins declare `HostActionDescriptor`s with `Dataset`/`Row`/`Cluster` scope and an optional `param_schema`; the host renders scope-aware buttons plus a schema-driven modal and publishes `HostActionRequest`s to `CTX_INVESTIGATION_ACTION_REQUESTS`.
 
+## [2.0.0](https://github.com/muthmann/augur-rs/compare/v1.0.0...v2.0.0) (2026-08-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **plugin-api:** FfiMarkerOverlayItem gains source_dataset_id and source_row_id; PLUGIN_ABI_VERSION bumps from 3 to 4. Runtime plugins must rebuild against current augur-plugin-api.
+
+### Features
+
+* ✨ add host-owned investigation workspace ([2933536](https://github.com/muthmann/augur-rs/commit/2933536130f1657fcbdc062f936e2064caf356ae))
+* ✨ implement analysis execution model ([2d82e84](https://github.com/muthmann/augur-rs/commit/2d82e84c110a84944f249cec1665e0d6e5175595))
+* ✨ reorganize viewer toolbar and inspector layout ([9fac2e7](https://github.com/muthmann/augur-rs/commit/9fac2e7ea42e851c43a1831d680c3373a7c4ae8a))
+* **api,gui:** ✨ add Text, Path, and Button setting kinds ([ec16089](https://github.com/muthmann/augur-rs/commit/ec16089d601ef6fc5c474879b09375f0d207b706))
+* **api,runtime,gui:** ✨ add worker-owned plugin control plane ([85cc03c](https://github.com/muthmann/augur-rs/commit/85cc03cfbb2ef0276cc47b958d986803a9b36225))
+* **cli:** ✨ add analyze time-range overrides, fix inverted cancel flag ([1b3b632](https://github.com/muthmann/augur-rs/commit/1b3b6329e312cb7bfb4b2657d5b048d59d4795bc))
+* **core,api,runtime:** ✨ deliver external triggers and execution context to plugins (ABI v5) ([737b9d0](https://github.com/muthmann/augur-rs/commit/737b9d000e46e49fc5f8bae8d719fa38f0748ab3))
+* **core,prophesee,gui,cli:** ✨ show absolute values for abstract camera settings ([14f3e45](https://github.com/muthmann/augur-rs/commit/14f3e451562da6e7cf054ba22b4c187ae2f0b6f0))
+* **core:** ✨ split camera control from stream reads to keep recording gap-free ([83329af](https://github.com/muthmann/augur-rs/commit/83329af8da52b1e0a02926c586f4a8f75086406b))
+* **gui,cli:** ✨ check for and install updates from inside the app ([3cf5567](https://github.com/muthmann/augur-rs/commit/3cf5567f7c05334a7c10c5a68f78c998e916e5db))
+* **gui:** ✨ add measurement cursors and visible-window statistics to series views ([e16e4cf](https://github.com/muthmann/augur-rs/commit/e16e4cfc800a4c15850c58f09785783c407e1670))
+* **gui:** ✨ add per-view and global freeze for host-view snapshots ([25b93c1](https://github.com/muthmann/augur-rs/commit/25b93c1ca12d00bccaf0792405e3b29737a0522d))
+* **gui:** ✨ add PNG export to series host-view windows ([88cdd6c](https://github.com/muthmann/augur-rs/commit/88cdd6c1bd5ca335d97749891aaa3c70d2970b62))
+* **gui:** ✨ leave evidence when a session dies ([4cd35ad](https://github.com/muthmann/augur-rs/commit/4cd35ad0a7c25fbb611afea38a82aa59cf8855aa))
+* **gui:** ✨ make analysis runs the primary analysis workflow ([5915726](https://github.com/muthmann/augur-rs/commit/5915726c24be6b009b1d0de890e7b2a7ffe6c537))
+* **gui:** 🎨 implement AugurRS design system (passes 1–6.2) ([786e445](https://github.com/muthmann/augur-rs/commit/786e445ac944e534c44a8343fbb510c1c5cbd29b))
+* **gui:** add Python event ingress module and documentation ([8c0ec93](https://github.com/muthmann/augur-rs/commit/8c0ec93587d2feeee866cfb51e757390c441f696))
+* **gui:** complete AugurRS design system (passes 6–8 + toast integration) ([ecf293d](https://github.com/muthmann/augur-rs/commit/ecf293d54bda5a1f8fbc8c1c5b4cf4f8e881f9dc))
+* **plugin-api,runtime,gui:** ✨ expose sensor measurements to plugins ([29741c0](https://github.com/muthmann/augur-rs/commit/29741c0e8040fc1f803f62785b9ba1e483dd4200))
+* **plugin-api:** ✨ add host action bus and clickable overlay row binding ([e9c0974](https://github.com/muthmann/augur-rs/commit/e9c0974a2820c5d451dbee675e41ac48bfdf91d6))
+* **runtime:** ✨ add half-open analysis ranges, replay probing, and a JSON→TOML settings bridge ([1fccfa0](https://github.com/muthmann/augur-rs/commit/1fccfa005b2d675ee54c24e84089a5f88a921b44))
+* **update:** ✨ add the augur-update crate ([803d4ba](https://github.com/muthmann/augur-rs/commit/803d4bad4210e1d2207400847a90e4c461e14cbb))
+
+
+### Bug Fixes
+
+* 🐛 apply replay acquisition time to emitted frame windows ([05f49a5](https://github.com/muthmann/augur-rs/commit/05f49a55d34ede5d9f83b7e4cd0e3b55cb2d9072))
+* 🐛 restore investigation candidate click selection ([bad2acd](https://github.com/muthmann/augur-rs/commit/bad2acdee5d9edb9badf5e28db66bb556ea85013))
+* 🐛 route plugin history through upstream event source ([5cda19c](https://github.com/muthmann/augur-rs/commit/5cda19c95fe680fcf0f555daa4a19151fc6274e8))
+* **ci:** 🐛 grant the packaging caller the permissions release.yml declares ([a1fe088](https://github.com/muthmann/augur-rs/commit/a1fe08895ffcd4d353bd50609d9f965b7a4fee06))
+* **ci:** 🐛 make tagged releases actually publish binaries ([2b447c6](https://github.com/muthmann/augur-rs/commit/2b447c6ea1a23d29334339d903141bbc97a3c021))
+* **ci:** update Cargo.lock after v1.0.0 release ([654eac5](https://github.com/muthmann/augur-rs/commit/654eac554e2533947fd52c3ba374f25e0b42de01))
+* **ci:** update Cargo.lock after v1.0.0 release and auto-sync on future releases ([8cb1d12](https://github.com/muthmann/augur-rs/commit/8cb1d12b2d3296a51692210f63c6811377078588))
+* **core,prophesee,gui,cli:** 🐛 close remaining .raw recording gap sources ([4e286a3](https://github.com/muthmann/augur-rs/commit/4e286a3ccfc81a323096cf16ae4f0c2f56281050))
+* **core:** 🐛 close lossless-recording gaps in the disk path ([e8eac94](https://github.com/muthmann/augur-rs/commit/e8eac94bb7b67d8ec6ff5798646f4722ca64bbac))
+* **core:** 🐛 keep preview alive when a frame exceeds event-ring capacity ([65e1906](https://github.com/muthmann/augur-rs/commit/65e1906fce59ed5c3dc7e614465973da6d1a315a))
+* **event-types:** 🐛 evict wrapped-write overlap behind older ring survivor ([e663ae9](https://github.com/muthmann/augur-rs/commit/e663ae993e0dd9020f2437c54e5eadb80f8e30d2))
+* **gui,core:** 🐛 stop the UI claiming more than it can back up ([dd77d9b](https://github.com/muthmann/augur-rs/commit/dd77d9bb4fdcbd2bf65b8d25fa26e6485b930935))
+* **gui:** 🐛 align replay 2D/3D windows through seek, step, and pause ([6fbedb7](https://github.com/muthmann/augur-rs/commit/6fbedb77b3951533f63be61624b80356c4a6e64c))
+* **gui:** 🐛 keep plugin host views repainting without input events ([416115c](https://github.com/muthmann/augur-rs/commit/416115ccf6c50a6f7e20c5e45a4e5d48e3bd7423))
+* **gui:** 🐛 keep the host-view dock inside its panel and closable ([0611fff](https://github.com/muthmann/augur-rs/commit/0611fff032db0db2100c111cc8514dd7f2b1b7e0))
+* **gui:** 🐛 keep the sensor readout section visible and open ([18f6331](https://github.com/muthmann/augur-rs/commit/18f6331c8108deb4ddc53629e6d44879209ba165))
+* **gui:** 🐛 persist the sensor-monitoring recording switch ([d43652a](https://github.com/muthmann/augur-rs/commit/d43652a42418f658b32c23e2aaabed1df6a27642))
+* **gui:** 🐛 stop the dock tab strip deadlocking the UI thread ([45f8a04](https://github.com/muthmann/augur-rs/commit/45f8a04ac0758bf30300a9236f907181027d36e0))
+* **gui:** add explicit f32 suffixes to float literals ([15dbf5a](https://github.com/muthmann/augur-rs/commit/15dbf5af9355b56d1ceb694b2f8c7b1f0abacdec))
+* **gui:** fix panel layout bugs and visual polish ([f23c634](https://github.com/muthmann/augur-rs/commit/f23c634af1f09017535b57a7e5d0db7aa7a734c9))
+* **prophesee:** 🐛 build the async USB reader on Windows ([92b0464](https://github.com/muthmann/augur-rs/commit/92b04648e35c9b3aa73a232f24ce97946eec26b4))
+* **release:** 🐛 name the AppImage icon to match the desktop entry ([1dbef92](https://github.com/muthmann/augur-rs/commit/1dbef92a293ea3ce91cdbf9b43ba41863295ed13))
+* **release:** 🐛 resolve the packaging output directory to an absolute path ([194e2bd](https://github.com/muthmann/augur-rs/commit/194e2bd26608b2183131b92eb4ba4b764679b2dd))
+* **runtime:** 🐛 give plugin-runtime state explicit host/worker owners ([1984b4a](https://github.com/muthmann/augur-rs/commit/1984b4a6a4ba191f05ac6107a9b5b4440e9ddc53))
+* **runtime:** 🐛 refresh plugin settings schema at the UI cache cadence ([21800ff](https://github.com/muthmann/augur-rs/commit/21800ff8aff2ce76167ecacb9316678ff40bb49e))
+
+
+### Performance Improvements
+
+* ⚡️ cut per-frame point-cloud re-decoding and dedupe hot paths ([f17a4d0](https://github.com/muthmann/augur-rs/commit/f17a4d0b9fbd99a4a739131118de6e5feba9e81e))
+* **gui:** ⚡️ cut per-frame 3D scene and upload costs, fix translucent occlusion ([ea7f948](https://github.com/muthmann/augur-rs/commit/ea7f948b1ae7203787ec32a054040dce3a37c7fe))
+* **prophesee:** ⚡️ queue async multi-URB bulk reads on the stream endpoint ([0141415](https://github.com/muthmann/augur-rs/commit/0141415c4c7dcd2d13ffe540f165c203ff0f2f35))
+* **runtime:** ⚡️ decode host-view datasets on the worker, change-driven ([ae21e6d](https://github.com/muthmann/augur-rs/commit/ae21e6d058274f65d833de1f1d58ff2be9bd5f8b))
+
 ## [1.0.0](https://github.com/muthmann/augur-rs/compare/v0.1.0...v1.0.0) (2026-04-07)
 
 
