@@ -3309,15 +3309,39 @@ host_commands = ["start_recording", "stop_recording"]
         let _ = fs::remove_dir_all(plugins_dir);
     }
 
+    /// Wait for a frame-independent control result instead of assuming one has already been
+    /// published.
+    ///
+    /// The worker ticks the control plane on its own thread every `CONTROL_TICK_INTERVAL`, so
+    /// sleeping a fixed multiple of that interval and polling once asserts on scheduler latency
+    /// rather than on behaviour: spawning the thread and scanning the plugin directory can
+    /// exceed the interval on a loaded CI runner. Polling to a generous deadline still fails if
+    /// the tick never happens, without turning runner load into a failure.
+    fn await_control_result(worker: &LiveAnalysisWorker) -> LiveControlResult {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match worker.try_recv_control() {
+                Ok(result) => return result,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("worker control channel closed before a periodic result arrived")
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no periodic control result within 10s of spawning the worker"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
     #[test]
     fn live_worker_ticks_control_plane_without_analysis_frames() {
         let plugins_dir = unique_temp_dir("worker-control-tick");
         let (worker, _rx) = LiveAnalysisWorker::spawn(plugins_dir.clone(), 1024 * 1024);
 
-        thread::sleep(CONTROL_TICK_INTERVAL.saturating_mul(2));
-        let result = worker
-            .try_recv_control()
-            .expect("periodic control result arrives without an analysis frame");
+        let result = await_control_result(&worker);
         assert_eq!(result.execution, ExecutionContext::fail_closed());
         assert!(
             result.host_snapshot_sequence > 0,
