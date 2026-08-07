@@ -53,6 +53,11 @@ metadata. Plugin-specific research semantics are still outside this repository.
 - Narrow split panes now keep both the 2D preview and the 3D inspection surface clipped to their
   actual pane rects instead of letting either pane reserve space under the right inspector or over
   the neighboring split pane.
+- The divider caps the 2D pane at the image's natural display width, derived from the hardware ROI
+  aspect ratio, so a height-limited image adds no whitespace. That cap is floored at the minimum
+  pane width: a tall, narrow ROI puts the natural width below the minimum, and letting the cap win
+  would invert the divider's clamp range (this panicked the GUI on a `36x720`-style ROI). Keeping
+  the pane usable takes priority over honouring the cap.
 - The 2D preview toolbar and 3D controls now scroll horizontally at narrow widths, so hover text,
   layer/status labels, and tool buttons no longer force the split panes wider than the divider
   allocation.

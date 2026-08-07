@@ -15,6 +15,7 @@ and the current 3D workspace behavior in
 - hovering the preview shows the current sensor-space `x, y` cursor position
 - the toolbar uses compact icon buttons with hover tooltips for ROI, histogram, line-profile, ruler, annotation, zoom, and popup actions, and it keeps the hover readout on the same row instead of wrapping
 - `Select ROI` turns the preview into a rectangular drag tool that writes back to `CameraConfig::roi`
+- the ROI settings section has a `Reset to full frame` button that restores `x 0, y 0` at the reported sensor size; it is disabled while the ROI already covers the whole sensor, so it doubles as an indicator that every pixel is active
 - zoom-out, zoom-in, and fit-to-window icon buttons control preview zoom, while drag-panning is available whenever the view is zoomed in
 - `Crop to ROI` switches the 2D preview between full-sensor rendering and ROI-only rendering without changing the allocated canvas size; it crops to the selected software annotation when one is selected, otherwise it uses the hardware ROI
 - the toolbar also owns the histogram toggle plus line-profile, ruler, and software-annotation tool modes

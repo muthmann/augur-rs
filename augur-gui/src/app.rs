@@ -11366,10 +11366,14 @@ fn show_investigation_split_in_rect(
 
     let handle_width = 12.0;
     let usable_width = (full_rect.width() - handle_width).max(1.0);
-    let min_pane_width = 280.0f32.min(((usable_width - 40.0).max(40.0)) * 0.5);
-    let (min_ratio, max_ratio) = investigation_split_ratio_bounds(usable_width, min_pane_width);
-    // Hard-cap the left pane so it cannot grow past the 2D image's natural display width.
-    let max_left = (usable_width - min_pane_width).min(max_left_width.unwrap_or(f32::MAX));
+    let bounds = InvestigationSplitBounds::new(usable_width, max_left_width);
+    let (min_pane_width, max_left) = (bounds.min_pane_width, bounds.max_left);
+    let (min_ratio, max_ratio) = (bounds.min_ratio, bounds.max_ratio);
+    // `split_ratio` is persisted layout state; a non-finite value from an older or hand-edited
+    // session would propagate NaN into every rect below instead of failing loudly.
+    if !split_ratio.is_finite() {
+        *split_ratio = 0.5;
+    }
     let mut left_width =
         (usable_width * (*split_ratio).clamp(min_ratio, max_ratio)).clamp(min_pane_width, max_left);
     let handle_rect = egui::Rect::from_min_size(
@@ -11441,6 +11445,45 @@ fn show_investigation_pane<R>(
         .inner
     })
     .inner
+}
+
+/// Pane-width limits for the 2D/3D investigation split.
+///
+/// Kept as a pure value so the ordering invariant it exists to hold —
+/// `min_pane_width <= max_left` — is testable without a live `egui::Ui`. Violating it made
+/// `f32::clamp` panic whenever a tall, narrow ROI capped the 2D pane below the minimum width.
+#[derive(Debug, Clone, Copy)]
+struct InvestigationSplitBounds {
+    min_pane_width: f32,
+    max_left: f32,
+    min_ratio: f32,
+    max_ratio: f32,
+}
+
+impl InvestigationSplitBounds {
+    fn new(usable_width: f32, max_left_width: Option<f32>) -> Self {
+        let usable_width = if usable_width.is_finite() {
+            usable_width.max(1.0)
+        } else {
+            1.0
+        };
+        let min_pane_width = 280.0f32.min(((usable_width - 40.0).max(40.0)) * 0.5);
+        let (min_ratio, max_ratio) = investigation_split_ratio_bounds(usable_width, min_pane_width);
+        // The cap keeps the left pane from growing past the 2D image's natural display width, but
+        // a tall, narrow ROI puts that width below `min_pane_width`. Floor the cap there: keeping
+        // the pane usable beats honouring the cap, and an inverted clamp range panics. The final
+        // `.max()` also absorbs a NaN cap (a NaN ROI aspect), since `f32::max` returns the
+        // non-NaN operand.
+        let max_left = (usable_width - min_pane_width)
+            .min(max_left_width.unwrap_or(f32::MAX))
+            .max(min_pane_width);
+        Self {
+            min_pane_width,
+            max_left,
+            min_ratio,
+            max_ratio,
+        }
+    }
 }
 
 fn investigation_split_ratio_bounds(usable_width: f32, min_pane_width: f32) -> (f32, f32) {
@@ -11891,8 +11934,9 @@ mod tests {
         roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
         should_dispatch_live_analysis_for_state, store_hover_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
-        viewport_stream_active, CameraApp, PluginRecordingSession, PopupSharedData,
-        RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
+        viewport_stream_active, CameraApp, InvestigationSplitBounds, PluginRecordingSession,
+        PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH,
+        RAW_EVENTS_ON_LAYER_ID,
     };
     use super::{
         clip_to_panel, dock_tab_strip_width, publish_window_frame, should_seed_default_dock_tabs,
@@ -12929,5 +12973,54 @@ mod tests {
     #[test]
     fn split_ratio_bounds_collapse_to_center_when_min_panes_fill_the_width() {
         assert_eq!(investigation_split_ratio_bounds(200.0, 120.0), (0.5, 0.5));
+    }
+
+    #[test]
+    fn split_bounds_stay_ordered_when_a_narrow_roi_caps_the_2d_pane() {
+        // A tall, narrow ROI (e.g. 36x720 over a 594 px tall split) makes the 2D image's natural
+        // display width ~29.7 px — far under the 280 px minimum pane width. The cap must not
+        // invert the clamp range.
+        let bounds = InvestigationSplitBounds::new(1_188.0, Some(29.7));
+
+        assert_eq!(bounds.min_pane_width, 280.0);
+        assert!(
+            bounds.max_left >= bounds.min_pane_width,
+            "max_left {} must not fall below min_pane_width {}",
+            bounds.max_left,
+            bounds.min_pane_width
+        );
+        // Reproduces the panicking expression from `show_investigation_split_in_rect`.
+        let _ = (bounds.max_left * 0.5).clamp(bounds.min_pane_width, bounds.max_left);
+    }
+
+    #[test]
+    fn split_bounds_honour_a_cap_that_still_leaves_a_usable_pane() {
+        let bounds = InvestigationSplitBounds::new(1_188.0, Some(400.0));
+
+        assert_eq!(bounds.max_left, 400.0);
+    }
+
+    #[test]
+    fn split_bounds_stay_ordered_for_degenerate_widths_and_caps() {
+        for (usable_width, cap) in [
+            (1_188.0_f32, Some(f32::NAN)),
+            (1_188.0, Some(0.0)),
+            (1_188.0, Some(-10.0)),
+            (1.0, None),
+            (0.0, Some(29.7)),
+            (f32::NAN, Some(29.7)),
+        ] {
+            let bounds = InvestigationSplitBounds::new(usable_width, cap);
+
+            assert!(
+                bounds.min_pane_width.is_finite() && bounds.max_left.is_finite(),
+                "non-finite bounds for width {usable_width} cap {cap:?}"
+            );
+            assert!(
+                bounds.max_left >= bounds.min_pane_width,
+                "inverted bounds for width {usable_width} cap {cap:?}"
+            );
+            assert!(bounds.min_ratio <= bounds.max_ratio);
+        }
     }
 }
