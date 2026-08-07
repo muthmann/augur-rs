@@ -1,6 +1,6 @@
 use augur_core::{
     camera::BiasReadback,
-    config::CameraConfig,
+    config::{CameraConfig, RoiConfig},
     pipeline::{PipelineStatsSnapshot, SensorMonitoringSnapshot},
 };
 
@@ -201,6 +201,24 @@ pub fn draw_settings(
                 )
                 .changed();
         });
+        // A narrow or off-screen ROI is easy to drag into and hard to type back out of, so the
+        // way back to the whole sensor is one click. Disabled once it would be a no-op, so the
+        // button doubles as an indicator of whether the sensor is fully active.
+        let full_frame = full_frame_roi(sensor_width, sensor_height);
+        let is_full_frame = roi_is_full_frame(cfg.roi, sensor_width, sensor_height);
+        ui.add_space(crate::theme::sp::SP_2);
+        if ui
+            .add_enabled(!is_full_frame, egui::Button::new("Reset to full frame"))
+            .on_hover_text(format!(
+                "Reactivate every pixel: x 0, y 0, w {}, h {}.",
+                full_frame.width, full_frame.height
+            ))
+            .on_disabled_hover_text("The ROI already covers the whole sensor.")
+            .clicked()
+        {
+            cfg.roi = full_frame;
+            changed = true;
+        }
     });
 
     ui.separator();
@@ -477,6 +495,24 @@ fn draw_sensor_readout(ui: &mut egui::Ui, snapshot: &SensorMonitoringSnapshot) {
     }
 }
 
+/// The ROI covering every pixel of the sensor actually in front of us.
+///
+/// [`RoiConfig::full_frame`] hard-codes the IMX636 geometry; this stays honest about the
+/// reported sensor size, and never emits a zero-sized ROI that the config would reject.
+fn full_frame_roi(sensor_width: u16, sensor_height: u16) -> RoiConfig {
+    RoiConfig {
+        x: 0,
+        y: 0,
+        width: sensor_width.max(1),
+        height: sensor_height.max(1),
+    }
+}
+
+fn roi_is_full_frame(roi: RoiConfig, sensor_width: u16, sensor_height: u16) -> bool {
+    let full = full_frame_roi(sensor_width, sensor_height);
+    roi.x == full.x && roi.y == full.y && roi.width == full.width && roi.height == full.height
+}
+
 /// Three significant digits, so a value that jitters in its last decimal does
 /// not make the panel look unstable.
 pub(crate) fn format_measurement(value: f32, unit: &str) -> String {
@@ -504,5 +540,46 @@ mod tests {
     fn measurement_keeps_two_decimals_below_ten() {
         assert_eq!(format_measurement(0.0, "lux"), "0.00 lux");
         assert_eq!(format_measurement(9.999, "µs"), "10.00 µs");
+    }
+
+    #[test]
+    fn full_frame_reset_follows_the_reported_sensor_size() {
+        let roi = full_frame_roi(640, 480);
+
+        assert_eq!((roi.x, roi.y, roi.width, roi.height), (0, 0, 640, 480));
+        roi.validate(640, 480).expect("reset ROI must be valid");
+    }
+
+    #[test]
+    fn full_frame_reset_never_produces_a_zero_sized_roi() {
+        let roi = full_frame_roi(0, 0);
+
+        assert_eq!((roi.width, roi.height), (1, 1));
+        roi.validate(1, 1).expect("reset ROI must be valid");
+    }
+
+    #[test]
+    fn full_frame_detection_distinguishes_a_cropped_roi() {
+        assert!(roi_is_full_frame(full_frame_roi(1280, 720), 1280, 720));
+        assert!(!roi_is_full_frame(
+            RoiConfig {
+                x: 0,
+                y: 0,
+                width: 36,
+                height: 720,
+            },
+            1280,
+            720
+        ));
+        assert!(!roi_is_full_frame(
+            RoiConfig {
+                x: 8,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            1280,
+            720
+        ));
     }
 }
