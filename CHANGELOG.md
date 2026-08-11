@@ -11,6 +11,14 @@
 * ✨ clickable 2D overlays bound to their backing row via marker `source_row`, with reason-first summary card for rejected-fit rows.
 * ✨ generic host action bus: plugins declare `HostActionDescriptor`s with `Dataset`/`Row`/`Cluster` scope and an optional `param_schema`; the host renders scope-aware buttons plus a schema-driven modal and publishes `HostActionRequest`s to `CTX_INVESTIGATION_ACTION_REQUESTS`.
 
+## [2.0.2](https://github.com/muthmann/augur-rs/compare/v2.0.1...v2.0.2) (2026-08-07)
+
+
+### Bug Fixes
+
+* **gui:** 🐛 stop a narrow ROI panicking the 2D/3D split divider ([ff46629](https://github.com/muthmann/augur-rs/commit/ff46629147e2a114526d1d041ce29edbf5962c44))
+* **gui:** 🐛 stop a narrow ROI panicking the 2D/3D split divider ([a6539b7](https://github.com/muthmann/augur-rs/commit/a6539b7d63c2e0627e4a2a74d3d5817fb6dfda43))
+
 ## [2.0.1](https://github.com/muthmann/augur-rs/compare/v2.0.0...v2.0.1) (2026-08-05)
 
 
