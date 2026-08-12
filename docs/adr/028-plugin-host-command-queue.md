@@ -1,4 +1,4 @@
-# ADR 028: Allowlisted Plugin to Host Recording Commands
+# ADR 028: Declared Plugin-to-Host Commands
 
 ## Status
 
@@ -12,12 +12,11 @@ GUI-control capability.
 
 ## Decision
 
-The ABI exposes a closed `HostCommand` enum. The implemented verbs are
-`start_recording`, `stop_recording` and `apply_biases` — the last added by
-ADR 036, which keeps the same declaration, dedupe and rejection machinery
-described here.
+The ABI exposes a closed `HostCommand` enum of generic host operations. The
+implemented verbs cover recording control and complete camera-configuration
+sessions. They do not name plugins or encode one workflow's scientific policy.
 
-- A plugin must declare each verb in `plugin.toml` via `host_commands`. The
+- A plugin must declare each capability in `plugin.toml` via `host_commands`. The
   live worker rejects undeclared commands before they reach the GUI.
 - Commands are accepted only while the worker has a live execution context
   with effects enabled. Replay, offline analysis, and GUI mirrors fail closed.
@@ -69,9 +68,14 @@ Workflow plugins can coordinate capture without direct camera or arbitrary
 file-system access. They must choose names relative to the host-configured
 recording directory and handle explicit rejection/finalization replies.
 
+The manifest declaration limits authority; it is not a host-side list of known
+plugin IDs. The same generic commands are available to any plugin that declares
+them, and the host remains functional when all plugins are removed.
+
 ## References
 
 - ADR 013: Self-Describing Recording Metadata
 - ADR 026: External Triggers and Execution Context
 - ADR 027: Worker-Owned Semantic Plugin Services
+- ADR 037: Host-Owned Camera Profiles And Plugin Configuration Sessions
 - `docs/features/plugin-service-control-plane.md`

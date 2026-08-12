@@ -31,13 +31,14 @@ use augur_core::{
 use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy, ExternalTriggerEvent};
 use augur_plugin_api::{
     CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
-    CameraDigitalFilterV1, CameraExternalTriggerV1, CameraGlobalSettingsV1, EventFiltersV1,
-    ExecutionContext, ExecutionMode, FfiCdEvent, GlobalSettings, HostActionRequest,
-    HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostCommand,
-    HostCommandOutcome, HostCommandReply, HostDatasetKind, HostViewKind, Image2dV1,
-    PluginDiscontinuity, PluginInput, SensorBiasCodesV1, SensorBiasOffsetsV1, SensorBiasReadbackV1,
-    SensorMonitoringV1, Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1,
-    CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
+    CameraConfigurationSourceV1, CameraDigitalFilterV1, CameraExternalTriggerV1,
+    CameraGlobalSettingsV1, EventFiltersV1, ExecutionContext, ExecutionMode, FfiCdEvent,
+    GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
+    HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply, HostDatasetKind,
+    HostViewKind, Image2dV1, PluginDiscontinuity, PluginInput, SensorBiasCodesV1,
+    SensorBiasReadbackV1, SensorMonitoringV1, Series1dV1, SettingsSchema, TableColumnValues,
+    TableDatasetV1, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+    HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
@@ -893,25 +894,7 @@ struct PluginRecordingFinalizeTask {
     rx: mpsc::Receiver<PluginRecordingFinalizeResult>,
 }
 
-/// An `ApplyBiases` command whose registers are written, now waiting for the
-/// sensor to confirm what it is actually running.
-///
-/// The reply is deliberately not sent at reconfigure time. The whole value of
-/// this command to a threshold measurement is that the codes on the die are
-/// *shown* to be the requested ones, and the only thing that can show that is a
-/// monitoring read taken after the write landed.
-#[derive(Debug)]
-struct PendingBiasApply {
-    source_plugin_id: String,
-    request_id: u64,
-    /// Offsets written into the camera config, after the host's range check.
-    applied: SensorBiasOffsetsV1,
-    /// When the reconfigure was handed to the control thread. Only a reading
-    /// taken after this instant can confirm the command.
-    applied_at: Instant,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CameraConfigurationSession {
     owner_plugin_id: String,
     original: CameraConfig,
@@ -934,6 +917,10 @@ enum PendingCameraConfigurationKind {
 
 #[derive(Debug)]
 struct PendingCameraConfigurationApply {
+    /// Configuration active immediately before this apply. A failed update
+    /// rolls back here, while the session's original remains available for the
+    /// final explicit restore.
+    rollback: CameraConfig,
     original: CameraConfig,
     snapshot: CameraConfigurationSnapshotV1,
     provenance: CameraConfigurationProvenanceV1,
@@ -948,12 +935,10 @@ struct PendingCameraConfiguration {
     kind: PendingCameraConfigurationKind,
 }
 
-/// How long the host waits for a monitoring read that confirms an
-/// `ApplyBiases`. The control thread re-reads the bias block immediately after
-/// a reconfigure, so this is many times the expected latency: long enough that
-/// a busy USB link is not mistaken for a failure, short enough that an
-/// unattended survey is not stalled by one bad point.
-const BIAS_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the host waits for a monitoring read that confirms a camera
+/// configuration. The control thread re-reads the bias block immediately after
+/// a reconfigure, so this is many times the expected latency.
+const CAMERA_CONFIGURATION_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Programmed code for one bias, the way the sensor computes it: the per-unit
 /// factory trim plus the configured offset, saturated into the 8-bit register.
@@ -1073,76 +1058,9 @@ fn snapshot_sha256(snapshot: &CameraConfigurationSnapshotV1) -> Result<String, S
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-/// Offset window the IMX636 driver accepts. Mirrors `check_range` in
-/// `augur-prophesee`, so a caller is told which value was wrong instead of
-/// getting an opaque reconfigure failure several layers down.
-const BIAS_OFFSET_RANGE: std::ops::RangeInclusive<i32> = -85..=140;
-
-/// Host state an `ApplyBiases` is judged against.
-struct BiasApplyState {
-    recording_active: bool,
-    stc_enabled: bool,
-    trail_enabled: bool,
-    camera_running: bool,
-    apply_in_flight: bool,
-}
-
-/// Why this bias change must not happen, or `None` to go ahead.
-///
-/// Each rule is one the host is the only place able to enforce: a plugin cannot
-/// see whether the operator is recording, and a plugin that checked the filters
-/// from its own context-bus copy could be a frame behind.
-fn bias_apply_refusal(
-    state: &BiasApplyState,
-    diff_on: Option<i32>,
-    diff_off: Option<i32>,
-) -> Option<(&'static str, String)> {
-    // Changing a threshold mid-file would put two different sensors into one
-    // recording, and nothing downstream could separate them again.
-    if state.recording_active {
-        return Some((
-            "recording_active",
-            "biases cannot be changed while a recording is running or being finalized".into(),
-        ));
-    }
-    // STC and Trail discard events before they are streamed, which is exactly
-    // the quantity a threshold measurement counts.
-    if state.stc_enabled || state.trail_enabled {
-        return Some((
-            "event_filters_enabled",
-            "turn the STC and Trail filters off before changing threshold biases".into(),
-        ));
-    }
-    if !state.camera_running {
-        return Some((
-            "no_camera",
-            "no camera is running, so there are no bias registers to write".into(),
-        ));
-    }
-    if state.apply_in_flight {
-        return Some((
-            "bias_apply_busy",
-            "a previous bias change is still waiting for its readback".into(),
-        ));
-    }
-    for (name, value) in [("diff_on", diff_on), ("diff_off", diff_off)] {
-        if let Some(value) = value.filter(|value| !BIAS_OFFSET_RANGE.contains(value)) {
-            return Some((
-                "bias_out_of_range",
-                format!(
-                    "{name} offset {value} is outside the supported {}..={}",
-                    BIAS_OFFSET_RANGE.start(),
-                    BIAS_OFFSET_RANGE.end()
-                ),
-            ));
-        }
-    }
-    None
-}
-
-/// What the latest monitoring snapshot says about a parked `ApplyBiases`.
+/// What the latest monitoring snapshot says about an applied configuration.
 #[derive(Debug, PartialEq)]
-enum BiasReadbackVerdict {
+enum ConfigurationReadbackVerdict {
     /// No reading yet that could settle it, and the timeout has not run out.
     Waiting,
     Confirmed {
@@ -1155,63 +1073,19 @@ enum BiasReadbackVerdict {
     },
 }
 
-/// Decide a parked `ApplyBiases` against the latest monitoring snapshot.
-///
-/// A snapshot `age_s` old was read at `now - age_s`, so it can confirm a change
-/// made `since_apply` ago only if `age_s <= since_apply` — otherwise the codes
-/// from *before* the change would be accepted as proof of it, which is the one
-/// failure this whole command exists to prevent.
-fn bias_readback_verdict(
-    applied: SensorBiasOffsetsV1,
-    snapshot: Option<(f64, Option<augur_core::camera::BiasReadback>)>,
-    since_apply: Duration,
-) -> BiasReadbackVerdict {
-    let confirmed = snapshot
-        .filter(|(age_s, _)| *age_s <= since_apply.as_secs_f64())
-        .and_then(|(age_s, biases)| biases.map(|biases| (biases, age_s)));
-    let Some((biases, age_s)) = confirmed else {
-        if since_apply < BIAS_READBACK_TIMEOUT {
-            return BiasReadbackVerdict::Waiting;
-        }
-        return BiasReadbackVerdict::Refused {
-            code: "bias_readback_unavailable",
-            message: "the sensor did not report its bias codes after the change".to_owned(),
-        };
-    };
-
-    let expected_on = expected_bias_code(biases.factory_default.diff_on, applied.diff_on);
-    let expected_off = expected_bias_code(biases.factory_default.diff_off, applied.diff_off);
-    if biases.current.diff_on != expected_on || biases.current.diff_off != expected_off {
-        return BiasReadbackVerdict::Refused {
-            code: "bias_readback_mismatch",
-            message: format!(
-                "sensor reports diff_on={} diff_off={}, expected {expected_on}/{expected_off}",
-                biases.current.diff_on, biases.current.diff_off
-            ),
-        };
-    }
-    BiasReadbackVerdict::Confirmed {
-        readback: SensorBiasReadbackV1 {
-            current: bias_codes_v1(&biases.current),
-            factory_default: bias_codes_v1(&biases.factory_default),
-        },
-        age_s,
-    }
-}
-
 fn configuration_readback_verdict(
     expected: &CameraConfig,
     snapshot: Option<(f64, Option<augur_core::camera::BiasReadback>)>,
     since_apply: Duration,
-) -> BiasReadbackVerdict {
+) -> ConfigurationReadbackVerdict {
     let confirmed = snapshot
         .filter(|(age_s, _)| *age_s <= since_apply.as_secs_f64())
         .and_then(|(age_s, biases)| biases.map(|biases| (biases, age_s)));
     let Some((biases, age_s)) = confirmed else {
-        if since_apply < BIAS_READBACK_TIMEOUT {
-            return BiasReadbackVerdict::Waiting;
+        if since_apply < CAMERA_CONFIGURATION_READBACK_TIMEOUT {
+            return ConfigurationReadbackVerdict::Waiting;
         }
-        return BiasReadbackVerdict::Refused {
+        return ConfigurationReadbackVerdict::Refused {
             code: "bias_readback_unavailable",
             message:
                 "the sensor did not report its bias codes after the camera configuration change"
@@ -1227,7 +1101,7 @@ fn configuration_readback_verdict(
         refr: expected_bias_code(biases.factory_default.refr, offsets.refr),
     };
     if biases.current != expected_codes {
-        return BiasReadbackVerdict::Refused {
+        return ConfigurationReadbackVerdict::Refused {
             code: "bias_readback_mismatch",
             message: format!(
                 "sensor bias codes {:?} do not match expected {:?}",
@@ -1235,7 +1109,7 @@ fn configuration_readback_verdict(
             ),
         };
     }
-    BiasReadbackVerdict::Confirmed {
+    ConfigurationReadbackVerdict::Confirmed {
         readback: SensorBiasReadbackV1 {
             current: bias_codes_v1(&biases.current),
             factory_default: bias_codes_v1(&biases.factory_default),
@@ -1429,8 +1303,8 @@ pub struct CameraApp {
     pending_preview_frame: Option<PreviewFrame>,
     /// EXT_TRIGGER edges from preview frames that were drained but never
     /// processed (drain-to-newest and the process-interval throttle drop whole
-    /// frames). Carried into the next processed frame so plugins that fold on
-    /// the trigger (stage-a-a1) see every edge, not just the survivors'.
+    /// frames). Carried into the next processed frame so plugins that consume
+    /// trigger edges see every edge, not just the survivors'.
     carried_external_triggers: Vec<ExternalTriggerEvent>,
     /// How many accumulation windows the preview pipeline delivered, and how
     /// many of those actually reached the plugins. Live analysis is
@@ -1478,7 +1352,6 @@ pub struct CameraApp {
     live_control_status: HashMap<String, LivePluginControlStatus>,
     plugin_recording_session: Option<PluginRecordingSession>,
     plugin_recording_finalize_task: Option<PluginRecordingFinalizeTask>,
-    pending_bias_apply: Option<PendingBiasApply>,
     camera_configuration_session: Option<CameraConfigurationSession>,
     pending_camera_configuration: Option<PendingCameraConfiguration>,
     live_host_snapshots: Vec<LivePluginHostSnapshot>,
@@ -1711,7 +1584,6 @@ impl CameraApp {
             live_control_status: HashMap::new(),
             plugin_recording_session: None,
             plugin_recording_finalize_task: None,
-            pending_bias_apply: None,
             camera_configuration_session: None,
             pending_camera_configuration: None,
             live_host_snapshots: Vec::new(),
@@ -3580,7 +3452,6 @@ impl CameraApp {
 
     fn poll_live_control_results(&mut self) {
         self.poll_plugin_recording_finalize();
-        self.poll_pending_bias_apply();
         self.poll_pending_camera_configuration();
         while let Ok(result) = self.live_analysis_worker.try_recv_control() {
             // Host commands are routed regardless of epoch. The worker has
@@ -3707,22 +3578,7 @@ impl CameraApp {
                         return;
                     }
                 };
-                // Written into the crash breadcrumb before the recording starts,
-                // so a death during an unattended survey is pinned to the point
-                // it was on rather than to the night it happened. The plugin
-                // states its own position when it has one; an ordinary
-                // recording is just its run id.
-                let position = match (
-                    metadata.get("protocol_point_index"),
-                    metadata.get("protocol_point_total"),
-                ) {
-                    (Some(index), Some(total)) => format!(" (protocol row {index}/{total})"),
-                    _ => String::new(),
-                };
-                crate::diagnostics::note(format!(
-                    "recording {run_id}{position} → {}",
-                    path.display()
-                ));
+                crate::diagnostics::note(format!("recording {run_id} → {}", path.display()));
                 if let Some(session) = self
                     .camera_configuration_session
                     .as_ref()
@@ -3814,117 +3670,22 @@ impl CameraApp {
                 session.stop_request_id = Some(request.request_id);
                 self.stop_pipeline();
             }
-            HostCommand::ApplyBiases { diff_on, diff_off } => {
-                self.execute_plugin_apply_biases(
+            HostCommand::ApplyCameraConfiguration { configuration } => self
+                .execute_plugin_apply_camera_configuration(
                     source_plugin_id,
                     request.request_id,
-                    diff_on,
-                    diff_off,
-                );
-            }
-            HostCommand::ApplyCameraConfiguration {
-                profile_name,
-                snapshot,
-            } => self.execute_plugin_apply_camera_configuration(
-                source_plugin_id,
-                request.request_id,
-                profile_name,
-                snapshot,
-            ),
+                    configuration,
+                ),
             HostCommand::RestoreCameraConfiguration => self
                 .execute_plugin_restore_camera_configuration(source_plugin_id, request.request_id),
         }
-    }
-
-    /// Reprogram `diff_on`/`diff_off` on behalf of a plugin, then wait for the
-    /// sensor to confirm it.
-    ///
-    /// Every refusal here is a laboratory rule the host is the only place able
-    /// to enforce: a plugin cannot see whether the operator is recording, and a
-    /// plugin that checked the filters itself could be wrong by a frame.
-    fn execute_plugin_apply_biases(
-        &mut self,
-        source_plugin_id: String,
-        request_id: u64,
-        diff_on: Option<i32>,
-        diff_off: Option<i32>,
-    ) {
-        if self.config_dirty || self.acq_dirty {
-            self.reject_plugin_host_command(
-                source_plugin_id,
-                request_id,
-                "unapplied_operator_settings",
-                "apply or discard the operator's pending camera edits before a plugin changes biases",
-            );
-            return;
-        }
-        if self
-            .camera_configuration_session
-            .as_ref()
-            .is_some_and(|session| session.owner_plugin_id != source_plugin_id)
-        {
-            self.reject_plugin_host_command(
-                source_plugin_id,
-                request_id,
-                "camera_configuration_owned_by_other_plugin",
-                "another plugin owns the active camera-configuration session",
-            );
-            return;
-        }
-        let state = BiasApplyState {
-            recording_active: self.mode == AppMode::Recording
-                || self.plugin_recording_session.is_some()
-                || self.plugin_recording_finalize_task.is_some(),
-            stc_enabled: self.config.digital_filter.stc_enabled,
-            trail_enabled: self.config.digital_filter.trail_enabled,
-            camera_running: self.controller.is_some(),
-            apply_in_flight: self.pending_bias_apply.is_some(),
-        };
-        if let Some((code, message)) = bias_apply_refusal(&state, diff_on, diff_off) {
-            self.reject_plugin_host_command(source_plugin_id, request_id, code, message);
-            return;
-        }
-
-        let applied = SensorBiasOffsetsV1 {
-            diff_on: diff_on.unwrap_or(self.config.biases.diff_on),
-            diff_off: diff_off.unwrap_or(self.config.biases.diff_off),
-        };
-        self.config.biases.diff_on = applied.diff_on;
-        self.config.biases.diff_off = applied.diff_off;
-        self.config_dirty = true;
-        let applied_at = Instant::now();
-        // Reuses the operator's own Apply path, so a plugin cannot reach the
-        // camera by a route the GUI does not already take (and validate).
-        self.apply_runtime_changes_now_with_feedback(false);
-        if self.config_dirty {
-            // `apply_runtime_changes_now` clears the flag only once the config
-            // actually reached the control thread; it is still set if
-            // validation or the channel send failed, and it has already
-            // reported why.
-            self.reject_plugin_host_command(
-                source_plugin_id,
-                request_id,
-                "bias_apply_failed",
-                self.last_error
-                    .clone()
-                    .unwrap_or_else(|| "the camera did not accept the new settings".into()),
-            );
-            return;
-        }
-        self.pending_bias_apply = Some(PendingBiasApply {
-            source_plugin_id,
-            request_id,
-            applied,
-            applied_at,
-        });
     }
 
     fn execute_plugin_apply_camera_configuration(
         &mut self,
         source_plugin_id: String,
         request_id: u64,
-        profile_name: Option<String>,
-        inline_snapshot: Option<CameraConfigurationSnapshotV1>,
+        configuration: CameraConfigurationSourceV1,
     ) {
         if self.mode == AppMode::Recording
             || self.plugin_recording_session.is_some()
@@ -3956,21 +3717,56 @@ impl CameraApp {
             );
             return;
         }
-        if self.camera_configuration_session.is_some()
-            || self.pending_camera_configuration.is_some()
-            || self.pending_bias_apply.is_some()
-        {
+        if self.pending_camera_configuration.is_some() {
             self.reject_plugin_host_command(
                 source_plugin_id,
                 request_id,
                 "camera_configuration_busy",
-                "a camera configuration change or session is already active",
+                "a camera configuration change is already waiting for confirmation",
+            );
+            return;
+        }
+        if self
+            .camera_configuration_session
+            .as_ref()
+            .is_some_and(|session| session.owner_plugin_id != source_plugin_id)
+        {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "camera_configuration_owned_by_other_plugin",
+                "another plugin owns the active camera-configuration session",
             );
             return;
         }
 
-        let (snapshot, provenance) = match (profile_name, inline_snapshot) {
-            (Some(name), None) => {
+        let (snapshot, provenance) = match configuration {
+            CameraConfigurationSourceV1::Current => {
+                let snapshot = camera_configuration_snapshot(&self.config);
+                let sha256 = match snapshot_sha256(&snapshot) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.reject_plugin_host_command(
+                            source_plugin_id,
+                            request_id,
+                            "snapshot_invalid",
+                            error,
+                        );
+                        return;
+                    }
+                };
+                (
+                    snapshot,
+                    CameraConfigurationProvenanceV1 {
+                        source: "current_configuration".into(),
+                        profile_name: None,
+                        schema_version: PROFILE_SCHEMA_VERSION,
+                        profile_revision: None,
+                        sha256,
+                    },
+                )
+            }
+            CameraConfigurationSourceV1::NamedProfile { name } => {
                 let loaded =
                     match ProfileStore::in_app_config_dir().and_then(|store| store.load(&name)) {
                         Ok(loaded) => loaded,
@@ -3997,7 +3793,7 @@ impl CameraApp {
                     },
                 )
             }
-            (None, Some(snapshot)) => {
+            CameraConfigurationSourceV1::Snapshot { snapshot } => {
                 let sha256 = match snapshot_sha256(&snapshot) {
                     Ok(value) => value,
                     Err(error) => {
@@ -4022,15 +3818,6 @@ impl CameraApp {
                     },
                 )
             }
-            _ => {
-                self.reject_plugin_host_command(
-                    source_plugin_id,
-                    request_id,
-                    "configuration_source_invalid",
-                    "provide exactly one of profile_name or snapshot",
-                );
-                return;
-            }
         };
         let desired = match camera_config_from_snapshot(&snapshot) {
             Ok(config) => config,
@@ -4044,33 +3831,37 @@ impl CameraApp {
                 return;
             }
         };
-        if !desired.global.record_sensor_telemetry {
-            self.reject_plugin_host_command(
-                source_plugin_id,
-                request_id,
-                "sensor_reading_disabled",
-                "the selected camera configuration does not enable Record sensor monitoring",
-            );
-            return;
-        }
-        let original = self.config.clone();
+        let rollback = self.config.clone();
+        let original = self
+            .camera_configuration_session
+            .as_ref()
+            .map_or_else(|| rollback.clone(), |session| session.original.clone());
         let applied_at = Instant::now();
         if let Err(error) = self.apply_plugin_camera_configuration_now(desired.clone()) {
-            let restore_result = self.apply_plugin_camera_configuration_now(original.clone());
-            let message = match restore_result {
-                Ok(()) => format!(
-                    "the camera did not accept the plugin configuration ({error}); the pre-run configuration was restored"
-                ),
-                Err(restore_error) => format!(
-                    "the camera did not accept the plugin configuration ({error}) and the pre-run configuration could not be restored ({restore_error})"
-                ),
-            };
-            self.reject_plugin_host_command(
+            if let Err(restore_error) = self.apply_plugin_camera_configuration_now(rollback.clone())
+            {
+                self.reject_plugin_host_command(
+                    source_plugin_id,
+                    request_id,
+                    "camera_configuration_rollback_failed",
+                    format!(
+                        "the camera did not accept the plugin configuration ({error}) and the previous configuration could not be reapplied ({restore_error})"
+                    ),
+                );
+                return;
+            }
+            self.pending_camera_configuration = Some(PendingCameraConfiguration {
                 source_plugin_id,
                 request_id,
-                "camera_configuration_apply_failed",
-                message,
-            );
+                expected: rollback,
+                applied_at: Instant::now(),
+                kind: PendingCameraConfigurationKind::RollbackAfterFailedApply {
+                    rejection_code: "camera_configuration_apply_failed".into(),
+                    rejection_message: format!(
+                        "the camera did not accept the plugin configuration ({error})"
+                    ),
+                },
+            });
             return;
         }
         self.pending_camera_configuration = Some(PendingCameraConfiguration {
@@ -4080,6 +3871,7 @@ impl CameraApp {
             applied_at,
             kind: PendingCameraConfigurationKind::Apply(Box::new(
                 PendingCameraConfigurationApply {
+                    rollback,
                     original,
                     snapshot,
                     provenance,
@@ -4193,7 +3985,6 @@ impl CameraApp {
             || self.plugin_recording_session.is_some()
             || self.plugin_recording_finalize_task.is_some()
             || self.pending_camera_configuration.is_some()
-            || self.pending_bias_apply.is_some()
         {
             self.reject_plugin_host_command(
                 source_plugin_id,
@@ -4223,60 +4014,6 @@ impl CameraApp {
         });
     }
 
-    /// Answer a parked `ApplyBiases` once the sensor has been read again.
-    ///
-    /// Only a reading taken *after* the reconfigure can confirm it — the
-    /// monitoring snapshot is a few hundred milliseconds old by construction,
-    /// so accepting the newest one unconditionally would let the codes from
-    /// before the change confirm the change.
-    fn poll_pending_bias_apply(&mut self) {
-        let Some(pending) = self.pending_bias_apply.as_ref() else {
-            return;
-        };
-        let since_apply = pending.applied_at.elapsed();
-        let snapshot = self
-            .controller
-            .as_ref()
-            .and_then(PipelineController::sensor_monitoring);
-        let verdict = bias_readback_verdict(
-            pending.applied,
-            snapshot
-                .as_ref()
-                .map(|snapshot| (snapshot.age_s, snapshot.values.biases)),
-            since_apply,
-        );
-        if verdict == BiasReadbackVerdict::Waiting {
-            return;
-        }
-        let pending = self.pending_bias_apply.take().expect("checked above");
-        match verdict {
-            BiasReadbackVerdict::Waiting => unreachable!("returned above"),
-            BiasReadbackVerdict::Confirmed { readback, age_s } => {
-                self.toast_queue.push(
-                    "Plugin camera biases confirmed by sensor readback",
-                    crate::toast::ToastTone::Success,
-                );
-                self.submit_plugin_host_reply(
-                    pending.source_plugin_id,
-                    HostCommandReply {
-                        request_id: pending.request_id,
-                        outcome: HostCommandOutcome::BiasesApplied {
-                            applied: pending.applied,
-                            readback,
-                            readback_age_s: age_s,
-                        },
-                    },
-                );
-            }
-            BiasReadbackVerdict::Refused { code, message } => self.reject_plugin_host_command(
-                pending.source_plugin_id,
-                pending.request_id,
-                code,
-                message,
-            ),
-        }
-    }
-
     fn poll_pending_camera_configuration(&mut self) {
         let Some(pending) = self.pending_camera_configuration.as_ref() else {
             return;
@@ -4293,7 +4030,7 @@ impl CameraApp {
                 .map(|snapshot| (snapshot.age_s, snapshot.values.biases)),
             since_apply,
         );
-        if verdict == BiasReadbackVerdict::Waiting {
+        if verdict == ConfigurationReadbackVerdict::Waiting {
             return;
         }
         let pending = self
@@ -4301,13 +4038,14 @@ impl CameraApp {
             .take()
             .expect("checked above");
         match verdict {
-            BiasReadbackVerdict::Waiting => unreachable!("returned above"),
-            BiasReadbackVerdict::Confirmed { readback, age_s } => match pending.kind {
+            ConfigurationReadbackVerdict::Waiting => unreachable!("returned above"),
+            ConfigurationReadbackVerdict::Confirmed { readback, age_s } => match pending.kind {
                 PendingCameraConfigurationKind::Apply(apply) => {
                     let PendingCameraConfigurationApply {
-                    original,
-                    snapshot,
-                    provenance,
+                        rollback: _,
+                        original,
+                        snapshot,
+                        provenance,
                     } = *apply;
                     self.camera_configuration_session = Some(CameraConfigurationSession {
                         owner_plugin_id: pending.source_plugin_id.clone(),
@@ -4353,37 +4091,36 @@ impl CameraApp {
                     rejection_code,
                     rejection_message,
                 } => {
-                    self.camera_configuration_session = None;
                     self.reject_plugin_host_command(
                         pending.source_plugin_id,
                         pending.request_id,
                         &rejection_code,
                         format!(
-                            "{rejection_message}; the pre-run camera configuration was restored and confirmed"
+                            "{rejection_message}; the previous camera configuration was restored and confirmed"
                         ),
                     );
                 }
             },
-            BiasReadbackVerdict::Refused { code, message } => match pending.kind {
+            ConfigurationReadbackVerdict::Refused { code, message } => match pending.kind {
                 PendingCameraConfigurationKind::Apply(apply) => {
-                    let original = apply.original;
+                    let rollback = apply.rollback;
                     let applied_at = Instant::now();
                     if let Err(restore_error) =
-                        self.apply_plugin_camera_configuration_now(original.clone())
+                        self.apply_plugin_camera_configuration_now(rollback.clone())
                     {
                         self.reject_plugin_host_command(
                             pending.source_plugin_id,
                             pending.request_id,
                             "camera_configuration_rollback_failed",
                             format!(
-                                "camera configuration was rejected ({code}: {message}) and the pre-run configuration could not be reapplied ({restore_error})"
+                                "camera configuration was rejected ({code}: {message}) and the previous configuration could not be reapplied ({restore_error})"
                             ),
                         );
                     } else {
                         self.pending_camera_configuration = Some(PendingCameraConfiguration {
                             source_plugin_id: pending.source_plugin_id,
                             request_id: pending.request_id,
-                            expected: original,
+                            expected: rollback,
                             applied_at,
                             kind: PendingCameraConfigurationKind::RollbackAfterFailedApply {
                                 rejection_code: code.into(),
@@ -4400,7 +4137,7 @@ impl CameraApp {
                     pending.request_id,
                     "camera_configuration_rollback_unconfirmed",
                     format!(
-                        "camera configuration was rejected ({rejection_code}: {rejection_message}); the pre-run configuration was reapplied but its sensor readback failed ({code}: {message})"
+                        "camera configuration was rejected ({rejection_code}: {rejection_message}); the previous configuration was reapplied but its sensor readback failed ({code}: {message})"
                     ),
                 ),
                 PendingCameraConfigurationKind::Restore => self.reject_plugin_host_command(
@@ -7278,12 +7015,11 @@ impl CameraApp {
         // Poll while something can consume the values: the settings panel
         // renders them, and live plugins receive them on the context bus. A
         // collapsed panel with no live plugins costs no USB control transfers.
-        // A bias change in flight is waiting on a reading to confirm it, so it
-        // pins polling on regardless of what else is open.
+        // A configuration change in flight is waiting on a reading to confirm
+        // it, so it pins polling on regardless of what else is open.
         controller.sensor_monitoring_needed.store(
             self.settings_panel_open
                 || self.runtime_plugins_enabled()
-                || self.pending_bias_apply.is_some()
                 || self.pending_camera_configuration.is_some(),
             Ordering::Relaxed,
         );
@@ -9713,9 +9449,9 @@ impl eframe::App for CameraApp {
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.runtime_plugins_enabled() {
-            // Device-owner plugins (Stage-A bench) publish worker status and
-            // datasets on the control tick even with no camera stream; keep a
-            // slow poll alive so their UI stays current in Idle mode.
+            // Device-owner plugins can publish worker status and datasets on
+            // the control tick even with no camera stream; keep a slow poll
+            // alive so their UI stays current in Idle mode.
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.refresh_host_view_registry_if_dirty();
@@ -13034,8 +12770,7 @@ fn render_action_modal_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        acq_time_us_from_ms, bias_apply_refusal, bias_readback_verdict,
-        camera_config_from_snapshot, camera_configuration_requires_restart,
+        acq_time_us_from_ms, camera_config_from_snapshot, camera_configuration_requires_restart,
         camera_configuration_snapshot, configuration_readback_verdict,
         derived_replay_preview_interval_ms, expected_bias_code, host_view_kind_is_dockable,
         investigation_split_ratio_bounds, is_newer_host_snapshot_sequence,
@@ -13049,16 +12784,15 @@ mod tests {
         roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
         should_dispatch_live_analysis_for_state, store_hover_state, sync_acq_time_atomic,
         sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
-        viewport_stream_active, BiasApplyState, BiasReadbackVerdict, CameraApp,
-        InvestigationSplitBounds, PluginRecordingSession, PopupSharedData, RawEventSceneInput,
-        DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
+        viewport_stream_active, CameraApp, ConfigurationReadbackVerdict, InvestigationSplitBounds,
+        PluginRecordingSession, PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH,
+        DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
     };
     use super::{
         clip_to_panel, dock_tab_strip_width, publish_window_frame, should_seed_default_dock_tabs,
     };
     use crate::host_views::{HostWindowFrameData, SeriesWindowViewportData};
     use augur_event_types::{BackpressureBehavior, CursorPolicy};
-    use augur_plugin_api::SensorBiasOffsetsV1;
     use augur_runtime::{LiveHostDatasetSnapshot, LivePluginHostSnapshot};
     use std::{
         collections::{HashMap, HashSet},
@@ -13108,11 +12842,11 @@ mod tests {
         fs::create_dir_all(root.join("runs")).expect("test directory exists");
         let configured = root.join("manual.raw");
 
-        let path = resolve_plugin_recording_path(&configured, "runs/a1", "run-1", false)
+        let path = resolve_plugin_recording_path(&configured, "runs/point", "run-1", false)
             .expect("relative child path is accepted");
-        assert_eq!(path, root.join("runs/a1.raw"));
+        assert_eq!(path, root.join("runs/point.raw"));
         fs::write(&path, b"existing").expect("collision fixture is written");
-        let (code, _) = resolve_plugin_recording_path(&configured, "runs/a1", "run-1", false)
+        let (code, _) = resolve_plugin_recording_path(&configured, "runs/point", "run-1", false)
             .expect_err("existing path is rejected");
         assert_eq!(code, "recording_path_exists");
 
@@ -13162,16 +12896,6 @@ mod tests {
         assert_eq!(recording_target_name(None), "recording");
     }
 
-    fn idle_bias_state() -> BiasApplyState {
-        BiasApplyState {
-            recording_active: false,
-            stc_enabled: false,
-            trail_enabled: false,
-            camera_running: true,
-            apply_in_flight: false,
-        }
-    }
-
     fn readback(current_on: u8, current_off: u8) -> augur_core::camera::BiasReadback {
         augur_core::camera::BiasReadback {
             current: augur_core::camera::BiasCodes {
@@ -13188,135 +12912,6 @@ mod tests {
                 hpf: 0,
                 refr: 138,
             },
-        }
-    }
-
-    #[test]
-    fn a_bias_change_is_refused_while_anything_is_recording() {
-        // The one rule a plugin cannot enforce for itself: it has no way to see
-        // that the operator pressed Record.
-        let state = BiasApplyState {
-            recording_active: true,
-            ..idle_bias_state()
-        };
-        let (code, _) =
-            bias_apply_refusal(&state, Some(20), Some(20)).expect("a recording must refuse");
-        assert_eq!(code, "recording_active");
-    }
-
-    #[test]
-    fn a_bias_change_is_refused_while_a_filter_is_dropping_events() {
-        for state in [
-            BiasApplyState {
-                stc_enabled: true,
-                ..idle_bias_state()
-            },
-            BiasApplyState {
-                trail_enabled: true,
-                ..idle_bias_state()
-            },
-        ] {
-            let (code, _) =
-                bias_apply_refusal(&state, Some(0), Some(0)).expect("a filter must refuse");
-            assert_eq!(code, "event_filters_enabled");
-        }
-    }
-
-    #[test]
-    fn a_bias_offset_outside_the_driver_range_names_the_field_that_was_wrong() {
-        let (code, message) = bias_apply_refusal(&idle_bias_state(), Some(0), Some(200))
-            .expect("an out-of-range offset must refuse");
-        assert_eq!(code, "bias_out_of_range");
-        assert!(message.contains("diff_off"), "{message}");
-        assert!(message.contains("200"), "{message}");
-
-        assert!(bias_apply_refusal(&idle_bias_state(), Some(-85), Some(140)).is_none());
-        assert!(bias_apply_refusal(&idle_bias_state(), None, None).is_none());
-    }
-
-    #[test]
-    fn a_second_bias_change_waits_for_the_first_ones_readback() {
-        let state = BiasApplyState {
-            apply_in_flight: true,
-            ..idle_bias_state()
-        };
-        let (code, _) = bias_apply_refusal(&state, Some(0), Some(0)).expect("must refuse");
-        assert_eq!(code, "bias_apply_busy");
-    }
-
-    #[test]
-    fn a_reading_older_than_the_change_cannot_confirm_it() {
-        // The failure this command exists to prevent: the monitoring snapshot
-        // is always a little stale, so the codes from *before* the write are
-        // sitting right there looking like an answer.
-        let applied = SensorBiasOffsetsV1 {
-            diff_on: 12,
-            diff_off: -8,
-        };
-        let stale = Some((2.0, Some(readback(114, 32))));
-        assert_eq!(
-            bias_readback_verdict(applied, stale, Duration::from_secs_f64(0.5)),
-            BiasReadbackVerdict::Waiting,
-            "a reading taken before the change must not settle the command"
-        );
-    }
-
-    #[test]
-    fn a_reading_taken_after_the_change_confirms_the_absolute_codes() {
-        let applied = SensorBiasOffsetsV1 {
-            diff_on: 12,
-            diff_off: -8,
-        };
-        // 102 + 12 = 114, 40 - 8 = 32.
-        let fresh = Some((0.2, Some(readback(114, 32))));
-        let BiasReadbackVerdict::Confirmed { readback, age_s } =
-            bias_readback_verdict(applied, fresh, Duration::from_secs_f64(0.5))
-        else {
-            panic!("a fresh matching reading must confirm the command");
-        };
-        assert_eq!(readback.current.diff_on, 114);
-        assert_eq!(readback.current.diff_off, 32);
-        assert_eq!(readback.factory_default.diff_on, 102);
-        assert_eq!(age_s, 0.2);
-    }
-
-    #[test]
-    fn codes_that_disagree_with_the_request_are_a_rejection_not_a_receipt() {
-        let applied = SensorBiasOffsetsV1 {
-            diff_on: 12,
-            diff_off: -8,
-        };
-        let wrong = Some((0.2, Some(readback(120, 32))));
-        let BiasReadbackVerdict::Refused { code, message } =
-            bias_readback_verdict(applied, wrong, Duration::from_secs_f64(0.5))
-        else {
-            panic!("codes that disagree must be refused");
-        };
-        assert_eq!(code, "bias_readback_mismatch");
-        assert!(message.contains("120"), "{message}");
-        assert!(message.contains("114"), "{message}");
-    }
-
-    #[test]
-    fn a_sensor_that_never_reports_its_codes_times_out_rather_than_hanging() {
-        let applied = SensorBiasOffsetsV1 {
-            diff_on: 0,
-            diff_off: 0,
-        };
-        assert_eq!(
-            bias_readback_verdict(applied, None, Duration::from_secs(1)),
-            BiasReadbackVerdict::Waiting,
-            "inside the timeout the host keeps waiting"
-        );
-        // A monitoring block that reports everything *but* the biases is the
-        // same situation: there is nothing to confirm against.
-        for snapshot in [None, Some((0.1, None))] {
-            let BiasReadbackVerdict::Refused { code, .. } =
-                bias_readback_verdict(applied, snapshot, Duration::from_secs(6))
-            else {
-                panic!("the timeout must settle the command");
-            };
-            assert_eq!(code, "bias_readback_unavailable");
         }
     }
 
@@ -13378,9 +12973,9 @@ mod tests {
                 Some((2.0, Some(readback(114, 32)))),
                 Duration::from_secs_f64(0.5),
             ),
-            BiasReadbackVerdict::Waiting
+            ConfigurationReadbackVerdict::Waiting
         );
-        let BiasReadbackVerdict::Confirmed {
+        let ConfigurationReadbackVerdict::Confirmed {
             readback: confirmed_readback,
             ..
         } = configuration_readback_verdict(
@@ -13395,7 +12990,7 @@ mod tests {
 
         let mut wrong = readback(114, 32);
         wrong.current.fo = 54;
-        let BiasReadbackVerdict::Refused { code, .. } = configuration_readback_verdict(
+        let ConfigurationReadbackVerdict::Refused { code, .. } = configuration_readback_verdict(
             &expected,
             Some((0.1, Some(wrong))),
             Duration::from_secs_f64(0.5),

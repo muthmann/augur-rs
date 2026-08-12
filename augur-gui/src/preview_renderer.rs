@@ -1740,9 +1740,8 @@ impl WgpuPreviewRenderer {
             0,
             bytemuck::cast_slice(&self.count_packed_events),
         );
-        // One invocation per event. This is the dispatch that used to die: a
-        // 2 Hz, high-contrast A1 point delivers millions of events in a single
-        // preview frame.
+        // One invocation per event. A high-contrast source can deliver
+        // millions of events in a single preview frame.
         let grid = self.dispatch_grid(events.len() as u32);
         self.queue().write_buffer(
             &self.count_uniform_buffer,
@@ -2616,8 +2615,8 @@ fn pack_time_surface_event(event: &augur_core::pipeline::CdEvent) -> [u32; 2] {
 /// `(n, 1, 1)` dispatch therefore dies above 4_194_240 items — and it dies as a
 /// *validation panic*, not an error, taking the process with it.
 ///
-/// A low-frequency, high-contrast A1 point reaches that in one preview frame:
-/// 2 Hz at `a = 1.7` produced 4_952_000 events, asking for 77_375 workgroups.
+/// A dense frame can reach that limit: 4_952_000 events ask for 77_375
+/// workgroups.
 ///
 /// So the grid grows into `y` once `x` is full, and the shader recovers the
 /// linear index as `gid.x + gid.y * span`.

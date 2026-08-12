@@ -1688,7 +1688,6 @@ fn host_command_verb(command: &HostCommand) -> &'static str {
     match command {
         HostCommand::StartRecording { .. } => "start_recording",
         HostCommand::StopRecording => "stop_recording",
-        HostCommand::ApplyBiases { .. } => "apply_biases",
         HostCommand::ApplyCameraConfiguration { .. } => "apply_camera_configuration",
         HostCommand::RestoreCameraConfiguration => "restore_camera_configuration",
     }
@@ -3177,8 +3176,8 @@ mod tests {
         fs::write(
             plugins_dir.join("plugin.toml"),
             r#"
-id = "stage-a.modulation"
-name = "Stage-A Modulation"
+id = "example.device"
+name = "Example Device"
 version = "1.0.0"
 host_commands = ["start_recording", "stop_recording"]
 "#,
@@ -3186,7 +3185,7 @@ host_commands = ["start_recording", "stop_recording"]
         .expect("manifest is written");
 
         let manifest = read_manifest(&plugins_dir).expect("manifest is valid");
-        assert_eq!(manifest.id.as_deref(), Some("stage-a.modulation"));
+        assert_eq!(manifest.id.as_deref(), Some("example.device"));
         assert_eq!(
             manifest.host_commands,
             ["start_recording", "stop_recording"]
@@ -3201,7 +3200,7 @@ host_commands = ["start_recording", "stop_recording"]
         fs::create_dir_all(&plugins_dir).expect("test plugin directory is created");
         fs::write(
             plugins_dir.join("plugin.toml"),
-            "id = \"Stage A\"\nname = \"Stage A\"\nversion = \"1.0.0\"\n",
+            "id = \"Example Plugin\"\nname = \"Example Plugin\"\nversion = \"1.0.0\"\n",
         )
         .expect("manifest is written");
 

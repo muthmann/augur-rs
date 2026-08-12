@@ -359,7 +359,7 @@ mod tests {
             assert!(store.save(name, &CameraConfig::default(), false).is_err());
         }
         assert!(store
-            .save("A1 low noise", &CameraConfig::default(), false)
+            .save("low noise", &CameraConfig::default(), false)
             .is_ok());
         let _ = fs::remove_dir_all(store.root);
     }

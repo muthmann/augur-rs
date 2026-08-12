@@ -60,32 +60,12 @@ pub enum HostCommand {
         metadata: BTreeMap<String, String>,
     },
     StopRecording,
-    /// Reprogram the two contrast-threshold biases on a live camera.
-    ///
-    /// Deliberately two fields wide. A threshold survey has to move `diff_on`
-    /// and `diff_off` and nothing else — `fo`, `hpf`, `refr`, the ROI and the
-    /// pixel mask must stay exactly where the operator left them, or the
-    /// points are not comparable. Making them unreachable through this command
-    /// is stronger than asking a plugin not to touch them, and it keeps the
-    /// grant a plugin is asking for legible in `plugin.toml`.
-    ///
-    /// Values are offsets around the per-unit factory trim, exactly as the
-    /// host settings panel expresses them — see [`SensorBiasReadbackV1`]. A
-    /// `None` field leaves that bias where it is.
-    ApplyBiases {
-        #[serde(default)]
-        diff_on: Option<i32>,
-        #[serde(default)]
-        diff_off: Option<i32>,
-    },
-    /// Begin an exclusive host-camera configuration session for a measurement.
-    /// Exactly one source must be present. A named profile is resolved by the
-    /// host once; an inline snapshot is already immutable.
+    /// Apply a complete host-camera configuration inside an exclusive session.
+    /// The first call preserves the active configuration for a later restore;
+    /// subsequent calls from the same plugin update the session without losing
+    /// that original state.
     ApplyCameraConfiguration {
-        #[serde(default)]
-        profile_name: Option<String>,
-        #[serde(default)]
-        snapshot: Option<CameraConfigurationSnapshotV1>,
+        configuration: CameraConfigurationSourceV1,
     },
     /// Restore the host configuration that was active before this plugin's
     /// configuration session began. Only the owning plugin may restore it.
@@ -120,23 +100,6 @@ pub enum HostCommandOutcome {
         sha256: Option<String>,
         duration_us: u64,
         reason: String,
-    },
-    /// The biases are programmed *and* the sensor has been asked what it is
-    /// actually running.
-    ///
-    /// This is a confirmation, not an acknowledgement. A threshold point is
-    /// only worth recording if the codes on the die can be shown to be the
-    /// ones the protocol asked for, so the host does not answer until a
-    /// monitoring read taken *after* the reconfigure came back matching. A
-    /// reading that never arrives, or that disagrees, is a rejection.
-    BiasesApplied {
-        /// The offsets the host programmed.
-        applied: SensorBiasOffsetsV1,
-        /// Absolute codes read off the sensor afterwards, with the factory
-        /// trim they are offset from.
-        readback: SensorBiasReadbackV1,
-        /// Seconds between the reconfigure and the reading that confirmed it.
-        readback_age_s: f64,
     },
     CameraConfigurationApplied {
         snapshot: CameraConfigurationSnapshotV1,
@@ -221,12 +184,8 @@ pub struct GlobalSettings {
 }
 
 /// State of the on-sensor filters that discard events before they are streamed.
-///
-/// A measurement that counts events against a threshold setting has to know
-/// these are off — a filter that drops "redundant" events changes the very
-/// quantity being measured — and has to be able to say so afterwards. The host
-/// publishes them so a plugin can refuse a survey up front instead of finding
-/// out from the data.
+/// Plugins can use this host-owned state to decide whether the active camera
+/// configuration is compatible with their own workflow.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct EventFiltersV1 {
     /// Spatio-temporal contrast filter.
@@ -234,9 +193,7 @@ pub struct EventFiltersV1 {
     /// Trail filter. Shares the on-chip block with STC, so the two are
     /// mutually exclusive.
     pub trail_enabled: bool,
-    /// Event-rate controller. Always `false` on this host, which has no ERC —
-    /// the field exists so a measurement that must record "ERC was off" has a
-    /// name to record it under, and so sidecars stay readable if one is added.
+    /// Event-rate controller. Always `false` on hosts that do not implement one.
     pub erc_enabled: bool,
 }
 
@@ -250,18 +207,22 @@ pub struct SensorBiasCodesV1 {
     pub refr: u8,
 }
 
-/// The two contrast-threshold biases as *offsets* around the factory trim,
-/// which is how the host settings panel and [`HostCommand::ApplyBiases`]
-/// express them. The absolute code programmed is
-/// `(factory_default + offset).clamp(0, 255)`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct SensorBiasOffsetsV1 {
-    pub diff_on: i32,
-    pub diff_off: i32,
+/// Source for a complete host-owned camera configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum CameraConfigurationSourceV1 {
+    /// Preserve and confirm the configuration currently active in the host.
+    Current,
+    /// Resolve a named host profile at apply time.
+    NamedProfile { name: String },
+    /// Apply an immutable, versioned snapshot supplied by the plugin.
+    Snapshot {
+        snapshot: CameraConfigurationSnapshotV1,
+    },
 }
 
-/// Versioned host-owned camera/global settings snapshot used by measurement
-/// protocols. It intentionally contains no plugin-local settings.
+/// Versioned host-owned camera/global settings snapshot. It intentionally
+/// contains no plugin-local settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CameraConfigurationSnapshotV1 {
     pub schema_version: u32,
@@ -1149,8 +1110,9 @@ mod camera_command_tests {
     #[test]
     fn camera_configuration_command_roundtrips_without_losing_sensor_recording() {
         let command = HostCommand::ApplyCameraConfiguration {
-            profile_name: None,
-            snapshot: Some(snapshot()),
+            configuration: CameraConfigurationSourceV1::Snapshot {
+                snapshot: snapshot(),
+            },
         };
         let json = serde_json::to_string(&command).expect("serialize");
         let decoded: HostCommand = serde_json::from_str(&json).expect("deserialize");
@@ -1159,16 +1121,14 @@ mod camera_command_tests {
     }
 
     #[test]
-    fn the_narrow_bias_command_keeps_omitted_fields_backward_compatible() {
-        let decoded: HostCommand =
-            serde_json::from_str(r#"{"command":"apply_biases","diff_on":12}"#)
-                .expect("legacy narrow command");
+    fn current_configuration_source_is_explicit() {
+        let command = HostCommand::ApplyCameraConfiguration {
+            configuration: CameraConfigurationSourceV1::Current,
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
         assert_eq!(
-            decoded,
-            HostCommand::ApplyBiases {
-                diff_on: Some(12),
-                diff_off: None,
-            }
+            json,
+            r#"{"command":"apply_camera_configuration","configuration":{"source":"current"}}"#
         );
     }
 }

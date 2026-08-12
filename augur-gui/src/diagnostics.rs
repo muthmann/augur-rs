@@ -318,7 +318,7 @@ mod tests {
         Session {
             breadcrumb: dir.join("session-4242.open"),
             started_at: "2026-08-05T21:00:00Z".into(),
-            activity: "recording A1-survey_p23 (protocol row 23/40)".into(),
+            activity: "recording automated-run_p23 (protocol row 23/40)".into(),
         }
         .persist();
         report_unclean_sessions(&dir);

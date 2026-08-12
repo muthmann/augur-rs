@@ -7,17 +7,18 @@ mod settings;
 
 pub use context::{
     CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
-    CameraDigitalFilterV1, CameraExternalTriggerV1, CameraGlobalSettingsV1, EventFiltersV1,
-    GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
-    HostActionScope, HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply,
-    HostCommandRequest, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
-    HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement,
-    HostViewRegistry, Image2dV1, PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasOffsetsV1,
-    SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn,
-    TableColumnData, TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
-    TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
-    TableDatasetV1, TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    CameraConfigurationSourceV1, CameraDigitalFilterV1, CameraExternalTriggerV1,
+    CameraGlobalSettingsV1, EventFiltersV1, GlobalSettings, HostActionDescriptor,
+    HostActionRequest, HostActionRequestQueue, HostActionScope, HostActionScopePayload,
+    HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest, HostDatasetDescriptor,
+    HostDatasetDisplayMetadata, HostDatasetKind, HostDatasetRelation, HostMarkerShape,
+    HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1,
+    PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome, PluginServiceReply,
+    PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasReadbackV1, SensorMonitoringV1,
+    Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnDisplayEntry,
+    TableColumnDisplayFormat, TableColumnDisplayMetadata, TableColumnValues,
+    TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1,
+    TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
     CTX_INVESTIGATION_ACTION_REQUESTS, CTX_SENSOR_MONITORING, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 pub use event_store::EventStore;
@@ -105,6 +106,38 @@ mod tests {
         PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginStateKind,
         PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
     };
+
+    fn camera_configuration_snapshot() -> crate::CameraConfigurationSnapshotV1 {
+        crate::CameraConfigurationSnapshotV1 {
+            schema_version: 1,
+            biases: crate::CameraBiasOffsetsV1::default(),
+            roi: crate::RoiV1 {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            masked_pixels: Vec::new(),
+            digital_filter: crate::CameraDigitalFilterV1 {
+                stc_enabled: false,
+                stc_threshold_us: 1_000,
+                trail_enabled: false,
+            },
+            external_trigger: crate::CameraExternalTriggerV1::default(),
+            global: crate::CameraGlobalSettingsV1 {
+                nm_per_pixel: 4_860.0,
+                pixel_scale_calibrated: false,
+                sensor_width: 1280,
+                sensor_height: 720,
+                acq_time_ms: 50,
+                event_store_budget_mib: 100,
+                preview_interval_ms: 33,
+                point_cloud_interval_ms: 67,
+                disk_writer_buffer_mib: 4,
+                record_sensor_telemetry: false,
+            },
+        }
+    }
 
     #[test]
     fn ffi_layouts_are_stable() {
@@ -246,34 +279,39 @@ mod tests {
     }
 
     #[test]
-    fn apply_biases_names_only_the_two_threshold_biases() {
-        // The narrowness is the point: no wire field exists for fo, hpf, refr,
-        // the ROI or the pixel mask, so no plugin can reach them.
-        let command = HostCommand::ApplyBiases {
-            diff_on: Some(-20),
-            diff_off: None,
-        };
-        let json = serde_json::to_string(&command).expect("must serialize");
-        assert_eq!(
-            json,
-            r#"{"command":"apply_biases","diff_on":-20,"diff_off":null}"#
-        );
-        for forbidden in ["fo", "hpf", "refr", "roi", "mask"] {
-            assert!(
-                !json.contains(forbidden),
-                "{forbidden} is reachable: {json}"
-            );
+    fn complete_camera_configuration_sources_round_trip() {
+        let commands = [
+            HostCommand::ApplyCameraConfiguration {
+                configuration: crate::CameraConfigurationSourceV1::Current,
+            },
+            HostCommand::ApplyCameraConfiguration {
+                configuration: crate::CameraConfigurationSourceV1::NamedProfile {
+                    name: "low noise".into(),
+                },
+            },
+            HostCommand::ApplyCameraConfiguration {
+                configuration: crate::CameraConfigurationSourceV1::Snapshot {
+                    snapshot: camera_configuration_snapshot(),
+                },
+            },
+        ];
+        for command in commands {
+            let json = serde_json::to_string(&command).expect("must serialize");
+            let decoded: HostCommand = serde_json::from_str(&json).expect("must deserialize");
+            assert_eq!(decoded, command);
         }
-        let decoded: HostCommand = serde_json::from_str(&json).expect("must deserialize");
-        assert_eq!(decoded, command);
     }
 
     #[test]
-    fn a_bias_confirmation_carries_the_codes_the_sensor_reported() {
-        let outcome = HostCommandOutcome::BiasesApplied {
-            applied: crate::SensorBiasOffsetsV1 {
-                diff_on: 12,
-                diff_off: -8,
+    fn a_configuration_confirmation_carries_the_sensor_readback() {
+        let outcome = HostCommandOutcome::CameraConfigurationApplied {
+            snapshot: camera_configuration_snapshot(),
+            provenance: crate::CameraConfigurationProvenanceV1 {
+                source: "current_configuration".into(),
+                profile_name: None,
+                schema_version: 1,
+                profile_revision: None,
+                sha256: "ab".repeat(32),
             },
             readback: crate::SensorBiasReadbackV1 {
                 current: crate::SensorBiasCodesV1 {
@@ -578,8 +616,8 @@ mod tests {
         let inbox = PluginControlInbox {
             service_replies: vec![PluginServiceReply {
                 request_id: 7,
-                source_plugin_id: "workflow.a1".into(),
-                target_plugin_id: "device.modulation".into(),
+                source_plugin_id: "workflow.example".into(),
+                target_plugin_id: "device.example".into(),
                 service: "apply.v1".into(),
                 outcome: PluginServiceOutcome::Accepted {
                     payload: serde_json::json!({"revision": 3}),
@@ -605,7 +643,7 @@ mod tests {
                 },
             ],
             snapshots: vec![PluginControlSnapshot {
-                plugin_id: "device.modulation".into(),
+                plugin_id: "device.example".into(),
                 topic: "state.v1".into(),
                 revision: 3,
                 payload: serde_json::json!({"connected": true}),
@@ -636,7 +674,7 @@ mod tests {
         let service = PluginServiceRequest {
             request_id: 10,
             source_plugin_id: String::new(),
-            target_plugin_id: "device.modulation".into(),
+            target_plugin_id: "device.example".into(),
             service: "output_off.v1".into(),
             payload: serde_json::Value::Null,
         };

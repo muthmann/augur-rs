@@ -130,11 +130,10 @@ output directory; absolute paths and traversal are rejected. See
 
 Camera settings remain host-owned:
 
-- `apply_biases` changes only optional `diff_on`/`diff_off` offsets and returns
-  only after a fresh matching sensor readback;
-- `apply_camera_configuration` selects exactly one named host profile or
-  immutable versioned snapshot, applies it immediately, and returns the
-  resolved snapshot and provenance after readback; and
+- `apply_camera_configuration` selects the currently applied configuration, a
+  named host profile, or an immutable complete snapshot, applies it
+  immediately, and returns the resolved snapshot and provenance after a fresh
+  matching sensor readback; and
 - `restore_camera_configuration` is restricted to the plugin that owns the
   active configuration session.
 
@@ -142,7 +141,10 @@ These commands are Apply operations, not requests to populate the UI. The host
 rejects existing unapplied operator edits instead of overwriting them, and a
 successful reply means the settings panel shows the applied values without an
 additional user click. The host also performs a required Preview restart itself.
-See ADR 036 and ADR 037.
+The session owner can apply later complete snapshots and the final restore still
+returns to the configuration from before the session. Plugins, not the host,
+define which fields may vary and which scientific conditions are required.
+See ADR 037.
 
 ## Host Views
 
