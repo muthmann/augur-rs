@@ -3,7 +3,9 @@
 //! Profiles are host-owned. Runtime plugins may reference a name through the
 //! host command contract, but they never read or write this directory.
 
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
