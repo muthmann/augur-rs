@@ -388,8 +388,13 @@ pub fn run_offline_analysis(
                 sensor_height: info.height,
                 acq_time_ms: acq_time_us.div_ceil(1_000),
                 event_store_budget_bytes: event_store.memory_budget_bytes(),
+                record_sensor_telemetry: false,
                 roi: Default::default(),
                 masked_pixels: Vec::new(),
+                // An offline pass replays a file. Any filtering the sensor did
+                // happened before that file existed, so there is no live state
+                // to mirror here.
+                event_filters: Default::default(),
             },
         )?;
 

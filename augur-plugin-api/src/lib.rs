@@ -6,14 +6,16 @@ mod macros;
 mod settings;
 
 pub use context::{
+    CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    CameraDigitalFilterV1, CameraExternalTriggerV1, CameraGlobalSettingsV1, EventFiltersV1,
     GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
     HostActionScope, HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply,
     HostCommandRequest, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
     HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement,
     HostViewRegistry, Image2dV1, PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasReadbackV1,
-    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
-    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
+    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasOffsetsV1,
+    SensorBiasReadbackV1, SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn,
+    TableColumnData, TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
     TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
     TableDatasetV1, TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
     CTX_INVESTIGATION_ACTION_REQUESTS, CTX_SENSOR_MONITORING, HOST_ACTION_CLUSTER_ROWS_PARAM,
@@ -82,8 +84,8 @@ pub mod __private {
 mod tests {
     use super::{
         context::{
-            GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
-            HostActionScope, HostActionScopePayload, HostDatasetDescriptor,
+            EventFiltersV1, GlobalSettings, HostActionDescriptor, HostActionRequest,
+            HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostDatasetDescriptor,
             HostDatasetDisplayMetadata, HostDatasetKind, HostMarkerShape, HostViewDescriptor,
             HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine,
             Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
@@ -209,6 +211,7 @@ mod tests {
             sensor_height: 720,
             acq_time_ms: 50,
             event_store_budget_bytes: 100 * 1024 * 1024,
+            record_sensor_telemetry: true,
             roi: crate::RoiV1 {
                 x: 4,
                 y: 8,
@@ -216,6 +219,11 @@ mod tests {
                 height: 480,
             },
             masked_pixels: vec![(1, 2), (3, 4)],
+            event_filters: EventFiltersV1 {
+                stc_enabled: false,
+                trail_enabled: true,
+                erc_enabled: false,
+            },
         };
 
         let json = serde_json::to_vec(&settings).expect("settings must serialize");
@@ -223,6 +231,71 @@ mod tests {
             serde_json::from_slice(&json).expect("settings must deserialize");
         assert_eq!(decoded, settings);
         assert_eq!(CTX_GLOBAL_SETTINGS, "augur.global_settings");
+    }
+
+    #[test]
+    fn settings_from_a_host_with_no_filter_block_read_as_all_off() {
+        // The field is additive: a plugin built against this API must still be
+        // able to read what an older host published, and "no block" is the
+        // same situation as "no filters", not a parse failure.
+        let json = br#"{"nm_per_pixel":65.0,"sensor_width":1280,"sensor_height":720,
+            "acq_time_ms":50,"event_store_budget_bytes":1024}"#;
+        let decoded: GlobalSettings = serde_json::from_slice(json).expect("must deserialize");
+        assert_eq!(decoded.event_filters, EventFiltersV1::default());
+        assert!(!decoded.event_filters.stc_enabled);
+    }
+
+    #[test]
+    fn apply_biases_names_only_the_two_threshold_biases() {
+        // The narrowness is the point: no wire field exists for fo, hpf, refr,
+        // the ROI or the pixel mask, so no plugin can reach them.
+        let command = HostCommand::ApplyBiases {
+            diff_on: Some(-20),
+            diff_off: None,
+        };
+        let json = serde_json::to_string(&command).expect("must serialize");
+        assert_eq!(
+            json,
+            r#"{"command":"apply_biases","diff_on":-20,"diff_off":null}"#
+        );
+        for forbidden in ["fo", "hpf", "refr", "roi", "mask"] {
+            assert!(
+                !json.contains(forbidden),
+                "{forbidden} is reachable: {json}"
+            );
+        }
+        let decoded: HostCommand = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn a_bias_confirmation_carries_the_codes_the_sensor_reported() {
+        let outcome = HostCommandOutcome::BiasesApplied {
+            applied: crate::SensorBiasOffsetsV1 {
+                diff_on: 12,
+                diff_off: -8,
+            },
+            readback: crate::SensorBiasReadbackV1 {
+                current: crate::SensorBiasCodesV1 {
+                    diff_on: 114,
+                    diff_off: 32,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 138,
+                },
+                factory_default: crate::SensorBiasCodesV1 {
+                    diff_on: 102,
+                    diff_off: 40,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 138,
+                },
+            },
+            readback_age_s: 0.4,
+        };
+        let json = serde_json::to_vec(&outcome).expect("must serialize");
+        let decoded: HostCommandOutcome = serde_json::from_slice(&json).expect("must deserialize");
+        assert_eq!(decoded, outcome);
     }
 
     #[test]

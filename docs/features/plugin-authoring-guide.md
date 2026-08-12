@@ -74,12 +74,15 @@ if let Some(monitoring) = context.sensor_monitoring() {
 }
 ```
 
-**It is optional context, never an input to results.** The value is `None` on
+**It is optional context, never an input to offline analysis results.** The value is `None` on
 replay, decoded imports, and deterministic offline analysis runs — there is no
 device to ask. A plugin whose output changes with its presence would disagree
 between a live preview and an offline re-run of the same recording, which
 breaks the guarantee that analysis runs are reproducible (ADR 025). Use it for
 logging, provenance, and sanity checks on capture conditions.
+An explicitly live measurement coordinator may instead fail closed when its
+protocol requires sensor-confirmed settings; it must not change an analysis
+result merely because the same recorded file is replayed without hardware.
 
 These are sensor-monitor conversion outputs, not traceably calibrated
 instruments. Public IMX636/OpenEB material does not specify uncertainty,
@@ -120,10 +123,26 @@ effects are permitted only for `PluginRuntimeRole::LiveWorker` when
 `ExecutionContext::hardware_effects_allowed()` is true. `UiMirror` and
 `OfflineAnalysis` must stay inert.
 
-Recording commands additionally require the corresponding manifest
-`host_commands` entry. Recording paths are relative to the host-configured
+Host commands require the corresponding manifest `host_commands` entry.
+`start_recording` and `stop_recording` use paths relative to the host-configured
 output directory; absolute paths and traversal are rejected. See
 [Plugin Service Control Plane](./plugin-service-control-plane.md).
+
+Camera settings remain host-owned:
+
+- `apply_biases` changes only optional `diff_on`/`diff_off` offsets and returns
+  only after a fresh matching sensor readback;
+- `apply_camera_configuration` selects exactly one named host profile or
+  immutable versioned snapshot, applies it immediately, and returns the
+  resolved snapshot and provenance after readback; and
+- `restore_camera_configuration` is restricted to the plugin that owns the
+  active configuration session.
+
+These commands are Apply operations, not requests to populate the UI. The host
+rejects existing unapplied operator edits instead of overwriting them, and a
+successful reply means the settings panel shows the applied values without an
+additional user click. The host also performs a required Preview restart itself.
+See ADR 036 and ADR 037.
 
 ## Host Views
 

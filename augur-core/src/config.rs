@@ -85,6 +85,13 @@ pub struct GlobalSettingsConfig {
     pub preview_interval_ms: u64,
     pub point_cloud_interval_ms: u64,
     pub disk_writer_buffer_mib: u64,
+    /// Persist the sensor-monitoring companion CSV with each camera recording.
+    ///
+    /// This is host-owned acquisition state. Keeping it in the configuration
+    /// makes loading a named profile reproduce the recording behavior instead
+    /// of only changing the visible camera registers.
+    #[serde(default)]
+    pub record_sensor_telemetry: bool,
 }
 
 impl Default for GlobalSettingsConfig {
@@ -99,6 +106,7 @@ impl Default for GlobalSettingsConfig {
             preview_interval_ms: 33,
             point_cloud_interval_ms: 67,
             disk_writer_buffer_mib: 4,
+            record_sensor_telemetry: false,
         }
     }
 }
@@ -287,6 +295,7 @@ mod tests {
                 preview_interval_ms: 40,
                 point_cloud_interval_ms: 90,
                 disk_writer_buffer_mib: 8,
+                record_sensor_telemetry: true,
             },
             ..CameraConfig::default()
         };

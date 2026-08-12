@@ -352,9 +352,10 @@ impl LiveAnalysisWorker {
     }
 
     pub fn submit_host_reply(&self, plugin_id: String, reply: HostCommandReply) {
-        let _ = self
-            .tx
-            .send(LiveAnalysisCommand::HostReply { plugin_id, reply });
+        let _ = self.tx.send(LiveAnalysisCommand::HostReply {
+            plugin_id,
+            reply: Box::new(reply),
+        });
     }
 
     pub fn try_recv_control(&self) -> Result<LiveControlResult, mpsc::TryRecvError> {
@@ -480,7 +481,7 @@ enum LiveAnalysisCommand {
     },
     HostReply {
         plugin_id: String,
-        reply: HostCommandReply,
+        reply: Box<HostCommandReply>,
     },
     Stop,
 }
@@ -1687,6 +1688,9 @@ fn host_command_verb(command: &HostCommand) -> &'static str {
     match command {
         HostCommand::StartRecording { .. } => "start_recording",
         HostCommand::StopRecording => "stop_recording",
+        HostCommand::ApplyBiases { .. } => "apply_biases",
+        HostCommand::ApplyCameraConfiguration { .. } => "apply_camera_configuration",
+        HostCommand::RestoreCameraConfiguration => "restore_camera_configuration",
     }
 }
 
@@ -2102,7 +2106,7 @@ impl WorkerState {
                 handled
             }
             LiveAnalysisCommand::HostReply { plugin_id, reply } => {
-                self.control.resolve_host_request(plugin_id, reply);
+                self.control.resolve_host_request(plugin_id, *reply);
                 handled
             }
             LiveAnalysisCommand::Configure {

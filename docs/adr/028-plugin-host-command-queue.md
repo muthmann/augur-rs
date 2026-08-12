@@ -13,7 +13,9 @@ GUI-control capability.
 ## Decision
 
 The ABI exposes a closed `HostCommand` enum. The implemented verbs are
-`start_recording` and `stop_recording`.
+`start_recording`, `stop_recording` and `apply_biases` — the last added by
+ADR 036, which keeps the same declaration, dedupe and rejection machinery
+described here.
 
 - A plugin must declare each verb in `plugin.toml` via `host_commands`. The
   live worker rejects undeclared commands before they reach the GUI.

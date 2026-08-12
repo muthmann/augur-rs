@@ -48,3 +48,5 @@ Name files as `docs/adr/<nnn>-<slug>.md` and keep this index updated.
 - [ADR 033: Measurement Provenance In The UI](./033-measurement-provenance-in-the-ui.md)
 - [ADR 034: A Crash Leaves Evidence, And The Two Kinds Are Told Apart](./034-crash-visibility.md)
 - [ADR 035: Preview Compute Dispatches Are Sized Against The Device's Limit](./035-preview-dispatch-grid.md)
+- [ADR 036: A Plugin May Change Two Biases, And Only Against A Readback](./036-plugin-bias-apply-command.md)
+- [ADR 037: Host-Owned Camera Profiles And Plugin Configuration Sessions](./037-host-owned-camera-profiles-and-plugin-configuration-sessions.md)
