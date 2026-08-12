@@ -47,6 +47,9 @@ time.workspace = true
 criterion = "0.5"
 pollster = "0.3"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [[bench]]
 name = "preview_bench"
 harness = false

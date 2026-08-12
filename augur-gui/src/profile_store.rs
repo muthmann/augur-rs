@@ -6,6 +6,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use augur_core::config::CameraConfig;
 use serde::{Deserialize, Serialize};
@@ -207,6 +208,8 @@ fn validate_name(name: &str) -> Result<(), String> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     let parent = path
         .parent()
         .ok_or_else(|| format!("profile path '{}' has no parent", path.display()))?;
@@ -214,7 +217,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("profile");
-    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp-{}-{sequence}",
+        std::process::id()
+    ));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -228,8 +235,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Err(error) = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        // Windows does not allow a rename while this ordinary file handle is
+        // open, even when the destination does not exist.
+        drop(file);
+        replace_file(&temporary, path)?;
+        sync_parent_directory(parent)?;
         Ok(())
     })() {
         let _ = fs::remove_file(&temporary);
@@ -241,18 +251,70 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: Both pointers refer to live, null-terminated UTF-16 buffers for
+    // the complete call. The function does not retain either pointer. Source
+    // and destination are in the same profile directory, so this remains a
+    // same-volume atomic replacement; WRITE_THROUGH waits for the move to be
+    // flushed before reporting success.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
+    // `MOVEFILE_WRITE_THROUGH` above supplies the Windows durability barrier.
+    // Opening a directory through `File::open` is not supported on Windows.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_store(label: &str) -> ProfileStore {
+        static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
+        let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         ProfileStore::at(std::env::temp_dir().join(format!(
-            "augur-profile-test-{}-{label}-{unique}",
+            "augur-profile-test-{}-{label}-{unique}-{sequence}",
             std::process::id()
         )))
     }
