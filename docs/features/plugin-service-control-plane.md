@@ -11,7 +11,9 @@ recording commands with definitive start and finalization receipts.
 
 Control-plane plugins declare a stable `id` in `plugin.toml`. IDs use lowercase
 ASCII letters/digits plus `.`, `-`, and `_`, and must be unique. A plugin may
-also declare `host_commands = ["start_recording", "stop_recording"]`.
+also declare the exact operations it uses in `host_commands`. The closed set is
+`start_recording`, `stop_recording`, `apply_camera_configuration`, and
+`restore_camera_configuration`.
 
 The host assigns one of three runtime roles before applying settings:
 
@@ -54,6 +56,21 @@ restore Preview, so the host never re-opens a device the operator just closed
 or that just failed. The reply cache is write-once, so that end-of-run
 notification cannot displace the cached `RecordingStarted`. Failures return a
 typed partial receipt with the actual path and all available file facts.
+
+## Camera-configuration commands
+
+`ApplyCameraConfiguration` selects the current host configuration, a named
+profile, or a complete inline snapshot. `RestoreCameraConfiguration` returns to
+the pre-session configuration. Both operations require their matching manifest
+verb. Confirmation is tied to the control-thread configuration generation, so
+a sensor sample taken before the requested update cannot confirm it.
+
+The host resolves file-backed pixel masks and normalizes bounded global values
+before it hashes, applies, returns, or records a snapshot. While an apply,
+rollback, restore, or confirmed configuration session is active, operator
+camera edits, manual capture transitions, plugin enable/disable, reload, and
+rescan are locked. Only the owning plugin can start a recording against the
+confirmed snapshot or restore the session.
 
 Host commands are routed regardless of the analysis epoch: both starting and
 stopping a recording bump the epoch, so a plugin-driven cycle reliably produces

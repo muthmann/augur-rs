@@ -2987,6 +2987,7 @@ mod sensor_footer_tests {
                 temperature_c: Some(41.24),
                 biases: None,
             },
+            bias_configuration_generation: 0,
             age_s,
             error: error.map(str::to_owned),
         }

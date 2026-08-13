@@ -14,6 +14,15 @@ pub trait PseeSensor: Send {
     fn name(&self) -> &'static str;
     fn geometry(&self) -> (u16, u16);
 
+    /// Validate and freeze a complete configuration before any register is
+    /// changed. Implementations may resolve device-specific resources such as
+    /// file-backed masks into the returned configuration.
+    fn prepare_configuration(&self, config: &CameraConfig) -> Result<CameraConfig> {
+        let (width, height) = self.geometry();
+        config.validate(width, height)?;
+        Ok(config.clone())
+    }
+
     fn init(&mut self, transport: &mut Transport) -> Result<()>;
     fn set_biases(&mut self, transport: &mut Transport, cfg: &BiasConfig) -> Result<()>;
     fn set_roi(&mut self, transport: &mut Transport, roi: &RoiConfig) -> Result<()>;

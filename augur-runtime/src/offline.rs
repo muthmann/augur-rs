@@ -335,6 +335,7 @@ pub fn run_offline_analysis(
         ),
     };
     plugin_manager.scan_and_load()?;
+    validate_configured_offline_plugins(&plugin_manager, &options.config)?;
     apply_offline_plugin_config(&mut plugin_manager, &options.config)?;
     for record in plugin_manager.records_mut() {
         if let Some(plugin) = record.plugin_mut() {
@@ -475,6 +476,37 @@ fn apply_offline_plugin_config(
         }
         for (key, value) in plugin_config.setting_values() {
             plugin.set_setting_value(&key, &toml_value_to_json(value)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_configured_offline_plugins(
+    plugin_manager: &PluginManager,
+    config: &OfflineAnalysisConfig,
+) -> Result<(), String> {
+    for (name, plugin_config) in &config.plugins {
+        if plugin_config.enabled == Some(false) {
+            continue;
+        }
+        let Some(record) = plugin_manager
+            .records()
+            .iter()
+            .find(|record| record.name() == name)
+        else {
+            return Err(format!(
+                "offline analysis requires enabled plugin '{name}', but it was not found"
+            ));
+        };
+        if let Some(error) = record.load_error() {
+            return Err(format!(
+                "offline analysis requires enabled plugin '{name}', but it failed to load: {error}"
+            ));
+        }
+        if record.plugin().is_none() {
+            return Err(format!(
+                "offline analysis requires enabled plugin '{name}', but it is unavailable"
+            ));
         }
     }
     Ok(())
@@ -880,6 +912,136 @@ mod tests {
         )
         .expect_err("empty range must be rejected");
         assert!(err.contains("range"), "unexpected error: {err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_analysis_rejects_a_missing_enabled_plugin() {
+        let root = unique_temp_dir("offline-missing-plugin");
+        fs::create_dir_all(&root).expect("temp root");
+        let input = root.join("events.csv");
+        fs::write(&input, "%geometry:8,8\n1,1,1,10\n").expect("write csv replay");
+        let plugins_dir = root.join("plugins");
+        fs::create_dir_all(&plugins_dir).expect("plugins dir");
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "required-analysis".to_owned(),
+            OfflinePluginConfig {
+                enabled: Some(true),
+                ..OfflinePluginConfig::default()
+            },
+        );
+
+        let error = run_offline_analysis(
+            OfflineAnalysisOptions {
+                input_path: input,
+                output_dir: root.join("out"),
+                plugins_dir: Some(plugins_dir),
+                config: OfflineAnalysisConfig {
+                    plugins,
+                    ..OfflineAnalysisConfig::default()
+                },
+                stop: None,
+                session_id: None,
+            },
+            |_| {},
+        )
+        .expect_err("a missing enabled plugin must fail closed");
+
+        assert!(
+            error.contains("required-analysis"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("not found"), "unexpected error: {error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_analysis_allows_a_missing_explicitly_disabled_plugin() {
+        let root = unique_temp_dir("offline-disabled-plugin");
+        fs::create_dir_all(&root).expect("temp root");
+        let input = root.join("events.csv");
+        fs::write(&input, "%geometry:8,8\n1,1,1,10\n").expect("write csv replay");
+        let plugins_dir = root.join("plugins");
+        fs::create_dir_all(&plugins_dir).expect("plugins dir");
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "disabled-analysis".to_owned(),
+            OfflinePluginConfig {
+                enabled: Some(false),
+                ..OfflinePluginConfig::default()
+            },
+        );
+
+        run_offline_analysis(
+            OfflineAnalysisOptions {
+                input_path: input,
+                output_dir: root.join("out"),
+                plugins_dir: Some(plugins_dir),
+                config: OfflineAnalysisConfig {
+                    plugins,
+                    ..OfflineAnalysisConfig::default()
+                },
+                stop: None,
+                session_id: None,
+            },
+            |_| {},
+        )
+        .expect("an explicitly disabled plugin is optional");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_analysis_rejects_an_enabled_plugin_that_failed_to_load() {
+        let root = unique_temp_dir("offline-load-failure");
+        fs::create_dir_all(&root).expect("temp root");
+        let input = root.join("events.csv");
+        fs::write(&input, "%geometry:8,8\n1,1,1,10\n").expect("write csv replay");
+        let plugins_dir = root.join("plugins");
+        let broken_dir = plugins_dir.join("broken");
+        fs::create_dir_all(&broken_dir).expect("broken plugin directory");
+        fs::write(
+            broken_dir.join("plugin.toml"),
+            r#"
+id = "broken.plugin"
+name = "Broken Plugin"
+version = "1.0.0"
+description = "Missing library fixture"
+domain = "test"
+library = "missing_library"
+"#,
+        )
+        .expect("broken manifest");
+        let mut plugins = BTreeMap::new();
+        plugins.insert(
+            "Broken Plugin".to_owned(),
+            OfflinePluginConfig {
+                enabled: Some(true),
+                ..OfflinePluginConfig::default()
+            },
+        );
+
+        let error = run_offline_analysis(
+            OfflineAnalysisOptions {
+                input_path: input,
+                output_dir: root.join("out"),
+                plugins_dir: Some(plugins_dir),
+                config: OfflineAnalysisConfig {
+                    plugins,
+                    ..OfflineAnalysisConfig::default()
+                },
+                stop: None,
+                session_id: None,
+            },
+            |_| {},
+        )
+        .expect_err("a required load failure must fail closed");
+
+        assert!(error.contains("Broken Plugin"), "unexpected error: {error}");
+        assert!(
+            error.contains("failed to load"),
+            "unexpected error: {error}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

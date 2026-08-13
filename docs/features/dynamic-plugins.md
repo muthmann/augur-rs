@@ -38,7 +38,12 @@ version = "0.2.0"
 description = "Demonstrates the runtime plugin manifest format."
 domain = "general"
 library = "augur_plugin_example"
-host_commands = ["start_recording", "stop_recording"]
+host_commands = [
+  "start_recording",
+  "stop_recording",
+  "apply_camera_configuration",
+  "restore_camera_configuration",
+]
 ```
 
 Fields:
@@ -51,7 +56,7 @@ Fields:
 | `description` | yes | One-line summary |
 | `domain` | yes | Category tag (e.g. `general`, `analysis`, `vision`, `robotics`) |
 | `library` | no | Base name of the dynamic library, **without** the `lib` prefix and without the platform extension (`.dylib`, `.so`, `.dll`). If omitted, the loader auto-discovers a single library file in the directory. |
-| `host_commands` | no | Closed recording verbs the plugin may request. Omitted means no host-command capability. |
+| `host_commands` | no | Closed host-operation verbs the plugin may request: `start_recording`, `stop_recording`, `apply_camera_configuration`, and `restore_camera_configuration`. Omitted means no host-command capability. |
 
 For example, `library = "augur_plugin_example"` resolves to `libaugur_plugin_example.dylib` on macOS, `libaugur_plugin_example.so` on Linux, and `augur_plugin_example.dll` on Windows.
 

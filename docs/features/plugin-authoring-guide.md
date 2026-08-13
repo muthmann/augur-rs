@@ -236,7 +236,7 @@ missing retained frames.
 
 ## Lifecycle And State
 
-The current dynamic plugin ABI is v4. Plugins built against older vtable layouts
+The current dynamic plugin ABI is v6. Plugins built against older vtable layouts
 must be rebuilt before the host will load them.
 
 Plugins are accumulating by default. The default `on_discontinuity`

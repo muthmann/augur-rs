@@ -31,6 +31,10 @@ offline pipeline.
    re-publishes them at any time and pauses replay first. CSV/PNG/JSON
    exports land in the run's output folder ("Open folder").
 
+The runner fails closed if any configured plugin that is not explicitly
+disabled is missing, ABI-incompatible, or otherwise failed to load. It never
+reports a successful run that silently omitted a requested analysis plugin.
+
 ## Provenance
 
 The workspace inspector shows a **Data source** badge naming what it
@@ -69,7 +73,8 @@ polarity and cancelled every run immediately; fixed alongside this feature.)
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --workspace --locked` (range clamp, empty-range rejection,
-  probe bounds, dialog request building, config parsing)
+  required-plugin validation, probe bounds, dialog request building, config
+  parsing)
 - End-to-end: `augur-cli analyze` on a synthetic CSV recording with
   `--t-start-us 10 --t-end-us 20` produces exactly the `[10, 20)` window;
   the whole-file run covers `[10, 41)`.

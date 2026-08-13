@@ -44,6 +44,13 @@ configuration itself. It does not wait for an operator action. The UI shows the
 applied values and reports sensor confirmation only after the fresh readback
 succeeds.
 
+Before apply, the host resolves any file-backed mask into explicit pixels and
+normalizes bounded global settings. The resulting effective configuration is
+the only value sent to the camera, hashed, returned to the plugin, and written
+to recording provenance. Runtime reconfiguration carries a monotonic
+generation through the control thread; only monitoring sampled after that
+generation was successfully applied may confirm the operation.
+
 Only one plugin owns a configuration session. The owner can replace the active
 configuration with another complete snapshot while keeping the original
 pre-session configuration for the final restore. This is the generic mechanism
@@ -57,9 +64,17 @@ does not return the original rejection until that rollback has its own fresh
 readback. Stop, abort, and normal completion use the same explicit restore
 command. A restore without confirmation is an error, not success.
 
+Pending operations and active sessions are exclusive workflow boundaries.
+Operator camera edits and manual capture transitions are locked. Plugin
+enable/disable, reload, and rescan are also locked because replacing the owner
+would strand the host-owned restore obligation. A recording may start only for
+the owning plugin and only when the current configuration still equals the
+confirmed snapshot.
+
 The host enforces only generic safety and ownership rules: no camera change
 during recording/finalization, no overwritten pending operator edits, one
-session owner, schema and camera-range validation, and fresh readback. A plugin
+session owner, schema and camera-range validation, generation-bound readback,
+and immutable resolved provenance. A plugin
 must enforce its own scientific gates, such as required telemetry capture,
 disabled event filters, or which fields it permits its protocol to vary.
 
