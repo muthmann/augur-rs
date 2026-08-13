@@ -76,6 +76,12 @@ mkdir -p "$output_dir"
   cd "$repo_root"
   cargo build --release --locked --bin AugurRS
   bash resources/macos-bundle.sh "$binary_path" "$output_dir"
+  # Rust's Mach-O carries a linker signature for the standalone binary. Once
+  # it is placed beside Info.plist and the icon that signature no longer seals
+  # the complete app bundle, so Finder/Gatekeeper rejects the local artifact.
+  # Re-sign the finished bundle exactly as the release packaging path does.
+  codesign --force --deep --sign - "$app_path"
+  codesign --verify --deep --strict "$app_path"
 )
 
 if $install_app; then
