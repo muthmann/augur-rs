@@ -19,14 +19,24 @@ Each runtime plugin ships as:
 - a Rust crate that depends on `augur-plugin-api`
 - optional companion payload crates such as `augur-plugin-types`
 
+The manifest can declare `min_augur_version = "2.0.2"`. The loader validates
+this semantic version before opening the dynamic library and leaves an
+actionable error in the Plugin Manager when the installed host is too old.
+Use the oldest release that provides every context key, host command, and
+runtime behavior the plugin relies on. Do not leave a Stage-A acquisition
+plugin at a historical default when it requires newer recording provenance or
+sensor telemetry; an ABI-compatible library can still be behaviorally
+incompatible with an older host.
+
 At startup or on rescan, `augur-gui`:
 
 1. walks `~/.augur/plugins/`
 2. parses each `plugin.toml`
 3. resolves the matching library file
-4. loads the exported `augur_plugin_vtable` symbol
-5. rejects stale plugins by comparing both `PluginVTable::vtable_size` and `PluginVTable::abi_version`
-6. instantiates the plugin and caches its declarative settings/status metadata
+4. rejects a plugin whose `min_augur_version` is newer than the host
+5. loads the exported `augur_plugin_vtable` symbol
+6. rejects stale plugins by comparing both `PluginVTable::vtable_size` and `PluginVTable::abi_version`
+7. instantiates the plugin and caches its declarative settings/status metadata
 
 Loader failures are non-fatal and stay visible in the Plugin Manager.
 
