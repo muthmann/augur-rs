@@ -970,6 +970,9 @@ fn camera_configuration_snapshot(config: &CameraConfig) -> CameraConfigurationSn
             stc_enabled: config.digital_filter.stc_enabled,
             stc_threshold_us: config.digital_filter.stc_threshold_us,
             trail_enabled: config.digital_filter.trail_enabled,
+            // This host has no ERC implementation. Publishing explicit OFF is
+            // distinct from an older host omitting the state entirely.
+            erc_enabled: Some(false),
         },
         external_trigger: CameraExternalTriggerV1 {
             enabled: config.external_triggers.enabled,
@@ -1013,6 +1016,20 @@ fn camera_config_from_snapshot(
             "camera snapshot schema {} is unsupported (supported: {})",
             snapshot.schema_version, PROFILE_SCHEMA_VERSION
         ));
+    }
+    match snapshot.digital_filter.erc_enabled {
+        Some(false) => {}
+        Some(true) => {
+            return Err(
+                "camera snapshot requests ERC enabled, but this host has no ERC support".into(),
+            )
+        }
+        None => {
+            return Err(
+                "camera snapshot does not state the ERC state; save a new profile with this host"
+                    .into(),
+            )
+        }
     }
     let config = CameraConfig {
         biases: augur_core::config::BiasConfig {
@@ -13125,8 +13142,24 @@ mod tests {
         config.global.record_sensor_telemetry = true;
         let snapshot = camera_configuration_snapshot(&config);
         assert!(snapshot.global.record_sensor_telemetry);
+        assert_eq!(snapshot.digital_filter.erc_enabled, Some(false));
         let decoded = camera_config_from_snapshot(&snapshot).expect("valid snapshot");
         assert_eq!(camera_configuration_snapshot(&decoded), snapshot);
+    }
+
+    #[test]
+    fn camera_snapshot_refuses_missing_or_enabled_erc_state() {
+        let config = augur_core::config::CameraConfig::default();
+        let mut snapshot = camera_configuration_snapshot(&config);
+        snapshot.digital_filter.erc_enabled = None;
+        assert!(camera_config_from_snapshot(&snapshot)
+            .expect_err("missing ERC state must fail closed")
+            .contains("does not state the ERC state"));
+
+        snapshot.digital_filter.erc_enabled = Some(true);
+        assert!(camera_config_from_snapshot(&snapshot)
+            .expect_err("unsupported ERC must be refused")
+            .contains("no ERC support"));
     }
 
     #[test]

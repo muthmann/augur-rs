@@ -122,6 +122,7 @@ mod tests {
                 stc_enabled: false,
                 stc_threshold_us: 1_000,
                 trail_enabled: false,
+                erc_enabled: Some(false),
             },
             external_trigger: crate::CameraExternalTriggerV1::default(),
             global: crate::CameraGlobalSettingsV1 {

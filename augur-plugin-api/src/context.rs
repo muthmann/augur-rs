@@ -250,6 +250,10 @@ pub struct CameraDigitalFilterV1 {
     pub stc_enabled: bool,
     pub stc_threshold_us: u32,
     pub trail_enabled: bool,
+    /// Event-rate controller state. `None` means the host did not report it;
+    /// scientific consumers must not interpret an older missing field as OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erc_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1090,6 +1094,7 @@ mod camera_command_tests {
                 stc_enabled: false,
                 stc_threshold_us: 0,
                 trail_enabled: false,
+                erc_enabled: Some(false),
             },
             external_trigger: CameraExternalTriggerV1::default(),
             global: CameraGlobalSettingsV1 {
