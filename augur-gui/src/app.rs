@@ -10080,6 +10080,7 @@ impl eframe::App for CameraApp {
                                                                         let p = crate::theme::palette_for_visuals(
                                                                             ui.visuals(),
                                                                         );
+                                                                        ui.style_mut().wrap = Some(false);
                                                                         if crate::theme::icon_button(
                                                                             ui,
                                                                             egui_phosphor::regular::EYE_SLASH,
@@ -10091,12 +10092,6 @@ impl eframe::App for CameraApp {
                                                                             analysis_toggle_changed = true;
                                                                         }
                                                                         ui.add_space(crate::theme::sp::SP_1);
-                                                                        ui.label(
-                                                                            egui::RichText::new(&plugin_name)
-                                                                                .strong()
-                                                                                .size(13.0)
-                                                                                .color(p.fg_2),
-                                                                        );
                                                                         ui.with_layout(
                                                                             egui::Layout::right_to_left(
                                                                                 egui::Align::Center,
@@ -10106,6 +10101,17 @@ impl eframe::App for CameraApp {
                                                                                     ui,
                                                                                     "off",
                                                                                     crate::theme::Tone::Neutral,
+                                                                                );
+                                                                                ui.add(
+                                                                                    egui::Label::new(
+                                                                                        egui::RichText::new(
+                                                                                            &plugin_name,
+                                                                                        )
+                                                                                        .strong()
+                                                                                        .size(13.0)
+                                                                                        .color(p.fg_2),
+                                                                                    )
+                                                                                    .truncate(true),
                                                                                 );
                                                                             },
                                                                         );
@@ -10154,6 +10160,13 @@ impl eframe::App for CameraApp {
                                                             let p = crate::theme::palette_for_visuals(
                                                                 ui.visuals(),
                                                             );
+                                                            // A fixed-height row must not wrap. With
+                                                            // wrapping inherited from the panel, the
+                                                            // nested right-aligned chip block measures
+                                                            // its width from content and overflows the
+                                                            // allocated row, which grows the stored
+                                                            // SidePanel width (see `layer_row`).
+                                                            ui.style_mut().wrap = Some(false);
                                                             if crate::theme::icon_button(
                                                                 ui,
                                                                 egui_phosphor::regular::EYE,
@@ -10165,12 +10178,10 @@ impl eframe::App for CameraApp {
                                                                 analysis_toggle_changed = true;
                                                             }
                                                             ui.add_space(crate::theme::sp::SP_1);
-                                                            ui.label(
-                                                                egui::RichText::new(&plugin_name)
-                                                                    .strong()
-                                                                    .size(13.0)
-                                                                    .color(p.ink),
-                                                            );
+                                                            // Chips anchor right and keep their
+                                                            // natural width; the name is added last so
+                                                            // it takes only the width that is left and
+                                                            // is elided instead of widening the panel.
                                                             ui.with_layout(
                                                                 egui::Layout::right_to_left(
                                                                     egui::Align::Center,
@@ -10188,6 +10199,20 @@ impl eframe::App for CameraApp {
                                                                         ui,
                                                                         phase_label,
                                                                         crate::theme::Tone::Info,
+                                                                    );
+                                                                    // `truncate` already reveals the
+                                                                    // full name on hover when it is
+                                                                    // elided.
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            egui::RichText::new(
+                                                                                &plugin_name,
+                                                                            )
+                                                                            .strong()
+                                                                            .size(13.0)
+                                                                            .color(p.ink),
+                                                                        )
+                                                                        .truncate(true),
                                                                     );
                                                                 },
                                                             );
