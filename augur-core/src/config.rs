@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -85,6 +86,13 @@ pub struct GlobalSettingsConfig {
     pub preview_interval_ms: u64,
     pub point_cloud_interval_ms: u64,
     pub disk_writer_buffer_mib: u64,
+    /// Persist the sensor-monitoring companion CSV with each camera recording.
+    ///
+    /// This is host-owned acquisition state. Keeping it in the configuration
+    /// makes loading a named profile reproduce the recording behavior instead
+    /// of only changing the visible camera registers.
+    #[serde(default)]
+    pub record_sensor_telemetry: bool,
 }
 
 impl Default for GlobalSettingsConfig {
@@ -99,7 +107,23 @@ impl Default for GlobalSettingsConfig {
             preview_interval_ms: 33,
             point_cloud_interval_ms: 67,
             disk_writer_buffer_mib: 4,
+            record_sensor_telemetry: false,
         }
+    }
+}
+
+impl GlobalSettingsConfig {
+    /// Return the effective host-safe values used by the runtime.
+    pub fn normalized(mut self) -> Self {
+        self.nm_per_pixel = self.nm_per_pixel.max(1.0);
+        self.sensor_width = self.sensor_width.max(1);
+        self.sensor_height = self.sensor_height.max(1);
+        self.acq_time_ms = self.acq_time_ms.max(1);
+        self.event_store_budget_mib = self.event_store_budget_mib.max(1);
+        self.preview_interval_ms = self.preview_interval_ms.max(10);
+        self.point_cloud_interval_ms = self.point_cloud_interval_ms.max(20);
+        self.disk_writer_buffer_mib = self.disk_writer_buffer_mib.max(1);
+        self
     }
 }
 
@@ -166,14 +190,45 @@ impl PixelMaskConfig {
         Ok(())
     }
 
-    pub fn to_bitfield(&self, width: u16, height: u16) -> Result<Vec<u8>> {
+    /// Resolve explicit coordinates and an optional bitfield file into one
+    /// immutable list of masked pixels.
+    pub fn resolved_masked_pixels(&self, width: u16, height: u16) -> Result<Vec<(u16, u16)>> {
+        self.validate(width, height)?;
+        let mut pixels = self.masked_pixels.clone();
+
         if let Some(path) = &self.mask_file {
-            return std::fs::read(path).map_err(Into::into);
+            let bytes = fs::read(path)?;
+            let expected_size = (width as usize * height as usize).div_ceil(8);
+            if bytes.len() != expected_size {
+                return Err(CameraError::Config(format!(
+                    "mask file '{}' has {} bytes, expected {} for {}x{} bitfield",
+                    path.display(),
+                    bytes.len(),
+                    expected_size,
+                    width,
+                    height
+                )));
+            }
+
+            for y in 0..height {
+                for x in 0..width {
+                    let index = y as usize * width as usize + x as usize;
+                    if (bytes[index / 8] >> (index % 8)) & 1 == 1 {
+                        pixels.push((x, y));
+                    }
+                }
+            }
         }
 
+        let mut seen = HashSet::new();
+        pixels.retain(|pixel| seen.insert(*pixel));
+        Ok(pixels)
+    }
+
+    pub fn to_bitfield(&self, width: u16, height: u16) -> Result<Vec<u8>> {
         let total_bits = width as usize * height as usize;
         let mut bits = vec![0_u8; total_bits.div_ceil(8)];
-        for &(x, y) in &self.masked_pixels {
+        for (x, y) in self.resolved_masked_pixels(width, height)? {
             let idx = y as usize * width as usize + x as usize;
             let byte = idx / 8;
             let bit = idx % 8;
@@ -212,6 +267,16 @@ pub struct ExternalTriggerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temporary_mask_path(label: &str) -> PathBuf {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "augur-mask-{label}-{}-{}.bin",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn parses_hot_pixels_alias() {
@@ -275,6 +340,43 @@ mod tests {
     }
 
     #[test]
+    fn pixel_mask_resolution_merges_and_deduplicates_file_pixels() {
+        let path = temporary_mask_path("resolution");
+        // 4x2 pixels: file masks (1,0) and (3,1).
+        fs::write(&path, [0b1000_0010]).expect("mask fixture");
+        let mask = PixelMaskConfig {
+            masked_pixels: vec![(1, 0), (2, 1)],
+            mask_file: Some(path.clone()),
+        };
+
+        assert_eq!(
+            mask.resolved_masked_pixels(4, 2).expect("resolved mask"),
+            vec![(1, 0), (2, 1), (3, 1)]
+        );
+        assert_eq!(
+            mask.to_bitfield(4, 2).expect("resolved bitfield"),
+            vec![0b1100_0010]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pixel_mask_resolution_rejects_wrong_bitfield_size() {
+        let path = temporary_mask_path("size");
+        fs::write(&path, [0_u8; 2]).expect("mask fixture");
+        let mask = PixelMaskConfig {
+            masked_pixels: Vec::new(),
+            mask_file: Some(path.clone()),
+        };
+
+        let error = mask
+            .resolved_masked_pixels(4, 2)
+            .expect_err("wrong-sized bitfield must fail");
+        assert!(error.to_string().contains("expected 1"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn global_settings_round_trip_through_toml() {
         let cfg = CameraConfig {
             global: GlobalSettingsConfig {
@@ -287,6 +389,7 @@ mod tests {
                 preview_interval_ms: 40,
                 point_cloud_interval_ms: 90,
                 disk_writer_buffer_mib: 8,
+                record_sensor_telemetry: true,
             },
             ..CameraConfig::default()
         };
@@ -295,6 +398,31 @@ mod tests {
         let decoded: CameraConfig = toml::from_str(&encoded).expect("camera config must parse");
 
         assert_eq!(decoded.global, cfg.global);
+    }
+
+    #[test]
+    fn global_settings_normalization_matches_runtime_minima() {
+        let normalized = GlobalSettingsConfig {
+            nm_per_pixel: 0.0,
+            sensor_width: 0,
+            sensor_height: 0,
+            acq_time_ms: 0,
+            event_store_budget_mib: 0,
+            preview_interval_ms: 0,
+            point_cloud_interval_ms: 0,
+            disk_writer_buffer_mib: 0,
+            ..GlobalSettingsConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(normalized.nm_per_pixel, 1.0);
+        assert_eq!(normalized.sensor_width, 1);
+        assert_eq!(normalized.sensor_height, 1);
+        assert_eq!(normalized.acq_time_ms, 1);
+        assert_eq!(normalized.event_store_budget_mib, 1);
+        assert_eq!(normalized.preview_interval_ms, 10);
+        assert_eq!(normalized.point_cloud_interval_ms, 20);
+        assert_eq!(normalized.disk_writer_buffer_mib, 1);
     }
 
     #[test]

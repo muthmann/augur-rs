@@ -33,7 +33,7 @@ folder has been chosen and has to survive choosing a different one.
                             violation, abort, stack overflow, out of memory,
                             kill or power loss)
                             pid 9330 · started 2026-08-05T23:02:41Z · augur 1.0.0
-                            while: recording A1-survey_… (protocol row 23/40)
+                            while: recording automated-run_p23
 ```
 
 | entry | meaning |
@@ -79,9 +79,9 @@ The breadcrumb carries one line saying what the program was doing, so a crash is
 pinned to a point in the work rather than to a time of night. It is overwritten,
 not accumulated — the question is "what was it doing when it died".
 
-Plugin-driven recordings set it, and a plugin that states its own position gets
-that position recorded: A1's declarative protocol sends `protocol_point_index`
-and `protocol_point_total` in its recording metadata, which become
-`(protocol row 23/40)`. Between points it reads `idle between plugin
-recordings`, so a death *during* a recording is distinguishable from one
-*between* two of them — a different fault with a different cause.
+Plugin-driven recordings set it from their generic run ID. The host does not
+interpret plugin metadata or know whether a run represents a protocol row,
+survey, or another workflow. A plugin can include useful position information
+in its run ID. Between recordings it reads `idle between plugin recordings`, so
+a death *during* a recording is distinguishable from one *between* two of them
+— a different fault with a different cause.

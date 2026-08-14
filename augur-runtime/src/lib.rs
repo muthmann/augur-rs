@@ -352,9 +352,10 @@ impl LiveAnalysisWorker {
     }
 
     pub fn submit_host_reply(&self, plugin_id: String, reply: HostCommandReply) {
-        let _ = self
-            .tx
-            .send(LiveAnalysisCommand::HostReply { plugin_id, reply });
+        let _ = self.tx.send(LiveAnalysisCommand::HostReply {
+            plugin_id,
+            reply: Box::new(reply),
+        });
     }
 
     pub fn try_recv_control(&self) -> Result<LiveControlResult, mpsc::TryRecvError> {
@@ -480,7 +481,7 @@ enum LiveAnalysisCommand {
     },
     HostReply {
         plugin_id: String,
-        reply: HostCommandReply,
+        reply: Box<HostCommandReply>,
     },
     Stop,
 }
@@ -811,6 +812,11 @@ pub struct PluginManifest {
     pub id: Option<String>,
     pub name: String,
     pub version: String,
+    /// Oldest Augur host release this plugin supports. Hosts reject newer
+    /// requirements before loading the dynamic library instead of silently
+    /// running a plugin without the context or host services it expects.
+    #[serde(default)]
+    pub min_augur_version: Option<String>,
     pub description: Option<String>,
     pub domain: Option<String>,
     pub library: Option<String>,
@@ -1687,6 +1693,8 @@ fn host_command_verb(command: &HostCommand) -> &'static str {
     match command {
         HostCommand::StartRecording { .. } => "start_recording",
         HostCommand::StopRecording => "stop_recording",
+        HostCommand::ApplyCameraConfiguration { .. } => "apply_camera_configuration",
+        HostCommand::RestoreCameraConfiguration => "restore_camera_configuration",
     }
 }
 
@@ -2102,7 +2110,7 @@ impl WorkerState {
                 handled
             }
             LiveAnalysisCommand::HostReply { plugin_id, reply } => {
-                self.control.resolve_host_request(plugin_id, reply);
+                self.control.resolve_host_request(plugin_id, *reply);
                 handled
             }
             LiveAnalysisCommand::Configure {
@@ -2758,7 +2766,32 @@ fn read_manifest(entry_dir: &Path) -> Result<PluginManifest, String> {
     if let Some(id) = manifest.id.as_deref() {
         validate_plugin_id(id).map_err(|err| format!("{}: {err}", manifest_path.display()))?;
     }
+    validate_minimum_augur_version(&manifest, &manifest_path)?;
     Ok(manifest)
+}
+
+fn validate_minimum_augur_version(
+    manifest: &PluginManifest,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    let Some(required) = manifest.min_augur_version.as_deref() else {
+        return Ok(());
+    };
+    let required = semver::Version::parse(required).map_err(|error| {
+        format!(
+            "{}: invalid min_augur_version `{required}`: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("the workspace package version must be valid semver");
+    if current < required {
+        return Err(format!(
+            "{} requires Augur {required} or newer, but this host is {current}; update Augur before loading the plugin",
+            manifest_path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_plugin_id(id: &str) -> Result<(), String> {
@@ -3173,19 +3206,57 @@ mod tests {
         fs::write(
             plugins_dir.join("plugin.toml"),
             r#"
-id = "stage-a.modulation"
-name = "Stage-A Modulation"
+id = "example.device"
+name = "Example Device"
 version = "1.0.0"
+min_augur_version = "1.0.0"
 host_commands = ["start_recording", "stop_recording"]
 "#,
         )
         .expect("manifest is written");
 
         let manifest = read_manifest(&plugins_dir).expect("manifest is valid");
-        assert_eq!(manifest.id.as_deref(), Some("stage-a.modulation"));
+        assert_eq!(manifest.id.as_deref(), Some("example.device"));
+        assert_eq!(manifest.min_augur_version.as_deref(), Some("1.0.0"));
         assert_eq!(
             manifest.host_commands,
             ["start_recording", "stop_recording"]
+        );
+
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn manifest_rejects_a_newer_host_requirement_before_loading_the_library() {
+        let plugins_dir = unique_temp_dir("manifest-newer-host");
+        fs::create_dir_all(&plugins_dir).expect("test plugin directory is created");
+        fs::write(
+            plugins_dir.join("plugin.toml"),
+            "name = \"Future Plugin\"\nversion = \"1.0.0\"\nmin_augur_version = \"999.0.0\"\n",
+        )
+        .expect("manifest is written");
+
+        let error = read_manifest(&plugins_dir).expect_err("newer host requirement must fail");
+        assert!(error.contains("requires Augur 999.0.0 or newer"), "{error}");
+        assert!(error.contains("update Augur"), "{error}");
+
+        let _ = fs::remove_dir_all(plugins_dir);
+    }
+
+    #[test]
+    fn manifest_rejects_an_invalid_host_requirement() {
+        let plugins_dir = unique_temp_dir("manifest-invalid-host-version");
+        fs::create_dir_all(&plugins_dir).expect("test plugin directory is created");
+        fs::write(
+            plugins_dir.join("plugin.toml"),
+            "name = \"Broken Plugin\"\nversion = \"1.0.0\"\nmin_augur_version = \"current\"\n",
+        )
+        .expect("manifest is written");
+
+        let error = read_manifest(&plugins_dir).expect_err("invalid semver must fail");
+        assert!(
+            error.contains("invalid min_augur_version `current`"),
+            "{error}"
         );
 
         let _ = fs::remove_dir_all(plugins_dir);
@@ -3197,7 +3268,7 @@ host_commands = ["start_recording", "stop_recording"]
         fs::create_dir_all(&plugins_dir).expect("test plugin directory is created");
         fs::write(
             plugins_dir.join("plugin.toml"),
-            "id = \"Stage A\"\nname = \"Stage A\"\nversion = \"1.0.0\"\n",
+            "id = \"Example Plugin\"\nname = \"Example Plugin\"\nversion = \"1.0.0\"\n",
         )
         .expect("manifest is written");
 

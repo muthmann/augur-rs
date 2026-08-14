@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, thread, time::Duration};
+use std::{thread, time::Duration};
 
 use augur_core::{
     camera::{BiasCodes, BiasReadback, SensorMonitoring, SensorMonitoringSelection},
@@ -310,38 +310,7 @@ impl Imx636 {
         Ok(())
     }
 
-    fn decode_masked_pixels(mask: &PixelMaskConfig) -> Result<Vec<(u16, u16)>> {
-        let mut pixels = mask.masked_pixels.clone();
-
-        if let Some(path) = &mask.mask_file {
-            let bytes = fs::read(path)?;
-            let expected_size = (SENSOR_WIDTH as usize * SENSOR_HEIGHT as usize).div_ceil(8);
-            if bytes.len() != expected_size {
-                return Err(CameraError::Config(format!(
-                    "mask file '{}' has {} bytes, expected {} for {}x{} bitfield",
-                    path.display(),
-                    bytes.len(),
-                    expected_size,
-                    SENSOR_WIDTH,
-                    SENSOR_HEIGHT
-                )));
-            }
-
-            for y in 0..SENSOR_HEIGHT {
-                for x in 0..SENSOR_WIDTH {
-                    let idx = y as usize * SENSOR_WIDTH as usize + x as usize;
-                    let b = bytes[idx / 8];
-                    let bit = idx % 8;
-                    if (b >> bit) & 1 == 1 {
-                        pixels.push((x, y));
-                    }
-                }
-            }
-        }
-
-        let mut seen = HashSet::new();
-        pixels.retain(|p| seen.insert(*p));
-
+    fn validate_mask_capacity(pixels: &[(u16, u16)]) -> Result<()> {
         if pixels.len() > DEM_SLOTS {
             return Err(CameraError::Config(format!(
                 "IMX636 digital mask supports up to {DEM_SLOTS} pixels, got {}",
@@ -349,7 +318,21 @@ impl Imx636 {
             )));
         }
 
-        Ok(pixels)
+        Ok(())
+    }
+
+    fn validate_digital_filter(filter: &DigitalFilterConfig) -> Result<()> {
+        if filter.stc_enabled && filter.trail_enabled {
+            return Err(CameraError::Config(
+                "STC and Trail cannot be enabled simultaneously on IMX636".into(),
+            ));
+        }
+        if filter.stc_threshold_us < 1_000 || filter.stc_threshold_us > 100_000 {
+            return Err(CameraError::Config(
+                "stc_threshold_us must be in [1000, 100000]".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn stc_param_for(threshold_us: u32) -> StcThresholdParam {
@@ -465,6 +448,23 @@ impl PseeSensor for Imx636 {
         (SENSOR_WIDTH, SENSOR_HEIGHT)
     }
 
+    fn prepare_configuration(
+        &self,
+        config: &augur_core::config::CameraConfig,
+    ) -> Result<augur_core::config::CameraConfig> {
+        config.validate(SENSOR_WIDTH, SENSOR_HEIGHT)?;
+        Self::validate_bias_ranges(&config.biases)?;
+        Self::validate_digital_filter(&config.digital_filter)?;
+
+        let mut prepared = config.clone();
+        prepared.pixel_mask.masked_pixels = config
+            .pixel_mask
+            .resolved_masked_pixels(SENSOR_WIDTH, SENSOR_HEIGHT)?;
+        prepared.pixel_mask.mask_file = None;
+        Self::validate_mask_capacity(&prepared.pixel_mask.masked_pixels)?;
+        Ok(prepared)
+    }
+
     fn init(&mut self, transport: &mut Transport) -> Result<()> {
         let compatible = if self.compatible.is_empty() {
             "<unknown>".to_string()
@@ -575,7 +575,8 @@ impl PseeSensor for Imx636 {
     }
 
     fn set_pixel_mask(&mut self, transport: &mut Transport, mask: &PixelMaskConfig) -> Result<()> {
-        let pixels = Self::decode_masked_pixels(mask)?;
+        let pixels = mask.resolved_masked_pixels(SENSOR_WIDTH, SENSOR_HEIGHT)?;
+        Self::validate_mask_capacity(&pixels)?;
         let mut tz = Treuzell::new(transport);
 
         for i in 0..DEM_SLOTS {
@@ -595,17 +596,7 @@ impl PseeSensor for Imx636 {
         transport: &mut Transport,
         filter: &DigitalFilterConfig,
     ) -> Result<()> {
-        if filter.stc_enabled && filter.trail_enabled {
-            return Err(CameraError::Config(
-                "STC and Trail cannot be enabled simultaneously on IMX636".into(),
-            ));
-        }
-
-        if filter.stc_threshold_us < 1_000 || filter.stc_threshold_us > 100_000 {
-            return Err(CameraError::Config(
-                "stc_threshold_us must be in [1000, 100000]".into(),
-            ));
-        }
+        Self::validate_digital_filter(filter)?;
 
         let mut tz = Treuzell::new(transport);
 
@@ -1396,6 +1387,32 @@ const STC_THRESHOLD_PARAMS: [StcThresholdParam; 100] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_preflight_rejects_sensor_specific_values_before_apply() {
+        let sensor = Imx636::default();
+
+        let mut invalid_bias = augur_core::config::CameraConfig::default();
+        invalid_bias.biases.diff_on = 141;
+        let error = sensor
+            .prepare_configuration(&invalid_bias)
+            .expect_err("out-of-range bias must fail preflight");
+        assert!(error.to_string().contains("diff_on"));
+
+        let mut invalid_filter = augur_core::config::CameraConfig::default();
+        invalid_filter.digital_filter.stc_threshold_us = 999;
+        let error = sensor
+            .prepare_configuration(&invalid_filter)
+            .expect_err("sensor-specific STC range must fail preflight");
+        assert!(error.to_string().contains("[1000, 100000]"));
+
+        let mut oversized_mask = augur_core::config::CameraConfig::default();
+        oversized_mask.pixel_mask.masked_pixels = (0..=DEM_SLOTS as u16).map(|x| (x, 0)).collect();
+        let error = sensor
+            .prepare_configuration(&oversized_mask)
+            .expect_err("DEM capacity must fail preflight");
+        assert!(error.to_string().contains("up to 64"));
+    }
 
     #[test]
     fn external_trigger_enable_sequence_enables_channel_zero() {

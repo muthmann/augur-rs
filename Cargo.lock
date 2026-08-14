@@ -647,6 +647,7 @@ dependencies = [
  "tiff",
  "time",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -684,6 +685,7 @@ dependencies = [
  "augur-plugin-api",
  "image",
  "libloading 0.8.9",
+ "semver",
  "serde",
  "serde_json",
  "toml",

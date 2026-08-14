@@ -8,6 +8,11 @@ Live IMX636 monitoring can be recorded alongside a RAW event stream when the
 operator enables **Record sensor monitoring** in the Capture card. The option is
 off by default and is locked for the duration of a recording.
 
+The option is part of the persisted global camera configuration and named
+camera profiles. Loading or plugin-applying a profile therefore restores the
+actual recording behavior, not only the visible checkbox. Older configuration
+files omit the field and keep the safe default `false`.
+
 For a RAW target such as:
 
 ```text

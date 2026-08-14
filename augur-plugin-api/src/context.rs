@@ -60,6 +60,16 @@ pub enum HostCommand {
         metadata: BTreeMap<String, String>,
     },
     StopRecording,
+    /// Apply a complete host-camera configuration inside an exclusive session.
+    /// The first call preserves the active configuration for a later restore;
+    /// subsequent calls from the same plugin update the session without losing
+    /// that original state.
+    ApplyCameraConfiguration {
+        configuration: CameraConfigurationSourceV1,
+    },
+    /// Restore the host configuration that was active before this plugin's
+    /// configuration session began. Only the owning plugin may restore it.
+    RestoreCameraConfiguration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +100,16 @@ pub enum HostCommandOutcome {
         sha256: Option<String>,
         duration_us: u64,
         reason: String,
+    },
+    CameraConfigurationApplied {
+        snapshot: CameraConfigurationSnapshotV1,
+        provenance: CameraConfigurationProvenanceV1,
+        readback: SensorBiasReadbackV1,
+        readback_age_s: f64,
+    },
+    CameraConfigurationRestored {
+        readback: SensorBiasReadbackV1,
+        readback_age_s: f64,
     },
     Rejected {
         code: String,
@@ -147,12 +167,34 @@ pub struct GlobalSettings {
     pub sensor_height: u16,
     pub acq_time_ms: u64,
     pub event_store_budget_bytes: usize,
+    /// Whether live recordings persist the sensor-monitoring companion file.
+    /// Older hosts omit it and therefore retain the safe disabled default.
+    #[serde(default)]
+    pub record_sensor_telemetry: bool,
     /// Active ROI from the host camera config.
     #[serde(default)]
     pub roi: RoiV1,
     /// Masked (dead/hot) pixels from the host camera config.
     #[serde(default)]
     pub masked_pixels: Vec<(u16, u16)>,
+    /// Sensor-side event-shaping stages that change *which* events reach the
+    /// stream at all.
+    #[serde(default)]
+    pub event_filters: EventFiltersV1,
+}
+
+/// State of the on-sensor filters that discard events before they are streamed.
+/// Plugins can use this host-owned state to decide whether the active camera
+/// configuration is compatible with their own workflow.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EventFiltersV1 {
+    /// Spatio-temporal contrast filter.
+    pub stc_enabled: bool,
+    /// Trail filter. Shares the on-chip block with STC, so the two are
+    /// mutually exclusive.
+    pub trail_enabled: bool,
+    /// Event-rate controller. Always `false` on hosts that do not implement one.
+    pub erc_enabled: bool,
 }
 
 /// Absolute 8-bit bias codes as programmed on the sensor.
@@ -163,6 +205,88 @@ pub struct SensorBiasCodesV1 {
     pub fo: u8,
     pub hpf: u8,
     pub refr: u8,
+}
+
+/// Source for a complete host-owned camera configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum CameraConfigurationSourceV1 {
+    /// Preserve and confirm the configuration currently active in the host.
+    Current,
+    /// Resolve a named host profile at apply time.
+    NamedProfile { name: String },
+    /// Apply an immutable, versioned snapshot supplied by the plugin.
+    Snapshot {
+        snapshot: CameraConfigurationSnapshotV1,
+    },
+}
+
+/// Versioned host-owned camera/global settings snapshot. It intentionally
+/// contains no plugin-local settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CameraConfigurationSnapshotV1 {
+    pub schema_version: u32,
+    pub biases: CameraBiasOffsetsV1,
+    pub roi: RoiV1,
+    #[serde(default)]
+    pub masked_pixels: Vec<(u16, u16)>,
+    pub digital_filter: CameraDigitalFilterV1,
+    #[serde(default)]
+    pub external_trigger: CameraExternalTriggerV1,
+    pub global: CameraGlobalSettingsV1,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CameraBiasOffsetsV1 {
+    pub diff_on: i32,
+    pub diff_off: i32,
+    pub fo: i32,
+    pub hpf: i32,
+    pub refr: i32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraDigitalFilterV1 {
+    pub stc_enabled: bool,
+    pub stc_threshold_us: u32,
+    pub trail_enabled: bool,
+    /// Event-rate controller state. `None` means the host did not report it;
+    /// scientific consumers must not interpret an older missing field as OFF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erc_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CameraExternalTriggerV1 {
+    pub enabled: bool,
+    pub channel: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CameraGlobalSettingsV1 {
+    pub nm_per_pixel: f64,
+    #[serde(default)]
+    pub pixel_scale_calibrated: bool,
+    pub sensor_width: u16,
+    pub sensor_height: u16,
+    pub acq_time_ms: u64,
+    pub event_store_budget_mib: u64,
+    pub preview_interval_ms: u64,
+    pub point_cloud_interval_ms: u64,
+    pub disk_writer_buffer_mib: u64,
+    #[serde(default)]
+    pub record_sensor_telemetry: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraConfigurationProvenanceV1 {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<u64>,
+    pub sha256: String,
 }
 
 /// Programmed bias codes together with the per-unit factory trim the
@@ -942,5 +1066,74 @@ impl Series1dV1 {
 
     pub fn total_points(&self) -> usize {
         self.lines.iter().map(|line| line.points.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod camera_command_tests {
+    use super::*;
+
+    fn snapshot() -> CameraConfigurationSnapshotV1 {
+        CameraConfigurationSnapshotV1 {
+            schema_version: 1,
+            biases: CameraBiasOffsetsV1 {
+                diff_on: 12,
+                diff_off: -7,
+                fo: 0,
+                hpf: 0,
+                refr: 0,
+            },
+            roi: RoiV1 {
+                x: 1,
+                y: 2,
+                width: 640,
+                height: 480,
+            },
+            masked_pixels: vec![(3, 4)],
+            digital_filter: CameraDigitalFilterV1 {
+                stc_enabled: false,
+                stc_threshold_us: 0,
+                trail_enabled: false,
+                erc_enabled: Some(false),
+            },
+            external_trigger: CameraExternalTriggerV1::default(),
+            global: CameraGlobalSettingsV1 {
+                nm_per_pixel: 1_000.0,
+                pixel_scale_calibrated: true,
+                sensor_width: 1280,
+                sensor_height: 720,
+                acq_time_ms: 1,
+                event_store_budget_mib: 512,
+                preview_interval_ms: 16,
+                point_cloud_interval_ms: 50,
+                disk_writer_buffer_mib: 64,
+                record_sensor_telemetry: true,
+            },
+        }
+    }
+
+    #[test]
+    fn camera_configuration_command_roundtrips_without_losing_sensor_recording() {
+        let command = HostCommand::ApplyCameraConfiguration {
+            configuration: CameraConfigurationSourceV1::Snapshot {
+                snapshot: snapshot(),
+            },
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        let decoded: HostCommand = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, command);
+        assert!(json.contains("record_sensor_telemetry"));
+    }
+
+    #[test]
+    fn current_configuration_source_is_explicit() {
+        let command = HostCommand::ApplyCameraConfiguration {
+            configuration: CameraConfigurationSourceV1::Current,
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"command":"apply_camera_configuration","configuration":{"source":"current"}}"#
+        );
     }
 }

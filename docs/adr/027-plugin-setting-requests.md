@@ -67,5 +67,5 @@ service contracts rather than exposing arbitrary setting mutation.
 
 - ADR 024: Host/Worker Plugin State Ownership
 - ADR 026: External Triggers and Execution Context
-- ADR 028: Allowlisted Plugin to Host Commands
+- ADR 028: Declared Plugin-to-Host Commands
 - `docs/features/plugin-service-control-plane.md`

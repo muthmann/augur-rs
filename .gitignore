@@ -19,5 +19,6 @@
 /docs/ai/
 
 # Local tool state
+/.agents/
 /.claude/
 /.opencode/

@@ -30,12 +30,15 @@ use augur_core::{
 };
 use augur_event_types::{BackpressureBehavior, CursorId, CursorPolicy, ExternalTriggerEvent};
 use augur_plugin_api::{
-    ExecutionContext, ExecutionMode, FfiCdEvent, GlobalSettings, HostActionRequest,
-    HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostCommand,
-    HostCommandOutcome, HostCommandReply, HostDatasetKind, HostViewKind, Image2dV1,
-    PluginDiscontinuity, PluginInput, SensorBiasCodesV1, SensorBiasReadbackV1, SensorMonitoringV1,
-    Series1dV1, SettingsSchema, TableColumnValues, TableDatasetV1, CTX_GLOBAL_SETTINGS,
-    CTX_INVESTIGATION_ACTION_REQUESTS, HOST_ACTION_CLUSTER_ROWS_PARAM,
+    CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    CameraConfigurationSourceV1, CameraDigitalFilterV1, CameraExternalTriggerV1,
+    CameraGlobalSettingsV1, EventFiltersV1, ExecutionContext, ExecutionMode, FfiCdEvent,
+    GlobalSettings, HostActionRequest, HostActionRequestQueue, HostActionScope,
+    HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply, HostDatasetKind,
+    HostViewKind, Image2dV1, PluginDiscontinuity, PluginInput, SensorBiasCodesV1,
+    SensorBiasReadbackV1, SensorMonitoringV1, Series1dV1, SettingsSchema, TableColumnValues,
+    TableDatasetV1, CTX_GLOBAL_SETTINGS, CTX_INVESTIGATION_ACTION_REQUESTS,
+    HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 use augur_prophesee::evk4::Evk4Camera;
 use augur_runtime::{
@@ -89,6 +92,7 @@ use crate::{
     },
     preview_perf::{PerfMetricSnapshot, PreviewPerfStats},
     preview_renderer::{PreviewDisplayTexture, PreviewRenderRequest, PreviewRenderer},
+    profile_store::{ProfileStore, PROFILE_SCHEMA_VERSION},
     python_ingress::{
         PythonIngressDatasetInfo, PythonIngressDatasetRequest, PythonIngressServer,
         PythonIngressStartRequest, PythonIngressStatus, DEFAULT_PYTHON_INGRESS_PORT,
@@ -117,13 +121,6 @@ const DOCK_ACTIVE_STORAGE_KEY: &str = "augur_gui.dock_active";
 const DOCK_DEFAULTS_SEEDED_STORAGE_KEY: &str = "augur_gui.dock_defaults_seeded";
 /// Whether recordings write their sensor-monitoring companion CSV.
 ///
-/// Persisted, unlike the other recording toggles, because it is a property of
-/// how a bench records rather than of one session. Plugins that treat the
-/// telemetry as run provenance — Stage-A A1 compacts it into the measurement
-/// folder — cannot ask for it and cannot tell "the operator does not want it"
-/// from "the checkbox reset itself overnight". A silent reset costs a whole
-/// survey's bench conditions, and the loss is only discovered afterwards.
-const RECORD_SENSOR_TELEMETRY_STORAGE_KEY: &str = "augur_gui.record_sensor_telemetry";
 const DOCK_DEFAULT_HEIGHT: f32 = 220.0;
 const DOCK_MIN_HEIGHT: f32 = 120.0;
 const DOCK_MAX_SCREEN_FRACTION: f32 = 0.45;
@@ -897,6 +894,289 @@ struct PluginRecordingFinalizeTask {
     rx: mpsc::Receiver<PluginRecordingFinalizeResult>,
 }
 
+#[derive(Debug, Clone)]
+struct CameraConfigurationSession {
+    owner_plugin_id: String,
+    original: CameraConfig,
+    applied: CameraConfigurationSnapshotV1,
+    provenance: CameraConfigurationProvenanceV1,
+}
+
+#[derive(Debug)]
+enum PendingCameraConfigurationKind {
+    Apply(Box<PendingCameraConfigurationApply>),
+    /// The requested configuration failed readback and the host has applied
+    /// the pre-run configuration again. The original rejection is returned
+    /// only after that rollback has its own fresh readback.
+    RollbackAfterFailedApply {
+        rejection_code: String,
+        rejection_message: String,
+    },
+    Restore,
+}
+
+#[derive(Debug)]
+struct PendingCameraConfigurationApply {
+    /// Configuration active immediately before this apply. A failed update
+    /// rolls back here, while the session's original remains available for the
+    /// final explicit restore.
+    rollback: CameraConfig,
+    original: CameraConfig,
+    snapshot: CameraConfigurationSnapshotV1,
+    provenance: CameraConfigurationProvenanceV1,
+}
+
+#[derive(Debug)]
+struct PendingCameraConfiguration {
+    source_plugin_id: String,
+    request_id: u64,
+    expected: CameraConfig,
+    required_generation: u64,
+    submitted_at: Instant,
+    kind: PendingCameraConfigurationKind,
+}
+
+/// How long the host waits for a monitoring read that confirms a camera
+/// configuration. The control thread re-reads the bias block immediately after
+/// a reconfigure, so this is many times the expected latency.
+const CAMERA_CONFIGURATION_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Programmed code for one bias, the way the sensor computes it: the per-unit
+/// factory trim plus the configured offset, saturated into the 8-bit register.
+/// Mirrors `Imx636::encode_bias` so the host can say what it expects to read
+/// back before it reads it.
+fn expected_bias_code(factory_default: u8, offset: i32) -> u8 {
+    (factory_default as i32 + offset).clamp(0, 255) as u8
+}
+
+fn camera_configuration_snapshot(config: &CameraConfig) -> CameraConfigurationSnapshotV1 {
+    CameraConfigurationSnapshotV1 {
+        schema_version: PROFILE_SCHEMA_VERSION,
+        biases: CameraBiasOffsetsV1 {
+            diff_on: config.biases.diff_on,
+            diff_off: config.biases.diff_off,
+            fo: config.biases.fo,
+            hpf: config.biases.hpf,
+            refr: config.biases.refr,
+        },
+        roi: augur_plugin_api::RoiV1 {
+            x: config.roi.x,
+            y: config.roi.y,
+            width: config.roi.width,
+            height: config.roi.height,
+        },
+        masked_pixels: config.pixel_mask.masked_pixels.clone(),
+        digital_filter: CameraDigitalFilterV1 {
+            stc_enabled: config.digital_filter.stc_enabled,
+            stc_threshold_us: config.digital_filter.stc_threshold_us,
+            trail_enabled: config.digital_filter.trail_enabled,
+            // This host has no ERC implementation. Publishing explicit OFF is
+            // distinct from an older host omitting the state entirely.
+            erc_enabled: Some(false),
+        },
+        external_trigger: CameraExternalTriggerV1 {
+            enabled: config.external_triggers.enabled,
+            channel: config.external_triggers.channel,
+        },
+        global: CameraGlobalSettingsV1 {
+            nm_per_pixel: config.global.nm_per_pixel,
+            pixel_scale_calibrated: config.global.pixel_scale_calibrated,
+            sensor_width: config.global.sensor_width,
+            sensor_height: config.global.sensor_height,
+            acq_time_ms: config.global.acq_time_ms,
+            event_store_budget_mib: config.global.event_store_budget_mib,
+            preview_interval_ms: config.global.preview_interval_ms,
+            point_cloud_interval_ms: config.global.point_cloud_interval_ms,
+            disk_writer_buffer_mib: config.global.disk_writer_buffer_mib,
+            record_sensor_telemetry: config.global.record_sensor_telemetry,
+        },
+    }
+}
+
+fn resolved_camera_configuration(mut config: CameraConfig) -> Result<CameraConfig, String> {
+    config.global = config.global.normalized();
+    let width = config.global.sensor_width;
+    let height = config.global.sensor_height;
+    config.pixel_mask.masked_pixels = config
+        .pixel_mask
+        .resolved_masked_pixels(width, height)
+        .map_err(|error| format!("camera pixel mask is invalid: {error}"))?;
+    config.pixel_mask.mask_file = None;
+    config
+        .validate(width, height)
+        .map_err(|error| format!("camera configuration is invalid: {error}"))?;
+    Ok(config)
+}
+
+fn camera_config_from_snapshot(
+    snapshot: &CameraConfigurationSnapshotV1,
+) -> Result<CameraConfig, String> {
+    if snapshot.schema_version != PROFILE_SCHEMA_VERSION {
+        return Err(format!(
+            "camera snapshot schema {} is unsupported (supported: {})",
+            snapshot.schema_version, PROFILE_SCHEMA_VERSION
+        ));
+    }
+    match snapshot.digital_filter.erc_enabled {
+        Some(false) => {}
+        Some(true) => {
+            return Err(
+                "camera snapshot requests ERC enabled, but this host has no ERC support".into(),
+            )
+        }
+        None => {
+            return Err(
+                "camera snapshot does not state the ERC state; save a new profile with this host"
+                    .into(),
+            )
+        }
+    }
+    let config = CameraConfig {
+        biases: augur_core::config::BiasConfig {
+            diff_on: snapshot.biases.diff_on,
+            diff_off: snapshot.biases.diff_off,
+            fo: snapshot.biases.fo,
+            hpf: snapshot.biases.hpf,
+            refr: snapshot.biases.refr,
+        },
+        roi: augur_core::config::RoiConfig {
+            x: snapshot.roi.x,
+            y: snapshot.roi.y,
+            width: snapshot.roi.width,
+            height: snapshot.roi.height,
+        },
+        pixel_mask: augur_core::config::PixelMaskConfig {
+            masked_pixels: snapshot.masked_pixels.clone(),
+            mask_file: None,
+        },
+        digital_filter: augur_core::config::DigitalFilterConfig {
+            stc_enabled: snapshot.digital_filter.stc_enabled,
+            stc_threshold_us: snapshot.digital_filter.stc_threshold_us,
+            trail_enabled: snapshot.digital_filter.trail_enabled,
+        },
+        external_triggers: augur_core::config::ExternalTriggerConfig {
+            enabled: snapshot.external_trigger.enabled,
+            channel: snapshot.external_trigger.channel,
+        },
+        global: GlobalSettingsConfig {
+            nm_per_pixel: snapshot.global.nm_per_pixel,
+            pixel_scale_calibrated: snapshot.global.pixel_scale_calibrated,
+            sensor_width: snapshot.global.sensor_width,
+            sensor_height: snapshot.global.sensor_height,
+            acq_time_ms: snapshot.global.acq_time_ms,
+            event_store_budget_mib: snapshot.global.event_store_budget_mib,
+            preview_interval_ms: snapshot.global.preview_interval_ms,
+            point_cloud_interval_ms: snapshot.global.point_cloud_interval_ms,
+            disk_writer_buffer_mib: snapshot.global.disk_writer_buffer_mib,
+            record_sensor_telemetry: snapshot.global.record_sensor_telemetry,
+        },
+    };
+    resolved_camera_configuration(config)
+        .map_err(|error| format!("camera snapshot is invalid: {error}"))
+}
+
+fn camera_configuration_requires_restart(current: &CameraConfig, desired: &CameraConfig) -> bool {
+    desired.external_triggers.enabled != current.external_triggers.enabled
+        || desired.external_triggers.channel != current.external_triggers.channel
+        || desired.global.sensor_width != current.global.sensor_width
+        || desired.global.sensor_height != current.global.sensor_height
+        || desired.global.disk_writer_buffer_mib != current.global.disk_writer_buffer_mib
+}
+
+fn validate_camera_configuration_recording_start(
+    current: &CameraConfig,
+    pending: bool,
+    session: Option<&CameraConfigurationSession>,
+    owner_plugin_id: Option<&str>,
+) -> Result<(), String> {
+    if pending {
+        return Err(
+            "recording cannot start while a camera configuration is waiting for confirmation"
+                .into(),
+        );
+    }
+    let Some(session) = session else {
+        return Ok(());
+    };
+    if owner_plugin_id != Some(session.owner_plugin_id.as_str()) {
+        return Err("recording cannot start while a plugin owns the camera configuration".into());
+    }
+    if camera_configuration_snapshot(current) != session.applied {
+        return Err(
+            "the active camera configuration no longer matches the confirmed plugin snapshot"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_sha256(snapshot: &CameraConfigurationSnapshotV1) -> Result<String, String> {
+    let bytes = serde_json::to_vec(snapshot)
+        .map_err(|error| format!("cannot serialize camera snapshot: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// What the latest monitoring snapshot says about an applied configuration.
+#[derive(Debug, PartialEq)]
+enum ConfigurationReadbackVerdict {
+    /// No reading yet that could settle it, and the timeout has not run out.
+    Waiting,
+    Confirmed {
+        readback: SensorBiasReadbackV1,
+        age_s: f64,
+    },
+    Refused {
+        code: &'static str,
+        message: String,
+    },
+}
+
+fn configuration_readback_verdict(
+    expected: &CameraConfig,
+    required_generation: u64,
+    snapshot: Option<(u64, f64, Option<augur_core::camera::BiasReadback>)>,
+    since_submit: Duration,
+) -> ConfigurationReadbackVerdict {
+    let confirmed = snapshot
+        .filter(|(generation, _, _)| *generation == required_generation)
+        .and_then(|(_, age_s, biases)| biases.map(|biases| (biases, age_s)));
+    let Some((biases, age_s)) = confirmed else {
+        if since_submit < CAMERA_CONFIGURATION_READBACK_TIMEOUT {
+            return ConfigurationReadbackVerdict::Waiting;
+        }
+        return ConfigurationReadbackVerdict::Refused {
+            code: "bias_readback_unavailable",
+            message:
+                "the sensor did not report its bias codes after the camera configuration change"
+                    .to_owned(),
+        };
+    };
+    let offsets = &expected.biases;
+    let expected_codes = augur_core::camera::BiasCodes {
+        diff_on: expected_bias_code(biases.factory_default.diff_on, offsets.diff_on),
+        diff_off: expected_bias_code(biases.factory_default.diff_off, offsets.diff_off),
+        fo: expected_bias_code(biases.factory_default.fo, offsets.fo),
+        hpf: expected_bias_code(biases.factory_default.hpf, offsets.hpf),
+        refr: expected_bias_code(biases.factory_default.refr, offsets.refr),
+    };
+    if biases.current != expected_codes {
+        return ConfigurationReadbackVerdict::Refused {
+            code: "bias_readback_mismatch",
+            message: format!(
+                "sensor bias codes {:?} do not match expected {:?}",
+                biases.current, expected_codes
+            ),
+        };
+    }
+    ConfigurationReadbackVerdict::Confirmed {
+        readback: SensorBiasReadbackV1 {
+            current: bias_codes_v1(&biases.current),
+            factory_default: bias_codes_v1(&biases.factory_default),
+        },
+        age_s,
+    }
+}
+
 fn format_timestamp_now() -> String {
     let dur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1082,8 +1362,8 @@ pub struct CameraApp {
     pending_preview_frame: Option<PreviewFrame>,
     /// EXT_TRIGGER edges from preview frames that were drained but never
     /// processed (drain-to-newest and the process-interval throttle drop whole
-    /// frames). Carried into the next processed frame so plugins that fold on
-    /// the trigger (stage-a-a1) see every edge, not just the survivors'.
+    /// frames). Carried into the next processed frame so plugins that consume
+    /// trigger edges see every edge, not just the survivors'.
     carried_external_triggers: Vec<ExternalTriggerEvent>,
     /// How many accumulation windows the preview pipeline delivered, and how
     /// many of those actually reached the plugins. Live analysis is
@@ -1131,6 +1411,8 @@ pub struct CameraApp {
     live_control_status: HashMap<String, LivePluginControlStatus>,
     plugin_recording_session: Option<PluginRecordingSession>,
     plugin_recording_finalize_task: Option<PluginRecordingFinalizeTask>,
+    camera_configuration_session: Option<CameraConfigurationSession>,
+    pending_camera_configuration: Option<PendingCameraConfiguration>,
     live_host_snapshots: Vec<LivePluginHostSnapshot>,
     /// Highest worker host-view sequence applied from either the analysis or
     /// control result channel.
@@ -1161,6 +1443,7 @@ pub struct CameraApp {
     popup_open: bool,
     lock_settings_while_recording: bool,
     record_sensor_telemetry: bool,
+    profile_name: String,
     settings_panel_open: bool,
     analysis_panel_open: bool,
     plugins_window_open: bool,
@@ -1269,11 +1552,7 @@ impl CameraApp {
             .and_then(|s| s.get_string(DOCK_OPEN_STORAGE_KEY))
             .map(|s| s != "false")
             .unwrap_or(true);
-        let record_sensor_telemetry = cc
-            .storage
-            .and_then(|s| s.get_string(RECORD_SENSOR_TELEMETRY_STORAGE_KEY))
-            .map(|s| s == "true")
-            .unwrap_or(false);
+        let record_sensor_telemetry = GlobalSettingsConfig::default().record_sensor_telemetry;
         // Restore the dock tab set so views the user closed stay closed across
         // restarts. Ids whose provider is absent simply do not render.
         let dock_tabs: Vec<String> = cc
@@ -1364,6 +1643,8 @@ impl CameraApp {
             live_control_status: HashMap::new(),
             plugin_recording_session: None,
             plugin_recording_finalize_task: None,
+            camera_configuration_session: None,
+            pending_camera_configuration: None,
             live_host_snapshots: Vec::new(),
             live_host_snapshot_sequence: 0,
             runtime_snapshot_source: None,
@@ -1387,6 +1668,7 @@ impl CameraApp {
             popup_open: false,
             lock_settings_while_recording: true,
             record_sensor_telemetry,
+            profile_name: String::new(),
             settings_panel_open: true,
             analysis_panel_open: true,
             plugins_window_open: false,
@@ -1473,6 +1755,7 @@ impl CameraApp {
             preview_interval_ms: self.preview_interval_ms,
             point_cloud_interval_ms: self.point_cloud_interval_ms,
             disk_writer_buffer_mib: self.disk_writer_buffer_mib,
+            record_sensor_telemetry: self.record_sensor_telemetry,
         };
     }
 
@@ -1494,6 +1777,7 @@ impl CameraApp {
             sensor_height: self.sensor_height,
             acq_time_ms: self.published_acq_time_ms(),
             event_store_budget_bytes: self.event_store.memory_budget_bytes(),
+            record_sensor_telemetry: self.record_sensor_telemetry,
             roi: augur_plugin_api::RoiV1 {
                 x: self.config.roi.x,
                 y: self.config.roi.y,
@@ -1501,6 +1785,14 @@ impl CameraApp {
                 height: self.config.roi.height,
             },
             masked_pixels: self.config.pixel_mask.masked_pixels.clone(),
+            event_filters: EventFiltersV1 {
+                stc_enabled: self.config.digital_filter.stc_enabled,
+                trail_enabled: self.config.digital_filter.trail_enabled,
+                // This host has no event-rate controller to enable. Reported
+                // anyway so a measurement that must record "ERC was off" is
+                // recording a fact rather than an omission.
+                erc_enabled: false,
+            },
         }
     }
 
@@ -1543,16 +1835,18 @@ impl CameraApp {
     }
 
     fn apply_global_config(&mut self, global: &GlobalSettingsConfig) {
-        self.nm_per_pixel = global.nm_per_pixel.max(1.0);
+        let global = global.clone().normalized();
+        self.nm_per_pixel = global.nm_per_pixel;
         self.pixel_scale_calibrated = global.pixel_scale_calibrated;
-        self.sensor_width = global.sensor_width.max(1);
-        self.sensor_height = global.sensor_height.max(1);
-        self.acq_time_ms = global.acq_time_ms.max(1);
-        self.preview_interval_ms = global.preview_interval_ms.max(10);
-        self.point_cloud_interval_ms = global.point_cloud_interval_ms.max(20);
-        self.disk_writer_buffer_mib = global.disk_writer_buffer_mib.max(1);
+        self.sensor_width = global.sensor_width;
+        self.sensor_height = global.sensor_height;
+        self.acq_time_ms = global.acq_time_ms;
+        self.preview_interval_ms = global.preview_interval_ms;
+        self.point_cloud_interval_ms = global.point_cloud_interval_ms;
+        self.disk_writer_buffer_mib = global.disk_writer_buffer_mib;
+        self.record_sensor_telemetry = global.record_sensor_telemetry;
         self.event_store
-            .set_memory_budget(mib_to_bytes(global.event_store_budget_mib.max(1)));
+            .set_memory_budget(mib_to_bytes(global.event_store_budget_mib));
         self.sync_config_global_from_runtime();
     }
 
@@ -2506,10 +2800,12 @@ impl CameraApp {
             }
         }
 
-        if let Some(new_roi) = output.new_roi {
-            self.config.roi = new_roi;
-            if self.mode != AppMode::Replaying {
-                self.config_dirty = true;
+        if !self.settings_are_locked() {
+            if let Some(new_roi) = output.new_roi {
+                self.config.roi = new_roi;
+                if self.mode != AppMode::Replaying {
+                    self.config_dirty = true;
+                }
             }
         }
 
@@ -3218,6 +3514,7 @@ impl CameraApp {
 
     fn poll_live_control_results(&mut self) {
         self.poll_plugin_recording_finalize();
+        self.poll_pending_camera_configuration();
         while let Ok(result) = self.live_analysis_worker.try_recv_control() {
             // Host commands are routed regardless of epoch. The worker has
             // already recorded each one as in-flight, and re-emission is
@@ -3304,7 +3601,7 @@ impl CameraApp {
             HostCommand::StartRecording {
                 run_id,
                 base_path,
-                metadata,
+                mut metadata,
             } => {
                 if run_id.trim().is_empty() {
                     self.reject_plugin_host_command(
@@ -3343,29 +3640,45 @@ impl CameraApp {
                         return;
                     }
                 };
-                // Written into the crash breadcrumb before the recording starts,
-                // so a death during an unattended survey is pinned to the point
-                // it was on rather than to the night it happened. The plugin
-                // states its own position when it has one; an ordinary
-                // recording is just its run id.
-                let position = match (
-                    metadata.get("protocol_point_index"),
-                    metadata.get("protocol_point_total"),
-                ) {
-                    (Some(index), Some(total)) => format!(" (protocol row {index}/{total})"),
-                    _ => String::new(),
-                };
-                crate::diagnostics::note(format!(
-                    "recording {run_id}{position} → {}",
-                    path.display()
-                ));
+                crate::diagnostics::note(format!("recording {run_id} → {}", path.display()));
+                if let Some(session) = self
+                    .camera_configuration_session
+                    .as_ref()
+                    .filter(|session| session.owner_plugin_id == source_plugin_id)
+                {
+                    metadata.insert(
+                        "camera_configuration_source".into(),
+                        session.provenance.source.clone(),
+                    );
+                    if let Some(name) = &session.provenance.profile_name {
+                        metadata.insert("camera_profile_name".into(), name.clone());
+                    }
+                    if let Some(revision) = session.provenance.profile_revision {
+                        metadata.insert("camera_profile_revision".into(), revision.to_string());
+                    }
+                    metadata.insert(
+                        "camera_configuration_schema".into(),
+                        session.provenance.schema_version.to_string(),
+                    );
+                    metadata.insert(
+                        "camera_configuration_sha256".into(),
+                        session.provenance.sha256.clone(),
+                    );
+                    if let Ok(snapshot_json) = serde_json::to_string(&session.applied) {
+                        metadata.insert("camera_configuration_snapshot_json".into(), snapshot_json);
+                    }
+                }
                 let mut recording_metadata = metadata
                     .into_iter()
                     .map(|(key, value)| (format!("plugin_{}", sanitize_file_stem(&key)), value))
                     .collect::<BTreeMap<_, _>>();
                 recording_metadata.insert("plugin_source_id".into(), source_plugin_id.clone());
                 recording_metadata.insert("plugin_run_id".into(), run_id.clone());
-                match self.begin_recording(Some(path.clone()), recording_metadata) {
+                match self.begin_recording(
+                    Some(path.clone()),
+                    recording_metadata,
+                    Some(&source_plugin_id),
+                ) {
                     Ok(actual_path) => {
                         self.plugin_recording_session = Some(PluginRecordingSession {
                             source_plugin_id: source_plugin_id.clone(),
@@ -3423,6 +3736,485 @@ impl CameraApp {
                 session.stop_request_id = Some(request.request_id);
                 self.stop_pipeline();
             }
+            HostCommand::ApplyCameraConfiguration { configuration } => self
+                .execute_plugin_apply_camera_configuration(
+                    source_plugin_id,
+                    request.request_id,
+                    configuration,
+                ),
+            HostCommand::RestoreCameraConfiguration => self
+                .execute_plugin_restore_camera_configuration(source_plugin_id, request.request_id),
+        }
+    }
+
+    fn execute_plugin_apply_camera_configuration(
+        &mut self,
+        source_plugin_id: String,
+        request_id: u64,
+        configuration: CameraConfigurationSourceV1,
+    ) {
+        if self.mode == AppMode::Recording
+            || self.plugin_recording_session.is_some()
+            || self.plugin_recording_finalize_task.is_some()
+        {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "recording_active",
+                "camera configuration cannot change during a recording or finalization",
+            );
+            return;
+        }
+        if self.controller.is_none() {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "no_camera",
+                "no camera is running, so there is no configuration to apply",
+            );
+            return;
+        }
+        if self.config_dirty || self.acq_dirty {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "unapplied_operator_settings",
+                "apply or discard the operator's pending camera edits before starting a configuration session",
+            );
+            return;
+        }
+        if self.pending_camera_configuration.is_some() {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "camera_configuration_busy",
+                "a camera configuration change is already waiting for confirmation",
+            );
+            return;
+        }
+        if self
+            .camera_configuration_session
+            .as_ref()
+            .is_some_and(|session| session.owner_plugin_id != source_plugin_id)
+        {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "camera_configuration_owned_by_other_plugin",
+                "another plugin owns the active camera-configuration session",
+            );
+            return;
+        }
+
+        let (desired, provenance_source, profile_name, profile_revision) = match configuration {
+            CameraConfigurationSourceV1::Current => {
+                (self.config.clone(), "current_configuration", None, None)
+            }
+            CameraConfigurationSourceV1::NamedProfile { name } => {
+                let loaded =
+                    match ProfileStore::in_app_config_dir().and_then(|store| store.load(&name)) {
+                        Ok(loaded) => loaded,
+                        Err(error) => {
+                            self.reject_plugin_host_command(
+                                source_plugin_id,
+                                request_id,
+                                "profile_invalid",
+                                error,
+                            );
+                            return;
+                        }
+                    };
+                let identity = loaded.identity;
+                (
+                    loaded.profile.camera,
+                    "named_profile",
+                    Some(identity.name),
+                    Some(identity.revision),
+                )
+            }
+            CameraConfigurationSourceV1::Snapshot { snapshot } => {
+                let config = match camera_config_from_snapshot(&snapshot) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        self.reject_plugin_host_command(
+                            source_plugin_id,
+                            request_id,
+                            "snapshot_invalid",
+                            error,
+                        );
+                        return;
+                    }
+                };
+                (config, "inline_snapshot", None, None)
+            }
+        };
+        let desired = match resolved_camera_configuration(desired) {
+            Ok(config) => config,
+            Err(error) => {
+                self.reject_plugin_host_command(
+                    source_plugin_id,
+                    request_id,
+                    "snapshot_invalid",
+                    error,
+                );
+                return;
+            }
+        };
+        let snapshot = camera_configuration_snapshot(&desired);
+        let sha256 = match snapshot_sha256(&snapshot) {
+            Ok(value) => value,
+            Err(error) => {
+                self.reject_plugin_host_command(
+                    source_plugin_id,
+                    request_id,
+                    "snapshot_invalid",
+                    error,
+                );
+                return;
+            }
+        };
+        let provenance = CameraConfigurationProvenanceV1 {
+            source: provenance_source.into(),
+            profile_name,
+            schema_version: PROFILE_SCHEMA_VERSION,
+            profile_revision,
+            sha256,
+        };
+        let rollback = self.config.clone();
+        let original = self
+            .camera_configuration_session
+            .as_ref()
+            .map_or_else(|| rollback.clone(), |session| session.original.clone());
+        let required_generation = match self.apply_plugin_camera_configuration_now(desired.clone())
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                let rollback_generation = match self
+                    .apply_plugin_camera_configuration_now(rollback.clone())
+                {
+                    Ok(generation) => generation,
+                    Err(restore_error) => {
+                        self.reject_plugin_host_command(
+                                    source_plugin_id,
+                                    request_id,
+                                    "camera_configuration_rollback_failed",
+                                    format!(
+                                        "the camera did not accept the plugin configuration ({error}) and the previous configuration could not be reapplied ({restore_error})"
+                                    ),
+                                );
+                        return;
+                    }
+                };
+                self.pending_camera_configuration = Some(PendingCameraConfiguration {
+                    source_plugin_id,
+                    request_id,
+                    expected: rollback,
+                    required_generation: rollback_generation,
+                    submitted_at: Instant::now(),
+                    kind: PendingCameraConfigurationKind::RollbackAfterFailedApply {
+                        rejection_code: "camera_configuration_apply_failed".into(),
+                        rejection_message: format!(
+                            "the camera did not accept the plugin configuration ({error})"
+                        ),
+                    },
+                });
+                return;
+            }
+        };
+        self.pending_camera_configuration = Some(PendingCameraConfiguration {
+            source_plugin_id,
+            request_id,
+            expected: desired,
+            required_generation,
+            submitted_at: Instant::now(),
+            kind: PendingCameraConfigurationKind::Apply(Box::new(
+                PendingCameraConfigurationApply {
+                    rollback,
+                    original,
+                    snapshot,
+                    provenance,
+                },
+            )),
+        });
+    }
+
+    /// Apply a complete plugin-owned configuration immediately. Settings that
+    /// the live control thread cannot change cause an automatic Preview
+    /// restart; this command never parks waiting for an operator Apply click.
+    fn apply_plugin_camera_configuration_now(
+        &mut self,
+        desired: CameraConfig,
+    ) -> Result<u64, String> {
+        let restart = self.controller.is_none()
+            || camera_configuration_requires_restart(&self.config, &desired);
+        if restart {
+            self.stop_preview_for_plugin_configuration()?;
+        }
+
+        self.config = desired;
+        self.mask_file = self
+            .config
+            .pixel_mask
+            .mask_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let global = self.config.global.clone();
+        self.apply_global_config(&global);
+
+        if restart {
+            self.start_preview_for_plugin_configuration()?;
+            return Ok(0);
+        }
+
+        self.config_dirty = true;
+        self.acq_dirty = true;
+        let generation = self
+            .apply_runtime_changes_now_with_feedback(false)?
+            .ok_or_else(|| "the camera control path is unavailable".to_owned())?;
+        if self.config_dirty || self.acq_dirty {
+            return Err(self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "the camera did not accept the configuration".into()));
+        }
+        Ok(generation)
+    }
+
+    /// Stop only the camera pipeline. The live plugin worker and its pending
+    /// host request must survive, otherwise the plugin that requested the
+    /// restart could never receive its readback reply.
+    fn stop_preview_for_plugin_configuration(&mut self) -> Result<(), String> {
+        self.event_store.detach_upstream();
+        self.event_store.clear();
+        let Some(controller) = self.controller.take() else {
+            return Ok(());
+        };
+        controller
+            .shutdown()
+            .map_err(|error| format!("pipeline shutdown failed: {error}"))?;
+        self.texture = None;
+        self.latest_frame = None;
+        self.pending_preview_frame = None;
+        self.carried_external_triggers.clear();
+        self.preview_renderer.reset();
+        self.preview_perf.reset();
+        self.last_preview_process_at = None;
+        Ok(())
+    }
+
+    /// Start Preview without resetting the plugin worker. This is the second
+    /// half of one in-flight `ApplyCameraConfiguration` operation.
+    fn start_preview_for_plugin_configuration(&mut self) -> Result<(), String> {
+        let controller = self.start_pipeline_inner(true)?;
+        self.sync_pipeline_requirements(&controller);
+        self.controller = Some(controller);
+        self.mode = AppMode::Previewing;
+        self.with_active_viewer_mut(ViewerState::clear_session_state);
+        self.config_dirty = false;
+        self.acq_dirty = false;
+        self.last_error = None;
+        self.camera_status = "Previewing with plugin camera configuration.".into();
+        Ok(())
+    }
+
+    fn execute_plugin_restore_camera_configuration(
+        &mut self,
+        source_plugin_id: String,
+        request_id: u64,
+    ) {
+        let Some(session) = self.camera_configuration_session.as_ref() else {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "no_camera_configuration_session",
+                "this plugin has no camera configuration to restore",
+            );
+            return;
+        };
+        if session.owner_plugin_id != source_plugin_id {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "camera_configuration_owned_by_other_plugin",
+                "only the plugin that applied the camera configuration may restore it",
+            );
+            return;
+        }
+        if self.mode == AppMode::Recording
+            || self.plugin_recording_session.is_some()
+            || self.plugin_recording_finalize_task.is_some()
+            || self.pending_camera_configuration.is_some()
+        {
+            self.reject_plugin_host_command(
+                source_plugin_id,
+                request_id,
+                "camera_configuration_busy",
+                "finish the recording or pending camera change before restoring",
+            );
+            return;
+        }
+        let original = session.original.clone();
+        let required_generation = match self.apply_plugin_camera_configuration_now(original.clone())
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.reject_plugin_host_command(
+                    source_plugin_id,
+                    request_id,
+                    "camera_configuration_restore_failed",
+                    error,
+                );
+                return;
+            }
+        };
+        self.pending_camera_configuration = Some(PendingCameraConfiguration {
+            source_plugin_id,
+            request_id,
+            expected: original,
+            required_generation,
+            submitted_at: Instant::now(),
+            kind: PendingCameraConfigurationKind::Restore,
+        });
+    }
+
+    fn poll_pending_camera_configuration(&mut self) {
+        let Some(pending) = self.pending_camera_configuration.as_ref() else {
+            return;
+        };
+        let since_submit = pending.submitted_at.elapsed();
+        let snapshot = self
+            .controller
+            .as_ref()
+            .and_then(PipelineController::sensor_monitoring);
+        let verdict = configuration_readback_verdict(
+            &pending.expected,
+            pending.required_generation,
+            snapshot.as_ref().map(|snapshot| {
+                (
+                    snapshot.bias_configuration_generation,
+                    snapshot.age_s,
+                    snapshot.values.biases,
+                )
+            }),
+            since_submit,
+        );
+        if verdict == ConfigurationReadbackVerdict::Waiting {
+            return;
+        }
+        let pending = self
+            .pending_camera_configuration
+            .take()
+            .expect("checked above");
+        match verdict {
+            ConfigurationReadbackVerdict::Waiting => unreachable!("returned above"),
+            ConfigurationReadbackVerdict::Confirmed { readback, age_s } => match pending.kind {
+                PendingCameraConfigurationKind::Apply(apply) => {
+                    let PendingCameraConfigurationApply {
+                        rollback: _,
+                        original,
+                        snapshot,
+                        provenance,
+                    } = *apply;
+                    self.camera_configuration_session = Some(CameraConfigurationSession {
+                        owner_plugin_id: pending.source_plugin_id.clone(),
+                        original,
+                        applied: snapshot.clone(),
+                        provenance: provenance.clone(),
+                    });
+                    self.toast_queue.push(
+                        "Plugin camera configuration confirmed by sensor readback",
+                        crate::toast::ToastTone::Success,
+                    );
+                    self.submit_plugin_host_reply(
+                        pending.source_plugin_id,
+                        HostCommandReply {
+                            request_id: pending.request_id,
+                            outcome: HostCommandOutcome::CameraConfigurationApplied {
+                                snapshot,
+                                provenance,
+                                readback,
+                                readback_age_s: age_s,
+                            },
+                        },
+                    );
+                }
+                PendingCameraConfigurationKind::Restore => {
+                    self.camera_configuration_session = None;
+                    self.toast_queue.push(
+                        "Pre-run camera configuration restored and confirmed",
+                        crate::toast::ToastTone::Success,
+                    );
+                    self.submit_plugin_host_reply(
+                        pending.source_plugin_id,
+                        HostCommandReply {
+                            request_id: pending.request_id,
+                            outcome: HostCommandOutcome::CameraConfigurationRestored {
+                                readback,
+                                readback_age_s: age_s,
+                            },
+                        },
+                    );
+                }
+                PendingCameraConfigurationKind::RollbackAfterFailedApply {
+                    rejection_code,
+                    rejection_message,
+                } => {
+                    self.reject_plugin_host_command(
+                        pending.source_plugin_id,
+                        pending.request_id,
+                        &rejection_code,
+                        format!(
+                            "{rejection_message}; the previous camera configuration was restored and confirmed"
+                        ),
+                    );
+                }
+            },
+            ConfigurationReadbackVerdict::Refused { code, message } => match pending.kind {
+                PendingCameraConfigurationKind::Apply(apply) => {
+                    let rollback = apply.rollback;
+                    match self.apply_plugin_camera_configuration_now(rollback.clone()) {
+                        Err(restore_error) => self.reject_plugin_host_command(
+                            pending.source_plugin_id,
+                            pending.request_id,
+                            "camera_configuration_rollback_failed",
+                            format!(
+                                "camera configuration was rejected ({code}: {message}) and the previous configuration could not be reapplied ({restore_error})"
+                            ),
+                        ),
+                        Ok(required_generation) => {
+                            self.pending_camera_configuration = Some(PendingCameraConfiguration {
+                                source_plugin_id: pending.source_plugin_id,
+                                request_id: pending.request_id,
+                                expected: rollback,
+                                required_generation,
+                                submitted_at: Instant::now(),
+                                kind: PendingCameraConfigurationKind::RollbackAfterFailedApply {
+                                    rejection_code: code.into(),
+                                    rejection_message: message,
+                                },
+                            });
+                        }
+                    }
+                }
+                PendingCameraConfigurationKind::RollbackAfterFailedApply {
+                    rejection_code,
+                    rejection_message,
+                } => self.reject_plugin_host_command(
+                    pending.source_plugin_id,
+                    pending.request_id,
+                    "camera_configuration_rollback_unconfirmed",
+                    format!(
+                        "camera configuration was rejected ({rejection_code}: {rejection_message}); the previous configuration was reapplied but its sensor readback failed ({code}: {message})"
+                    ),
+                ),
+                PendingCameraConfigurationKind::Restore => self.reject_plugin_host_command(
+                    pending.source_plugin_id,
+                    pending.request_id,
+                    code,
+                    message,
+                ),
+            },
         }
     }
 
@@ -6291,8 +7083,12 @@ impl CameraApp {
         // Poll while something can consume the values: the settings panel
         // renders them, and live plugins receive them on the context bus. A
         // collapsed panel with no live plugins costs no USB control transfers.
+        // A configuration change in flight is waiting on a reading to confirm
+        // it, so it pins polling on regardless of what else is open.
         controller.sensor_monitoring_needed.store(
-            self.settings_panel_open || self.runtime_plugins_enabled(),
+            self.settings_panel_open
+                || self.runtime_plugins_enabled()
+                || self.pending_camera_configuration.is_some(),
             Ordering::Relaxed,
         );
     }
@@ -6430,6 +7226,7 @@ impl CameraApp {
         // One primary per surface: yield the ink fill to the canvas CTA while
         // it is on screen, take it back once the canvas shows a live preview.
         let is_primary = !self.canvas_cta_visible(mode);
+        let configuration_workflow_active = self.camera_configuration_workflow_active();
         crate::theme::card_frame(ui).show(ui, |ui| {
             crate::theme::section_subhead(ui, "Capture");
             ui.small(&self.camera_status);
@@ -6446,20 +7243,38 @@ impl CameraApp {
                 }
                 AppMode::Idle => {
                     if ui
-                        .add(crate::theme::action_button(is_primary, "Start Preview"))
+                        .add_enabled(
+                            !configuration_workflow_active,
+                            crate::theme::action_button(is_primary, "Start Preview"),
+                        )
                         .clicked()
                     {
                         self.start_preview();
                     }
-                    if ui.button("Record").clicked() {
+                    if ui
+                        .add_enabled(!configuration_workflow_active, egui::Button::new("Record"))
+                        .clicked()
+                    {
                         self.start_recording();
                     }
                 }
                 AppMode::Previewing => {
-                    if ui.add(crate::theme::primary_button("Record")).clicked() {
+                    if ui
+                        .add_enabled(
+                            !configuration_workflow_active,
+                            crate::theme::primary_button("Record"),
+                        )
+                        .clicked()
+                    {
                         self.start_recording();
                     }
-                    if ui.button("Stop Preview").clicked() {
+                    if ui
+                        .add_enabled(
+                            !configuration_workflow_active,
+                            egui::Button::new("Stop Preview"),
+                        )
+                        .clicked()
+                    {
                         self.stop_pipeline();
                     }
                 }
@@ -6578,7 +7393,10 @@ impl CameraApp {
     }
 
     fn start_preview(&mut self) {
-        if self.mode != AppMode::Idle || self.replay_open_task.is_some() {
+        if self.mode != AppMode::Idle
+            || self.replay_open_task.is_some()
+            || self.camera_configuration_workflow_active()
+        {
             return;
         }
         match self.start_pipeline_inner(true) {
@@ -6607,7 +7425,7 @@ impl CameraApp {
     }
 
     fn start_recording(&mut self) {
-        match self.begin_recording(None, BTreeMap::new()) {
+        match self.begin_recording(None, BTreeMap::new(), None) {
             Ok(path) => self.toast_queue.push(
                 format!("Recording started: {}", path.display()),
                 crate::toast::ToastTone::Info,
@@ -6623,6 +7441,7 @@ impl CameraApp {
         &mut self,
         output_path: Option<PathBuf>,
         metadata: BTreeMap<String, String>,
+        camera_configuration_owner: Option<&str>,
     ) -> Result<PathBuf, String> {
         if self.mode == AppMode::Recording || self.replay_open_task.is_some() {
             return Err("recording cannot start while Augur is busy".into());
@@ -6630,6 +7449,12 @@ impl CameraApp {
         if self.mode == AppMode::Replaying {
             return Err("recording cannot start during replay".into());
         }
+        validate_camera_configuration_recording_start(
+            &self.config,
+            self.pending_camera_configuration.is_some(),
+            self.camera_configuration_session.as_ref(),
+            camera_configuration_owner,
+        )?;
         if self.mode == AppMode::Previewing {
             self.stop_pipeline();
         }
@@ -7751,6 +8576,14 @@ impl CameraApp {
 
     fn stop_pipeline_with_failure(&mut self, mut pipeline_failure: Option<String>) {
         let was_replaying = self.mode == AppMode::Replaying;
+        if let Some(pending) = self.pending_camera_configuration.take() {
+            self.reject_plugin_host_command(
+                pending.source_plugin_id,
+                pending.request_id,
+                "camera_configuration_interrupted",
+                "the camera pipeline stopped before the configuration could be confirmed",
+            );
+        }
         let plugin_recording = self.plugin_recording_session.take();
         let recording_duration_us = self
             .controller
@@ -7998,6 +8831,13 @@ impl CameraApp {
     }
 
     fn apply_runtime_changes_now(&mut self) {
+        let _ = self.apply_runtime_changes_now_with_feedback(true);
+    }
+
+    fn apply_runtime_changes_now_with_feedback(
+        &mut self,
+        report_success: bool,
+    ) -> Result<Option<u64>, String> {
         self.sync_config_global_from_runtime();
 
         // Without a pipeline there is no camera to send anything to. Saying so
@@ -8008,22 +8848,28 @@ impl CameraApp {
                        applied when you start Preview or Record."
                 .to_owned();
             self.toast_queue.push(msg, crate::toast::ToastTone::Info);
-            return;
+            return Ok(None);
         };
 
+        let mut configuration_generation = None;
         if self.config_dirty {
             if let Err(e) = self.config.validate(self.sensor_width, self.sensor_height) {
                 let msg = format!("settings invalid: {e}");
                 self.last_error = Some(msg.clone());
-                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
-                return;
+                self.toast_queue
+                    .push(msg.clone(), crate::toast::ToastTone::Error);
+                return Err(msg);
             }
-            if let Err(e) = ctrl.settings_tx.try_send(self.config.clone()) {
-                let msg = format!("failed sending runtime settings: {e}");
-                self.last_error = Some(msg.clone());
-                self.toast_queue.push(msg, crate::toast::ToastTone::Error);
-                return;
-            }
+            let generation = ctrl
+                .try_apply_settings(self.config.clone())
+                .map_err(|error| {
+                    let message = format!("failed sending runtime settings: {error}");
+                    self.last_error = Some(message.clone());
+                    self.toast_queue
+                        .push(message.clone(), crate::toast::ToastTone::Error);
+                    message
+                })?;
+            configuration_generation = Some(generation);
             self.config_dirty = false;
         }
 
@@ -8033,8 +8879,11 @@ impl CameraApp {
         }
 
         self.last_error = None;
-        self.toast_queue
-            .push("Settings applied", crate::toast::ToastTone::Success);
+        if report_success {
+            self.toast_queue
+                .push("Settings applied", crate::toast::ToastTone::Success);
+        }
+        Ok(configuration_generation)
     }
 
     fn publish_pending_action_requests(&mut self) {
@@ -8558,6 +9407,24 @@ impl CameraApp {
     fn settings_are_locked(&self) -> bool {
         self.mode == AppMode::Replaying
             || (self.mode == AppMode::Recording && self.lock_settings_while_recording)
+            || self.camera_configuration_workflow_active()
+    }
+
+    fn camera_configuration_workflow_active(&self) -> bool {
+        self.pending_camera_configuration.is_some() || self.camera_configuration_session.is_some()
+    }
+
+    fn block_plugin_lifecycle_change_if_needed(&mut self) -> bool {
+        if !self.camera_configuration_workflow_active() {
+            return false;
+        }
+        let message =
+            "restore the active plugin camera configuration before changing loaded plugins"
+                .to_owned();
+        self.last_error = Some(message.clone());
+        self.toast_queue
+            .push(message, crate::toast::ToastTone::Warn);
+        true
     }
 
     fn current_replay_byte_fraction(&self) -> f32 {
@@ -8656,6 +9523,14 @@ impl CameraApp {
     fn copy_detected_hotpixels_to_mask(&mut self) {
         use crate::settings::IMX636_DEM_SLOTS;
 
+        if self.settings_are_locked() {
+            self.toast_queue.push(
+                "Camera settings are locked by the active configuration session",
+                crate::toast::ToastTone::Warn,
+            );
+            return;
+        }
+
         let detected = self.latest_detected_hotpixels();
         if detected.is_empty() {
             self.analysis_notice = Some("No detected hotpixels are available to copy.".into());
@@ -8715,15 +9590,16 @@ impl eframe::App for CameraApp {
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if self.runtime_plugins_enabled() {
-            // Device-owner plugins (Stage-A bench) publish worker status and
-            // datasets on the control tick even with no camera stream; keep a
-            // slow poll alive so their UI stays current in Idle mode.
+            // Device-owner plugins can publish worker status and datasets on
+            // the control tick even with no camera stream; keep a slow poll
+            // alive so their UI stays current in Idle mode.
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.refresh_host_view_registry_if_dirty();
 
         let mode = self.mode;
         let settings_locked = self.settings_are_locked();
+        let camera_configuration_workflow_active = self.camera_configuration_workflow_active();
         let mut analysis_toggle_changed = false;
         let mut analysis_parameter_changed = false;
         let mut plugin_scan_requested = false;
@@ -8852,7 +9728,9 @@ impl eframe::App for CameraApp {
                     }
                     if ui
                         .add_enabled(
-                            mode != AppMode::Recording && mode != AppMode::Replaying,
+                            mode != AppMode::Recording
+                                && mode != AppMode::Replaying
+                                && !settings_locked,
                             egui::Button::new("Load Config…"),
                         )
                         .clicked()
@@ -8909,6 +9787,125 @@ impl eframe::App for CameraApp {
                         }
                         ui.close_menu();
                     }
+                    ui.separator();
+                    ui.menu_button("Named Profiles", |ui| {
+                        ui.label("Profile name");
+                        ui.text_edit_singleline(&mut self.profile_name);
+                        if ui
+                            .add_enabled(
+                                mode != AppMode::Replaying && !self.profile_name.trim().is_empty(),
+                                egui::Button::new("Save / update current"),
+                            )
+                            .clicked()
+                        {
+                            self.sync_config_global_from_runtime();
+                            let name = self.profile_name.trim().to_owned();
+                            match ProfileStore::in_app_config_dir()
+                                .and_then(|store| store.save(&name, &self.config, true))
+                            {
+                                Ok(loaded) => self.toast_queue.push(
+                                    format!(
+                                        "Profile '{}' saved as revision {}",
+                                        loaded.identity.name, loaded.identity.revision
+                                    ),
+                                    crate::toast::ToastTone::Success,
+                                ),
+                                Err(error) => {
+                                    self.last_error = Some(error.clone());
+                                    self.toast_queue
+                                        .push(error, crate::toast::ToastTone::Error);
+                                }
+                            }
+                        }
+                        ui.separator();
+                        match ProfileStore::in_app_config_dir().and_then(|store| store.list()) {
+                            Ok(entries) if entries.is_empty() => {
+                                ui.weak("No saved profiles");
+                            }
+                            Ok(entries) => {
+                                for entry in entries {
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                mode != AppMode::Recording
+                                                    && mode != AppMode::Replaying
+                                                    && !settings_locked,
+                                                egui::Button::new(format!(
+                                                    "{} (r{})",
+                                                    entry.name, entry.revision
+                                                )),
+                                            )
+                                            .clicked()
+                                        {
+                                            match ProfileStore::in_app_config_dir()
+                                                .and_then(|store| store.load(&entry.name))
+                                            {
+                                                Ok(loaded) => {
+                                                    self.config = loaded.profile.camera;
+                                                    let global = self.config.global.clone();
+                                                    self.apply_global_config(&global);
+                                                    self.mask_file = self
+                                                        .config
+                                                        .pixel_mask
+                                                        .mask_file
+                                                        .as_ref()
+                                                        .map(|path| path.display().to_string())
+                                                        .unwrap_or_default();
+                                                    let running = self.controller.is_some();
+                                                    self.config_dirty = running;
+                                                    self.acq_dirty = running;
+                                                    self.profile_name = entry.name.clone();
+                                                    self.toast_queue.push(
+                                                        format!(
+                                                            "Profile '{}' loaded{}",
+                                                            entry.name,
+                                                            if running {
+                                                                " — click Apply Settings"
+                                                            } else {
+                                                                ""
+                                                            }
+                                                        ),
+                                                        if running {
+                                                            crate::toast::ToastTone::Warn
+                                                        } else {
+                                                            crate::toast::ToastTone::Success
+                                                        },
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    self.last_error = Some(error.clone());
+                                                    self.toast_queue.push(
+                                                        error,
+                                                        crate::toast::ToastTone::Error,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if ui.small_button("Delete").clicked() {
+                                            match ProfileStore::in_app_config_dir()
+                                                .and_then(|store| store.delete(&entry.name))
+                                            {
+                                                Ok(()) => self.toast_queue.push(
+                                                    format!("Profile '{}' deleted", entry.name),
+                                                    crate::toast::ToastTone::Info,
+                                                ),
+                                                Err(error) => {
+                                                    self.last_error = Some(error.clone());
+                                                    self.toast_queue.push(
+                                                        error,
+                                                        crate::toast::ToastTone::Error,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
+                        }
+                    });
                 });
 
                 // ── Analysis ──────────────────────────────────────────────────
@@ -8967,7 +9964,13 @@ impl eframe::App for CameraApp {
                                 continue;
                             };
                             let mut enabled = plugin.enabled();
-                            if ui.checkbox(&mut enabled, plugin.name()).changed() {
+                            if ui
+                                .add_enabled(
+                                    !camera_configuration_workflow_active,
+                                    egui::Checkbox::new(&mut enabled, plugin.name()),
+                                )
+                                .changed()
+                            {
                                 plugin.set_enabled(enabled);
                                 analysis_toggle_changed = true;
                             }
@@ -8987,7 +9990,9 @@ impl eframe::App for CameraApp {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            mode == AppMode::Idle && self.camera_info.is_some(),
+                            mode == AppMode::Idle
+                                && self.camera_info.is_some()
+                                && !camera_configuration_workflow_active,
                             egui::Button::new("Preview").shortcut_text("\u{2318}P"),
                         )
                         .clicked()
@@ -8998,7 +10003,8 @@ impl eframe::App for CameraApp {
                     if ui
                         .add_enabled(
                             (mode == AppMode::Idle || mode == AppMode::Previewing)
-                                && self.camera_info.is_some(),
+                                && self.camera_info.is_some()
+                                && !camera_configuration_workflow_active,
                             egui::Button::new("Record").shortcut_text("\u{2318}R"),
                         )
                         .clicked()
@@ -9008,7 +10014,9 @@ impl eframe::App for CameraApp {
                     }
                     if ui
                         .add_enabled(
-                            mode != AppMode::Idle,
+                            mode != AppMode::Idle
+                                && (mode == AppMode::Recording
+                                    || !camera_configuration_workflow_active),
                             egui::Button::new("Stop").shortcut_text("\u{2318}."),
                         )
                         .clicked()
@@ -9090,8 +10098,8 @@ impl eframe::App for CameraApp {
                     ui.menu_button("Acquisition time…", |ui| {
                         ui.label("Acquisition time [ms]")
                             .on_hover_text(ACQ_TIME_TOOLTIP);
-                        let acq_time_locked =
-                            mode == AppMode::Recording && settings_locked;
+                        let acq_time_locked = camera_configuration_workflow_active
+                            || (mode == AppMode::Recording && settings_locked);
                         let response = ui
                             .add_enabled(
                                 !acq_time_locked,
@@ -9139,7 +10147,8 @@ impl eframe::App for CameraApp {
                         ui.label("Physical pixel scale")
                             .on_hover_text(PIXEL_SCALE_TOOLTIP);
                         let response = ui
-                            .add(
+                            .add_enabled(
+                                !camera_configuration_workflow_active,
                                 egui::DragValue::new(&mut self.nm_per_pixel)
                                     .speed(1.0)
                                     .clamp_range(1.0..=10_000.0),
@@ -9154,9 +10163,12 @@ impl eframe::App for CameraApp {
                         // so readouts stay marked until someone states that it
                         // holds for their setup.
                         if ui
-                            .checkbox(
-                                &mut self.pixel_scale_calibrated,
-                                "Calibrated for this setup",
+                            .add_enabled(
+                                !camera_configuration_workflow_active,
+                                egui::Checkbox::new(
+                                    &mut self.pixel_scale_calibrated,
+                                    "Calibrated for this setup",
+                                ),
                             )
                             .on_hover_text(
                                 "Tick this once the value above is the real sample-plane scale \
@@ -9179,7 +10191,8 @@ impl eframe::App for CameraApp {
                         ui.horizontal(|ui| {
                             let width_response = ui
                                 .add_enabled(
-                                    mode == AppMode::Idle,
+                                    mode == AppMode::Idle
+                                        && !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut self.sensor_width)
                                         .prefix("w ")
                                         .clamp_range(1..=u16::MAX),
@@ -9190,7 +10203,8 @@ impl eframe::App for CameraApp {
                             }
                             let height_response = ui
                                 .add_enabled(
-                                    mode == AppMode::Idle,
+                                    mode == AppMode::Idle
+                                        && !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut self.sensor_height)
                                         .prefix("h ")
                                         .clamp_range(1..=u16::MAX),
@@ -9206,7 +10220,10 @@ impl eframe::App for CameraApp {
                         let mut event_store_budget_mb = self.event_store_budget_mib();
                         ui.label("Budget [MB]").on_hover_text(EVENT_HISTORY_TOOLTIP);
                         let event_store_response = ui
-                            .add(egui::Slider::new(&mut event_store_budget_mb, 1..=1024))
+                            .add_enabled(
+                                !camera_configuration_workflow_active,
+                                egui::Slider::new(&mut event_store_budget_mb, 1..=1024),
+                            )
                             .on_hover_text(EVENT_HISTORY_TOOLTIP);
                         if event_store_response.changed() {
                             let budget_bytes = mib_to_bytes(event_store_budget_mb);
@@ -9229,7 +10246,8 @@ impl eframe::App for CameraApp {
                             ui.label("Preview update [Hz]")
                                 .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
                             let response = ui
-                                .add(
+                                .add_enabled(
+                                    !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut preview_hz)
                                         .clamp_range(5.0..=100.0)
                                         .speed(0.5),
@@ -9252,7 +10270,8 @@ impl eframe::App for CameraApp {
                             ui.label("Point cloud update [Hz]")
                                 .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
                             let response = ui
-                                .add(
+                                .add_enabled(
+                                    !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut point_cloud_hz)
                                         .clamp_range(2.0..=50.0)
                                         .speed(0.5),
@@ -9269,7 +10288,8 @@ impl eframe::App for CameraApp {
                                 .on_hover_text(DISK_WRITER_BUFFER_TOOLTIP);
                             let response = ui
                                 .add_enabled(
-                                    mode == AppMode::Idle,
+                                    mode == AppMode::Idle
+                                        && !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut self.disk_writer_buffer_mib)
                                         .clamp_range(1..=64),
                                 )
@@ -9530,7 +10550,13 @@ impl eframe::App for CameraApp {
                         self.plugins_window_open = !self.plugins_window_open;
                         ui.close_menu();
                     }
-                    if ui.button("Scan for New Plugins").clicked() {
+                    if ui
+                        .add_enabled(
+                            !camera_configuration_workflow_active,
+                            egui::Button::new("Scan for New Plugins"),
+                        )
+                        .clicked()
+                    {
                         plugin_scan_requested = true;
                         ui.close_menu();
                     }
@@ -9671,7 +10697,7 @@ impl eframe::App for CameraApp {
             });
         });
 
-        if plugin_scan_requested {
+        if plugin_scan_requested && !self.block_plugin_lifecycle_change_if_needed() {
             match self.plugin_manager.scan_and_load() {
                 Ok(()) => {
                     self.last_error = None;
@@ -10081,12 +11107,17 @@ impl eframe::App for CameraApp {
                                                                             ui.visuals(),
                                                                         );
                                                                         ui.style_mut().wrap = Some(false);
-                                                                        if crate::theme::icon_button(
-                                                                            ui,
-                                                                            egui_phosphor::regular::EYE_SLASH,
-                                                                            "Enable plugin",
-                                                                        )
-                                                                        .clicked()
+                                                                        if ui
+                                                                            .add_enabled_ui(
+                                                                                !camera_configuration_workflow_active,
+                                                                                |ui| crate::theme::icon_button(
+                                                                                    ui,
+                                                                                    egui_phosphor::regular::EYE_SLASH,
+                                                                                    "Enable plugin",
+                                                                                ),
+                                                                            )
+                                                                            .inner
+                                                                            .clicked()
                                                                         {
                                                                             plugin.set_enabled(true);
                                                                             analysis_toggle_changed = true;
@@ -10167,12 +11198,17 @@ impl eframe::App for CameraApp {
                                                             // allocated row, which grows the stored
                                                             // SidePanel width (see `layer_row`).
                                                             ui.style_mut().wrap = Some(false);
-                                                            if crate::theme::icon_button(
-                                                                ui,
-                                                                egui_phosphor::regular::EYE,
-                                                                "Disable plugin",
-                                                            )
-                                                            .clicked()
+                                                            if ui
+                                                                .add_enabled_ui(
+                                                                    !camera_configuration_workflow_active,
+                                                                    |ui| crate::theme::icon_button(
+                                                                        ui,
+                                                                        egui_phosphor::regular::EYE,
+                                                                        "Disable plugin",
+                                                                    ),
+                                                                )
+                                                                .inner
+                                                                .clicked()
                                                             {
                                                                 plugin.set_enabled(false);
                                                                 analysis_toggle_changed = true;
@@ -10333,7 +11369,13 @@ impl eframe::App for CameraApp {
                         "Directory: {}",
                         self.plugin_manager.plugins_dir().display()
                     ));
-                    if ui.button("Scan for New Plugins").clicked() {
+                    if ui
+                        .add_enabled(
+                            !camera_configuration_workflow_active,
+                            egui::Button::new("Scan for New Plugins"),
+                        )
+                        .clicked()
+                    {
                         rescan_requested = true;
                     }
                     if ui.button("Open Plugins Folder").clicked() {
@@ -10378,7 +11420,13 @@ impl eframe::App for CameraApp {
 
                             if let Some(plugin) = record.plugin_mut() {
                                 let mut enabled = plugin.enabled();
-                                if ui.checkbox(&mut enabled, "").changed() {
+                                if ui
+                                    .add_enabled(
+                                        !camera_configuration_workflow_active,
+                                        egui::Checkbox::new(&mut enabled, ""),
+                                    )
+                                    .changed()
+                                {
                                     plugin.set_enabled(enabled);
                                     analysis_toggle_changed = true;
                                 }
@@ -10386,7 +11434,13 @@ impl eframe::App for CameraApp {
                                 ui.label("-");
                             }
 
-                            if ui.button("Reload").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !camera_configuration_workflow_active,
+                                    egui::Button::new("Reload"),
+                                )
+                                .clicked()
+                            {
                                 reload_requested = Some(index);
                             }
                             ui.end_row();
@@ -10406,18 +11460,20 @@ impl eframe::App for CameraApp {
             });
 
         if let Some(index) = reload_requested {
-            match self.plugin_manager.reload_plugin(index) {
-                Ok(()) => {
-                    self.last_error = None;
-                    self.reset_analysis();
-                    self.reload_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
-                    analysis_toggle_changed = true;
+            if !self.block_plugin_lifecycle_change_if_needed() {
+                match self.plugin_manager.reload_plugin(index) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        self.reset_analysis();
+                        self.reload_live_plugin_configuration(PluginDiscontinuity::SettingsChanged);
+                        analysis_toggle_changed = true;
+                    }
+                    Err(err) => self.last_error = Some(err),
                 }
-                Err(err) => self.last_error = Some(err),
             }
         }
 
-        if rescan_requested {
+        if rescan_requested && !self.block_plugin_lifecycle_change_if_needed() {
             match self.plugin_manager.scan_and_load() {
                 Ok(()) => {
                     self.last_error = None;
@@ -10484,16 +11540,24 @@ impl eframe::App for CameraApp {
                         input.consume_key(egui::Modifiers::COMMAND, egui::Key::CloseBracket),
                     )
                 });
-            if start_preview && mode == AppMode::Idle && self.camera_info.is_some() {
+            if start_preview
+                && mode == AppMode::Idle
+                && self.camera_info.is_some()
+                && !camera_configuration_workflow_active
+            {
                 self.start_preview();
             }
             if start_recording
                 && matches!(mode, AppMode::Idle | AppMode::Previewing)
                 && self.camera_info.is_some()
+                && !camera_configuration_workflow_active
             {
                 self.start_recording();
             }
-            if stop_capture && mode != AppMode::Idle {
+            if stop_capture
+                && mode != AppMode::Idle
+                && (mode == AppMode::Recording || !camera_configuration_workflow_active)
+            {
                 self.stop_pipeline();
             }
             if toggle_settings {
@@ -11221,10 +12285,6 @@ impl eframe::App for CameraApp {
             DOCK_DEFAULTS_SEEDED_STORAGE_KEY,
             self.dock_defaults_seeded.to_string(),
         );
-        storage.set_string(
-            RECORD_SENSOR_TELEMETRY_STORAGE_KEY,
-            self.record_sensor_telemetry.to_string(),
-        );
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -11947,7 +13007,9 @@ fn render_action_modal_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        acq_time_us_from_ms, derived_replay_preview_interval_ms, host_view_kind_is_dockable,
+        acq_time_us_from_ms, camera_config_from_snapshot, camera_configuration_requires_restart,
+        camera_configuration_snapshot, configuration_readback_verdict,
+        derived_replay_preview_interval_ms, expected_bias_code, host_view_kind_is_dockable,
         investigation_split_ratio_bounds, is_newer_host_snapshot_sequence,
         live_analysis_coverage_text, live_snapshot_generations_equal, pipeline_stream_active,
         python_ingress_pipeline_config, python_ingress_replay_info, raw_event_focus_volume,
@@ -11956,10 +13018,12 @@ mod tests {
         replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
         replay_step_target_time_us, replay_step_uses_current_controller,
         replay_time_from_position_sources, resolve_plugin_recording_path,
-        roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
-        should_dispatch_live_analysis_for_state, store_hover_state, sync_acq_time_atomic,
-        sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
-        viewport_stream_active, CameraApp, InvestigationSplitBounds, PluginRecordingSession,
+        resolved_camera_configuration, roi_is_effectively_full_frame, sha256_file,
+        short_host_view_chip_title, should_dispatch_live_analysis_for_state, store_hover_state,
+        sync_acq_time_atomic, sync_popup_investigation_payload,
+        sync_retained_event_history_from_upstream, validate_camera_configuration_recording_start,
+        viewport_stream_active, CameraApp, CameraConfigurationSession,
+        ConfigurationReadbackVerdict, InvestigationSplitBounds, PluginRecordingSession,
         PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH,
         RAW_EVENTS_ON_LAYER_ID,
     };
@@ -12017,11 +13081,11 @@ mod tests {
         fs::create_dir_all(root.join("runs")).expect("test directory exists");
         let configured = root.join("manual.raw");
 
-        let path = resolve_plugin_recording_path(&configured, "runs/a1", "run-1", false)
+        let path = resolve_plugin_recording_path(&configured, "runs/point", "run-1", false)
             .expect("relative child path is accepted");
-        assert_eq!(path, root.join("runs/a1.raw"));
+        assert_eq!(path, root.join("runs/point.raw"));
         fs::write(&path, b"existing").expect("collision fixture is written");
-        let (code, _) = resolve_plugin_recording_path(&configured, "runs/a1", "run-1", false)
+        let (code, _) = resolve_plugin_recording_path(&configured, "runs/point", "run-1", false)
             .expect_err("existing path is rejected");
         assert_eq!(code, "recording_path_exists");
 
@@ -12069,6 +13133,212 @@ mod tests {
             "output_20260801_101500.raw"
         );
         assert_eq!(recording_target_name(None), "recording");
+    }
+
+    fn readback(current_on: u8, current_off: u8) -> augur_core::camera::BiasReadback {
+        augur_core::camera::BiasReadback {
+            current: augur_core::camera::BiasCodes {
+                diff_on: current_on,
+                diff_off: current_off,
+                fo: 55,
+                hpf: 0,
+                refr: 138,
+            },
+            factory_default: augur_core::camera::BiasCodes {
+                diff_on: 102,
+                diff_off: 40,
+                fo: 55,
+                hpf: 0,
+                refr: 138,
+            },
+        }
+    }
+
+    #[test]
+    fn an_offset_that_would_leave_the_register_saturates_like_the_sensor_does() {
+        assert_eq!(expected_bias_code(102, 12), 114);
+        assert_eq!(expected_bias_code(10, -85), 0);
+        assert_eq!(expected_bias_code(250, 140), 255);
+    }
+
+    #[test]
+    fn a_camera_snapshot_roundtrip_includes_the_sensor_recording_switch() {
+        let mut config = augur_core::config::CameraConfig::default();
+        config.global.record_sensor_telemetry = true;
+        let snapshot = camera_configuration_snapshot(&config);
+        assert!(snapshot.global.record_sensor_telemetry);
+        assert_eq!(snapshot.digital_filter.erc_enabled, Some(false));
+        let decoded = camera_config_from_snapshot(&snapshot).expect("valid snapshot");
+        assert_eq!(camera_configuration_snapshot(&decoded), snapshot);
+    }
+
+    #[test]
+    fn camera_snapshot_refuses_missing_or_enabled_erc_state() {
+        let config = augur_core::config::CameraConfig::default();
+        let mut snapshot = camera_configuration_snapshot(&config);
+        snapshot.digital_filter.erc_enabled = None;
+        assert!(camera_config_from_snapshot(&snapshot)
+            .expect_err("missing ERC state must fail closed")
+            .contains("does not state the ERC state"));
+
+        snapshot.digital_filter.erc_enabled = Some(true);
+        assert!(camera_config_from_snapshot(&snapshot)
+            .expect_err("unsupported ERC must be refused")
+            .contains("no ERC support"));
+    }
+
+    #[test]
+    fn resolved_snapshot_contains_file_mask_and_effective_global_values() {
+        let root = unique_recording_test_dir();
+        fs::create_dir_all(&root).expect("test directory exists");
+        let mask_path = root.join("mask.bin");
+        fs::write(&mask_path, [0b1000_0010]).expect("mask fixture is written");
+
+        let mut config = augur_core::config::CameraConfig::default();
+        config.roi.width = 4;
+        config.roi.height = 2;
+        config.pixel_mask.masked_pixels = vec![(1, 0), (2, 1)];
+        config.pixel_mask.mask_file = Some(mask_path);
+        config.global.sensor_width = 4;
+        config.global.sensor_height = 2;
+        config.global.nm_per_pixel = 0.0;
+        config.global.acq_time_ms = 0;
+        config.global.event_store_budget_mib = 0;
+        config.global.preview_interval_ms = 0;
+        config.global.point_cloud_interval_ms = 0;
+        config.global.disk_writer_buffer_mib = 0;
+
+        let resolved = resolved_camera_configuration(config).expect("configuration resolves");
+        assert_eq!(
+            resolved.pixel_mask.masked_pixels,
+            vec![(1, 0), (2, 1), (3, 1)]
+        );
+        assert!(resolved.pixel_mask.mask_file.is_none());
+        assert_eq!(resolved.global.nm_per_pixel, 1.0);
+        assert_eq!(resolved.global.acq_time_ms, 1);
+        assert_eq!(resolved.global.preview_interval_ms, 10);
+        assert_eq!(resolved.global.point_cloud_interval_ms, 20);
+        assert_eq!(resolved.global.disk_writer_buffer_mib, 1);
+
+        let snapshot = camera_configuration_snapshot(&resolved);
+        assert_eq!(snapshot.masked_pixels, resolved.pixel_mask.masked_pixels);
+        assert_eq!(snapshot.global.preview_interval_ms, 10);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recording_guard_enforces_pending_state_owner_and_confirmed_snapshot() {
+        let config = augur_core::config::CameraConfig::default();
+        let snapshot = camera_configuration_snapshot(&config);
+        let session = CameraConfigurationSession {
+            owner_plugin_id: "workflow.plugin".into(),
+            original: config.clone(),
+            applied: snapshot,
+            provenance: augur_plugin_api::CameraConfigurationProvenanceV1 {
+                source: "inline_snapshot".into(),
+                profile_name: None,
+                schema_version: 1,
+                profile_revision: None,
+                sha256: "test".into(),
+            },
+        };
+
+        assert!(validate_camera_configuration_recording_start(&config, true, None, None).is_err());
+        assert!(validate_camera_configuration_recording_start(
+            &config,
+            false,
+            Some(&session),
+            None,
+        )
+        .is_err());
+        assert!(validate_camera_configuration_recording_start(
+            &config,
+            false,
+            Some(&session),
+            Some("workflow.plugin"),
+        )
+        .is_ok());
+
+        let mut changed = config;
+        changed.biases.diff_on += 1;
+        assert!(validate_camera_configuration_recording_start(
+            &changed,
+            false,
+            Some(&session),
+            Some("workflow.plugin"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn plugin_configuration_restart_decision_covers_pipeline_owned_settings() {
+        let current = augur_core::config::CameraConfig::default();
+
+        let mut live_change = current.clone();
+        live_change.biases.diff_on += 1;
+        assert!(!camera_configuration_requires_restart(
+            &current,
+            &live_change
+        ));
+
+        let mut trigger_change = current.clone();
+        trigger_change.external_triggers.enabled = !current.external_triggers.enabled;
+        assert!(camera_configuration_requires_restart(
+            &current,
+            &trigger_change
+        ));
+
+        let mut writer_change = current.clone();
+        writer_change.global.disk_writer_buffer_mib += 1;
+        assert!(camera_configuration_requires_restart(
+            &current,
+            &writer_change
+        ));
+    }
+
+    #[test]
+    fn a_complete_camera_apply_needs_a_fresh_match_for_every_bias() {
+        let mut expected = augur_core::config::CameraConfig::default();
+        expected.biases.diff_on = 12;
+        expected.biases.diff_off = -8;
+        expected.biases.fo = 0;
+        expected.biases.hpf = 0;
+        expected.biases.refr = 0;
+
+        assert_eq!(
+            configuration_readback_verdict(
+                &expected,
+                4,
+                Some((3, 0.1, Some(readback(114, 32)))),
+                Duration::from_secs_f64(0.5),
+            ),
+            ConfigurationReadbackVerdict::Waiting
+        );
+        let ConfigurationReadbackVerdict::Confirmed {
+            readback: confirmed_readback,
+            ..
+        } = configuration_readback_verdict(
+            &expected,
+            4,
+            Some((4, 0.1, Some(readback(114, 32)))),
+            Duration::from_secs_f64(0.5),
+        )
+        else {
+            panic!("all five matching codes must confirm the configuration");
+        };
+        assert_eq!(confirmed_readback.current.diff_on, 114);
+
+        let mut wrong = readback(114, 32);
+        wrong.current.fo = 54;
+        let ConfigurationReadbackVerdict::Refused { code, .. } = configuration_readback_verdict(
+            &expected,
+            4,
+            Some((4, 0.1, Some(wrong))),
+            Duration::from_secs_f64(0.5),
+        ) else {
+            panic!("one wrong auxiliary bias must reject the configuration");
+        };
+        assert_eq!(code, "bias_readback_mismatch");
     }
 
     #[test]

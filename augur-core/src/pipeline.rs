@@ -17,7 +17,8 @@ use augur_event_types::{
     EventRing, EventSource, ExternalTriggerEvent, FetchError, FrameWindowEntry, RingAppendError,
 };
 use crossbeam_channel::{
-    bounded, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
+    bounded, select, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError,
+    TrySendError,
 };
 use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
@@ -685,6 +686,10 @@ impl PipelineStatsSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct SensorMonitoringSnapshot {
     pub values: SensorMonitoring,
+    /// Generation of the last camera configuration that was fully applied
+    /// before `values.biases` was read. Generation 0 is the pipeline's initial
+    /// configuration. Polls that do not include biases never advance it.
+    pub bias_configuration_generation: u64,
     /// Wall-clock age of the reading.
     pub age_s: f64,
     /// Error from the most recent poll, if it failed. `values` then still holds
@@ -695,6 +700,7 @@ pub struct SensorMonitoringSnapshot {
 #[derive(Debug)]
 struct SensorMonitoringState {
     values: SensorMonitoring,
+    bias_configuration_generation: u64,
     at: Instant,
     error: Option<String>,
 }
@@ -858,9 +864,38 @@ pub fn sensor_telemetry_path(raw_path: &Path) -> Option<PathBuf> {
 }
 
 impl SensorMonitoringState {
+    fn from_values(values: SensorMonitoring, at: Instant, configuration_generation: u64) -> Self {
+        let bias_configuration_generation = if values.biases.is_some() {
+            configuration_generation
+        } else {
+            0
+        };
+        Self {
+            values,
+            bias_configuration_generation,
+            at,
+            error: None,
+        }
+    }
+
+    fn merge_values(
+        &mut self,
+        values: SensorMonitoring,
+        at: Instant,
+        configuration_generation: u64,
+    ) {
+        if values.biases.is_some() {
+            self.bias_configuration_generation = configuration_generation;
+        }
+        merge_monitoring_values(&mut self.values, values);
+        self.at = at;
+        self.error = None;
+    }
+
     fn snapshot_at(&self, now: Instant) -> SensorMonitoringSnapshot {
         SensorMonitoringSnapshot {
             values: self.values,
+            bias_configuration_generation: self.bias_configuration_generation,
             age_s: now.saturating_duration_since(self.at).as_secs_f64(),
             error: self.error.clone(),
         }
@@ -875,6 +910,7 @@ fn poll_sensor_monitoring(
     needed: &AtomicBool,
     state: &Mutex<Option<SensorMonitoringState>>,
     last_poll: &mut Option<Instant>,
+    configuration_generation: u64,
 ) {
     if !needed.load(Ordering::Relaxed) {
         // Drop the stale reading so a reopened panel never shows values from
@@ -902,11 +938,11 @@ fn poll_sensor_monitoring(
             // available, they are just all missing", so publish nothing.
             Ok(values) if values.is_empty() => *slot = None,
             Ok(values) => {
-                *slot = Some(SensorMonitoringState {
+                *slot = Some(SensorMonitoringState::from_values(
                     values,
-                    at: Instant::now(),
-                    error: None,
-                })
+                    Instant::now(),
+                    configuration_generation,
+                ));
             }
             Err(err) => {
                 let message = err.to_string();
@@ -917,6 +953,7 @@ fn poll_sensor_monitoring(
                     None => {
                         *slot = Some(SensorMonitoringState {
                             values: SensorMonitoring::default(),
+                            bias_configuration_generation: 0,
                             at: Instant::now(),
                             error: Some(message),
                         })
@@ -934,6 +971,7 @@ fn poll_sensor_telemetry(
     monitoring_state: &Mutex<Option<SensorMonitoringState>>,
     sample_tx: &Sender<SensorTelemetrySample>,
     telemetry_state: &Mutex<SensorTelemetrySnapshot>,
+    configuration_generation: u64,
 ) {
     let now = Instant::now();
     let Some((sample_id, poll_kind, selection)) = schedule.due(now) else {
@@ -961,16 +999,14 @@ fn poll_sensor_telemetry(
             if let Ok(mut slot) = monitoring_state.lock() {
                 match slot.as_mut() {
                     Some(existing) => {
-                        merge_monitoring_values(&mut existing.values, values);
-                        existing.at = completed;
-                        existing.error = None;
+                        existing.merge_values(values, completed, configuration_generation)
                     }
                     None => {
-                        *slot = Some(SensorMonitoringState {
+                        *slot = Some(SensorMonitoringState::from_values(
                             values,
-                            at: completed,
-                            error: None,
-                        });
+                            completed,
+                            configuration_generation,
+                        ));
                     }
                 }
             }
@@ -987,6 +1023,7 @@ fn poll_sensor_telemetry(
                     None => {
                         *slot = Some(SensorMonitoringState {
                             values: SensorMonitoring::default(),
+                            bias_configuration_generation: 0,
                             at: completed,
                             error: Some(message.clone()),
                         });
@@ -1539,6 +1576,7 @@ struct InlineCameraWorker<C: PacketStreamCamera> {
     camera: C,
     initial_config: CameraConfig,
     settings_rx: Receiver<CameraConfig>,
+    tracked_settings_rx: Receiver<CameraSettingsUpdate>,
 }
 
 impl<C: PacketStreamCamera> StreamWorker for InlineCameraWorker<C> {
@@ -1552,8 +1590,13 @@ impl<C: PacketStreamCamera> StreamWorker for InlineCameraWorker<C> {
     }
 
     fn poll_control(&mut self, error_tx: &Sender<String>) {
-        while let Ok(cfg) = self.settings_rx.try_recv() {
-            if let Err(e) = self.camera.configure(&cfg) {
+        while let Ok(update) = self.tracked_settings_rx.try_recv() {
+            if let Err(e) = self.camera.configure(&update.config) {
+                let _ = error_tx.try_send(format!("usb: runtime reconfigure failed: {e}"));
+            }
+        }
+        while let Ok(config) = self.settings_rx.try_recv() {
+            if let Err(e) = self.camera.configure(&config) {
                 let _ = error_tx.try_send(format!("usb: runtime reconfigure failed: {e}"));
             }
         }
@@ -1827,9 +1870,19 @@ fn run_stream_loop(
     }
 }
 
+#[derive(Debug)]
+struct CameraSettingsUpdate {
+    config: CameraConfig,
+    generation: u64,
+}
+
 pub struct PipelineController {
     pub frame_rx: Receiver<PreviewFrame>,
+    /// Backward-compatible untracked runtime settings channel. Hosts that need
+    /// readback confirmation should use [`Self::try_apply_settings`].
     pub settings_tx: Sender<CameraConfig>,
+    tracked_settings_tx: Sender<CameraSettingsUpdate>,
+    next_configuration_generation: Arc<AtomicU64>,
     pub acq_time_us: Arc<AtomicU64>,
     pub raw_events_needed: Arc<AtomicBool>,
     /// Demand flag for the sensor monitoring readback. The control thread only
@@ -1855,6 +1908,21 @@ struct RecordingSidecarState {
 }
 
 impl PipelineController {
+    /// Queue one runtime camera configuration and return the generation that
+    /// subsequent monitoring samples will carry after the control thread has
+    /// applied it successfully.
+    pub fn try_apply_settings(&self, config: CameraConfig) -> Result<u64> {
+        let generation = self
+            .next_configuration_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let update = CameraSettingsUpdate { config, generation };
+        self.tracked_settings_tx
+            .try_send(update)
+            .map_err(|error| CameraError::Channel(format!("runtime settings queue: {error}")))?;
+        Ok(generation)
+    }
+
     pub fn stats_snapshot(&self) -> PipelineStatsSnapshot {
         self.stats
             .lock()
@@ -2087,6 +2155,7 @@ where
     let (preview_tx, preview_rx) = bounded::<PreviewChunk>(PREVIEW_PACKET_QUEUE_CAPACITY);
     let (frame_tx, frame_rx) = bounded::<PreviewFrame>(PREVIEW_FRAME_QUEUE_CAPACITY);
     let (settings_tx, settings_rx) = bounded::<CameraConfig>(8);
+    let (tracked_settings_tx, tracked_settings_rx) = bounded::<CameraSettingsUpdate>(8);
     let (error_tx, error_rx) = bounded::<String>(32);
     let (sensor_telemetry_tx, sensor_telemetry_rx) = sensor_telemetry_writer
         .as_ref()
@@ -2102,6 +2171,7 @@ where
     ));
     let raw_events_needed = Arc::new(AtomicBool::new(false));
     let sensor_monitoring_needed = Arc::new(AtomicBool::new(false));
+    let next_configuration_generation = Arc::new(AtomicU64::new(0));
     let sensor_monitoring = Arc::new(Mutex::new(None::<SensorMonitoringState>));
     let sensor_telemetry_state = Arc::new(Mutex::new(SensorTelemetrySnapshot {
         output_path: sensor_telemetry_path.clone(),
@@ -2196,6 +2266,7 @@ where
             let error_control = error_tx.clone();
             let monitoring_needed = Arc::clone(&sensor_monitoring_needed);
             let monitoring_state = Arc::clone(&sensor_monitoring);
+            let configuration_generation_counter = Arc::clone(&next_configuration_generation);
             let telemetry_stats = Arc::clone(&stats);
             let telemetry_state = Arc::clone(&sensor_telemetry_state);
             let telemetry_sample_tx = sensor_telemetry_tx;
@@ -2221,12 +2292,15 @@ where
                     return;
                 }
                 let mut last_monitoring_poll = None;
+                let mut configuration_generation = 0;
                 loop {
-                    match settings_rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(cfg) => {
+                    select! {
+                        recv(tracked_settings_rx) -> update => match update {
+                        Ok(update) => {
                             last_monitoring_poll = None;
-                            match camera.configure(&cfg) {
+                            match camera.configure(&update.config) {
                                 Ok(()) => {
+                                    configuration_generation = update.generation;
                                     // New bias codes are live now; include them
                                     // in the next telemetry poll.
                                     if let Some(schedule) = telemetry_schedule.as_mut() {
@@ -2240,7 +2314,30 @@ where
                                 }
                             }
                         }
-                        Err(RecvTimeoutError::Timeout) => {
+                        Err(_) => break,
+                        },
+                        recv(settings_rx) -> config => match config {
+                        Ok(config) => {
+                            last_monitoring_poll = None;
+                            match camera.configure(&config) {
+                                Ok(()) => {
+                                    configuration_generation = configuration_generation_counter
+                                        .fetch_add(1, Ordering::Relaxed)
+                                        .wrapping_add(1);
+                                    if let Some(schedule) = telemetry_schedule.as_mut() {
+                                        schedule.force_bias_readback();
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = error_control.try_send(format!(
+                                        "control: runtime reconfigure failed: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                        },
+                        default(Duration::from_millis(50)) => {
                             if stop_control.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -2254,6 +2351,7 @@ where
                                     &monitoring_state,
                                     sample_tx,
                                     &telemetry_state,
+                                    configuration_generation,
                                 );
                             } else {
                                 poll_sensor_monitoring(
@@ -2261,10 +2359,10 @@ where
                                     &monitoring_needed,
                                     &monitoring_state,
                                     &mut last_monitoring_poll,
+                                    configuration_generation,
                                 );
                             }
                         }
-                        Err(RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 if let Err(e) = camera.stop_streaming() {
@@ -2283,6 +2381,7 @@ where
             camera,
             initial_config,
             settings_rx,
+            tracked_settings_rx,
         }),
     };
 
@@ -2568,6 +2667,8 @@ where
     Ok(PipelineController {
         frame_rx,
         settings_tx,
+        tracked_settings_tx,
+        next_configuration_generation,
         acq_time_us,
         raw_events_needed,
         sensor_monitoring_needed,
@@ -3838,6 +3939,44 @@ mod tests {
         }
     }
 
+    fn bias_reading(code: u8) -> SensorMonitoring {
+        let codes = crate::camera::BiasCodes {
+            diff_on: code,
+            diff_off: code,
+            fo: code,
+            hpf: code,
+            refr: code,
+        };
+        SensorMonitoring {
+            biases: Some(crate::camera::BiasReadback {
+                current: codes,
+                factory_default: codes,
+            }),
+            ..SensorMonitoring::default()
+        }
+    }
+
+    #[test]
+    fn non_bias_telemetry_does_not_advance_the_bias_generation() {
+        let now = Instant::now();
+        let mut state = SensorMonitoringState::from_values(bias_reading(10), now, 3);
+        state.merge_values(
+            SensorMonitoring {
+                illumination_lux: Some(42.0),
+                ..SensorMonitoring::default()
+            },
+            now,
+            4,
+        );
+
+        assert_eq!(state.bias_configuration_generation, 3);
+        assert_eq!(state.values.biases, bias_reading(10).biases);
+
+        state.merge_values(bias_reading(11), now, 5);
+        assert_eq!(state.bias_configuration_generation, 5);
+        assert_eq!(state.values.biases, bias_reading(11).biases);
+    }
+
     #[test]
     fn monitoring_poll_is_skipped_until_a_consumer_asks() {
         let mut camera = ScriptedMonitoringCamera::new(vec![Ok(dead_time_reading(6.0))]);
@@ -3845,7 +3984,7 @@ mod tests {
         let state = Mutex::new(None);
         let mut last_poll = None;
 
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 0);
 
         assert_eq!(camera.calls, 0, "an unasked-for readback must cost nothing");
         assert!(state.lock().expect("state lock").is_none());
@@ -3853,17 +3992,16 @@ mod tests {
 
     #[test]
     fn monitoring_poll_publishes_and_then_rate_limits() {
-        let mut camera = ScriptedMonitoringCamera::new(vec![
-            Ok(dead_time_reading(6.0)),
-            Ok(dead_time_reading(9.0)),
-        ]);
+        let mut first = dead_time_reading(6.0);
+        first.biases = bias_reading(10).biases;
+        let mut camera = ScriptedMonitoringCamera::new(vec![Ok(first), Ok(dead_time_reading(9.0))]);
         let needed = AtomicBool::new(true);
         let state = Mutex::new(None);
         let mut last_poll = None;
 
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 7);
         // Immediately again: inside the interval, so it must not touch the bus.
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 7);
 
         assert_eq!(camera.calls, 1, "polls inside the interval must be skipped");
         let published = state
@@ -3873,6 +4011,7 @@ mod tests {
             .expect("a reading must be published")
             .snapshot_at(Instant::now());
         assert_eq!(published.values.pixel_dead_time_us, Some(6.0));
+        assert_eq!(published.bias_configuration_generation, 7);
         assert!(published.error.is_none());
     }
 
@@ -3883,11 +4022,11 @@ mod tests {
         let state = Mutex::new(None);
         let mut last_poll = None;
 
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 0);
         assert!(state.lock().expect("state lock").is_some());
 
         needed.store(false, Ordering::Relaxed);
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 0);
 
         assert!(
             state.lock().expect("state lock").is_none(),
@@ -3903,7 +4042,7 @@ mod tests {
         let state = Mutex::new(None);
         let mut last_poll = None;
 
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 3);
 
         assert_eq!(camera.calls, 1);
         assert!(
@@ -3922,7 +4061,7 @@ mod tests {
         let state = Mutex::new(None);
         let mut last_poll = None;
 
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 3);
         let first_at = state
             .lock()
             .expect("state lock")
@@ -3932,7 +4071,7 @@ mod tests {
 
         // Force the interval open so the second, failing poll runs.
         last_poll = None;
-        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll);
+        poll_sensor_monitoring(&mut camera, &needed, &state, &mut last_poll, 4);
 
         let guard = state.lock().expect("state lock");
         let stored = guard.as_ref().expect("state must survive a failed read");
@@ -3983,6 +4122,105 @@ mod tests {
         assert_eq!(snapshot.values.pixel_dead_time_us, Some(6.0));
 
         controller.shutdown().expect("pipeline must shut down");
+    }
+
+    #[test]
+    fn monitoring_generation_advances_only_after_runtime_configure() {
+        let controller = spawn_pipeline(
+            ConfigurationGenerationCamera { diff_on_code: 102 },
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline must start");
+        controller
+            .sensor_monitoring_needed
+            .store(true, Ordering::Relaxed);
+
+        let mut updated = CameraConfig::default();
+        updated.biases.diff_on = 12;
+        let generation = controller
+            .try_apply_settings(updated)
+            .expect("runtime configuration must queue");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            if let Some(snapshot) = controller.sensor_monitoring() {
+                if snapshot.bias_configuration_generation == generation {
+                    break snapshot;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control thread never published the applied generation",
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            snapshot
+                .values
+                .biases
+                .expect("bias readback")
+                .current
+                .diff_on,
+            114
+        );
+
+        controller.shutdown().expect("pipeline must shut down");
+    }
+
+    struct ConfigurationGenerationCamera {
+        diff_on_code: u8,
+    }
+
+    impl EventCamera for ConfigurationGenerationCamera {
+        fn configure(&mut self, config: &CameraConfig) -> Result<()> {
+            self.diff_on_code = (102 + config.biases.diff_on).clamp(0, 255) as u8;
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+
+        fn read_monitoring(&mut self) -> Result<SensorMonitoring> {
+            let defaults = crate::camera::BiasCodes {
+                diff_on: 102,
+                diff_off: 40,
+                fo: 55,
+                hpf: 0,
+                refr: 138,
+            };
+            let mut current = defaults;
+            current.diff_on = self.diff_on_code;
+            Ok(SensorMonitoring {
+                biases: Some(crate::camera::BiasReadback {
+                    current,
+                    factory_default: defaults,
+                }),
+                ..SensorMonitoring::default()
+            })
+        }
+    }
+
+    impl PacketStreamCamera for ConfigurationGenerationCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("split camera reads via reader".into()))
+        }
+
+        fn split_stream_reader(&mut self) -> Option<Box<dyn crate::camera::PacketStreamReader>> {
+            Some(Box::new(CountingStreamReader {
+                reads: Arc::new(AtomicU64::new(0)),
+            }))
+        }
     }
 
     /// Split-capable camera that reports a fixed dead time, for the

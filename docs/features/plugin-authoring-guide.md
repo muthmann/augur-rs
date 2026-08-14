@@ -19,14 +19,24 @@ Each runtime plugin ships as:
 - a Rust crate that depends on `augur-plugin-api`
 - optional companion payload crates such as `augur-plugin-types`
 
+The manifest can declare `min_augur_version = "2.0.2"`. The loader validates
+this semantic version before opening the dynamic library and leaves an
+actionable error in the Plugin Manager when the installed host is too old.
+Use the oldest release that provides every context key, host command, and
+runtime behavior the plugin relies on. Do not leave a Stage-A acquisition
+plugin at a historical default when it requires newer recording provenance or
+sensor telemetry; an ABI-compatible library can still be behaviorally
+incompatible with an older host.
+
 At startup or on rescan, `augur-gui`:
 
 1. walks `~/.augur/plugins/`
 2. parses each `plugin.toml`
 3. resolves the matching library file
-4. loads the exported `augur_plugin_vtable` symbol
-5. rejects stale plugins by comparing both `PluginVTable::vtable_size` and `PluginVTable::abi_version`
-6. instantiates the plugin and caches its declarative settings/status metadata
+4. rejects a plugin whose `min_augur_version` is newer than the host
+5. loads the exported `augur_plugin_vtable` symbol
+6. rejects stale plugins by comparing both `PluginVTable::vtable_size` and `PluginVTable::abi_version`
+7. instantiates the plugin and caches its declarative settings/status metadata
 
 Loader failures are non-fatal and stay visible in the Plugin Manager.
 
@@ -74,12 +84,15 @@ if let Some(monitoring) = context.sensor_monitoring() {
 }
 ```
 
-**It is optional context, never an input to results.** The value is `None` on
+**It is optional context, never an input to offline analysis results.** The value is `None` on
 replay, decoded imports, and deterministic offline analysis runs — there is no
 device to ask. A plugin whose output changes with its presence would disagree
 between a live preview and an offline re-run of the same recording, which
 breaks the guarantee that analysis runs are reproducible (ADR 025). Use it for
 logging, provenance, and sanity checks on capture conditions.
+An explicitly live measurement coordinator may instead fail closed when its
+protocol requires sensor-confirmed settings; it must not change an analysis
+result merely because the same recorded file is replayed without hardware.
 
 These are sensor-monitor conversion outputs, not traceably calibrated
 instruments. Public IMX636/OpenEB material does not specify uncertainty,
@@ -120,10 +133,28 @@ effects are permitted only for `PluginRuntimeRole::LiveWorker` when
 `ExecutionContext::hardware_effects_allowed()` is true. `UiMirror` and
 `OfflineAnalysis` must stay inert.
 
-Recording commands additionally require the corresponding manifest
-`host_commands` entry. Recording paths are relative to the host-configured
+Host commands require the corresponding manifest `host_commands` entry.
+`start_recording` and `stop_recording` use paths relative to the host-configured
 output directory; absolute paths and traversal are rejected. See
 [Plugin Service Control Plane](./plugin-service-control-plane.md).
+
+Camera settings remain host-owned:
+
+- `apply_camera_configuration` selects the currently applied configuration, a
+  named host profile, or an immutable complete snapshot, applies it
+  immediately, and returns the resolved snapshot and provenance after a fresh
+  matching sensor readback; and
+- `restore_camera_configuration` is restricted to the plugin that owns the
+  active configuration session.
+
+These commands are Apply operations, not requests to populate the UI. The host
+rejects existing unapplied operator edits instead of overwriting them, and a
+successful reply means the settings panel shows the applied values without an
+additional user click. The host also performs a required Preview restart itself.
+The session owner can apply later complete snapshots and the final restore still
+returns to the configuration from before the session. Plugins, not the host,
+define which fields may vary and which scientific conditions are required.
+See ADR 037.
 
 ## Host Views
 
@@ -215,7 +246,7 @@ missing retained frames.
 
 ## Lifecycle And State
 
-The current dynamic plugin ABI is v4. Plugins built against older vtable layouts
+The current dynamic plugin ABI is v6. Plugins built against older vtable layouts
 must be rebuilt before the host will load them.
 
 Plugins are accumulating by default. The default `on_discontinuity`

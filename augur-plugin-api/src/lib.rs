@@ -6,16 +6,19 @@ mod macros;
 mod settings;
 
 pub use context::{
-    GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
-    HostActionScope, HostActionScopePayload, HostCommand, HostCommandOutcome, HostCommandReply,
-    HostCommandRequest, HostDatasetDescriptor, HostDatasetDisplayMetadata, HostDatasetKind,
-    HostDatasetRelation, HostMarkerShape, HostViewDescriptor, HostViewKind, HostViewPlacement,
-    HostViewRegistry, Image2dV1, PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome,
-    PluginServiceReply, PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasReadbackV1,
-    SensorMonitoringV1, Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData,
-    TableColumnDisplayEntry, TableColumnDisplayFormat, TableColumnDisplayMetadata,
-    TableColumnValues, TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d,
-    TableDatasetV1, TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
+    CameraBiasOffsetsV1, CameraConfigurationProvenanceV1, CameraConfigurationSnapshotV1,
+    CameraConfigurationSourceV1, CameraDigitalFilterV1, CameraExternalTriggerV1,
+    CameraGlobalSettingsV1, EventFiltersV1, GlobalSettings, HostActionDescriptor,
+    HostActionRequest, HostActionRequestQueue, HostActionScope, HostActionScopePayload,
+    HostCommand, HostCommandOutcome, HostCommandReply, HostCommandRequest, HostDatasetDescriptor,
+    HostDatasetDisplayMetadata, HostDatasetKind, HostDatasetRelation, HostMarkerShape,
+    HostViewDescriptor, HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1,
+    PluginControlInbox, PluginControlSnapshot, PluginServiceOutcome, PluginServiceReply,
+    PluginServiceRequest, RoiV1, SensorBiasCodesV1, SensorBiasReadbackV1, SensorMonitoringV1,
+    Series1dLine, Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnDisplayEntry,
+    TableColumnDisplayFormat, TableColumnDisplayMetadata, TableColumnValues,
+    TableColumnWidthPriority, TableCoordinateSpace2d, TableCoordinateSpace3d, TableDatasetV1,
+    TableRowProvenance, TableSchema, TableValueType, CTX_GLOBAL_SETTINGS,
     CTX_INVESTIGATION_ACTION_REQUESTS, CTX_SENSOR_MONITORING, HOST_ACTION_CLUSTER_ROWS_PARAM,
 };
 pub use event_store::EventStore;
@@ -82,8 +85,8 @@ pub mod __private {
 mod tests {
     use super::{
         context::{
-            GlobalSettings, HostActionDescriptor, HostActionRequest, HostActionRequestQueue,
-            HostActionScope, HostActionScopePayload, HostDatasetDescriptor,
+            EventFiltersV1, GlobalSettings, HostActionDescriptor, HostActionRequest,
+            HostActionRequestQueue, HostActionScope, HostActionScopePayload, HostDatasetDescriptor,
             HostDatasetDisplayMetadata, HostDatasetKind, HostMarkerShape, HostViewDescriptor,
             HostViewKind, HostViewPlacement, HostViewRegistry, Image2dV1, Series1dLine,
             Series1dPoint, Series1dV1, TableColumn, TableColumnData, TableColumnValues,
@@ -103,6 +106,39 @@ mod tests {
         PluginServiceOutcome, PluginServiceReply, PluginServiceRequest, PluginStateKind,
         PluginStateKindFn, PluginVTable, PLUGIN_ABI_VERSION,
     };
+
+    fn camera_configuration_snapshot() -> crate::CameraConfigurationSnapshotV1 {
+        crate::CameraConfigurationSnapshotV1 {
+            schema_version: 1,
+            biases: crate::CameraBiasOffsetsV1::default(),
+            roi: crate::RoiV1 {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            masked_pixels: Vec::new(),
+            digital_filter: crate::CameraDigitalFilterV1 {
+                stc_enabled: false,
+                stc_threshold_us: 1_000,
+                trail_enabled: false,
+                erc_enabled: Some(false),
+            },
+            external_trigger: crate::CameraExternalTriggerV1::default(),
+            global: crate::CameraGlobalSettingsV1 {
+                nm_per_pixel: 4_860.0,
+                pixel_scale_calibrated: false,
+                sensor_width: 1280,
+                sensor_height: 720,
+                acq_time_ms: 50,
+                event_store_budget_mib: 100,
+                preview_interval_ms: 33,
+                point_cloud_interval_ms: 67,
+                disk_writer_buffer_mib: 4,
+                record_sensor_telemetry: false,
+            },
+        }
+    }
 
     #[test]
     fn ffi_layouts_are_stable() {
@@ -209,6 +245,7 @@ mod tests {
             sensor_height: 720,
             acq_time_ms: 50,
             event_store_budget_bytes: 100 * 1024 * 1024,
+            record_sensor_telemetry: true,
             roi: crate::RoiV1 {
                 x: 4,
                 y: 8,
@@ -216,6 +253,11 @@ mod tests {
                 height: 480,
             },
             masked_pixels: vec![(1, 2), (3, 4)],
+            event_filters: EventFiltersV1 {
+                stc_enabled: false,
+                trail_enabled: true,
+                erc_enabled: false,
+            },
         };
 
         let json = serde_json::to_vec(&settings).expect("settings must serialize");
@@ -223,6 +265,76 @@ mod tests {
             serde_json::from_slice(&json).expect("settings must deserialize");
         assert_eq!(decoded, settings);
         assert_eq!(CTX_GLOBAL_SETTINGS, "augur.global_settings");
+    }
+
+    #[test]
+    fn settings_from_a_host_with_no_filter_block_read_as_all_off() {
+        // The field is additive: a plugin built against this API must still be
+        // able to read what an older host published, and "no block" is the
+        // same situation as "no filters", not a parse failure.
+        let json = br#"{"nm_per_pixel":65.0,"sensor_width":1280,"sensor_height":720,
+            "acq_time_ms":50,"event_store_budget_bytes":1024}"#;
+        let decoded: GlobalSettings = serde_json::from_slice(json).expect("must deserialize");
+        assert_eq!(decoded.event_filters, EventFiltersV1::default());
+        assert!(!decoded.event_filters.stc_enabled);
+    }
+
+    #[test]
+    fn complete_camera_configuration_sources_round_trip() {
+        let commands = [
+            HostCommand::ApplyCameraConfiguration {
+                configuration: crate::CameraConfigurationSourceV1::Current,
+            },
+            HostCommand::ApplyCameraConfiguration {
+                configuration: crate::CameraConfigurationSourceV1::NamedProfile {
+                    name: "low noise".into(),
+                },
+            },
+            HostCommand::ApplyCameraConfiguration {
+                configuration: crate::CameraConfigurationSourceV1::Snapshot {
+                    snapshot: camera_configuration_snapshot(),
+                },
+            },
+        ];
+        for command in commands {
+            let json = serde_json::to_string(&command).expect("must serialize");
+            let decoded: HostCommand = serde_json::from_str(&json).expect("must deserialize");
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn a_configuration_confirmation_carries_the_sensor_readback() {
+        let outcome = HostCommandOutcome::CameraConfigurationApplied {
+            snapshot: camera_configuration_snapshot(),
+            provenance: crate::CameraConfigurationProvenanceV1 {
+                source: "current_configuration".into(),
+                profile_name: None,
+                schema_version: 1,
+                profile_revision: None,
+                sha256: "ab".repeat(32),
+            },
+            readback: crate::SensorBiasReadbackV1 {
+                current: crate::SensorBiasCodesV1 {
+                    diff_on: 114,
+                    diff_off: 32,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 138,
+                },
+                factory_default: crate::SensorBiasCodesV1 {
+                    diff_on: 102,
+                    diff_off: 40,
+                    fo: 55,
+                    hpf: 0,
+                    refr: 138,
+                },
+            },
+            readback_age_s: 0.4,
+        };
+        let json = serde_json::to_vec(&outcome).expect("must serialize");
+        let decoded: HostCommandOutcome = serde_json::from_slice(&json).expect("must deserialize");
+        assert_eq!(decoded, outcome);
     }
 
     #[test]
@@ -505,8 +617,8 @@ mod tests {
         let inbox = PluginControlInbox {
             service_replies: vec![PluginServiceReply {
                 request_id: 7,
-                source_plugin_id: "workflow.a1".into(),
-                target_plugin_id: "device.modulation".into(),
+                source_plugin_id: "workflow.example".into(),
+                target_plugin_id: "device.example".into(),
                 service: "apply.v1".into(),
                 outcome: PluginServiceOutcome::Accepted {
                     payload: serde_json::json!({"revision": 3}),
@@ -532,7 +644,7 @@ mod tests {
                 },
             ],
             snapshots: vec![PluginControlSnapshot {
-                plugin_id: "device.modulation".into(),
+                plugin_id: "device.example".into(),
                 topic: "state.v1".into(),
                 revision: 3,
                 payload: serde_json::json!({"connected": true}),
@@ -563,7 +675,7 @@ mod tests {
         let service = PluginServiceRequest {
             request_id: 10,
             source_plugin_id: String::new(),
-            target_plugin_id: "device.modulation".into(),
+            target_plugin_id: "device.example".into(),
             service: "output_off.v1".into(),
             payload: serde_json::Value::Null,
         };
