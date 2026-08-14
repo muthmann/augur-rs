@@ -11,6 +11,26 @@
 * ✨ clickable 2D overlays bound to their backing row via marker `source_row`, with reason-first summary card for rejected-fit rows.
 * ✨ generic host action bus: plugins declare `HostActionDescriptor`s with `Dataset`/`Row`/`Cluster` scope and an optional `param_schema`; the host renders scope-aware buttons plus a schema-driven modal and publishes `HostActionRequest`s to `CTX_INVESTIGATION_ACTION_REQUESTS`.
 
+## [2.1.0](https://github.com/muthmann/augur-rs/compare/v2.0.2...v2.1.0) (2026-08-14)
+
+
+### Features
+
+* **camera:** ✨ let plugins apply confirmed profiles ([4dc1111](https://github.com/muthmann/augur-rs/commit/4dc11119d46041bbffcb7f181386400d1b4897a6))
+* **camera:** ✨ state the ERC setting in camera snapshots ([5d371e2](https://github.com/muthmann/augur-rs/commit/5d371e20ed80a6d7dd34713321a8d4d1e4f05fb6))
+* **camera:** add confirmed plugin configuration sessions ([6793ef6](https://github.com/muthmann/augur-rs/commit/6793ef624b20dd26059ece8a3f62f2a1af1881ab))
+* **runtime:** ✨ gate plugin loading on a minimum host version ([6f94093](https://github.com/muthmann/augur-rs/commit/6f94093dbb6cd23a0663ff943e875834f677df47))
+
+
+### Bug Fixes
+
+* **build:** 🐛 re-sign the macOS app bundle after packaging ([138393c](https://github.com/muthmann/augur-rs/commit/138393c5cbec119d39c216610592865f092b10ee))
+* **gui:** 🐛 gate profile imports by platform ([84c8074](https://github.com/muthmann/augur-rs/commit/84c8074da597a8ffeadb851a79d8d5c2a17a8fa5))
+* **gui:** 🐛 replace camera profiles atomically on Windows ([887f535](https://github.com/muthmann/augur-rs/commit/887f53544d8dbfa7f0634d920c959f78c670c572))
+* **gui:** 🐛 stop a plugin card header widening the analysis panel ([51939e0](https://github.com/muthmann/augur-rs/commit/51939e0de3b3166b5ce5620ea5fa226bd5edab20))
+* **gui:** 🐛 stop a plugin card header widening the analysis panel ([b257e14](https://github.com/muthmann/augur-rs/commit/b257e14e667b58d395db5a5afd4ea77988590d52))
+* **runtime:** 🐛 harden standalone configuration workflows ([3f0ea1e](https://github.com/muthmann/augur-rs/commit/3f0ea1ec5441d5a8e17fc25075637f4c9df7740a))
+
 ## [2.0.2](https://github.com/muthmann/augur-rs/compare/v2.0.1...v2.0.2) (2026-08-07)
 
 
