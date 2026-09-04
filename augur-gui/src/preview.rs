@@ -238,7 +238,7 @@ impl CpuPreviewImageCache {
 
     fn ensure_image(&mut self, size: [usize; 2]) {
         if self.image.size != size || self.image.pixels.len() != size[0].saturating_mul(size[1]) {
-            self.image = ColorImage::new(size, Color32::BLACK);
+            self.image = ColorImage::filled(size, Color32::BLACK);
         }
     }
 }

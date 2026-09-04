@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Instant;
 
 use augur_core::pipeline::PREVIEW_HISTOGRAM_BINS;
@@ -942,11 +941,13 @@ impl WgpuPreviewRenderer {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
+                multiview_mask: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self
                         .display_view
                         .as_ref()
                         .ok_or_else(|| "missing preview display view".to_owned())?,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -966,7 +967,7 @@ impl WgpuPreviewRenderer {
     }
 
     fn new(render_state: egui_wgpu::RenderState) -> Result<Self, String> {
-        let device = Arc::clone(&render_state.device);
+        let device = render_state.device.clone();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("augur_preview_shader"),
             source: wgpu::ShaderSource::Wgsl(PREVIEW_SHADER.into()),
@@ -1121,38 +1122,38 @@ impl WgpuPreviewRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("augur_preview_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let count_compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("augur_count_compute_pipeline_layout"),
-                bind_group_layouts: &[&count_compute_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&count_compute_bind_group_layout)],
+                immediate_size: 0,
             });
         let count_render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("augur_count_render_pipeline_layout"),
-                bind_group_layouts: &[&count_render_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&count_render_bind_group_layout)],
+                immediate_size: 0,
             });
         let time_surface_compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("augur_time_surface_compute_pipeline_layout"),
-                bind_group_layouts: &[&time_surface_compute_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&time_surface_compute_bind_group_layout)],
+                immediate_size: 0,
             });
         let time_surface_histogram_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("augur_time_surface_histogram_pipeline_layout"),
-                bind_group_layouts: &[&time_surface_histogram_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&time_surface_histogram_bind_group_layout)],
+                immediate_size: 0,
             });
         let time_surface_render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("augur_time_surface_render_pipeline_layout"),
-                bind_group_layouts: &[&time_surface_render_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&time_surface_render_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1160,12 +1161,14 @@ impl WgpuPreviewRenderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -1175,21 +1178,26 @@ impl WgpuPreviewRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
         let count_compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("augur_count_accumulate_pipeline"),
                 layout: Some(&count_compute_pipeline_layout),
                 module: &count_compute_shader,
-                entry_point: "cs_accumulate",
+                entry_point: Some("cs_accumulate"),
+                compilation_options: Default::default(),
+                cache: None,
             });
         let count_histogram_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("augur_count_histogram_pipeline"),
                 layout: Some(&count_compute_pipeline_layout),
                 module: &count_compute_shader,
-                entry_point: "cs_histogram",
+                entry_point: Some("cs_histogram"),
+                compilation_options: Default::default(),
+                cache: None,
             });
         let count_render_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1197,12 +1205,14 @@ impl WgpuPreviewRenderer {
                 layout: Some(&count_render_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &count_render_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &count_render_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8UnormSrgb,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -1212,21 +1222,26 @@ impl WgpuPreviewRenderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
+                cache: None,
             });
         let time_surface_compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("augur_time_surface_accumulate_pipeline"),
                 layout: Some(&time_surface_compute_pipeline_layout),
                 module: &time_surface_compute_shader,
-                entry_point: "cs_accumulate",
+                entry_point: Some("cs_accumulate"),
+                compilation_options: Default::default(),
+                cache: None,
             });
         let time_surface_histogram_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("augur_time_surface_histogram_pipeline"),
                 layout: Some(&time_surface_histogram_pipeline_layout),
                 module: &time_surface_histogram_shader,
-                entry_point: "cs_histogram",
+                entry_point: Some("cs_histogram"),
+                compilation_options: Default::default(),
+                cache: None,
             });
         let time_surface_render_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1234,12 +1249,14 @@ impl WgpuPreviewRenderer {
                 layout: Some(&time_surface_render_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &time_surface_render_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &time_surface_render_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8UnormSrgb,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -1249,7 +1266,8 @@ impl WgpuPreviewRenderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
+                cache: None,
             });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2659,7 +2677,12 @@ fn map_buffer_sync(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    device.poll(wgpu::Maintain::Wait);
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .map_err(|err| format!("{label} readback poll failed: {err}"))?;
     rx.recv()
         .map_err(|_| format!("{label} readback callback failed"))?
         .map_err(|err| format!("{label} readback failed: {err}"))?;
@@ -2765,14 +2788,14 @@ fn write_texture(
     bytes_per_pixel: u32,
 ) {
     queue.write_texture(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         bytes,
-        wgpu::ImageDataLayout {
+        wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(size[0].max(1) as u32 * bytes_per_pixel),
             rows_per_image: Some(size[1].max(1) as u32),
@@ -2881,11 +2904,12 @@ mod tests {
     fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
         });
         let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
     }
 
     /// The linearization, executed rather than argued about. A wrong
@@ -2937,14 +2961,16 @@ mod tests {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
             module: &module,
-            entry_point: "cs_accumulate",
+            entry_point: Some("cs_accumulate"),
+            compilation_options: Default::default(),
+            cache: None,
         });
 
         let counts_bytes = (WIDTH as u64) * 4;
@@ -3065,12 +3091,12 @@ mod tests {
             ("time_surface_render", TIME_SURFACE_RENDER_SHADER),
             ("time_surface_histogram", TIME_SURFACE_HISTOGRAM_SHADER),
         ] {
-            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let _module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
-            if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+            if let Some(error) = pollster::block_on(scope.pop()) {
                 panic!("{label} shader failed validation: {error}");
             }
         }

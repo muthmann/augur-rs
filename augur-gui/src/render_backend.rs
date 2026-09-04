@@ -83,7 +83,7 @@ fn run_with_renderer(renderer: Renderer) -> eframe::Result<()> {
     eframe::run_native(
         APP_TITLE,
         build_native_options(renderer),
-        Box::new(|cc| Box::new(CameraApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(CameraApp::new(cc)))),
     )
 }
 
@@ -110,12 +110,16 @@ fn build_native_options(renderer: Renderer) -> NativeOptions {
         ..Default::default()
     };
 
-    options.wgpu_options = egui_wgpu::WgpuConfiguration {
-        supported_backends: egui_wgpu::wgpu::Backends::PRIMARY | egui_wgpu::wgpu::Backends::GL,
-        power_preference: egui_wgpu::wgpu::PowerPreference::HighPerformance,
-        desired_maximum_frame_latency: Some(1),
-        ..Default::default()
-    };
+    // egui-wgpu 0.35 moved the instance/adapter knobs into `WgpuSetup` and the
+    // presentation knobs into `SurfaceConfig`; the requested behaviour is unchanged.
+    let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.surface.desired_maximum_frame_latency = Some(1);
+    if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends =
+            egui_wgpu::wgpu::Backends::PRIMARY | egui_wgpu::wgpu::Backends::GL;
+        setup.power_preference = egui_wgpu::wgpu::PowerPreference::HighPerformance;
+    }
+    options.wgpu_options = wgpu_options;
 
     options
 }

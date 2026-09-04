@@ -868,7 +868,7 @@ pub fn render_linked_table_view(
         ui.separator();
         ui.label("Page size");
         let mut selected_size = effective_state.page_size;
-        egui::ComboBox::from_id_source(("table_page_size", options.dataset_id))
+        egui::ComboBox::from_id_salt(("table_page_size", options.dataset_id))
             .selected_text(selected_size.label())
             .show_ui(ui, |ui| {
                 for size in TablePageSize::ALL {
@@ -1010,7 +1010,7 @@ pub fn render_linked_table_view(
                         let response = ui.add(
                             egui::Label::new(&value)
                                 .sense(egui::Sense::click())
-                                .truncate(true),
+                                .truncate(),
                         );
                         let response = if raw != value {
                             response.on_hover_text(raw)
@@ -1045,11 +1045,11 @@ pub fn render_density2d_view(
         ui.menu_button("Export Image", |ui| {
             if ui.button("PNG").clicked() {
                 actions.export_image = Some(HostViewImageFormat::Png);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("TIFF").clicked() {
                 actions.export_image = Some(HostViewImageFormat::Tiff);
-                ui.close_menu();
+                ui.close();
             }
         });
         if allow_clear && ui.button("Clear").clicked() {
@@ -1065,7 +1065,7 @@ pub fn render_density2d_view(
             &mut settings.contrast_percentile,
             90.0..=100.0,
         ));
-        egui::ComboBox::from_id_source(format!("{view_id}_colormap"))
+        egui::ComboBox::from_id_salt(format!("{view_id}_colormap"))
             .selected_text(settings.colormap.label())
             .show_ui(ui, |ui| {
                 for colormap in Colormap::ALL {
@@ -1136,11 +1136,11 @@ pub fn render_image2d_view(
         ui.menu_button("Export Image", |ui| {
             if ui.button("PNG").clicked() {
                 actions.export_image = Some(HostViewImageFormat::Png);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("TIFF").clicked() {
                 actions.export_image = Some(HostViewImageFormat::Tiff);
-                ui.close_menu();
+                ui.close();
             }
         });
         if allow_clear && ui.button("Clear").clicked() {
@@ -1154,7 +1154,7 @@ pub fn render_image2d_view(
             &mut settings.contrast_percentile,
             90.0..=100.0,
         ));
-        egui::ComboBox::from_id_source(format!("{view_id}_image_colormap"))
+        egui::ComboBox::from_id_salt(format!("{view_id}_image_colormap"))
             .selected_text(settings.colormap.label())
             .show_ui(ui, |ui| {
                 for colormap in Colormap::ALL {
@@ -1252,9 +1252,11 @@ pub fn render_scatter2d_view(
     let plot = scatter_plot_builder(options.view_id, schema, options.x_column, options.y_column);
     plot.show(ui, |plot_ui| {
         plot_ui.points(
-            Points::new(points)
-                .radius(2.0_f32)
-                .name(format!("{} vs {}", options.x_column, options.y_column)),
+            Points::new(
+                format!("{} vs {}", options.x_column, options.y_column),
+                points,
+            )
+            .radius(2.0_f32),
         );
     });
 
@@ -1387,13 +1389,13 @@ pub fn render_line_series_view(
             } else {
                 series.name.clone()
             };
-            plot_ui.line(Line::new(points).name(name));
+            plot_ui.line(Line::new(name, points));
         }
         if let Some(a) = cursors.a {
-            plot_ui.vline(VLine::new(a).name("A"));
+            plot_ui.vline(VLine::new("A", a));
         }
         if let Some(b) = cursors.b {
-            plot_ui.vline(VLine::new(b).name("B"));
+            plot_ui.vline(VLine::new("B", b));
         }
         if plot_ui.response().clicked() {
             if let Some(coord) = plot_ui.pointer_coordinate() {
@@ -1819,11 +1821,11 @@ pub fn render_density_window_viewport(
             ui.menu_button("Export Image", |ui| {
                 if ui.button("PNG").clicked() {
                     data.export_image_requested = Some(HostViewImageFormat::Png);
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("TIFF").clicked() {
                     data.export_image_requested = Some(HostViewImageFormat::Tiff);
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             if ui.button("Clear").clicked() {
@@ -1840,7 +1842,7 @@ pub fn render_density_window_viewport(
                 &mut data.settings.contrast_percentile,
                 90.0..=100.0,
             ));
-            egui::ComboBox::from_id_source(format!("{view_id}_viewport_colormap"))
+            egui::ComboBox::from_id_salt(format!("{view_id}_viewport_colormap"))
                 .selected_text(data.settings.colormap.label())
                 .show_ui(ui, |ui| {
                     for colormap in Colormap::ALL {
@@ -1918,11 +1920,11 @@ pub fn render_image_window_viewport(
             ui.menu_button("Export Image", |ui| {
                 if ui.button("PNG").clicked() {
                     data.export_image_requested = Some(HostViewImageFormat::Png);
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("TIFF").clicked() {
                     data.export_image_requested = Some(HostViewImageFormat::Tiff);
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             if ui.button("Clear").clicked() {
@@ -1934,7 +1936,7 @@ pub fn render_image_window_viewport(
                 &mut data.settings.contrast_percentile,
                 90.0..=100.0,
             ));
-            egui::ComboBox::from_id_source(format!("{view_id}_image_viewport_colormap"))
+            egui::ComboBox::from_id_salt(format!("{view_id}_image_viewport_colormap"))
                 .selected_text(data.settings.colormap.label())
                 .show_ui(ui, |ui| {
                     for colormap in Colormap::ALL {
@@ -2184,10 +2186,7 @@ fn render_image2d_dataset(
             colormap.lookup(normalized)
         })
         .collect();
-    Ok(ColorImage {
-        size: dataset.size(),
-        pixels,
-    })
+    Ok(ColorImage::new(dataset.size(), pixels))
 }
 
 fn render_density_image(
@@ -2258,10 +2257,7 @@ fn render_density_image(
         .collect();
 
     Ok(RenderedDensityImage {
-        image: ColorImage {
-            size: [width, height],
-            pixels,
-        },
+        image: ColorImage::new([width, height], pixels),
         size: [width, height],
     })
 }
@@ -2318,12 +2314,12 @@ fn percentile_finite(values: &[f32], percentile: f32) -> f32 {
     values[index.min(last)]
 }
 
-fn scatter_plot_builder(
-    view_id: &str,
-    schema: &TableSchema,
-    x_column: &str,
-    y_column: &str,
-) -> Plot {
+fn scatter_plot_builder<'a>(
+    view_id: &'a str,
+    schema: &'a TableSchema,
+    x_column: &'a str,
+    y_column: &'a str,
+) -> Plot<'a> {
     let plot = Plot::new(format!("{view_id}_scatter"))
         .legend(Legend::default())
         .height(280.0)
@@ -2340,11 +2336,11 @@ fn scatter_plot_builder(
     }
 }
 
-fn scatter_plot_points(
-    dataset: &TableDatasetV1,
-    x_column: &str,
-    y_column: &str,
-) -> Result<PlotPoints, String> {
+fn scatter_plot_points<'a>(
+    dataset: &'a TableDatasetV1,
+    x_column: &'a str,
+    y_column: &'a str,
+) -> Result<PlotPoints<'a>, String> {
     let x_values = dataset
         .column(x_column)
         .ok_or_else(|| format!("dataset is missing x column {x_column}"))?;

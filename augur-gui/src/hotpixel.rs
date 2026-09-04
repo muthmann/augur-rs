@@ -67,7 +67,7 @@ impl BuiltInHotpixelDetection {
                     ui.add(
                         egui::Slider::new(&mut this.history_depth, 4..=64)
                             .text("Smoothing depth")
-                            .clamp_to_range(true),
+                            .clamping(egui::SliderClamping::Always),
                     )
                     .on_hover_text(
                         "Higher values react more slowly but suppress frame-to-frame flicker.",
@@ -81,7 +81,7 @@ impl BuiltInHotpixelDetection {
                     ui.add(
                         egui::Slider::new(&mut this.threshold_factor, 2.0..=50.0)
                             .text("Threshold factor")
-                            .clamp_to_range(true),
+                            .clamping(egui::SliderClamping::Always),
                     )
                     .on_hover_text(
                         "A pixel is flagged when its activity exceeds this multiple of the global mean.",
@@ -95,7 +95,7 @@ impl BuiltInHotpixelDetection {
                     ui.add(
                         egui::Slider::new(&mut this.min_absolute_count, 1..=100)
                             .text("Min absolute count")
-                            .clamp_to_range(true),
+                            .clamping(egui::SliderClamping::Always),
                     )
                     .on_hover_text(
                         "Minimum per-frame event count required before a pixel can be treated as hot.",

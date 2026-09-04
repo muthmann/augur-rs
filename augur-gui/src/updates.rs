@@ -254,7 +254,7 @@ mod enabled {
             };
             if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                 self.check_now();
-                ui.close_menu();
+                ui.close();
             }
 
             let mut auto = self.prefs.check_on_startup;
@@ -273,7 +273,7 @@ mod enabled {
             if ui.button("Release notes").clicked() {
                 ui.ctx()
                     .open_url(egui::OpenUrl::new_tab(augur_update::releases_url()));
-                ui.close_menu();
+                ui.close();
             }
         }
 

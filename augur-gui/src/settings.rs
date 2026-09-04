@@ -22,7 +22,7 @@ const DEAD_TIME_TOOLTIP: &str = "Refractory period measured by the sensor's own 
 /// greyed out, so every section still opens and its values stay legible.
 fn section<R>(
     ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     default_open: bool,
     right: Option<&str>,
@@ -176,28 +176,28 @@ pub fn draw_settings(
                 .add(
                     egui::DragValue::new(&mut cfg.roi.x)
                         .prefix("x ")
-                        .clamp_range(0..=sensor_width.saturating_sub(1)),
+                        .range(0..=sensor_width.saturating_sub(1)),
                 )
                 .changed();
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut cfg.roi.y)
                         .prefix("y ")
-                        .clamp_range(0..=sensor_height.saturating_sub(1)),
+                        .range(0..=sensor_height.saturating_sub(1)),
                 )
                 .changed();
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut cfg.roi.width)
                         .prefix("w ")
-                        .clamp_range(1..=sensor_width.max(1)),
+                        .range(1..=sensor_width.max(1)),
                 )
                 .changed();
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut cfg.roi.height)
                         .prefix("h ")
-                        .clamp_range(1..=sensor_height.max(1)),
+                        .range(1..=sensor_height.max(1)),
                 )
                 .changed();
         });
@@ -241,12 +241,12 @@ pub fn draw_settings(
                 ui.add(
                     egui::DragValue::new(mask_x)
                         .prefix("x ")
-                        .clamp_range(0..=sensor_width.saturating_sub(1)),
+                        .range(0..=sensor_width.saturating_sub(1)),
                 );
                 ui.add(
                     egui::DragValue::new(mask_y)
                         .prefix("y ")
-                        .clamp_range(0..=sensor_height.saturating_sub(1)),
+                        .range(0..=sensor_height.saturating_sub(1)),
                 );
                 let can_add = cfg.pixel_mask.masked_pixels.len() < IMX636_DEM_SLOTS;
                 if ui

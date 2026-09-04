@@ -10,7 +10,7 @@
 //! system provides a dark counterpart, theme-stable where they encode data.
 
 use egui::epaint::Shadow;
-use egui::{Color32, Rounding, Stroke, Vec2};
+use egui::{Color32, CornerRadius, Stroke, Vec2};
 
 /// 4-based spacing scale (px). Matches `--aug-sp-*`.
 #[allow(dead_code)]
@@ -29,10 +29,10 @@ pub mod sp {
 /// Compact corner radii. Matches `--aug-r-*`.
 #[allow(dead_code)]
 pub mod radius {
-    pub const R_1: f32 = 2.0; // chips, inputs
-    pub const R_2: f32 = 4.0; // buttons
-    pub const R_3: f32 = 6.0; // panels (PANEL_ROUNDING)
-    pub const R_4: f32 = 8.0; // large cards
+    pub const R_1: u8 = 2; // chips, inputs
+    pub const R_2: u8 = 4; // buttons
+    pub const R_3: u8 = 6; // panels (PANEL_ROUNDING)
+    pub const R_4: u8 = 8; // large cards
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,8 +207,8 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
     visuals.panel_fill = p.bg_0;
     visuals.window_fill = p.bg_1;
     visuals.window_stroke = Stroke::new(1.0, p.line);
-    visuals.window_rounding = Rounding::same(radius::R_3);
-    visuals.menu_rounding = Rounding::same(radius::R_3);
+    visuals.window_corner_radius = CornerRadius::same(radius::R_3);
+    visuals.menu_corner_radius = CornerRadius::same(radius::R_3);
 
     visuals.faint_bg_color = p.bg_2;
     visuals.extreme_bg_color = p.bg_1;
@@ -223,9 +223,9 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
 
     // Subtle, restrained shadows — design says "1px outline preferred over a shadow".
     visuals.window_shadow = Shadow {
-        offset: Vec2::new(0.0, 2.0),
-        blur: 6.0,
-        spread: 0.0,
+        offset: [0, 2],
+        blur: 6,
+        spread: 0,
         color: if mode.is_dark() {
             Color32::from_black_alpha(160)
         } else {
@@ -236,14 +236,14 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
 
     // Buttons & widgets
     let widgets = &mut visuals.widgets;
-    let widget_rounding = Rounding::same(radius::R_2);
+    let widget_rounding = CornerRadius::same(radius::R_2);
 
     // Noninteractive: panel separators, frame outlines, default text.
     widgets.noninteractive.bg_fill = p.bg_1;
     widgets.noninteractive.weak_bg_fill = p.bg_1;
     widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.line);
     widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.fg_1);
-    widgets.noninteractive.rounding = widget_rounding;
+    widgets.noninteractive.corner_radius = widget_rounding;
     widgets.noninteractive.expansion = 0.0;
 
     // Inactive: at-rest button.
@@ -251,7 +251,7 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
     widgets.inactive.weak_bg_fill = p.bg_1;
     widgets.inactive.bg_stroke = Stroke::new(1.0, p.line);
     widgets.inactive.fg_stroke = Stroke::new(1.0, p.fg_1);
-    widgets.inactive.rounding = widget_rounding;
+    widgets.inactive.corner_radius = widget_rounding;
     widgets.inactive.expansion = 0.0;
 
     // Hovered: ~6% darker fill (light) / lighter fill (dark), no scaling.
@@ -259,7 +259,7 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
     widgets.hovered.weak_bg_fill = p.bg_2;
     widgets.hovered.bg_stroke = Stroke::new(1.0, p.line_strong);
     widgets.hovered.fg_stroke = Stroke::new(1.0, p.fg_0);
-    widgets.hovered.rounding = widget_rounding;
+    widgets.hovered.corner_radius = widget_rounding;
     widgets.hovered.expansion = 0.0;
 
     // Active (pressed): one step darker still.
@@ -267,7 +267,7 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
     widgets.active.weak_bg_fill = p.bg_3;
     widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
     widgets.active.fg_stroke = Stroke::new(1.0, p.fg_0);
-    widgets.active.rounding = widget_rounding;
+    widgets.active.corner_radius = widget_rounding;
     widgets.active.expansion = 0.0;
 
     // Focus ring uses Visuals::selection.stroke — already wired above. Make
@@ -276,7 +276,7 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
     widgets.open.weak_bg_fill = p.bg_2;
     widgets.open.bg_stroke = Stroke::new(1.0, p.accent);
     widgets.open.fg_stroke = Stroke::new(1.0, p.fg_0);
-    widgets.open.rounding = widget_rounding;
+    widgets.open.corner_radius = widget_rounding;
     widgets.open.expansion = 0.0;
 
     visuals.indent_has_left_vline = false;
@@ -285,7 +285,7 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
     visuals.striped = true;
     visuals.slider_trailing_fill = true;
 
-    visuals.text_cursor = Stroke::new(1.0, p.accent);
+    visuals.text_cursor.stroke = Stroke::new(1.0, p.accent);
 
     visuals
 }
@@ -296,11 +296,11 @@ pub fn visuals(mode: ThemeMode) -> egui::Visuals {
 /// settings / analysis / investigation surfaces.
 pub fn card_frame(ui: &egui::Ui) -> egui::Frame {
     let p = palette_for_visuals(ui.visuals());
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(p.bg_1)
         .stroke(Stroke::new(1.0, p.line))
-        .rounding(Rounding::same(radius::R_3))
-        .inner_margin(egui::Margin::symmetric(sp::SP_3, sp::SP_3))
+        .corner_radius(CornerRadius::same(radius::R_3))
+        .inner_margin(egui::Margin::symmetric(sp::SP_3 as i8, sp::SP_3 as i8))
 }
 
 /// Clamp a sub-area to the available/clip width and enable wrapping, so dense
@@ -310,7 +310,7 @@ pub fn constrain_section_width(ui: &mut egui::Ui) -> f32 {
     ui.set_min_width(width);
     ui.set_max_width(width);
     ui.set_width(width);
-    ui.style_mut().wrap = Some(true);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
     width
 }
 
@@ -380,7 +380,9 @@ pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response {
     let border = tone.border(&p);
 
     let font = egui::FontId::monospace(11.0);
-    let text_galley = ui.fonts(|fonts| fonts.layout_no_wrap(text.to_owned(), font.clone(), fg));
+    let text_galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(text.to_owned(), font.clone(), fg));
     let pad_x = 7.0;
     let pad_y = 2.0;
     let size = egui::vec2(
@@ -391,8 +393,12 @@ pub fn chip(ui: &mut egui::Ui, text: &str, tone: Tone) -> egui::Response {
     let radius = rect.height() * 0.5;
     ui.painter().rect_filled(rect, radius, bg);
     if border != Color32::TRANSPARENT {
-        ui.painter()
-            .rect_stroke(rect, radius, Stroke::new(1.0, border));
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Middle,
+        );
     }
     let text_pos = egui::pos2(rect.left() + pad_x, rect.top() + pad_y);
     ui.painter().galley(text_pos, text_galley, fg);
@@ -446,12 +452,12 @@ pub fn panel_header(
 ) -> bool {
     let p = palette_for_visuals(ui.visuals());
     let mut toggle_clicked = false;
-    egui::Frame::none()
+    egui::Frame::NONE
         .inner_margin(egui::Margin {
-            left: sp::SP_3,
-            right: sp::SP_3,
-            top: sp::SP_2,
-            bottom: sp::SP_2,
+            left: sp::SP_3 as i8,
+            right: sp::SP_3 as i8,
+            top: sp::SP_2 as i8,
+            bottom: sp::SP_2 as i8,
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -500,7 +506,9 @@ pub fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Respo
         painter.rect_filled(rect, radius::R_2, bg);
     }
     let font = egui::FontId::proportional(13.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(glyph.to_owned(), font.clone(), fg));
+    let galley = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap(glyph.to_owned(), font.clone(), fg));
     let pos = egui::pos2(
         rect.center().x - galley.size().x * 0.5,
         rect.center().y - galley.size().y * 0.5,
@@ -547,7 +555,7 @@ pub fn inspector_row(ui: &mut egui::Ui, label: &str, value: &str) -> egui::Respo
 /// Use this for any row of buttons or chips that lives in a narrow panel.
 pub fn wrap_row<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.horizontal_wrapped(|ui| {
-        ui.style_mut().wrap = Some(false);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         add_contents(ui)
     })
     .inner
@@ -560,7 +568,9 @@ pub fn wrap_row<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -
 /// rather than jumping once a measured-last-frame width arrives.
 pub fn button_width(ui: &egui::Ui, text: &str) -> f32 {
     let font_id = egui::TextStyle::Button.resolve(ui.style());
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font_id, Color32::WHITE));
+    let galley = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font_id, Color32::WHITE));
     galley.size().x + ui.spacing().button_padding.x * 2.0
 }
 
@@ -617,7 +627,9 @@ pub fn pill_cluster(
     let widths: Vec<f32> = options
         .iter()
         .map(|label| {
-            let g = ui.fonts(|f| f.layout_no_wrap((*label).to_owned(), font.clone(), p.fg_1));
+            let g = ui
+                .ctx()
+                .fonts_mut(|f| f.layout_no_wrap((*label).to_owned(), font.clone(), p.fg_1));
             g.size().x + segment_pad_x * 2.0
         })
         .collect();
@@ -625,8 +637,12 @@ pub fn pill_cluster(
     let (cluster_rect, _) =
         ui.allocate_exact_size(egui::vec2(total_width, height), egui::Sense::hover());
     // Outer cluster outline.
-    ui.painter()
-        .rect_stroke(cluster_rect, radius, Stroke::new(1.0, p.line_strong));
+    ui.painter().rect_stroke(
+        cluster_rect,
+        radius,
+        Stroke::new(1.0, p.line_strong),
+        egui::StrokeKind::Middle,
+    );
 
     let mut clicked = None;
     let mut x = cluster_rect.left();
@@ -651,23 +667,23 @@ pub fn pill_cluster(
             // round only the outer corners that touch the cluster edge.
             let fill_rect = seg_rect.shrink2(egui::vec2(1.0, 1.0));
             let r = if i == 0 && i == last_index {
-                Rounding::same(radius - 1.0)
+                CornerRadius::same(radius.saturating_sub(1))
             } else if i == 0 {
-                Rounding {
-                    nw: radius - 1.0,
-                    sw: radius - 1.0,
-                    ne: 0.0,
-                    se: 0.0,
+                CornerRadius {
+                    nw: radius.saturating_sub(1),
+                    sw: radius.saturating_sub(1),
+                    ne: 0,
+                    se: 0,
                 }
             } else if i == last_index {
-                Rounding {
-                    ne: radius - 1.0,
-                    se: radius - 1.0,
-                    nw: 0.0,
-                    sw: 0.0,
+                CornerRadius {
+                    ne: radius.saturating_sub(1),
+                    se: radius.saturating_sub(1),
+                    nw: 0,
+                    sw: 0,
                 }
             } else {
-                Rounding::ZERO
+                CornerRadius::ZERO
             };
             painter.rect_filled(fill_rect, r, p.ink);
         }
@@ -678,7 +694,9 @@ pub fn pill_cluster(
                 Stroke::new(1.0, p.line_strong),
             );
         }
-        let galley = ui.fonts(|f| f.layout_no_wrap((*label).to_owned(), font.clone(), fg));
+        let galley = ui
+            .ctx()
+            .fonts_mut(|f| f.layout_no_wrap((*label).to_owned(), font.clone(), fg));
         let text_pos = egui::pos2(
             seg_rect.center().x - galley.size().x * 0.5,
             seg_rect.center().y - galley.size().y * 0.5,
@@ -711,7 +729,7 @@ pub fn pill_cluster(
 /// open/closed state by `id_source` like egui's `CollapsingHeader`.
 pub fn collapse<R>(
     ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     default_open: bool,
     right: Option<&str>,
@@ -783,7 +801,7 @@ pub struct LayerRowResponse {
 /// full row response plus the new `visible` value when the eye is clicked.
 pub fn layer_row(
     ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
     visible: bool,
     color: [u8; 4],
     name: &str,
@@ -805,7 +823,7 @@ pub fn layer_row(
                 egui::vec2(row_width, row_height),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.style_mut().wrap = Some(false);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     ui.spacing_mut().item_spacing.x = sp::SP_2;
                     let glyph = if visible {
                         egui_phosphor::regular::EYE
@@ -838,6 +856,7 @@ pub fn layer_row(
                         rect,
                         radius::R_1,
                         Stroke::new(1.0, Color32::from_black_alpha(40)),
+                        egui::StrokeKind::Middle,
                     );
                     ui.add(
                         egui::Label::new(
@@ -846,7 +865,7 @@ pub fn layer_row(
                                 .size(11.0)
                                 .color(p.fg_1),
                         )
-                        .truncate(true),
+                        .truncate(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -924,7 +943,9 @@ pub fn icon_toggle_button(
         painter.rect_filled(rect, radius::R_2, bg);
     }
     let font = egui::FontId::proportional(14.0);
-    let galley = ui.fonts(|f| f.layout_no_wrap(glyph.to_owned(), font.clone(), fg));
+    let galley = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap(glyph.to_owned(), font.clone(), fg));
     let pos = egui::pos2(
         rect.center().x - galley.size().x * 0.5,
         rect.center().y - galley.size().y * 0.5,
@@ -956,8 +977,8 @@ pub fn apply_style(style: &mut egui::Style) {
     let s = &mut style.spacing;
     s.item_spacing = Vec2::new(sp::SP_2, sp::SP_1);
     s.button_padding = Vec2::new(sp::SP_2, sp::SP_1);
-    s.menu_margin = egui::Margin::symmetric(sp::SP_1, sp::SP_1);
-    s.window_margin = egui::Margin::same(sp::SP_3);
+    s.menu_margin = egui::Margin::symmetric(sp::SP_1 as i8, sp::SP_1 as i8);
+    s.window_margin = egui::Margin::same(sp::SP_3 as i8);
     s.indent = sp::SP_4;
     s.interact_size.y = 22.0;
     s.icon_width = 14.0;
