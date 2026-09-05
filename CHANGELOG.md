@@ -11,6 +11,14 @@
 * ✨ clickable 2D overlays bound to their backing row via marker `source_row`, with reason-first summary card for rejected-fit rows.
 * ✨ generic host action bus: plugins declare `HostActionDescriptor`s with `Dataset`/`Row`/`Cluster` scope and an optional `param_schema`; the host renders scope-aware buttons plus a schema-driven modal and publishes `HostActionRequest`s to `CTX_INVESTIGATION_ACTION_REQUESTS`.
 
+## [2.1.1](https://github.com/muthmann/augur-rs/compare/v2.1.0...v2.1.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **gui:** 🐛 upgrade to eframe 0.35 so debug builds start on macOS 26 ([1358d3b](https://github.com/muthmann/augur-rs/commit/1358d3b3ee61b7709375a09ec884aa9a218de302))
+* **gui:** 🐛 upgrade to eframe 0.35 so debug builds start on macOS 26 ([2ce0405](https://github.com/muthmann/augur-rs/commit/2ce040537f0545b5ca530ef0a0c7ac7e31335063))
+
 ## [2.1.0](https://github.com/muthmann/augur-rs/compare/v2.0.2...v2.1.0) (2026-08-14)
 
 
