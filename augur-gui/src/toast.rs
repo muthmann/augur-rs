@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, FontId, Rect, Rounding, Stroke, Vec2};
+use egui::{Color32, CornerRadius, FontId, Rect, Stroke, Vec2};
 
 /// A single toast notification.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl ToastQueue {
             return;
         }
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let margin = 16.0;
         let toast_width = 280.0;
         let toast_padding_x = 12.0;
@@ -75,9 +75,9 @@ impl ToastQueue {
 
         // Render from bottom to top so the newest toast is at the bottom.
         for toast in self.toasts.iter().rev() {
-            let palette = crate::theme::palette_for_visuals(&ctx.style().visuals);
+            let palette = crate::theme::palette_for_visuals(&ctx.style_of(ctx.theme()).visuals);
             let font = FontId::monospace(12.0);
-            let galley = ctx.fonts(|f| {
+            let galley = ctx.fonts_mut(|f| {
                 f.layout(
                     toast.message.clone(),
                     font,
@@ -100,27 +100,28 @@ impl ToastQueue {
             // Background fill
             painter.rect_filled(
                 toast_rect,
-                Rounding::same(crate::theme::radius::R_2),
+                CornerRadius::same(crate::theme::radius::R_2),
                 palette.bg_1,
             );
             // Border
             painter.rect_stroke(
                 toast_rect,
-                Rounding::same(crate::theme::radius::R_2),
+                CornerRadius::same(crate::theme::radius::R_2),
                 Stroke::new(1.0, palette.line),
+                egui::StrokeKind::Middle,
             );
             // Left accent border
             let accent_rect =
                 Rect::from_min_size(toast_rect.min, Vec2::new(border_left, toast_rect.height()));
             painter.rect_filled(
                 accent_rect,
-                Rounding {
+                CornerRadius {
                     nw: crate::theme::radius::R_2,
                     sw: crate::theme::radius::R_2,
-                    ne: 0.0,
-                    se: 0.0,
+                    ne: 0,
+                    se: 0,
                 },
-                toast.tone.border_color(&ctx.style().visuals),
+                toast.tone.border_color(&ctx.style_of(ctx.theme()).visuals),
             );
             // Text
             let text_pos = egui::pos2(

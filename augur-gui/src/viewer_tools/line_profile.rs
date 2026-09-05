@@ -120,7 +120,7 @@ impl LineProfileTool {
 
         let shared = Arc::clone(&self.shared);
         let viewport_id = egui::ViewportId::from_hash_of("viewer_line_profile_window");
-        let viewport_visuals = ctx.style().visuals.clone();
+        let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
         ctx.show_viewport_deferred(
             viewport_id,
             egui::ViewportBuilder::default()
@@ -139,7 +139,7 @@ impl LineProfileTool {
                             }
                         }
                     }
-                    egui::viewport::ViewportClass::Embedded => {
+                    egui::viewport::ViewportClass::EmbeddedWindow => {
                         let mut open = true;
                         egui::Window::new(LINE_PROFILE_VIEWPORT_TITLE)
                             .open(&mut open)
@@ -233,22 +233,10 @@ fn render_line_profile_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<LineProfil
         .legend(Legend::default())
         .height(260.0)
         .show(ui, |plot_ui| {
-            plot_ui.line(
-                Line::new(on_points)
-                    .name("ON")
-                    .color(Color32::from_rgb(0, 220, 120)),
-            );
-            plot_ui.line(
-                Line::new(off_points)
-                    .name("OFF")
-                    .color(Color32::from_rgb(255, 96, 96)),
-            );
+            plot_ui.line(Line::new("ON", on_points).color(Color32::from_rgb(0, 220, 120)));
+            plot_ui.line(Line::new("OFF", off_points).color(Color32::from_rgb(255, 96, 96)));
             if show_sum {
-                plot_ui.line(
-                    Line::new(sum_points)
-                        .name("Sum")
-                        .color(Color32::from_rgb(140, 180, 255)),
-                );
+                plot_ui.line(Line::new("Sum", sum_points).color(Color32::from_rgb(140, 180, 255)));
             }
         });
     ui.checkbox(&mut data.show_sum, "Show ON+OFF sum");

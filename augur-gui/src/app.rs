@@ -1531,10 +1531,12 @@ impl CameraApp {
             .and_then(|storage| storage.get_string(UI_THEME_STORAGE_KEY))
             .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_else(|| {
-                UiThemePreference::from_dark_mode(cc.egui_ctx.style().visuals.dark_mode)
+                UiThemePreference::from_dark_mode(
+                    cc.egui_ctx.style_of(cc.egui_ctx.theme()).visuals.dark_mode,
+                )
             });
         cc.egui_ctx.set_visuals(theme_preference.visuals());
-        cc.egui_ctx.style_mut(crate::theme::apply_style);
+        cc.egui_ctx.all_styles_mut(crate::theme::apply_style);
 
         // Load the owl brand mark once. Falls back to None if the asset is
         // missing — the menubar wordmark still renders without it.
@@ -1733,7 +1735,7 @@ impl CameraApp {
 
     fn apply_theme_to_ctx(&self, ctx: &egui::Context) {
         ctx.set_visuals(self.theme_preference.visuals());
-        ctx.style_mut(crate::theme::apply_style);
+        ctx.all_styles_mut(crate::theme::apply_style);
     }
 
     fn set_theme_preference(&mut self, ctx: &egui::Context, theme_preference: UiThemePreference) {
@@ -2030,7 +2032,8 @@ impl CameraApp {
                                         egui::vec2(ui.available_width(), 22.0),
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
-                                            ui.style_mut().wrap = Some(false);
+                                            ui.style_mut().wrap_mode =
+                                                Some(egui::TextWrapMode::Extend);
                                             ui.spacing_mut().item_spacing.x =
                                                 crate::theme::sp::SP_2;
                                             ui.label(
@@ -2455,13 +2458,13 @@ impl CameraApp {
                     ui.memory_mut(|mem| {
                         mem.data.insert_temp(detail_key, true);
                     });
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Isolate").clicked() {
                     self.with_active_viewer_mut(|viewer| {
                         viewer.investigation.isolate_layer(layer_id);
                     });
-                    ui.close_menu();
+                    ui.close();
                 }
             });
 
@@ -2488,7 +2491,7 @@ impl CameraApp {
                         if is_raw_event_layer {
                             ui.weak("3D sprites");
                         } else {
-                            egui::ComboBox::from_id_source(("investigation_layer_shape", layer_id))
+                            egui::ComboBox::from_id_salt(("investigation_layer_shape", layer_id))
                                 .selected_text(host_marker_shape_label(style.marker_shape))
                                 .show_ui(ui, |ui| {
                                     for shape in [
@@ -3217,8 +3220,7 @@ impl CameraApp {
 
                         ui.label(egui::RichText::new("Port").size(small_size));
                         ui.add(
-                            egui::DragValue::new(&mut self.imagej_dialog.port)
-                                .clamp_range(1..=u16::MAX),
+                            egui::DragValue::new(&mut self.imagej_dialog.port).range(1..=u16::MAX),
                         );
                         ui.end_row();
                     });
@@ -5786,7 +5788,8 @@ impl CameraApp {
     /// Render the bottom multi-view dock — a tab strip plus the active
     /// tab's body. Only renders while at least one tab resolves to a live host
     /// view and the dock is not collapsed.
-    fn render_host_view_dock(&mut self, ctx: &egui::Context) {
+    fn render_host_view_dock(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         // `dock_tabs` records what the user wants docked, so tabs are never
         // dropped here: an epoch bump or a plugin reload empties the registry
         // for a few frames, and pruning would silently retire those views for
@@ -5812,9 +5815,9 @@ impl CameraApp {
         if !self.dock_open {
             // Collapsed: render a thin strip with tab names so the user can
             // see what's docked at a glance.
-            egui::TopBottomPanel::bottom("host_view_dock_collapsed")
+            egui::Panel::bottom("host_view_dock_collapsed")
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     clip_to_panel(ui);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_2;
@@ -5850,21 +5853,21 @@ impl CameraApp {
             return;
         }
 
-        let dock_max_height = dock_max_height(ctx.screen_rect().height());
+        let dock_max_height = dock_max_height(ctx.viewport_rect().height());
         let dock_height = self.dock_height.clamp(DOCK_MIN_HEIGHT, dock_max_height);
         let mut new_height = None;
-        let mut panel = egui::TopBottomPanel::bottom("host_view_dock")
+        let mut panel = egui::Panel::bottom("host_view_dock")
             .resizable(true)
-            .min_height(DOCK_MIN_HEIGHT)
-            .default_height(dock_height);
+            .min_size(DOCK_MIN_HEIGHT)
+            .default_size(dock_height);
         if let Some(requested) = self.dock_height_request.take() {
             // egui keeps the panel height in its own `PanelState` once the
             // panel has been shown, so `default_height` no longer bites and a
             // programmatic resize has to go through the height range.
             let forced = requested.clamp(DOCK_MIN_HEIGHT, dock_max_height);
-            panel = panel.height_range(forced..=forced);
+            panel = panel.size_range(forced..=forced);
         }
-        let panel_response = panel.show(ctx, |ui| {
+        let panel_response = panel.show(ui, |ui| {
             clip_to_panel(ui);
             new_height = Some(ui.available_size().y + 0.0);
             // Resizer handle: centered 28×2 px bar at the top edge.
@@ -5928,7 +5931,7 @@ impl CameraApp {
             // screen, so the overflow painted over the side panels).
             let tabs_width = dock_tab_strip_width(ui.available_width());
             egui::ScrollArea::horizontal()
-                .id_source("host_view_dock_tab_strip")
+                .id_salt("host_view_dock_tab_strip")
                 .max_width(tabs_width)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
@@ -6001,12 +6004,12 @@ impl CameraApp {
 
     /// True while the dock fills its maximum share of the window.
     fn dock_is_maximized(&self, ctx: &egui::Context) -> bool {
-        self.dock_height >= dock_max_height(ctx.screen_rect().height()) - 1.0
+        self.dock_height >= dock_max_height(ctx.viewport_rect().height()) - 1.0
     }
 
     /// Maximize the dock, or restore the height it had before maximizing.
     fn toggle_dock_maximized(&mut self, ctx: &egui::Context) {
-        let max = dock_max_height(ctx.screen_rect().height());
+        let max = dock_max_height(ctx.viewport_rect().height());
         if self.dock_is_maximized(ctx) {
             let restored = self
                 .dock_height_before_maximize
@@ -6054,17 +6057,17 @@ impl CameraApp {
             } else {
                 palette.bg_2
             };
-            let tab_frame = egui::Frame::none()
+            let tab_frame = egui::Frame::NONE
                 .fill(bg)
-                .rounding(egui::Rounding {
+                .corner_radius(egui::CornerRadius {
                     nw: crate::theme::radius::R_2,
                     ne: crate::theme::radius::R_2,
-                    sw: 0.0,
-                    se: 0.0,
+                    sw: 0,
+                    se: 0,
                 })
                 .inner_margin(egui::Margin::symmetric(
-                    crate::theme::sp::SP_2,
-                    crate::theme::sp::SP_1,
+                    crate::theme::sp::SP_2 as i8,
+                    crate::theme::sp::SP_1 as i8,
                 ));
             let tab_response = tab_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -6388,22 +6391,23 @@ impl CameraApp {
                     );
                     let shared_for_viewport = Arc::clone(&shared);
                     let window_title = title.clone();
-                    let viewport_visuals = ctx.style().visuals.clone();
+                    let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| {
+                        move |ui, class| {
+                            let ctx = &ui.ctx().clone();
                             ctx.set_visuals(viewport_visuals.clone());
                             match class {
                                 egui::viewport::ViewportClass::Deferred => {
-                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
                                         render_table_window_viewport(ui, &shared_for_viewport);
                                     });
                                     finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
-                                egui::viewport::ViewportClass::Embedded => {
+                                egui::viewport::ViewportClass::EmbeddedWindow => {
                                     let mut open = true;
                                     egui::Window::new(&window_title)
                                         .open(&mut open)
@@ -6564,17 +6568,18 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
-                    let viewport_visuals = ctx.style().visuals.clone();
+                    let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1200.0, 860.0]),
-                        move |ctx, class| {
+                        move |ui, class| {
+                            let ctx = &ui.ctx().clone();
                             ctx.set_visuals(viewport_visuals.clone());
                             match class {
                                 egui::viewport::ViewportClass::Deferred => {
-                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
                                         render_density_window_viewport(
                                             ui,
                                             &view_id,
@@ -6583,7 +6588,7 @@ impl CameraApp {
                                     });
                                     finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
-                                egui::viewport::ViewportClass::Embedded => {
+                                egui::viewport::ViewportClass::EmbeddedWindow => {
                                     let mut open = true;
                                     egui::Window::new(&window_title)
                                         .open(&mut open)
@@ -6683,17 +6688,18 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
-                    let viewport_visuals = ctx.style().visuals.clone();
+                    let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| {
+                        move |ui, class| {
+                            let ctx = &ui.ctx().clone();
                             ctx.set_visuals(viewport_visuals.clone());
                             match class {
                                 egui::viewport::ViewportClass::Deferred => {
-                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
                                         render_scatter_window_viewport(
                                             ui,
                                             &view_id,
@@ -6702,7 +6708,7 @@ impl CameraApp {
                                     });
                                     finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
-                                egui::viewport::ViewportClass::Embedded => {
+                                egui::viewport::ViewportClass::EmbeddedWindow => {
                                     let mut open = true;
                                     egui::Window::new(&window_title)
                                         .open(&mut open)
@@ -6810,17 +6816,18 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
-                    let viewport_visuals = ctx.style().visuals.clone();
+                    let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| {
+                        move |ui, class| {
+                            let ctx = &ui.ctx().clone();
                             ctx.set_visuals(viewport_visuals.clone());
                             match class {
                                 egui::viewport::ViewportClass::Deferred => {
-                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
                                         render_image_window_viewport(
                                             ui,
                                             &view_id,
@@ -6829,7 +6836,7 @@ impl CameraApp {
                                     });
                                     finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
-                                egui::viewport::ViewportClass::Embedded => {
+                                egui::viewport::ViewportClass::EmbeddedWindow => {
                                     let mut open = true;
                                     egui::Window::new(&window_title)
                                         .open(&mut open)
@@ -6918,17 +6925,18 @@ impl CameraApp {
                     let shared_for_viewport = Arc::clone(&shared);
                     let view_id = view.descriptor.id.clone();
                     let window_title = title.clone();
-                    let viewport_visuals = ctx.style().visuals.clone();
+                    let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
                     ctx.show_viewport_deferred(
                         viewport_id,
                         egui::ViewportBuilder::default()
                             .with_title(&window_title)
                             .with_inner_size([1100.0, 760.0]),
-                        move |ctx, class| {
+                        move |ui, class| {
+                            let ctx = &ui.ctx().clone();
                             ctx.set_visuals(viewport_visuals.clone());
                             match class {
                                 egui::viewport::ViewportClass::Deferred => {
-                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                    egui::CentralPanel::default().show(ui, |ui| {
                                         render_series_window_viewport(
                                             ui,
                                             &view_id,
@@ -6952,7 +6960,7 @@ impl CameraApp {
                                     }
                                     finish_host_window_pass(ctx, &shared_for_viewport);
                                 }
-                                egui::viewport::ViewportClass::Embedded => {
+                                egui::viewport::ViewportClass::EmbeddedWindow => {
                                     let mut open = true;
                                     egui::Window::new(&window_title)
                                         .open(&mut open)
@@ -6998,7 +7006,10 @@ impl CameraApp {
                         self.toggle_host_view_dataset_frozen(&view.descriptor.dataset_id);
                     }
                     if export_png {
-                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Screenshot);
+                        ctx.send_viewport_cmd_to(
+                            viewport_id,
+                            egui::ViewportCommand::Screenshot(Default::default()),
+                        );
                         ctx.request_repaint_of(viewport_id);
                     }
                     if let Some(image) = screenshot {
@@ -9134,7 +9145,7 @@ impl CameraApp {
         ctx: &egui::Context,
         scene: &Investigation3dScene,
     ) {
-        if ctx.wants_keyboard_input() {
+        if ctx.egui_wants_keyboard_input() {
             return;
         }
 
@@ -9571,7 +9582,8 @@ impl CameraApp {
 }
 
 impl eframe::App for CameraApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.apply_theme_to_ctx(ctx);
         self.poll_replay_open_task();
         self.poll_python_ingress_requests();
@@ -9605,8 +9617,8 @@ impl eframe::App for CameraApp {
         let mut plugin_scan_requested = false;
         let mut open_plugins_dir_requested = false;
         let mut disconnect_external_tool_requested = false;
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 // ── Brand ─────────────────────────────────────────────────────
                 let palette = crate::theme::palette_for_visuals(ui.visuals());
                 if let Some(handle) = &self.brand_logo {
@@ -9646,12 +9658,12 @@ impl eframe::App for CameraApp {
                             .clicked()
                         {
                             self.open_tiff_stack_export_dialog();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if ui.button("Close Replay").clicked() {
                             self.stop_pipeline();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                     } else {
@@ -9675,7 +9687,7 @@ impl eframe::App for CameraApp {
                                 {
                                     self.output_path = path.display().to_string();
                                 }
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                         ui.horizontal(|ui| {
@@ -9696,7 +9708,7 @@ impl eframe::App for CameraApp {
                             .clicked()
                         {
                             self.open_replay_file();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                     }
@@ -9724,7 +9736,7 @@ impl eframe::App for CameraApp {
                                 );
                             }
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .add_enabled(
@@ -9785,7 +9797,7 @@ impl eframe::App for CameraApp {
                                 }
                             }
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     ui.menu_button("Named Profiles", |ui| {
@@ -9927,7 +9939,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.open_analysis_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     let runs_label = if self.analysis_runs.runs().is_empty() {
                         "Analysis Runs".to_owned()
@@ -9936,7 +9948,7 @@ impl eframe::App for CameraApp {
                     };
                     if ui.button(runs_label).clicked() {
                         self.analysis_runs.panel_open = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if self.analysis_runs.any_running() {
                         ui.separator();
@@ -9985,7 +9997,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.probe_camera();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui
@@ -9998,7 +10010,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.start_preview();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .add_enabled(
@@ -10010,7 +10022,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.start_recording();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .add_enabled(
@@ -10022,7 +10034,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.stop_pipeline();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .add_enabled(
@@ -10033,7 +10045,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.apply_runtime_changes();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if mode == AppMode::Replaying {
                         ui.separator();
@@ -10043,11 +10055,11 @@ impl eframe::App for CameraApp {
                             .clicked()
                         {
                             self.set_replay_paused(!self.replay_paused);
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Restart").clicked() {
                             self.restart_replay();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         ui.label("Speed:");
@@ -10151,7 +10163,7 @@ impl eframe::App for CameraApp {
                                 !camera_configuration_workflow_active,
                                 egui::DragValue::new(&mut self.nm_per_pixel)
                                     .speed(1.0)
-                                    .clamp_range(1.0..=10_000.0),
+                                    .range(1.0..=10_000.0),
                             )
                             .on_hover_text(PIXEL_SCALE_TOOLTIP);
                         if response.changed() {
@@ -10195,7 +10207,7 @@ impl eframe::App for CameraApp {
                                         && !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut self.sensor_width)
                                         .prefix("w ")
-                                        .clamp_range(1..=u16::MAX),
+                                        .range(1..=u16::MAX),
                                 )
                                 .on_hover_text(SENSOR_DIMENSIONS_TOOLTIP);
                             if width_response.changed() {
@@ -10207,7 +10219,7 @@ impl eframe::App for CameraApp {
                                         && !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut self.sensor_height)
                                         .prefix("h ")
-                                        .clamp_range(1..=u16::MAX),
+                                        .range(1..=u16::MAX),
                                 )
                                 .on_hover_text(SENSOR_DIMENSIONS_TOOLTIP);
                             if height_response.changed() {
@@ -10249,7 +10261,7 @@ impl eframe::App for CameraApp {
                                 .add_enabled(
                                     !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut preview_hz)
-                                        .clamp_range(5.0..=100.0)
+                                        .range(5.0..=100.0)
                                         .speed(0.5),
                                 )
                                 .on_hover_text(PREVIEW_UPDATE_TOOLTIP);
@@ -10273,7 +10285,7 @@ impl eframe::App for CameraApp {
                                 .add_enabled(
                                     !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut point_cloud_hz)
-                                        .clamp_range(2.0..=50.0)
+                                        .range(2.0..=50.0)
                                         .speed(0.5),
                                 )
                                 .on_hover_text(POINT_CLOUD_UPDATE_TOOLTIP);
@@ -10291,7 +10303,7 @@ impl eframe::App for CameraApp {
                                     mode == AppMode::Idle
                                         && !camera_configuration_workflow_active,
                                     egui::DragValue::new(&mut self.disk_writer_buffer_mib)
-                                        .clamp_range(1..=64),
+                                        .range(1..=64),
                                 )
                                 .on_hover_text(DISK_WRITER_BUFFER_TOOLTIP);
                             if response.changed() {
@@ -10430,7 +10442,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.settings_panel_open = !self.settings_panel_open;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .add(
@@ -10444,7 +10456,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.analysis_panel_open = !self.analysis_panel_open;
-                        ui.close_menu();
+                        ui.close();
                     }
                     let mut scale_bar_show =
                         self.with_active_viewer(|viewer| viewer.scale_bar_settings.show);
@@ -10514,13 +10526,13 @@ impl eframe::App for CameraApp {
                             )));
                             if ui.button("Stop Python Ingress").clicked() {
                                 self.stop_python_ingress_listener();
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                         None => {
                             if ui.button("Listen for Python Events…").clicked() {
                                 self.start_python_ingress_listener(ctx);
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     }
@@ -10529,13 +10541,13 @@ impl eframe::App for CameraApp {
                         ExternalToolStatus::Streaming | ExternalToolStatus::Connecting => {
                             if ui.button("Disconnect ImageJ bridge").clicked() {
                                 disconnect_external_tool_requested = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                         _ => {
                             if ui.button("Connect to ImageJ / Fiji…").clicked() {
                                 self.imagej_dialog.open = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     }
@@ -10548,7 +10560,7 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         self.plugins_window_open = !self.plugins_window_open;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui
                         .add_enabled(
@@ -10558,11 +10570,11 @@ impl eframe::App for CameraApp {
                         .clicked()
                     {
                         plugin_scan_requested = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Open Plugins Folder").clicked() {
                         open_plugins_dir_requested = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -10579,13 +10591,13 @@ impl eframe::App for CameraApp {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
                             "https://github.com/muthmann/augur-rs#readme",
                         ));
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Report an issue").clicked() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
                             "https://github.com/muthmann/augur-rs/issues",
                         ));
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -10753,11 +10765,11 @@ impl eframe::App for CameraApp {
         }
 
         if self.settings_panel_open {
-            egui::SidePanel::left("settings")
-                .exact_width(224.0)
+            egui::Panel::left("settings")
+                .exact_size(224.0)
                 .resizable(false)
                 .show_separator_line(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     if crate::theme::panel_header(
                         ui,
                         Some(egui_phosphor::regular::SLIDERS_HORIZONTAL),
@@ -10779,10 +10791,10 @@ impl eframe::App for CameraApp {
                     // the window at 1210x768 — reachable by screen readers,
                     // invisible to everyone else.
                     if mode != AppMode::Replaying {
-                        egui::TopBottomPanel::bottom("settings_footer")
-                            .frame(egui::Frame::none())
+                        egui::Panel::bottom("settings_footer")
+                            .frame(egui::Frame::NONE)
                             .show_separator_line(false)
-                            .show_inside(ui, |ui| {
+                            .show(ui, |ui| {
                                 ui.separator();
                                 if matches!(mode, AppMode::Previewing | AppMode::Recording) {
                                     let dirty = self.config_dirty || self.acq_dirty;
@@ -10872,18 +10884,18 @@ impl eframe::App for CameraApp {
                         });
                 });
         } else {
-            egui::SidePanel::left("settings-collapsed")
-                .exact_width(COLLAPSED_PANEL_WIDTH)
+            egui::Panel::left("settings-collapsed")
+                .exact_size(COLLAPSED_PANEL_WIDTH)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame({
                     // Zero inner margin: keeps set_min_width(32) within panel_rect
                     // so allocate_left_panel allocates exactly 32px, not 48px.
-                    let mut f = egui::Frame::side_top_panel(&ctx.style());
+                    let mut f = egui::Frame::side_top_panel(&ctx.style_of(ctx.theme()));
                     f.inner_margin = egui::Margin::ZERO;
                     f
                 })
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(crate::theme::sp::SP_2);
                         if ui
@@ -10907,14 +10919,14 @@ impl eframe::App for CameraApp {
         let hotpixel_enabled = self.hotpixel_detection.enabled();
         let has_analysis_extensions = hotpixel_enabled || !enabled_plugin_names.is_empty();
         if self.analysis_panel_open {
-            egui::SidePanel::right("analysis")
-                .default_width(ANALYSIS_PANEL_WIDTH)
-                .min_width(320.0)
-                .max_width(420.0)
+            egui::Panel::right("analysis")
+                .default_size(ANALYSIS_PANEL_WIDTH)
+                .min_size(320.0)
+                .max_size(420.0)
                 .resizable(true)
                 .show_separator_line(false)
-                .show(ctx, |ui| {
-                    ui.style_mut().wrap = Some(true);
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                     ui.vertical(|ui| {
                         if crate::theme::panel_header(
                             ui,
@@ -10928,7 +10940,7 @@ impl eframe::App for CameraApp {
                             self.analysis_panel_open = false;
                         }
                         egui::ScrollArea::vertical()
-                            .id_source("analysis_panel_scroll")
+                            .id_salt("analysis_panel_scroll")
                             .hscroll(false)
                             .horizontal_scroll_offset(0.0)
                             // `auto_shrink: [false, false]` — keep the
@@ -10936,15 +10948,15 @@ impl eframe::App for CameraApp {
                             // height changes (e.g. when a collapse opens).
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                egui::Frame::none()
+                                egui::Frame::NONE
                                     .inner_margin(egui::Margin {
-                                        left: crate::theme::sp::SP_3,
-                                        right: crate::theme::sp::SP_4,
-                                        top: 0.0,
-                                        bottom: crate::theme::sp::SP_3,
+                                        left: crate::theme::sp::SP_3 as i8,
+                                        right: crate::theme::sp::SP_4 as i8,
+                                        top: 0,
+                                        bottom: crate::theme::sp::SP_3 as i8,
                                     })
                                     .show(ui, |ui| {
-                                        ui.style_mut().wrap = Some(true);
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                                         self.render_investigation_inspector(ui);
 
                                         if has_analysis_extensions {
@@ -11106,7 +11118,7 @@ impl eframe::App for CameraApp {
                                                                         let p = crate::theme::palette_for_visuals(
                                                                             ui.visuals(),
                                                                         );
-                                                                        ui.style_mut().wrap = Some(false);
+                                                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                                                         if ui
                                                                             .add_enabled_ui(
                                                                                 !camera_configuration_workflow_active,
@@ -11142,7 +11154,7 @@ impl eframe::App for CameraApp {
                                                                                         .size(13.0)
                                                                                         .color(p.fg_2),
                                                                                     )
-                                                                                    .truncate(true),
+                                                                                    .truncate(),
                                                                                 );
                                                                             },
                                                                         );
@@ -11197,7 +11209,7 @@ impl eframe::App for CameraApp {
                                                             // its width from content and overflows the
                                                             // allocated row, which grows the stored
                                                             // SidePanel width (see `layer_row`).
-                                                            ui.style_mut().wrap = Some(false);
+                                                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                                             if ui
                                                                 .add_enabled_ui(
                                                                     !camera_configuration_workflow_active,
@@ -11248,7 +11260,7 @@ impl eframe::App for CameraApp {
                                                                             .size(13.0)
                                                                             .color(p.ink),
                                                                         )
-                                                                        .truncate(true),
+                                                                        .truncate(),
                                                                     );
                                                                 },
                                                             );
@@ -11327,16 +11339,16 @@ impl eframe::App for CameraApp {
                     });
                 });
         } else {
-            egui::SidePanel::right("analysis_collapsed")
-                .exact_width(COLLAPSED_PANEL_WIDTH)
+            egui::Panel::right("analysis_collapsed")
+                .exact_size(COLLAPSED_PANEL_WIDTH)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame({
-                    let mut f = egui::Frame::side_top_panel(&ctx.style());
+                    let mut f = egui::Frame::side_top_panel(&ctx.style_of(ctx.theme()));
                     f.inner_margin = egui::Margin::ZERO;
                     f
                 })
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(crate::theme::sp::SP_2);
                         if ui
@@ -11529,7 +11541,7 @@ impl eframe::App for CameraApp {
         self.handle_investigation_shortcuts(ctx, &investigation_scene_3d);
 
         // Global camera and panel shortcuts shown by the menus.
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let (start_preview, start_recording, stop_capture, toggle_settings, toggle_analysis) =
                 ctx.input_mut(|input| {
                     (
@@ -11579,10 +11591,10 @@ impl eframe::App for CameraApp {
         }
 
         if !self.popup_open {
-            self.render_host_view_dock(ctx);
+            self.render_host_view_dock(ui);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.popup_open {
                 let max_image_height = (ui.available_size().y - 56.0).max(180.0);
                 draw_text_placeholder(ui, max_image_height, "Preview open in separate window");
@@ -11805,20 +11817,21 @@ impl eframe::App for CameraApp {
 
         if self.popup_open {
             let shared = Arc::clone(&self.popup_shared);
-            let viewport_visuals = ctx.style().visuals.clone();
+            let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
             ctx.show_viewport_deferred(
                 egui::ViewportId::from_hash_of("popup_preview"),
                 egui::ViewportBuilder::default()
                     .with_title("Preview \u{2014} AugurRS")
                     .with_inner_size([1280.0, 820.0]),
-                move |ctx, class| {
+                move |ui, class| {
+                    let ctx = &ui.ctx().clone();
                     ctx.set_visuals(viewport_visuals.clone());
                     match class {
                         egui::viewport::ViewportClass::Deferred => {
                             let mut root_repaint_requested = false;
                             let mut repaint_after = None;
                             if let Ok(mut data) = shared.lock() {
-                                egui::CentralPanel::default().show(ctx, |ui| {
+                                egui::CentralPanel::default().show(ui, |ui| {
                                     let PopupSharedData {
                                         viewer,
                                         investigation_renderer,
@@ -12018,7 +12031,7 @@ impl eframe::App for CameraApp {
                                 request_root_repaint(ctx);
                             }
                         }
-                        egui::viewport::ViewportClass::Embedded => {
+                        egui::viewport::ViewportClass::EmbeddedWindow => {
                             let mut open = true;
                             egui::Window::new("Preview \u{2014} AugurRS")
                                 .open(&mut open)
@@ -12387,11 +12400,11 @@ fn shortcut_hint(ui: &mut egui::Ui, key: &str, label: &str) {
     let palette = crate::theme::palette_for_visuals(ui.visuals());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let key_frame = egui::Frame::none()
+        let key_frame = egui::Frame::NONE
             .fill(palette.bg_2)
             .stroke(egui::Stroke::new(1.0, palette.line))
-            .rounding(crate::theme::radius::R_1)
-            .inner_margin(egui::Margin::symmetric(4.0, 1.0));
+            .corner_radius(crate::theme::radius::R_1)
+            .inner_margin(egui::Margin::symmetric(4, 1));
         key_frame.show(ui, |ui| {
             ui.label(
                 egui::RichText::new(key)
@@ -12415,7 +12428,7 @@ fn notice_row(ui: &mut egui::Ui, glyph: &str, color: egui::Color32, message: &st
         |ui| {
             ui.spacing_mut().item_spacing.x = crate::theme::sp::SP_1;
             ui.label(egui::RichText::new(glyph).color(color));
-            ui.style_mut().wrap = Some(true);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.colored_label(color, message);
         },
     );
@@ -12423,7 +12436,7 @@ fn notice_row(ui: &mut egui::Ui, glyph: &str, color: egui::Color32, message: &st
 
 fn show_investigation_split(
     ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
     split_ratio: &mut f32,
     max_left_width: Option<f32>,
 ) -> (egui::Rect, egui::Rect) {
@@ -12440,7 +12453,7 @@ fn show_investigation_split(
 
 fn show_investigation_split_in_rect(
     ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
     split_ratio: &mut f32,
     full_rect: egui::Rect,
     max_left_width: Option<f32>,
@@ -12510,14 +12523,14 @@ fn show_investigation_split_in_rect(
 
 fn show_investigation_pane<R>(
     ui: &mut egui::Ui,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
     rect: egui::Rect,
     parent_clip: egui::Rect,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let pane_clip = rect.intersect(parent_clip);
     ui.push_id(id_source, |ui| {
-        ui.allocate_ui_at_rect(rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.set_clip_rect(pane_clip);
             ui.set_min_width(pane_clip.width().max(0.0));
             ui.set_min_height(pane_clip.height().max(0.0));
@@ -12906,7 +12919,7 @@ fn render_action_modal_schema(
                                 ui.label(&item.label);
                                 ui.add(
                                     egui::DragValue::new(&mut value)
-                                        .clamp_range(*min..=*max)
+                                        .range(*min..=*max)
                                         .speed(*speed),
                                 );
                             });
@@ -12922,7 +12935,7 @@ fn render_action_modal_schema(
                             let old = value;
                             ui.horizontal(|ui| {
                                 ui.label(&item.label);
-                                ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max));
+                                ui.add(egui::DragValue::new(&mut value).range(*min..=*max));
                             });
                             if value != old {
                                 object.insert(item.key.clone(), json!(value));
@@ -13512,19 +13525,19 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 860.0));
         let ctx = egui::Context::default();
         let mut observed = None;
-        let _ = ctx.run(
+        let _ = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(screen),
                 ..Default::default()
             },
-            |ctx| {
-                egui::SidePanel::left("settings")
-                    .exact_width(224.0)
-                    .show(ctx, |_| {});
-                egui::SidePanel::right("analysis")
-                    .exact_width(360.0)
-                    .show(ctx, |_| {});
-                egui::TopBottomPanel::bottom("host_view_dock").show(ctx, |ui| {
+            |ui| {
+                egui::Panel::left("settings")
+                    .exact_size(224.0)
+                    .show(ui, |_| {});
+                egui::Panel::right("analysis")
+                    .exact_size(360.0)
+                    .show(ui, |_| {});
+                egui::Panel::bottom("host_view_dock").show(ui, |ui| {
                     let inherited = ui.clip_rect();
                     clip_to_panel(ui);
                     observed = Some((inherited, ui.clip_rect(), ui.max_rect()));
@@ -13533,11 +13546,14 @@ mod tests {
         );
 
         let (inherited, clipped, panel) = observed.expect("the dock panel ran");
-        // egui hands every panel a screen-wide clip rect: without clipping, a
-        // tab strip wider than the dock paints over the analysis side panel.
+        // Up to egui 0.31 every panel inherited a screen-wide clip rect, so a tab
+        // strip wider than the dock painted over the analysis side panel; egui
+        // 0.35 narrows the inherited rect to the space the side panels leave.
+        // Assert the guarantee the dock depends on rather than either version's
+        // starting point: nothing the dock inherits reaches the side panels.
         assert!(
-            inherited.right() >= screen.right() - 0.5,
-            "expected the inherited panel clip rect to span the screen, got {inherited:?}"
+            inherited.right() <= screen.right() - 360.0 + 0.5,
+            "expected the inherited panel clip rect to stop at the analysis side panel, got {inherited:?}"
         );
         assert!(
             clipped.right() <= panel.right() + 0.5,

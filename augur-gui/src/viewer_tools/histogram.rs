@@ -110,7 +110,7 @@ impl HistogramWindow {
 
         let shared = Arc::clone(&self.shared);
         let viewport_id = egui::ViewportId::from_hash_of("viewer_histogram_window");
-        let viewport_visuals = ctx.style().visuals.clone();
+        let viewport_visuals = ctx.style_of(ctx.theme()).visuals.clone();
         ctx.show_viewport_deferred(
             viewport_id,
             egui::ViewportBuilder::default()
@@ -129,7 +129,7 @@ impl HistogramWindow {
                             }
                         }
                     }
-                    egui::viewport::ViewportClass::Embedded => {
+                    egui::viewport::ViewportClass::EmbeddedWindow => {
                         let mut open = true;
                         egui::Window::new(HISTOGRAM_VIEWPORT_TITLE)
                             .open(&mut open)
@@ -220,10 +220,12 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         .include_y(plot_max)
         .x_axis_label(x_axis_label)
         .y_axis_label(y_axis_label)
-        .label_formatter(move |_name, value| {
-            let bin = value.x.round().clamp(0.0, max_bin as f64) as usize;
+        .label_formatter(move |hover| {
+            let (egui_plot::HoverPosition::NearDataPoint { position, .. }
+            | egui_plot::HoverPosition::Elsewhere { position }) = hover;
+            let bin = position.x.round().clamp(0.0, max_bin as f64) as usize;
             let count = histogram_for_hover.get(bin).copied().unwrap_or_default();
-            format!("Pixel value: {bin}\nPixels: {count}")
+            Some(format!("Pixel value: {bin}\nPixels: {count}"))
         })
         .height(220.0)
         .show(ui, |plot_ui| {
@@ -239,9 +241,11 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
             let handle_y = plot_max * 0.03;
             let label_y = plot_max.max(1.0) * 0.98;
 
-            plot_ui.bar_chart(BarChart::new(bars).color(Color32::from_rgb(200, 200, 220)));
+            plot_ui.bar_chart(
+                BarChart::new("Histogram", bars).color(Color32::from_rgb(200, 200, 220)),
+            );
             plot_ui.vline(
-                VLine::new(f64::from(data.contrast.display_min))
+                VLine::new("Min", f64::from(data.contrast.display_min))
                     .color(if min_active {
                         Color32::from_rgb(120, 240, 255)
                     } else {
@@ -251,7 +255,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
                     .style(LineStyle::Solid),
             );
             plot_ui.vline(
-                VLine::new(f64::from(data.contrast.display_max))
+                VLine::new("Max", f64::from(data.contrast.display_max))
                     .color(if max_active {
                         Color32::from_rgb(255, 226, 120)
                     } else {
@@ -261,19 +265,26 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
                     .style(LineStyle::Solid),
             );
             plot_ui.points(
-                Points::new(vec![[f64::from(data.contrast.display_min), handle_y]])
-                    .shape(MarkerShape::Down)
-                    .radius(if min_active { 8.0_f32 } else { 6.0_f32 })
-                    .color(Color32::from_rgb(0, 220, 255)),
+                Points::new(
+                    "Min handle",
+                    vec![[f64::from(data.contrast.display_min), handle_y]],
+                )
+                .shape(MarkerShape::Down)
+                .radius(if min_active { 8.0_f32 } else { 6.0_f32 })
+                .color(Color32::from_rgb(0, 220, 255)),
             );
             plot_ui.points(
-                Points::new(vec![[f64::from(data.contrast.display_max), handle_y]])
-                    .shape(MarkerShape::Down)
-                    .radius(if max_active { 8.0_f32 } else { 6.0_f32 })
-                    .color(Color32::from_rgb(255, 196, 64)),
+                Points::new(
+                    "Max handle",
+                    vec![[f64::from(data.contrast.display_max), handle_y]],
+                )
+                .shape(MarkerShape::Down)
+                .radius(if max_active { 8.0_f32 } else { 6.0_f32 })
+                .color(Color32::from_rgb(255, 196, 64)),
             );
             plot_ui.text(
                 Text::new(
+                    "Min label",
                     PlotPoint::new(f64::from(data.contrast.display_min), label_y),
                     format!("Min {}", data.contrast.display_min),
                 )
@@ -282,6 +293,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
             );
             plot_ui.text(
                 Text::new(
+                    "Max label",
                     PlotPoint::new(f64::from(data.contrast.display_max), label_y),
                     format!("Max {}", data.contrast.display_max),
                 )
@@ -382,6 +394,7 @@ fn render_histogram_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<HistogramView
         gradient_rect,
         1.0,
         egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Middle,
     );
     ui.small(match data.mode {
         PreviewMode::Intensity(colormap) => format!("{} display ramp", colormap.label()),

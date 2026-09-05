@@ -457,8 +457,8 @@ impl WgpuInvestigation3dRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("augur_investigation_3d_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -481,7 +481,8 @@ impl WgpuInvestigation3dRenderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<PointInstanceRaw>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
@@ -516,7 +517,8 @@ impl WgpuInvestigation3dRenderer {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -539,13 +541,14 @@ impl WgpuInvestigation3dRenderer {
                 // that happened to be drawn later, punching see-through holes
                 // in the cloud. Blended point sprites render without depth
                 // writes.
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         Ok(Self {
@@ -714,8 +717,10 @@ impl WgpuInvestigation3dRenderer {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("augur_investigation_3d_render_pass"),
+                multiview_mask: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: display_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -863,7 +868,7 @@ pub(crate) fn draw_investigation_3d_canvas(
         state.apply_drag(Vec2::new(delta.x, delta.y), pan);
     }
     if response.hovered() {
-        let scroll_y = ui.ctx().input(|input| input.raw_scroll_delta.y);
+        let scroll_y = ui.ctx().input(|input| input.smooth_scroll_delta.y);
         state.apply_zoom(scroll_y);
     }
 
@@ -1007,15 +1012,16 @@ fn draw_3d_canvas_overlay(
         tray_rect,
         5.0,
         egui::Stroke::new(1.0, egui::Color32::from_white_alpha(50)),
+        egui::StrokeKind::Middle,
     );
 
     let content_rect = tray_rect.shrink2(egui::vec2(6.0, 4.0));
-    ui.allocate_ui_at_rect(content_rect, |ui| {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
         // The overlay styling and the control row are shared between the
         // scrolling single-row tray and the wrapped two-row tray, so both
         // are bound once and consumed by exactly one branch below.
         let style_overlay = |ui: &mut egui::Ui| {
-            ui.style_mut().wrap = Some(false);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
             ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
             ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
@@ -1107,7 +1113,7 @@ fn draw_3d_canvas_overlay(
                     ui.add_sized(
                         egui::vec2(68.0, 18.0),
                         egui::DragValue::new(&mut history.point_limit)
-                            .clamp_range(1_000..=100_000)
+                            .range(1_000..=100_000)
                             .speed(1_000.0),
                     )
                     .on_hover_text("Maximum raw-event points sampled into the 3D view.");
@@ -1173,7 +1179,7 @@ fn draw_3d_canvas_overlay(
             .inner
         } else {
             egui::ScrollArea::horizontal()
-                .id_source("investigation_3d_canvas_overlay")
+                .id_salt("investigation_3d_canvas_overlay")
                 .auto_shrink([false, false])
                 .max_height(30.0)
                 .show(ui, |ui| {
@@ -1257,7 +1263,7 @@ fn draw_3d_status_footer(
                 });
 
                 egui::CollapsingHeader::new("View details")
-                    .id_source("investigation_3d_view_details")
+                    .id_salt("investigation_3d_view_details")
                     .default_open(false)
                     .show(ui, |ui| {
                         crate::theme::constrain_section_width(ui);
@@ -1298,7 +1304,7 @@ fn draw_3d_status_footer(
                                 )
                                 .small(),
                             )
-                            .wrap(true),
+                            .wrap(),
                         );
                         ui.add(
                             egui::Label::new(
@@ -1307,7 +1313,7 @@ fn draw_3d_status_footer(
                                 )
                                 .small(),
                             )
-                            .wrap(true),
+                            .wrap(),
                         );
                     });
             });

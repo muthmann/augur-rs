@@ -87,10 +87,12 @@ Exports stay generic:
 Dockable views are shown either as tabs in the bottom host-view dock or as popped-out OS windows.
 Three host-side rules keep that surface predictable:
 
-- **The dock never claims space it does not own.** egui gives every panel a screen-wide clip rect,
-  so the dock clips its own contents (`clip_to_panel`) and scrolls its tab strip horizontally with
-  the control cluster (pop out / maximize / collapse) reserved on the right. Without this a long tab
-  strip paints across the analysis side panel.
+- **The dock never claims space it does not own.** The dock clips its own contents
+  (`clip_to_panel`) and scrolls its tab strip horizontally with the control cluster (pop out /
+  maximize / collapse) reserved on the right. Without this a long tab strip paints across the
+  analysis side panel — which is exactly what happened up to egui 0.31, where every panel inherited
+  a screen-wide clip rect. egui 0.35 narrows that inherited rect itself; the explicit clip stays so
+  the dock's own rect, not egui's default, defines the bound.
 - **`dock_tabs` is user intent, not derived state.** Default tabs are seeded exactly once, since
   every analysis parameter change re-resolves the registry and re-seeding would resurrect views the
   user closed. Ids that do not currently resolve (plugin reload, epoch bump) are skipped while

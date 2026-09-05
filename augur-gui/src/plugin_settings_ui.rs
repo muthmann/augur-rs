@@ -9,7 +9,7 @@ pub fn render_plugin_settings(
     plugin: &mut DynPlugin,
     authoritative_status: Option<&[StatusEntry]>,
     show_header: bool,
-    id_source: impl std::hash::Hash,
+    id_source: impl std::hash::Hash + std::fmt::Debug,
 ) -> Result<bool, String> {
     let mut changed = false;
 
@@ -75,7 +75,7 @@ fn render_setting_item(
     ui: &mut egui::Ui,
     plugin: &mut DynPlugin,
     item: &SettingItem,
-    id_source: &impl std::hash::Hash,
+    id_source: &(impl std::hash::Hash + std::fmt::Debug),
 ) -> Result<bool, String> {
     let widget_id = (id_source, item.key.as_str());
     match &item.kind {
@@ -151,7 +151,7 @@ fn render_setting_item(
                         crate::theme::field_label(ui, &item.label, None);
                         ui.add(
                             egui::DragValue::new(&mut value)
-                                .clamp_range(*min..=*max)
+                                .range(*min..=*max)
                                 .speed(*speed),
                         )
                     })
@@ -173,7 +173,7 @@ fn render_setting_item(
                 .push_id(widget_id, |ui| {
                     ui.horizontal(|ui| {
                         crate::theme::field_label(ui, &item.label, None);
-                        ui.add(egui::DragValue::new(&mut value).clamp_range(*min..=*max))
+                        ui.add(egui::DragValue::new(&mut value).range(*min..=*max))
                     })
                     .response
                 })
@@ -194,7 +194,7 @@ fn render_setting_item(
             let response = ui
                 .push_id(widget_id, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.style_mut().wrap = Some(false);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         for (index, variant) in variants.iter().enumerate() {
                             ui.radio_value(&mut value, index, variant);
                         }
@@ -307,7 +307,7 @@ fn render_setting_item(
 fn path_chars(ui: &egui::Ui, width: f32) -> usize {
     let size = egui::TextStyle::Small.resolve(ui.style()).size;
     let advance = ui
-        .fonts(|f| {
+        .fonts_mut(|f| {
             f.layout_no_wrap(
                 "0".to_owned(),
                 egui::FontId::monospace(size),
@@ -376,7 +376,12 @@ fn draw_sparkline(ui: &mut egui::Ui, values: &[f64], lower_is_better: bool) {
     let palette = crate::theme::palette_for_visuals(ui.visuals());
     let radius = crate::theme::radius::R_3;
     painter.rect_filled(rect, radius, palette.bg_2);
-    painter.rect_stroke(rect, radius, egui::Stroke::new(1.0, palette.line));
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, palette.line),
+        egui::StrokeKind::Middle,
+    );
 
     if values.len() < 2 {
         painter.text(

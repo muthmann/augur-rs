@@ -563,6 +563,7 @@ pub(crate) fn draw_text_placeholder(ui: &mut egui::Ui, max_image_height: f32, me
         rect,
         PANEL_ROUNDING,
         egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Middle,
     );
     painter.text(
         rect.center(),
@@ -590,9 +591,9 @@ fn draw_display_strip(
 ) {
     ui.push_id((input.viewer_id, "display_strip"), |ui| {
         let palette = crate::theme::palette_for_visuals(ui.visuals());
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(palette.bg_1)
-            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+            .inner_margin(egui::Margin::symmetric(10, 4))
             .stroke(egui::Stroke::new(1.0, palette.line));
         frame.show(ui, |ui| {
             egui::ScrollArea::horizontal()
@@ -602,7 +603,7 @@ fn draw_display_strip(
                     // Group 1 — preview mode
                     ui.label(egui::RichText::new("Mode").size(11.0).strong());
                     let previous_preview_mode = state.preview_mode;
-                    egui::ComboBox::from_id_source((input.viewer_id, "preview_mode"))
+                    egui::ComboBox::from_id_salt((input.viewer_id, "preview_mode"))
                         .width(140.0)
                         .selected_text(match state.preview_mode {
                             PreviewMode::Intensity(colormap) => {
@@ -646,7 +647,7 @@ fn draw_display_strip(
                     // Group 2 — scale bar
                     ui.checkbox(&mut state.scale_bar_settings.show, "Scale bar");
                     if state.scale_bar_settings.show {
-                        egui::ComboBox::from_id_source((
+                        egui::ComboBox::from_id_salt((
                             input.viewer_id,
                             "scale_bar_position",
                         ))
@@ -777,7 +778,7 @@ fn draw_status_footer(
                 }
 
                 egui::CollapsingHeader::new("Diagnostics")
-                    .id_source((input.viewer_id, "pipeline_details"))
+                    .id_salt((input.viewer_id, "pipeline_details"))
                     .default_open(emphasize_details)
                     .show(ui, |ui| {
                         crate::theme::constrain_section_width(ui);
@@ -902,7 +903,7 @@ fn draw_status_footer(
                             ui.horizontal(|ui| {
                                 ui.small("Session log:");
                                 if ui.small_button("Copy path").clicked() {
-                                    ui.output_mut(|out| out.copied_text = log.clone());
+                                    ui.ctx().copy_text(log.clone());
                                 }
                             });
                             ui.small(log);
@@ -1143,9 +1144,9 @@ fn draw_preview_toolbar(
         egui::vec2(ui.available_width(), toolbar_height),
         egui::Sense::hover(),
     );
-    ui.allocate_ui_at_rect(toolbar_rect, |ui| {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar_rect), |ui| {
         egui::ScrollArea::horizontal()
-            .id_source((input.viewer_id, "preview_toolbar_scroll"))
+            .id_salt((input.viewer_id, "preview_toolbar_scroll"))
             .auto_shrink([false, false])
             .max_height(toolbar_height)
             .show(ui, |ui| {
@@ -1804,7 +1805,7 @@ fn draw_preview_canvas(
         let text = parts.join("   ");
         let pad = egui::vec2(8.0, 4.0);
         let font = egui::FontId::monospace(11.0);
-        let galley = ui.fonts(|f| {
+        let galley = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap(
                 text,
                 font.clone(),
@@ -2084,7 +2085,7 @@ fn paint_marker_shape(
         MarkerShape::Box => {
             let rect = egui::Rect::from_center_size(center, egui::vec2(size * 2.0, size * 2.0));
             painter.rect_filled(rect, 1.0, fill);
-            painter.rect_stroke(rect, 1.0, stroke);
+            painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Middle);
         }
         MarkerShape::Ellipse => {
             let radii = egui::vec2(size * 1.2, size);
@@ -2433,7 +2434,7 @@ fn paint_sensor_rect(
         viewport.sensor_to_screen(image_rect, sensor_rect.min),
         viewport.sensor_to_screen(image_rect, sensor_rect.max),
     );
-    painter.rect_stroke(screen_rect, 0.0, stroke);
+    painter.rect_stroke(screen_rect, 0.0, stroke, egui::StrokeKind::Middle);
 }
 
 fn paint_analysis_overlays(
@@ -2621,7 +2622,7 @@ fn paint_annotation_shape(
                 viewport
                     .sensor_to_screen(image_rect, egui::pos2(f32::from(max.0), f32::from(max.1))),
             );
-            painter.rect_stroke(rect, 0.0, stroke);
+            painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Middle);
         }
         AnnotationShape::Ellipse {
             center,
@@ -2820,7 +2821,7 @@ pub(crate) fn draw_replay_transport(
         crate::theme::toolbar_separator(ui);
 
         let selected_label = replay_speed_label(replay.speed);
-        egui::ComboBox::from_id_source((viewer_id, "replay_speed_combo"))
+        egui::ComboBox::from_id_salt((viewer_id, "replay_speed_combo"))
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 for (speed, label) in REPLAY_SPEED_OPTIONS {
@@ -2843,8 +2844,9 @@ pub(crate) fn draw_replay_transport(
         if has_duration {
             crate::theme::toolbar_separator(ui);
 
-            let time_width =
-                ui.fonts(|f| {
+            let time_width = ui
+                .ctx()
+                .fonts_mut(|f| {
                     f.layout_no_wrap(
                         time_text.clone(),
                         egui::FontId::default(),
@@ -2852,11 +2854,15 @@ pub(crate) fn draw_replay_transport(
                     )
                 })
                 .size()
-                .x + ui.spacing().item_spacing.x * 2.0;
+                .x
+                + ui.spacing().item_spacing.x * 2.0;
 
             let mb_width = {
                 let small_font = egui::TextStyle::Small.resolve(ui.style());
-                ui.fonts(|f| f.layout_no_wrap(mb_text.clone(), small_font, egui::Color32::WHITE))
+                ui.ctx()
+                    .fonts_mut(|f| {
+                        f.layout_no_wrap(mb_text.clone(), small_font, egui::Color32::WHITE)
+                    })
                     .size()
                     .x
             } + ui.spacing().item_spacing.x * 3.0
@@ -2924,7 +2930,7 @@ fn handle_replay_shortcuts(
     replay: ViewerReplayState,
     output: &mut ViewerOutput,
 ) {
-    if !replay.active || ctx.wants_keyboard_input() {
+    if !replay.active || ctx.egui_wants_keyboard_input() {
         return;
     }
 

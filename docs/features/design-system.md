@@ -215,9 +215,11 @@ plugin reload). Each frame the dock renders only the ids that currently
 resolve to a dockable view, falls back to the first renderable tab while
 the active view is away, and mounts nothing at all when none resolve.
 
-The panel also clips its contents to itself (`clip_to_panel`) — egui
-hands panels a screen-wide clip rect, so anything that overflows would
-otherwise paint over the side panels.
+The panel also clips its contents to itself (`clip_to_panel`). Up to egui
+0.31 panels inherited a screen-wide clip rect, so anything that overflowed
+painted over the side panels; egui 0.35 narrows the inherited rect to the
+space the side panels leave, and the explicit clip stays as the guard that
+keeps the dock inside its own rect regardless of egui's default.
 
 ### `app.rs` — `render_dock_tab_strip`
 

@@ -155,7 +155,7 @@ impl ExportDialog {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Acquisition time [ms]");
-                    ui.add(egui::DragValue::new(&mut self.acq_time_ms).clamp_range(1..=60_000));
+                    ui.add(egui::DragValue::new(&mut self.acq_time_ms).range(1..=60_000));
                 });
 
                 let roi_label = format!(

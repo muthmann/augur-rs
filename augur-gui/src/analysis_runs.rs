@@ -594,7 +594,7 @@ impl AnalysisDialog {
         // ── Window ────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             theme::field_label(ui, "Window", Some("ms"));
-            ui.add(egui::DragValue::new(&mut self.window_ms).clamp_range(1..=60_000));
+            ui.add(egui::DragValue::new(&mut self.window_ms).range(1..=60_000));
             ui.small("events are grouped into fixed windows of this length");
         });
         if let Some(windows) = self.estimated_windows() {
