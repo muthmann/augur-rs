@@ -15,12 +15,23 @@ shim so your checks run against the same compiler:
 
 ```bash
 cargo --version   # must match rust-toolchain.toml
+rustc --version   # must match too — cargo alone is not enough
 ```
 
-If it does not, another `cargo` is earlier on your `PATH` — a Homebrew-installed one, for instance,
-which ignores `rust-toolchain.toml` entirely. Put `~/.cargo/bin` first, or call
-`~/.cargo/bin/cargo` explicitly. Checks that pass against a different compiler prove nothing about
-CI.
+If either does not, another toolchain is earlier on your `PATH` — a Homebrew-installed one, for
+instance, which ignores `rust-toolchain.toml` entirely. Fix it by putting `~/.cargo/bin` first:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Check `rustc` as well as `cargo`. Calling `~/.cargo/bin/cargo` explicitly is **not** sufficient:
+the shim runs the right cargo, but cargo then resolves `rustc` from `PATH` and finds the other one.
+That combination reports the pinned version from `cargo --version` while building against the wrong
+compiler, and surfaces as a puzzling `error: rustc <old> is not supported by the following packages`
+on dependencies whose MSRV is newer.
+
+Checks that pass against a different compiler prove nothing about CI.
 
 ## Development Checklist
 
