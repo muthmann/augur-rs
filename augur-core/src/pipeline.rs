@@ -1980,6 +1980,9 @@ impl PipelineController {
                 "one or more pipeline threads panicked".into(),
             ));
         }
+        // Workers can report failures while they stop, after the host's last
+        // error poll. Preserve those failures before dropping the receiver.
+        let worker_errors = self.error_rx.try_iter().collect::<Vec<_>>();
         let stats_snapshot = self.stats_snapshot();
         let sensor_telemetry_snapshot = self.sensor_telemetry();
         if let Some(recording_sidecar) = &mut self.recording_sidecar {
@@ -2017,6 +2020,9 @@ impl PipelineController {
                 recording_sidecar.metadata.clone(),
             )
             .save_to_path(&recording_sidecar.path)?;
+        }
+        if !worker_errors.is_empty() {
+            return Err(CameraError::Other(worker_errors.join("; ")));
         }
         Ok(())
     }
@@ -2872,6 +2878,46 @@ mod tests {
         fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
             Err(CameraError::Timeout("idle test camera".into()))
         }
+    }
+
+    struct StopFailureCamera;
+
+    impl EventCamera for StopFailureCamera {
+        fn configure(&mut self, _config: &CameraConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn start_streaming(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_streaming(&mut self) -> Result<()> {
+            Err(CameraError::Transport("stop transport timed out".into()))
+        }
+
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+    }
+
+    impl PacketStreamCamera for StopFailureCamera {
+        fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
+            Err(CameraError::Timeout("idle test camera".into()))
+        }
+    }
+
+    #[test]
+    fn shutdown_reports_camera_stop_failure_after_workers_join() {
+        let controller = spawn_pipeline(
+            StopFailureCamera,
+            Evt3CorePreviewDecoder::default(),
+            CameraConfig::default(),
+            PipelineOptions::preview_only(1280, 720),
+        )
+        .expect("pipeline starts");
+
+        let error = controller.shutdown().expect_err("camera stop failed");
+        assert!(error.to_string().contains("stop transport timed out"));
     }
 
     #[test]

@@ -154,6 +154,12 @@ additional user click. The host also performs a required Preview restart itself.
 The session owner can apply later complete snapshots and the final restore still
 returns to the configuration from before the session. Plugins, not the host,
 define which fields may vary and which scientific conditions are required.
+During an owned session, a finalized recording leaves the camera Idle. Start
+subsequent captures directly; request a configuration apply only when settings
+change. The owner may apply from Idle, in which case the host opens the camera
+for confirmed readback. Restore failures keep ownership and must be exposed as
+a retryable recovery state by the plugin. Recoverable host rejections are saved
+to `sessions.log` with request IDs.
 See ADR 037.
 
 ## Host Views

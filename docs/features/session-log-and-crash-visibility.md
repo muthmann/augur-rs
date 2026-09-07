@@ -39,6 +39,7 @@ folder has been chosen and has to survive choosing a different one.
 | entry | meaning |
 |---|---|
 | `START` | a session began — pid, version, OS, architecture |
+| `ERROR` | recoverable camera-open, pipeline-shutdown, or rejected plugin-command failure; includes process ID and current activity |
 | `EXIT   clean` | `main` returned; the session ended in an orderly way |
 | `PANIC` | a Rust panic: message, source location, the activity, and a backtrace |
 | `CRASH` | reported at the *next* start: the previous session never reached the end of `main` |
@@ -85,3 +86,14 @@ survey, or another workflow. A plugin can include useful position information
 in its run ID. Between recordings it reads `idle between plugin recordings`, so
 a death *during* a recording is distinguishable from one *between* two of them
 — a different fault with a different cause.
+
+## Recoverable camera errors
+
+A clean application exit does not mean that every recording succeeded. Camera
+open failures, shutdown failures and rejected host requests are appended as
+`ERROR` entries when they occur. Plugin request entries include the plugin ID,
+request ID, rejection code and reason. USB transaction errors identify the
+Treuzell property and whether the request write or response read failed.
+Shutdown consumes errors reported while workers are joining, so a failed camera
+stop cannot produce a successful recording receipt merely because its error
+arrived after the last UI poll.
