@@ -122,6 +122,21 @@ pub fn note(activity: impl Into<String>) {
     }
 }
 
+/// Records a recoverable failure in the session log, including the current
+/// activity. Unlike the breadcrumb, this evidence survives a clean exit.
+pub fn error(message: impl AsRef<str>) {
+    let activity = SESSION
+        .get()
+        .and_then(|session| session.try_lock().ok().map(|s| s.activity.clone()))
+        .unwrap_or_else(|| "unknown".into());
+    append(&format!(
+        "ERROR  pid {} · {}\n       while: {}",
+        process::id(),
+        message.as_ref(),
+        activity,
+    ));
+}
+
 /// Records the end of a clean run and removes the breadcrumb, so the next
 /// start does not report this session as a crash.
 ///
@@ -333,6 +348,14 @@ mod tests {
         assert!(text.contains("without unwinding"), "{text}");
         // Consumed, so one crash is not re-reported at every later start.
         assert!(!dir.join("session-4242.open").exists());
+
+        error("open camera failed: transport error: Operation timed out");
+        let text = fs::read_to_string(&log).expect("session log with failure");
+        assert!(text.contains("ERROR"), "{text}");
+        assert!(
+            text.contains("open camera failed: transport error: Operation timed out"),
+            "{text}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

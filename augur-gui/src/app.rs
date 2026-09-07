@@ -3572,13 +3572,17 @@ impl CameraApp {
         code: &str,
         message: impl Into<String>,
     ) {
+        let message = message.into();
+        crate::diagnostics::error(format!(
+            "plugin {plugin_id} request {request_id} rejected ({code}): {message}"
+        ));
         self.submit_plugin_host_reply(
             plugin_id,
             HostCommandReply {
                 request_id,
                 outcome: HostCommandOutcome::Rejected {
                     code: code.into(),
-                    message: message.into(),
+                    message,
                 },
             },
         );
@@ -8061,7 +8065,11 @@ impl CameraApp {
             opts
         };
 
-        let camera = Evk4Camera::open_imx636().map_err(|e| format!("open camera failed: {e}"))?;
+        let camera = Evk4Camera::open_imx636().map_err(|e| {
+            let message = format!("open camera failed: {e}");
+            crate::diagnostics::error(&message);
+            message
+        })?;
         let camera_info = camera.device_info();
         self.camera_info = Some(camera_info.clone());
         let mut options = options;
@@ -8587,6 +8595,7 @@ impl CameraApp {
             self.event_store.detach_upstream();
             if let Err(e) = controller.shutdown() {
                 let msg = format!("pipeline shutdown failed: {e}");
+                crate::diagnostics::error(&msg);
                 pipeline_failure.get_or_insert_with(|| msg.clone());
                 self.last_error = Some(msg.clone());
                 self.toast_queue.push(msg, crate::toast::ToastTone::Error);

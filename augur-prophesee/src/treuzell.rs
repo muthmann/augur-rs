@@ -172,10 +172,27 @@ impl<'a> Treuzell<'a> {
         request.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         request.extend_from_slice(payload);
 
-        self.transport.write_control(&request)?;
+        let written = self.transport.write_control(&request).map_err(|error| {
+            CameraError::Transport(format!(
+                "Treuzell property 0x{req_property:08x} request write failed: {error}"
+            ))
+        })?;
+        if written != request.len() {
+            return Err(CameraError::Transport(format!(
+                "Treuzell property 0x{req_property:08x} short request write: {written}/{} bytes",
+                request.len()
+            )));
+        }
 
         let mut response_buf = vec![0_u8; 16 * 1024];
-        let n = self.transport.read_control(&mut response_buf)?;
+        let n = self
+            .transport
+            .read_control(&mut response_buf)
+            .map_err(|error| {
+                CameraError::Transport(format!(
+                    "Treuzell property 0x{req_property:08x} response read failed: {error}"
+                ))
+            })?;
         if n < 8 {
             return Err(CameraError::Transport(
                 "Treuzell response shorter than header".into(),
