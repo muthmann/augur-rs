@@ -7444,7 +7444,11 @@ impl CameraApp {
             camera_configuration_owner,
         )?;
         if self.mode == AppMode::Previewing {
+            self.last_error = None;
             self.stop_pipeline();
+            if let Some(error) = &self.last_error {
+                return Err(error.clone());
+            }
         }
         let actual_path = output_path.unwrap_or(self.validated_output_path()?);
         let controller =
