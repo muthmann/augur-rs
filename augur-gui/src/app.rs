@@ -6184,37 +6184,14 @@ impl CameraApp {
                 let icon = host_view_kind_icon(&kind);
                 let label_title = short_host_view_chip_title(&title);
                 let label = format!("{icon}  {label_title}");
-                let response = ui
-                    .push_id(&id, |ui| {
-                        if active {
-                            ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(&label)
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(palette.ink),
-                                )
-                                .fill(palette.accent_weak)
-                                .stroke(egui::Stroke::new(1.0, palette.ink)),
-                            )
-                        } else {
-                            ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(&label).monospace().size(10.0),
-                                )
-                                .fill(palette.bg_1)
-                                .stroke(egui::Stroke::new(1.0, palette.line)),
-                            )
-                        }
-                        .on_hover_text(if in_dock {
-                            "Docked · right-click toggles window"
-                        } else if in_window {
-                            "Open in window · click docks here"
-                        } else {
-                            "Click: dock here · Right-click: open in window"
-                        })
-                    })
-                    .inner;
+                let response =
+                    host_view_chip(ui, &label, active, &palette).on_hover_text(if in_dock {
+                        "Docked · right-click toggles window"
+                    } else if in_window {
+                        "Open in window · click docks here"
+                    } else {
+                        "Click: dock here · Right-click: open in window"
+                    });
                 let response = response.on_hover_text(&title);
                 if response.clicked() {
                     self.dock_open_view(&id);
@@ -12341,6 +12318,40 @@ fn host_view_kind_is_dockable(kind: &augur_plugin_api::HostViewKind) -> bool {
     )
 }
 
+/// One host-view chip, added straight to `ui`.
+///
+/// Straight to `ui` on purpose — do NOT wrap the button in `ui.push_id` or any
+/// other scope. A scope closes with `advance_cursor_after_rect`, which moves
+/// the cursor without consulting the wrapping layout, so chips inside a scope
+/// never move down to the next line and the row keeps growing to the right.
+/// The analysis panel's scroll area has horizontal scrolling off with
+/// `auto_shrink[0] = false`, so it expands to that width; `Panel::right` then
+/// clamps its own rect to `max_size` by moving its left edge right, hands the
+/// freed space to the central panel, and the viewer — drawn after the panels —
+/// paints over the panel's left edge. A plugin with three long view titles
+/// (Stage-A A1) lost about a third of its controls that way.
+fn host_view_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    palette: &crate::theme::Palette,
+) -> egui::Response {
+    let text = egui::RichText::new(label).monospace().size(10.0);
+    if active {
+        ui.add(
+            egui::Button::new(text.color(palette.ink))
+                .fill(palette.accent_weak)
+                .stroke(egui::Stroke::new(1.0, palette.ink)),
+        )
+    } else {
+        ui.add(
+            egui::Button::new(text)
+                .fill(palette.bg_1)
+                .stroke(egui::Stroke::new(1.0, palette.line)),
+        )
+    }
+}
+
 fn short_host_view_chip_title(title: &str) -> String {
     const MAX_CHARS: usize = 22;
     let compact = title
@@ -13022,23 +13033,23 @@ mod tests {
     use super::{
         acq_time_us_from_ms, camera_config_from_snapshot, camera_configuration_requires_restart,
         camera_configuration_snapshot, configuration_readback_verdict,
-        derived_replay_preview_interval_ms, expected_bias_code, host_view_kind_is_dockable,
-        investigation_split_ratio_bounds, is_newer_host_snapshot_sequence,
-        live_analysis_coverage_text, live_snapshot_generations_equal, pipeline_stream_active,
-        python_ingress_pipeline_config, python_ingress_replay_info, raw_event_focus_volume,
-        raw_event_point_position, recording_finalize_outcome, recording_target_name,
-        replay_fraction_from_time, replay_history_has_display_override, replay_history_step_target,
-        replay_pipeline_config, replay_seek_target_reached, replay_snapshot_frame,
-        replay_step_target_time_us, replay_step_uses_current_controller,
-        replay_time_from_position_sources, resolve_plugin_recording_path,
-        resolved_camera_configuration, roi_is_effectively_full_frame, sha256_file,
-        short_host_view_chip_title, should_dispatch_live_analysis_for_state, store_hover_state,
-        sync_acq_time_atomic, sync_popup_investigation_payload,
-        sync_retained_event_history_from_upstream, validate_camera_configuration_recording_start,
-        viewport_stream_active, CameraApp, CameraConfigurationSession,
-        ConfigurationReadbackVerdict, InvestigationSplitBounds, PluginRecordingSession,
-        PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH,
-        RAW_EVENTS_ON_LAYER_ID,
+        derived_replay_preview_interval_ms, expected_bias_code, host_view_chip,
+        host_view_kind_is_dockable, investigation_split_ratio_bounds,
+        is_newer_host_snapshot_sequence, live_analysis_coverage_text,
+        live_snapshot_generations_equal, pipeline_stream_active, python_ingress_pipeline_config,
+        python_ingress_replay_info, raw_event_focus_volume, raw_event_point_position,
+        recording_finalize_outcome, recording_target_name, replay_fraction_from_time,
+        replay_history_has_display_override, replay_history_step_target, replay_pipeline_config,
+        replay_seek_target_reached, replay_snapshot_frame, replay_step_target_time_us,
+        replay_step_uses_current_controller, replay_time_from_position_sources,
+        resolve_plugin_recording_path, resolved_camera_configuration,
+        roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
+        should_dispatch_live_analysis_for_state, store_hover_state, sync_acq_time_atomic,
+        sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
+        validate_camera_configuration_recording_start, viewport_stream_active, CameraApp,
+        CameraConfigurationSession, ConfigurationReadbackVerdict, InvestigationSplitBounds,
+        PluginRecordingSession, PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH,
+        DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
     };
     use super::{
         clip_to_panel, dock_tab_strip_width, publish_window_frame, should_seed_default_dock_tabs,
@@ -13627,6 +13638,58 @@ mod tests {
         assert_eq!(
             short_host_view_chip_title("Very Long Host View Name That Will Wrap"),
             "Very Long Host View..."
+        );
+    }
+
+    #[test]
+    fn host_view_chips_wrap_inside_the_analysis_panel() {
+        // Stage-A A1 exposes three window views whose titles all reach the
+        // 22-character chip budget. Wrapped in a scope they stayed on one line
+        // and grew the panel past `max_size`, which pushed the central panel
+        // over the panel's left edge and hid a third of the plugin's controls.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 860.0));
+        let ctx = egui::Context::default();
+        let mut observed = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                egui::Panel::right("analysis")
+                    .exact_size(420.0)
+                    .show(ui, |ui| {
+                        // The analysis panel turns wrapping on for its subtree.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        let palette = crate::theme::palette_for_visuals(ui.visuals());
+                        let available = ui.available_width();
+                        let row_right = crate::theme::wrap_row(ui, |ui| {
+                            let mut right = f32::NEG_INFINITY;
+                            for title in [
+                                "A1 rolling response S_p (ON/OFF)",
+                                "A1 response probability q_p (ON/OFF)",
+                                "A1 a₀ locks (commanded depth per frequency)",
+                            ] {
+                                let label = format!(
+                                    "{}  {}",
+                                    egui_phosphor::regular::TABLE,
+                                    short_host_view_chip_title(title)
+                                );
+                                right = right
+                                    .max(host_view_chip(ui, &label, false, &palette).rect.right());
+                            }
+                            right
+                        });
+                        observed = Some((ui.min_rect().left(), available, row_right));
+                    });
+            },
+        );
+
+        let (left, available, row_right) = observed.expect("the analysis panel ran");
+        let row = row_right - left;
+        assert!(
+            row <= available + 0.5,
+            "the chip row must stay inside the analysis panel: {row} > {available}"
         );
     }
 
