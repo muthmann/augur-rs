@@ -1083,6 +1083,14 @@ fn camera_configuration_requires_restart(current: &CameraConfig, desired: &Camer
         || desired.global.disk_writer_buffer_mib != current.global.disk_writer_buffer_mib
 }
 
+fn should_resume_plugin_preview(
+    plugin_requested_stop: bool,
+    pipeline_failed: bool,
+    configuration_workflow_active: bool,
+) -> bool {
+    plugin_requested_stop && !pipeline_failed && !configuration_workflow_active
+}
+
 fn validate_camera_configuration_recording_start(
     current: &CameraConfig,
     pending: bool,
@@ -3771,7 +3779,12 @@ impl CameraApp {
             );
             return;
         }
-        if self.controller.is_none() {
+        if self.controller.is_none()
+            && self
+                .camera_configuration_session
+                .as_ref()
+                .is_none_or(|session| session.owner_plugin_id != source_plugin_id)
+        {
             self.reject_plugin_host_command(
                 source_plugin_id,
                 request_id,
@@ -4256,10 +4269,8 @@ impl CameraApp {
                 crate::toast::ToastTone::Info
             },
         );
-        // A plugin-requested stop returns to live Preview before the receipt is
-        // acknowledged, so workflow plugins can begin the next recording without
-        // an operator click. An operator Stop or a pipeline failure must not
-        // re-open the device the user just closed or that just failed.
+        // An owned configuration session starts its next capture directly from
+        // Idle. Other healthy plugin recordings retain the live-preview behavior.
         if result.auto_restart_preview {
             self.start_preview();
         }
@@ -8649,10 +8660,13 @@ impl CameraApp {
         pipeline_failure: Option<String>,
     ) {
         let (tx, rx) = mpsc::channel();
-        // Only a plugin-requested stop of a healthy pipeline hands the host
-        // back to live preview; an operator Stop or a camera failure must
-        // leave the device closed.
-        let auto_restart_preview = session.stop_request_id.is_some() && pipeline_failure.is_none();
+        // Configuration owners need no intermediate preview. They can open
+        // the next recording directly or request a confirmed configuration update.
+        let auto_restart_preview = should_resume_plugin_preview(
+            session.stop_request_id.is_some(),
+            pipeline_failure.is_some(),
+            self.camera_configuration_workflow_active(),
+        );
         let request_id = session.receipt_request_id();
         thread::spawn(move || {
             let outcome =
@@ -13057,12 +13071,13 @@ mod tests {
         replay_step_uses_current_controller, replay_time_from_position_sources,
         resolve_plugin_recording_path, resolved_camera_configuration,
         roi_is_effectively_full_frame, sha256_file, short_host_view_chip_title,
-        should_dispatch_live_analysis_for_state, store_hover_state, sync_acq_time_atomic,
-        sync_popup_investigation_payload, sync_retained_event_history_from_upstream,
-        validate_camera_configuration_recording_start, viewport_stream_active, CameraApp,
-        CameraConfigurationSession, ConfigurationReadbackVerdict, InvestigationSplitBounds,
-        PluginRecordingSession, PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH,
-        DOCK_MIN_TAB_STRIP_WIDTH, RAW_EVENTS_ON_LAYER_ID,
+        should_dispatch_live_analysis_for_state, should_resume_plugin_preview, store_hover_state,
+        sync_acq_time_atomic, sync_popup_investigation_payload,
+        sync_retained_event_history_from_upstream, validate_camera_configuration_recording_start,
+        viewport_stream_active, CameraApp, CameraConfigurationSession,
+        ConfigurationReadbackVerdict, InvestigationSplitBounds, PluginRecordingSession,
+        PopupSharedData, RawEventSceneInput, DOCK_CONTROLS_WIDTH, DOCK_MIN_TAB_STRIP_WIDTH,
+        RAW_EVENTS_ON_LAYER_ID,
     };
     use super::{
         clip_to_panel, dock_tab_strip_width, publish_window_frame, should_seed_default_dock_tabs,
@@ -13088,6 +13103,14 @@ mod tests {
             .expect("system clock is valid")
             .as_nanos();
         std::env::temp_dir().join(format!("augur-recording-contract-{nanos}"))
+    }
+
+    #[test]
+    fn configured_recordings_finish_without_reopening_preview() {
+        assert!(!should_resume_plugin_preview(true, false, true));
+        assert!(should_resume_plugin_preview(true, false, false));
+        assert!(!should_resume_plugin_preview(false, false, false));
+        assert!(!should_resume_plugin_preview(true, true, false));
     }
 
     #[test]

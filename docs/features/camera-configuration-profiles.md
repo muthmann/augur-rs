@@ -38,7 +38,12 @@ to the camera state and prevent a rollback during capture.
 The session owner may apply another complete snapshot while the session is
 active. The host still retains the original pre-session configuration. This
 keeps field-specific rules in the plugin and avoids field- or plugin-specific
-host commands.
+host commands. Between recordings an owned session stays Idle and the next
+recording opens directly, without an intermediate Preview. If the owner changes
+settings while Idle, the host opens Preview only to apply and confirm the new
+snapshot. The final restore also opens the camera when needed for readback.
+Ownership remains locked until that restoration is confirmed; a failed restore
+must remain retryable in the owning plugin.
 
 Each plugin-started recording stores the resolved immutable snapshot and its
 profile name, schema, revision, and SHA-256 of that effective snapshot. Changing
