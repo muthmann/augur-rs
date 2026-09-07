@@ -11,6 +11,20 @@
 * ✨ clickable 2D overlays bound to their backing row via marker `source_row`, with reason-first summary card for rejected-fit rows.
 * ✨ generic host action bus: plugins declare `HostActionDescriptor`s with `Dataset`/`Row`/`Cluster` scope and an optional `param_schema`; the host renders scope-aware buttons plus a schema-driven modal and publishes `HostActionRequest`s to `CTX_INVESTIGATION_ACTION_REQUESTS`.
 
+## [2.2.0](https://github.com/muthmann/augur-rs/compare/v2.1.2...v2.2.0) (2026-09-07)
+
+
+### Features
+
+* **gui:** ✨ log recoverable camera failures in the session log ([b7b770c](https://github.com/muthmann/augur-rs/commit/b7b770ccfc9004295a8743cd8be3d8397b569070))
+
+
+### Bug Fixes
+
+* **core:** 🐛 report worker failures raised while the pipeline stops ([3965acd](https://github.com/muthmann/augur-rs/commit/3965acd09aee0dda1a52de3842d9bdcd430f5dc6))
+* **gui:** 🐛 keep an owned camera configuration recording without a preview ([82ff565](https://github.com/muthmann/augur-rs/commit/82ff5652f4ab0118b79be3b2743d9be98065f110))
+* harden plugin-owned camera recordings against transport failures ([6ff4e86](https://github.com/muthmann/augur-rs/commit/6ff4e8634bab96c13a571691ee2d7f8590911e97))
+
 ## [2.1.2](https://github.com/muthmann/augur-rs/compare/v2.1.1...v2.1.2) (2026-09-07)
 
 
