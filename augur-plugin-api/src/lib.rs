@@ -141,6 +141,29 @@ mod tests {
     }
 
     #[test]
+    fn recording_root_is_optional_in_host_command_json() {
+        let legacy = serde_json::json!({"command": "start_recording", "run_id": "run", "base_path": "point"});
+        let command: HostCommand = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            &command,
+            HostCommand::StartRecording { root_dir: None, .. }
+        ));
+        assert!(serde_json::to_value(command)
+            .unwrap()
+            .get("root_dir")
+            .is_none());
+        let explicit = serde_json::json!({"command": "start_recording", "run_id": "run", "base_path": "point", "root_dir": "/chosen"});
+        let command: HostCommand = serde_json::from_value(explicit).unwrap();
+        assert!(
+            matches!(&command, HostCommand::StartRecording { root_dir: Some(root), .. } if root == "/chosen")
+        );
+        assert_eq!(
+            serde_json::to_value(command).unwrap()["root_dir"],
+            "/chosen"
+        );
+    }
+
+    #[test]
     fn ffi_layouts_are_stable() {
         assert_eq!(std::mem::size_of::<FfiSlice<u8>>(), 16);
         assert_eq!(std::mem::size_of::<FfiString>(), 16);
@@ -661,6 +684,7 @@ mod tests {
             command: HostCommand::StartRecording {
                 run_id: "run-9".into(),
                 base_path: "/data/run-9".into(),
+                root_dir: None,
                 metadata: [("reference_set".into(), "ref-1".into())]
                     .into_iter()
                     .collect(),

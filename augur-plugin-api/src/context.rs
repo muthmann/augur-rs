@@ -56,6 +56,9 @@ pub enum HostCommand {
     StartRecording {
         run_id: String,
         base_path: String,
+        /// Absolute recording root; omitted requests use the host output directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_dir: Option<String>,
         #[serde(default)]
         metadata: BTreeMap<String, String>,
     },

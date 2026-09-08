@@ -1233,6 +1233,7 @@ fn recording_started_at_now() -> String {
 
 fn resolve_plugin_recording_path(
     configured_output: &Path,
+    root_dir: Option<&str>,
     base_path: &str,
     run_id: &str,
     always_timestamp: bool,
@@ -1262,22 +1263,64 @@ fn resolve_plugin_recording_path(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let data_dir = if configured_dir.is_absolute() {
+    let directory_error = |err: std::io::Error| {
+        (
+            "output_directory_unavailable",
+            format!("resolving recording directory failed: {err}"),
+        )
+    };
+    let data_dir = if let Some(root) = root_dir {
+        let root = Path::new(root);
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err((
+                "invalid_recording_root",
+                "recording root must be absolute without parent traversal".into(),
+            ));
+        }
+        root.to_path_buf()
+    } else if configured_dir.is_absolute() {
         configured_dir.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|err| {
-                (
-                    "output_directory_unavailable",
-                    format!("resolving configured output directory failed: {err}"),
-                )
-            })?
+            .map_err(directory_error)?
             .join(configured_dir)
     };
-    let mut output = data_dir.join(relative);
+    fs::create_dir_all(&data_dir).map_err(directory_error)?;
+    let data_dir = fs::canonicalize(data_dir).map_err(directory_error)?;
+    let mut parent = data_dir.clone();
+    for component in relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .components()
+    {
+        parent.push(component);
+        // Check each existing ancestor before creating children beneath it.
+        if fs::symlink_metadata(&parent).is_ok() {
+            parent = fs::canonicalize(&parent).map_err(directory_error)?;
+            if !parent.starts_with(&data_dir) {
+                return Err((
+                    "path_outside_output_directory",
+                    "recording parent escapes the recording root".into(),
+                ));
+            }
+        } else {
+            fs::create_dir(&parent).map_err(directory_error)?;
+        }
+    }
+    let mut output = parent.join(relative.file_name().ok_or_else(|| {
+        (
+            "invalid_recording_path",
+            "recording path must have a file name".into(),
+        )
+    })?);
     if always_timestamp {
         output = insert_timestamp_suffix(&output);
-    } else if output.exists() {
+    }
+    if fs::symlink_metadata(&output).is_ok() {
         return Err((
             "recording_path_exists",
             format!(
@@ -3615,6 +3658,7 @@ impl CameraApp {
             HostCommand::StartRecording {
                 run_id,
                 base_path,
+                root_dir,
                 mut metadata,
             } => {
                 if run_id.trim().is_empty() {
@@ -3639,6 +3683,7 @@ impl CameraApp {
                 }
                 let path = match resolve_plugin_recording_path(
                     Path::new(&self.output_path),
+                    root_dir.as_deref(),
                     &base_path,
                     &run_id,
                     self.always_timestamp,
@@ -13141,22 +13186,107 @@ mod tests {
         fs::create_dir_all(root.join("runs")).expect("test directory exists");
         let configured = root.join("manual.raw");
 
-        let path = resolve_plugin_recording_path(&configured, "runs/point", "run-1", false)
+        let path = resolve_plugin_recording_path(&configured, None, "runs/point", "run-1", false)
             .expect("relative child path is accepted");
-        assert_eq!(path, root.join("runs/point.raw"));
+        assert_eq!(
+            path,
+            fs::canonicalize(&root).unwrap().join("runs/point.raw")
+        );
         fs::write(&path, b"existing").expect("collision fixture is written");
-        let (code, _) = resolve_plugin_recording_path(&configured, "runs/point", "run-1", false)
-            .expect_err("existing path is rejected");
+        let (code, _) =
+            resolve_plugin_recording_path(&configured, None, "runs/point", "run-1", false)
+                .expect_err("existing path is rejected");
         assert_eq!(code, "recording_path_exists");
 
-        let (code, _) = resolve_plugin_recording_path(&configured, "../escape", "run-1", false)
-            .expect_err("traversal is rejected");
+        let (code, _) =
+            resolve_plugin_recording_path(&configured, None, "../escape", "run-1", false)
+                .expect_err("traversal is rejected");
         assert_eq!(code, "path_outside_output_directory");
-        let (code, _) = resolve_plugin_recording_path(&configured, "/tmp/escape", "run-1", false)
-            .expect_err("absolute path is rejected");
+        let (code, _) =
+            resolve_plugin_recording_path(&configured, None, "/tmp/escape", "run-1", false)
+                .expect_err("absolute path is rejected");
         assert_eq!(code, "path_outside_output_directory");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_recording_root_overrides_global_and_rejects_invalid_roots() {
+        let root = unique_recording_test_dir();
+        let selected = root.join("selected");
+        let configured = root.join("wrong/manual.raw");
+        let path = resolve_plugin_recording_path(
+            &configured,
+            selected.to_str(),
+            "session/point",
+            "run",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            fs::canonicalize(&selected)
+                .unwrap()
+                .join("session/point.raw")
+        );
+        assert!(!root.join("wrong").exists());
+        for invalid in ["", "relative", "../escape"] {
+            assert_eq!(
+                resolve_plugin_recording_path(&configured, Some(invalid), "point", "run", false)
+                    .unwrap_err()
+                    .0,
+                "invalid_recording_root"
+            );
+        }
+        assert_eq!(
+            resolve_plugin_recording_path(
+                &configured,
+                selected.to_str(),
+                "../escape",
+                "run",
+                false
+            )
+            .unwrap_err()
+            .0,
+            "path_outside_output_directory"
+        );
+        let file_root = root.join("file");
+        fs::write(&file_root, b"file").unwrap();
+        assert_eq!(
+            resolve_plugin_recording_path(&configured, file_root.to_str(), "point", "run", false)
+                .unwrap_err()
+                .0,
+            "output_directory_unavailable"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_recording_rejects_symlink_escape_before_creating_children() {
+        use std::os::unix::fs::symlink;
+        let root = unique_recording_test_dir();
+        let selected = root.join("selected");
+        let outside = root.join("outside");
+        fs::create_dir_all(&selected).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, selected.join("escape")).unwrap();
+        let configured = selected.join("manual.raw");
+        assert_eq!(
+            resolve_plugin_recording_path(&configured, None, "escape/new/point", "run", false)
+                .unwrap_err()
+                .0,
+            "path_outside_output_directory"
+        );
+        assert!(!outside.join("new").exists());
+        symlink(outside.join("missing"), selected.join("dangling.raw")).unwrap();
+        assert_eq!(
+            resolve_plugin_recording_path(&configured, None, "dangling", "run", false)
+                .unwrap_err()
+                .0,
+            "recording_path_exists"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

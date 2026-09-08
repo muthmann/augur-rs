@@ -42,8 +42,9 @@ deadline after processing commands instead of starving control publication.
 
 ## Recording commands
 
-`StartRecording` accepts a run ID, relative base path, and metadata. The path
-is confined below the host's configured output directory, uses create-new
+`StartRecording` accepts a run ID, relative base path, metadata, and optional
+absolute `root_dir`. The path is confined below that root (or the host's configured
+output directory when omitted), uses create-new
 semantics, and returns the actual path and UTC start time. `StopRecording`
 finalizes through the normal pipeline and returns byte size, SHA-256, duration,
 and actual path. Hashing runs off the GUI thread. For a plugin-owned recording
@@ -94,3 +95,19 @@ Regression coverage includes ABI/message serialization, stable manifest ID
 validation, no-frame periodic control and host-view publication, cross-channel
 snapshot ordering, synchronously acknowledged effect revocation, and the
 existing core/runtime/GUI suites.
+
+## Explicit recording root (2026-09-07)
+
+`StartRecording.root_dir` optionally supplies an absolute recording directory.
+The host resolves the relative `base_path` below that root, independently of the
+manual recorder output. Without this field, existing configured-output behavior
+is retained. Parent traversal, child symlink escapes, and existing targets are
+rejected; parents are canonicalized before recording. Recorder exclusive creation
+remains the final file collision guard. This is not a sandbox against concurrent
+malicious directory replacement.
+
+Plugins using this field require a matching host build containing this change;
+no released minimum version is assigned here. Older hosts can ignore unknown JSON
+fields. Plugins must therefore verify the returned recording path before starting
+companion acquisition and stop the recording on a mismatch. Rust constructors
+must supply `root_dir: None` or the explicit root. Workspace versions are unchanged.
