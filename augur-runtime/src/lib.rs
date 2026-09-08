@@ -3725,6 +3725,7 @@ host_commands = ["start_recording", "stop_recording"]
                 command: HostCommand::StartRecording {
                     run_id: "run-1".into(),
                     base_path: "/tmp".into(),
+                    root_dir: None,
                     metadata: Default::default(),
                 },
             },

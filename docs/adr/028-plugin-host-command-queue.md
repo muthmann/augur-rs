@@ -37,8 +37,8 @@ sessions. They do not name plugins or encode one workflow's scientific policy.
   Individual command handlers validate host state, so a stale command is
   rejected rather than misapplied.
 - `StartRecording` supplies a run ID, a **relative** base path, and string
-  metadata. The host confines the path below the directory of its configured
-  output path, appends `.raw` when absent, and rejects absolute paths,
+  metadata plus an optional absolute `root_dir`. The host confines the path below
+  that root, or the directory of its configured output path when omitted, appends `.raw` when absent, and rejects absolute paths,
   traversal, and existing targets. The recorder uses `create_new` to close the
   check/create race. Plugin metadata is namespaced in recording metadata.
 - A successful start returns the actual absolute raw path and UTC start time.
@@ -79,3 +79,19 @@ them, and the host remains functional when all plugins are removed.
 - ADR 027: Worker-Owned Semantic Plugin Services
 - ADR 037: Host-Owned Camera Profiles And Plugin Configuration Sessions
 - `docs/features/plugin-service-control-plane.md`
+
+## Explicit recording root (2026-09-07)
+
+`StartRecording.root_dir` optionally supplies an absolute recording directory.
+The host resolves the relative `base_path` below that root, independently of the
+manual recorder output. Without this field, existing configured-output behavior
+is retained. Parent traversal, child symlink escapes, and existing targets are
+rejected; parents are canonicalized before recording. Recorder exclusive creation
+remains the final file collision guard. This is not a sandbox against concurrent
+malicious directory replacement.
+
+Plugins using this field require a matching host build containing this change;
+no released minimum version is assigned here. Older hosts can ignore unknown JSON
+fields. Plugins must therefore verify the returned recording path before starting
+companion acquisition and stop the recording on a mismatch. Rust constructors
+must supply `root_dir: None` or the explicit root. Workspace versions are unchanged.

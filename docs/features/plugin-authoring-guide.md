@@ -134,8 +134,9 @@ effects are permitted only for `PluginRuntimeRole::LiveWorker` when
 `OfflineAnalysis` must stay inert.
 
 Host commands require the corresponding manifest `host_commands` entry.
-`start_recording` and `stop_recording` use paths relative to the host-configured
-output directory; absolute paths and traversal are rejected. See
+`start_recording` uses a base path relative to its optional absolute `root_dir`,
+or the host-configured output directory when omitted; absolute base paths and
+traversal are rejected. `stop_recording` finalizes the owned recording. See
 [Plugin Service Control Plane](./plugin-service-control-plane.md).
 
 Camera settings remain host-owned:
@@ -388,3 +389,19 @@ cargo test -p augur-gui host_view
 cargo test -p augur-gui event_store
 cargo check -p augur-gui
 ```
+
+## Explicit recording root (2026-09-07)
+
+`StartRecording.root_dir` optionally supplies an absolute recording directory.
+The host resolves the relative `base_path` below that root, independently of the
+manual recorder output. Without this field, existing configured-output behavior
+is retained. Parent traversal, child symlink escapes, and existing targets are
+rejected; parents are canonicalized before recording. Recorder exclusive creation
+remains the final file collision guard. This is not a sandbox against concurrent
+malicious directory replacement.
+
+Plugins using this field require a matching host build containing this change;
+no released minimum version is assigned here. Older hosts can ignore unknown JSON
+fields. Plugins must therefore verify the returned recording path before starting
+companion acquisition and stop the recording on a mismatch. Rust constructors
+must supply `root_dir: None` or the explicit root. Workspace versions are unchanged.
