@@ -232,6 +232,38 @@ verified before anything is replaced, and updating is refused while a recording 
 active — the running version is written into every recording sidecar. See
 [In-App Updates](./docs/features/in-app-updates.md).
 
+### Windows: Camera Driver
+
+**Live capture on Windows needs one extra step.** Installing AugurRS is not enough — the EVK4 also
+needs a USB driver, and Windows does not ship one for it.
+
+AugurRS talks to the camera through libusb. On macOS and Linux libusb can open the device directly,
+but on Windows it can only open devices that have **WinUSB** bound to them. The EVK4 enumerates as a
+vendor-class device (`bInterfaceClass = 0xff`), for which Windows has no built-in driver, so out of
+the box it lands in Device Manager under **Other devices** with *"The drivers for this device are not
+installed (Code 28)"*. AugurRS then reports:
+
+```
+transport error: no Treuzell-compatible EVK device found (VID:PID 04b4:00f4/00f5 etc)
+```
+
+**Fix:** install the [Prophesee Metavision SDK](https://www.prophesee.ai/metavision-intelligence/)
+for Windows. Its installer ships the EVK driver and binds it to the camera. AugurRS does not use the
+SDK itself — only the driver it installs.
+
+To confirm it worked, replug the camera and check Device Manager: the EVK4 must appear under
+**Universal Serial Bus devices**, not under *Other devices*. Then:
+
+```powershell
+augur status
+```
+
+Also make sure the camera sits on a **USB 3.0 port** (blue / marked `SS`) with a USB 3 capable cable.
+On USB 2.0 the device may still enumerate but cannot sustain the event stream.
+
+macOS and Linux need no driver install. On Linux, a non-root user needs udev permissions for the
+device.
+
 ---
 
 ## Quick Start
@@ -253,7 +285,8 @@ cargo run -p augur-gui --bin AugurRS
 
 ### With a Camera
 
-**Requirements:** Rust toolchain, Prophesee EVK4 over USB 3.
+**Requirements:** Rust toolchain, Prophesee EVK4 over USB 3. On Windows, install the camera driver
+first — see [Windows: Camera Driver](#windows-camera-driver).
 
 ```bash
 # Check camera connection
