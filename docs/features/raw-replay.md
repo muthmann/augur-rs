@@ -41,7 +41,7 @@ That keeps `1x` much closer to recorded event time even when event density varie
 
 ## Decoded File Formats
 
-The decoded replay path is intentionally narrow and matches the evt3-core decoder output formats:
+The decoded replay path is intentionally narrow and matches the `evt3` decoder output formats:
 
 - `.csv` — XYPT rows with a required `%geometry:W,H` header
 - `.bin` — `EVT3BIN\0` header + 14-byte packed XYPT records
@@ -153,7 +153,7 @@ Some `.raw` files may differ from the standard header convention in three ways:
 2. **Missing `% end` terminator** — Augur follows Prophesee's RAW parsing rule that `% end` is optional and the payload begins as soon as the next line no longer starts with `% `.
 3. **Missing `% format` line** — if only `% geometry WxH` is present, the parser proceeds and assumes EVT3. A `% format` line that declares a non-EVT3 codec is still rejected.
 4. **Missing geometry** — Augur first tries known Prophesee plugin-family fallbacks such as `hal_plugin_gen41_*`, `hal_plugin_imx636_*`, `hal_plugin_gen31_*`, and `hal_plugin_genx320_*`; if that still fails, it decodes an initial payload window and derives a best-effort geometry from the observed event bounds.
-5. **Single trailing padding byte** — the published `evt3-core` crate now exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
+5. **Single trailing padding byte** — the published `evt3` crate exposes `finish_stream_lenient()`, so replay EOF can discard one benign trailing byte while the preview pipeline reports genuine finalization errors again.
 
 ## Verification
 
