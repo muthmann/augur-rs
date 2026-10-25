@@ -11,7 +11,7 @@ use std::{
 };
 
 use augur_event_types::{CompactEvent, EventChunk, EventSource, ExternalTriggerEvent, FetchError};
-use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
+use evt3::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
     camera::{DeviceInfo, EventCamera, PacketStreamCamera},

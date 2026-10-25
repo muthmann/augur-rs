@@ -890,7 +890,7 @@ fn validate_npy_header(path: &Path, header: &str) -> Result<()> {
     if !normalized.contains("'descr':[('x','<u2'),('y','<u2'),('p','<i2'),('','|V2'),('t','<i8')]")
     {
         return Err(CameraError::Config(format!(
-            "npy replay file {} has an unsupported dtype; expected evt3-core structured XYPT records",
+            "npy replay file {} has an unsupported dtype; expected evt3 structured XYPT records",
             path.display()
         )));
     }

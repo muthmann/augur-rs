@@ -20,7 +20,7 @@ use crossbeam_channel::{
     bounded, select, Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError,
     TrySendError,
 };
-use evt3_core::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
+use evt3::{CdEvent as Evt3CdEvent, Evt3Decoder, TriggerEvent as Evt3TriggerEvent};
 
 use crate::{
     camera::{

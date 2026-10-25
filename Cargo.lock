@@ -552,7 +552,7 @@ version = "2.2.1"
 dependencies = [
  "augur-event-types",
  "crossbeam-channel",
- "evt3-core",
+ "evt3",
  "gethostname",
  "hdf5-metno",
  "serde",
@@ -1558,10 +1558,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "evt3-core"
-version = "0.2.0"
+name = "evt3"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48554d6c7fb65ccdb702032c80f02c89708d1dfdf04cf448904a50d09bb1f1f1"
+checksum = "b95b1a4aa7d734181215ed687ec39ae07fab4f49b81372e7c374bb10ea0a8d6d"
 dependencies = [
  "byteorder",
  "thiserror 1.0.69",

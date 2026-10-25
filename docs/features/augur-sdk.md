@@ -8,7 +8,7 @@ A Rust workspace for controlling Prophesee EVK4 / IMX636 event cameras on macOS.
 
 | Crate | Role |
 |-------|------|
-| `augur-core` | Camera traits, TOML config types, streaming pipeline, and EVT3 preview decoding (via [`evt3-core`](https://crates.io/crates/evt3-core/0.2.0)) |
+| `augur-core` | Camera traits, TOML config types, streaming pipeline, and EVT3 preview decoding (via [`evt3`](https://crates.io/crates/evt3)) |
 | `augur-prophesee` | EVK4 Treuzell USB transport, IMX636 register sequences (ISSD init/start/stop/destroy), sensor trait implementation |
 | `augur-cli` | `status`, `record`, `config` commands |
 | `augur-gui` | Live preview, runtime controls, built-in hotpixel detection, and the dynamic plugin host |
